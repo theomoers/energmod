@@ -439,41 +439,41 @@ rule build_demand_profiles:
         "scripts/build_demand_profiles.py"
 
 
-rule build_renewable_profiles:
-    params:
-        crs=config["crs"],
-        renewable=config["renewable"],
-        countries=config["countries"],
-        alternative_clustering=config["cluster_options"]["alternative_clustering"],
-    input:
-        natura="resources/" + RDIR + "natura.tiff",
-        copernicus="data/copernicus/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif",
-        gebco="data/gebco/GEBCO_2021_TID.nc",
-        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
-        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
-        hydro_capacities="data/hydro_capacities.csv",
-        eia_hydro_generation="data/eia_hydro_annual_generation.csv",
-        powerplants="resources/" + RDIR + "powerplants.csv",
-        regions=lambda w: (
-            "resources/" + RDIR + "bus_regions/regions_onshore.geojson"
-            if w.technology in ("onwind", "solar", "hydro", "csp")
-            else "resources/" + RDIR + "bus_regions/regions_offshore.geojson"
-        ),
-        cutout=lambda w: "cutouts/"
-        + CDIR
-        + config["renewable"][w.technology]["cutout"]
-        + ".nc",
-    output:
-        profile="resources/" + RDIR + "renewable_profiles/profile_{technology}.nc",
-    log:
-        "logs/" + RDIR + "build_renewable_profile_{technology}.log",
-    benchmark:
-        "benchmarks/" + RDIR + "build_renewable_profiles_{technology}"
-    threads: ATLITE_NPROCESSES
-    resources:
-        mem_mb=ATLITE_NPROCESSES * 5000,
-    script:
-        "scripts/build_renewable_profiles.py"
+#rule build_renewable_profiles:
+#    params:
+#        crs=config["crs"],
+#        renewable=config["renewable"],
+#        countries=config["countries"],
+#        alternative_clustering=config["cluster_options"]["alternative_clustering"],
+#    input:
+#        natura="resources/" + RDIR + "natura.tiff",
+#        copernicus="data/copernicus/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif",
+#        gebco="data/gebco/GEBCO_2021_TID.nc",
+#        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
+#        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
+#        hydro_capacities="data/hydro_capacities.csv",
+#        eia_hydro_generation="data/eia_hydro_annual_generation.csv",
+#        powerplants="resources/" + RDIR + "powerplants.csv",
+#        regions=lambda w: (
+#            "resources/" + RDIR + "bus_regions/regions_onshore.geojson"
+#            if w.technology in ("onwind", "solar", "hydro", "csp")
+#            else "resources/" + RDIR + "bus_regions/regions_offshore.geojson"
+#        ),
+#        cutout=lambda w: "cutouts/"
+#        + CDIR
+#        + config["renewable"][w.technology]["cutout"]
+#        + ".nc",
+#    output:
+#        profile="resources/" + RDIR + "renewable_profiles/profile_{technology}.nc",
+#    log:
+#        "logs/" + RDIR + "build_renewable_profile_{technology}.log",
+#    benchmark:
+#        "benchmarks/" + RDIR + "build_renewable_profiles_{technology}"
+#    threads: ATLITE_NPROCESSES
+#    resources:
+#        mem_mb=ATLITE_NPROCESSES * 5000,
+#    script:
+#        "scripts/build_renewable_profiles.py"
 
 
 rule build_powerplants:
