@@ -651,26 +651,48 @@ sector:
       Co2L0.00: 0.01
 
   land_transport_fuel_cell_share: # 1 means all FCEVs HERE
+    BU_2020: 0.00
+    AP_2020: 0.002
+    NZ_2020: 0.01
+    DF_2020: 0.005
+    AB_2020: 0.005
     BU_2030: 0.00
     AP_2030: 0.004
     NZ_2030: 0.02
     DF_2030: 0.01
     AB_2030: 0.01
+    BU_2040: 0.00
+    AP_2040: 0.03
+    NZ_2040: 0.15
+    DF_2040: 0.04
+    AB_2040: 0.01
     BU_2050: 0.00
     AP_2050: 0.06
     NZ_2050: 0.28
     DF_2050: 0.08
+    AB_2050: 0.01
 
   land_transport_electric_share: # 1 means all EVs  # This leads to problems when non-zero HERE
+    BU_2020: 0.00
+    AP_2020: 0.03
+    NZ_2020: 0.06
+    DF_2020: 0.005
+    AB_2020: 0.005
     BU_2030: 0.00
     AP_2030: 0.075
     NZ_2030: 0.13
     DF_2030: 0.01
     AB_2030: 0.01
+    BU_2040: 0.00
+    AP_2040: 0.25
+    NZ_2040: 0.40
+    DF_2040: 0.015
+    AB_2040: 0.015
     BU_2050: 0.00
     AP_2050: 0.42
     NZ_2050: 0.68
     DF_2050: 0.011
+    AB_2050: 0.02
 
   co2_network: true
   co2_sequestration_potential: 200 #MtCO2/a sequestration potential for Europe
@@ -679,15 +701,26 @@ sector:
   shipping_average_efficiency: 0.4 #For conversion of fuel oil to propulsion in 2011
 
   shipping_hydrogen_share: #1.0
+    BU_2020: 0.00
+    AP_2020: 0.00
+    NZ_2020: 0.05
+    DF_2020: 0.02
+    AB_2020: 0.02
     BU_2030: 0.00
     AP_2030: 0.00
     NZ_2030: 0.10
     DF_2030: 0.05
     AB_2030: 0.05
+    BU_2040: 0.00
+    AP_2040: 0.12
+    NZ_2040: 0.23
+    DF_2040: 0.08
+    AB_2040: 0.08
     BU_2050: 0.00
     AP_2050: 0.25
     NZ_2050: 0.36
     DF_2050: 0.12
+    AB_2050: 0.12
 
   h2_cavern: true
   marginal_cost_storage: 0

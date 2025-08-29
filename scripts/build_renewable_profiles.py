@@ -251,7 +251,20 @@ def get_eia_annual_hydro_generation(fn, countries):
     df.index = cc.convert(df.index, to="iso2")
     df.index.name = "countries"
 
-    df = df.T[countries] * 1e6  # in MWh/a
+    # Filter countries to only include those that exist in the EIA data
+    available_countries = [c for c in countries if c in df.columns]
+    missing_countries = [c for c in countries if c not in df.columns]
+    
+    if missing_countries:
+        logger.warning(
+            f"The following countries are missing from EIA hydro data and will be skipped: {missing_countries}"
+        )
+    
+    if not available_countries:
+        logger.warning("No countries found in EIA hydro data. Returning empty dataframe.")
+        return pd.DataFrame()
+    
+    df = df.T[available_countries] * 1e6  # in MWh/a
     df.index = df.index.astype(int)
 
     return df

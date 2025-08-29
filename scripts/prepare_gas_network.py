@@ -565,6 +565,12 @@ def load_bus_region(onshore_path, pipelines):
         # )
         bus_regions_onshore = bus_regions_onshore.to_crs(epsg=3857)
 
+    # Fix potential geometry issues after CRS transformation
+    from shapely.validation import make_valid
+    bus_regions_onshore['geometry'] = bus_regions_onshore.geometry.apply(
+        lambda geom: make_valid(geom.buffer(1e-10)) if not geom.is_valid else geom.buffer(1e-10)
+    )
+    
     country_borders = unary_union(bus_regions_onshore.geometry)
 
     # Create a new GeoDataFrame containing the merged polygon

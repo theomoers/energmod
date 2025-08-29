@@ -51,8 +51,26 @@ def generate_periodic_profiles(dt_index, nodes, weekly_profile, localize=None):
 
     week_df = pd.DataFrame(index=dt_index, columns=nodes)
 
+    # Fallback timezone mapping for countries not recognized by pytz
+    fallback_timezones = {
+        'XK': 'Europe/Belgrade',  # Kosovo uses Central European Time like Serbia
+        'TW': 'Asia/Taipei',      # Taiwan
+    }
+
     for node in nodes:
-        timezone = pytz.timezone(pytz.country_timezones[node[:2]][0])
+        country_code = node[:2]
+        try:
+            timezone = pytz.timezone(pytz.country_timezones[country_code][0])
+        except KeyError:
+            # If country code not found in pytz, try fallback mapping
+            if country_code in fallback_timezones:
+                timezone = pytz.timezone(fallback_timezones[country_code])
+                print(f"Using fallback timezone {fallback_timezones[country_code]} for country code {country_code}")
+            else:
+                # Default to UTC if no fallback available
+                timezone = pytz.UTC
+                print(f"WARNING: Country code {country_code} not found in pytz or fallback mapping, using UTC")
+        
         tz_dt_index = dt_index.tz_convert(timezone)
         week_df[node] = [24 * dt.weekday() + dt.hour for dt in tz_dt_index]
         week_df[node] = week_df[node].map(weekly_profile)

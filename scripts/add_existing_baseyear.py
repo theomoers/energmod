@@ -208,6 +208,17 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
     # include renewables in df_agg
     add_existing_renewables(df_agg)
 
+    newer_assets = (df_agg.DateIn > max(grouping_years)).sum()
+    if newer_assets:
+        logger.warning(
+            f"There are {newer_assets} assets with build year "
+            f"after last power grouping year {max(grouping_years)}. "
+            "These assets are dropped and not considered."
+            "Consider to redefine the grouping years to keep them."
+        )
+        to_drop = df_agg[df_agg.DateIn > max(grouping_years)].index
+        df_agg.drop(to_drop, inplace=True)
+
     df_agg["grouping_year"] = np.take(
         grouping_years, np.digitize(df_agg.DateIn, grouping_years, right=True)
     )

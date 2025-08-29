@@ -104,6 +104,22 @@ if __name__ == "__main__":
     # Reduce the data to one value for the urban percent per country and year
     df = df.groupby(["country", "Year"], as_index=False).mean(numeric_only=True)
 
+    # Manually add Taiwan (TW) with linear urban population growth from 78.9% (2020) to 87.5% (2050)
+    years = df["Year"].unique()  # Source: https://www.statista.com/statistics/1319652/urbanization-rate-in-taiwan/
+    taiwan_data = []
+    for year in years:
+        # Linear interpolation: 78.9% in 2020 to 87.5% in 2050
+        urban_percent = 78.9 + (87.5 - 78.9) * (year - 2020) / (2050 - 2020)
+        urban_percent = round(urban_percent, 5)
+        taiwan_data.append({
+            "country": "TW",
+            "Year": year,
+            "Urban population as percentage of total population": urban_percent
+        })
+    
+    taiwan_df = pd.DataFrame(taiwan_data)
+    df = pd.concat([df, taiwan_df], ignore_index=True)
+
     df = df.set_index("country")
 
     # Save

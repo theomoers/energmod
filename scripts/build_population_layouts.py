@@ -46,11 +46,13 @@ if __name__ == "__main__":
     Iinv = cutout.indicatormatrix(nuts3.geometry)
 
     countries = np.sort(nuts3.country.unique())
+    print(f"Found {len(countries)} countries to process: {list(countries)}")
 
     urban_percent_df = read_csv_nafix(
         snakemake.input.urban_percent,
         index_col=0,
     )
+    print(f"Loaded urban percent data with {len(urban_percent_df)} rows")
 
     # Filter for the year used in the workflow
     urban_percent_df = urban_percent_df.loc[
@@ -84,6 +86,7 @@ if __name__ == "__main__":
     pop_urban = pd.Series(0.0, density_cells_pop.index)
 
     for ct in countries:
+        print(f"Processing country: {ct}")
         indicator_nuts3_ct = nuts3.country.apply(lambda x: 1.0 if x == ct else 0.0)
 
         indicator_cells_ct = pd.Series(Iinv.T.dot(indicator_nuts3_ct))
@@ -103,7 +106,17 @@ if __name__ == "__main__":
         # The first low density grid cells to reach rural fraction are rural
         asc_density_i = density_cells_pop_ct.sort_values().index
         asc_density_cumsum = pop_cells_ct[asc_density_i].cumsum() / pop_cells_ct.sum()
-        rural_fraction_ct = 1 - urban_fraction[ct]
+        # If country not in urban_fraction index, default to 55% urban (45% rural)
+        if ct in urban_fraction.index:
+            urban_frac_ct = urban_fraction[ct]
+            # Ensure we get a single float value (take first value if Series)
+            if hasattr(urban_frac_ct, 'iloc'):
+                urban_frac_ct = float(urban_frac_ct.iloc[0])
+            else:
+                urban_frac_ct = float(urban_frac_ct)
+            rural_fraction_ct = 1.0 - urban_frac_ct
+        else:
+            rural_fraction_ct = 1.0 - 0.55  # Default to 55% urban population (https://www.un.org/uk/desa/68-world-population-projected-live-urban-areas-2050-says-un)
         pop_ct_rural_b = asc_density_cumsum < rural_fraction_ct
         pop_ct_urban_b = ~pop_ct_rural_b
 

@@ -1971,13 +1971,13 @@ def add_land_transport(n, costs):
         ):
             n.madd(
                 "Load",
-                nodes,
+                spatial.nodes,
                 suffix=" land transport fuel cell",
-                bus=nodes + " H2",
+                bus=spatial.nodes + " H2",
                 carrier="land transport fuel cell",
                 p_set=fuel_cell_share
                 / options["transport_fuel_cell_efficiency"]
-                * transport[nodes],
+                * transport[spatial.nodes],
             )
 
     if ice_share > 0:
@@ -2791,6 +2791,18 @@ def add_electricity_distribution_grid(n, costs):
         # add max solar rooftop potential assuming 0.1 kW/m2 and 20 m2/person,
         # i.e. 2 kW/person (population data is in thousands of people) so we get MW
         potential = 0.1 * 20 * pop_solar
+
+        # For solar generators without population data, use average population
+        missing_solar = solar.difference(potential.index)
+        if len(missing_solar) > 0:
+            avg_population = pop_layout.total.mean()
+            print(f"No. of missing solar generators: {len(missing_solar)}")
+            print(f"Warning: Solar generators without population data: {missing_solar.tolist()}")
+            print(f"Using average population ({avg_population:.1f}k people) for missing solar generators")
+            
+            # Add missing entries with average population
+            for solar_gen in missing_solar:
+                potential[solar_gen] = 0.1 * 20 * avg_population
 
         n.madd(
             "Generator",

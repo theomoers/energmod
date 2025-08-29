@@ -168,8 +168,8 @@ world_iso:
   Oceania:
     AS: "american-samoa"  # Island
     AU: "australia"
-    FJ: "fiji"
-    KI: "kiribati"  # Island
+    # FJ: "fiji"
+    # KI: "kiribati"  # Island
     MH: "marshall-islands"
     FM: "micronesia"
     NR: "nauru"
@@ -181,8 +181,8 @@ world_iso:
     WS: "samoa"
     SB: "solomon-islands"
     TO: "tonga"
-    TV: "tuvalu"
-    VU: "vanuatu"  # Island
+    # TV: "tuvalu"
+    # VU: "vanuatu"  # Island
   Europe:
     AL: "albania"
     AD: "andorra"

@@ -10,6 +10,7 @@ from pathlib import Path
 import country_converter as coco
 import numpy as np
 import pandas as pd
+import requests
 from _helpers import BASE_DIR
 
 logger = logging.getLogger(__name__)
@@ -49,43 +50,52 @@ def download_number_of_vehicles():
 
     def _clean_data(df):
         df = df.dropna(subset=["number cars"])
-        df.loc[:, "number cars"] = df.loc[:, "number cars"].astype(int)
-        return df  # [["Country", "number cars"]]
+        # Reset index to ensure proper assignment
+        df = df.reset_index(drop=True)
+        df["number cars"] = df["number cars"].astype(int)
+        return df
 
-    storage_options = {"User-Agent": "Mozilla/5.0"}
-    url = "https://apps.who.int/gho/athena/data/GHO/RS_194?filter=COUNTRY:*&ead=&x-sideaxis=COUNTRY;YEAR;DATASOURCE&x-topaxis=GHO&profile=crosstable&format=csv"
+    url = "https://ghoapi.azureedge.net/api/RS_194"
     try:
-        vehicles_gho = pd.read_csv(
-            url, storage_options=storage_options, encoding="utf8"
-        )
-        print("File read successfully.")
+        response = requests.get(url, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        data = response.json()["value"]
+
+        # Convert to DataFrame and extract relevant fields
+        vehicles_gho = pd.DataFrame(data)
+        
+        # Keep only most recent data per country and extract needed columns
+        vehicles_gho = vehicles_gho.loc[vehicles_gho.groupby('SpatialDim')['TimeDim'].idxmax()]
+        vehicles_gho = vehicles_gho[['SpatialDim', 'NumericValue']].copy()
+        vehicles_gho.columns = ['country', 'number cars']
+        
+        print("WHO data read successfully.")
     except Exception as e:
-        logger.warning("Failed to read the file. Falling back on hard-coded data:", e)
+        logger.warning("Failed to read WHO API data. Falling back on hard-coded data: %s", e)
         return pd.DataFrame()
 
-    vehicles_gho = vehicles_gho.rename(
-        columns={
-            "Countries, territories and areas": "Country",
-            "Number of registered vehicles": "number cars",
-        }
+    # Convert country codes to full country names for consistency with the rest of the code
+    # The API returns 3-letter country codes, we need to convert them to country names
+    cc = coco.CountryConverter()
+    vehicles_gho['Country'] = cc.pandas_convert(
+        series=vehicles_gho['country'], to='name_short', not_found="not found"
     )
-
+    vehicles_gho = vehicles_gho[vehicles_gho['Country'] != "not found"]
+    vehicles_gho = vehicles_gho[['Country', 'number cars']].copy()
+    
+    # Add ISO2 codes
     vehicles_gho = add_iso2_country_code(vehicles_gho)
-
-    vehicles_gho["number cars"] = (
-        vehicles_gho["number cars"].str.replace(" ", "").replace("", np.nan)
-    )
-
     vehicles_gho = _clean_data(vehicles_gho)
 
     url = "https://en.wikipedia.org/wiki/List_of_countries_and_territories_by_motor_vehicles_per_capita"
+    storage_options = {"User-Agent": "Mozilla/5.0"}
     try:
         vehicles_wiki = pd.read_html(
             url, storage_options=storage_options, encoding="utf8"
         )[0]
         print("File read successfully.")
     except Exception as e:
-        logger.warning("Failed to read the file.", e)
+        logger.warning("Failed to read the file: %s", e)
         vehicles_wiki = pd.DataFrame(columns=["Country", "country", "number cars"])
 
     vehicles_wiki.rename(
@@ -127,7 +137,7 @@ def download_CO2_emissions():
         CO2_emissions = pd.read_excel(url, sheet_name="Data", skiprows=[0, 1, 2])
         print("File read successfully.")
     except Exception as e:
-        logger.warning("Failed to read the file. Falling back on hard-coded data:", e)
+        logger.warning("Failed to read the file. Falling back on hard-coded data: %s", e)
         return pd.DataFrame()
 
     CO2_emissions = CO2_emissions[

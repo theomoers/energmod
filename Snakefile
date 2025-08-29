@@ -88,18 +88,28 @@ if config["custom_rules"] is not []:
         include: rule
 
 
-rule clean:
-    run:
-        try:
-            shell("snakemake -j 1 solve_all_networks --delete-all-output")
-        except:
-            shell("snakemake -j 1 solve_all_networks_monte --delete-all-output")
-            pass
-        shell("snakemake -j 1 run_all_scenarios --delete-all-output")
+rule backup_config:
+    output:
+        "resources/" + RDIR + "config_complete.yaml"
+    log:
+        "logs/" + RDIR + "backup_config.log"
+    script:
+        "scripts/backup_config.py"
+
+
+#rule clean:
+#    run:
+#        try:
+#            shell("snakemake -j 1 solve_all_networks --delete-all-output")
+#        except:
+#            shell("snakemake -j 1 solve_all_networks_monte --delete-all-output")
+#            pass
+#        shell("snakemake -j 1 run_all_scenarios --delete-all-output")
 
 
 rule solve_all_networks:
     input:
+        "resources/" + RDIR + "config_complete.yaml",  # Ensure config is backed up
         expand(
             "results/" + RDIR + "networks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc",
             **config["scenario"],
@@ -256,7 +266,7 @@ rule build_shapes:
         "benchmarks/" + RDIR + "build_shapes"
     threads: 1
     resources:
-        mem_mb=3096,
+        mem_mb=51200, # used to be 3096
     script:
         "scripts/build_shapes.py"
 
@@ -415,23 +425,25 @@ else:
 
 if config["enable"].get("retrieve_cost_data", True):
 
-    rule retrieve_cost_data:
-        params:
-            version=config["costs"]["technology_data_version"],
-        input:
-            HTTP.remote(
-                f"raw.githubusercontent.com/PyPSA/technology-data/{config['costs']['technology_data_version']}/outputs/{cost_directory}"
-                + "costs_{year}.csv",
-                keep_local=True,
-            ),
-        output:
-            "resources/" + RDIR + "costs_{year}.csv",
-        log:
-            "logs/" + RDIR + "retrieve_cost_data_{year}.log",
-        resources:
-            mem_mb=5000,
-        run:
-            move(input[0], output[0])
+    if not config["costs"].get("customized", False): # True means customized --> cost data is retrieved
+
+        rule retrieve_cost_data:
+            params:
+                version=config["costs"]["technology_data_version"],
+            input:
+                HTTP.remote(
+                    f"raw.githubusercontent.com/PyPSA/technology-data/{config['costs']['technology_data_version']}/outputs/{cost_directory}"
+                    + "costs_{year}.csv",
+                    keep_local=True,
+                ),
+            output:
+                "resources/" + RDIR + "costs_{year}.csv",
+            log:
+                "logs/" + RDIR + "retrieve_cost_data_{year}.log",
+            resources:
+                mem_mb=5000,
+            run:
+                move(input[0], output[0])
 
 
 rule build_demand_profiles:
