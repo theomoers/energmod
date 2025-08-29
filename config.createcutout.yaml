@@ -1,0 +1,200 @@
+run:
+  name: "Global_cutout" # use this to keep track of runs with different settings
+  sector_name: "" # use this to keep track of sector scenario runs
+  shared_cutouts: true # set to true to share the default cutout(s) across runs
+  # Note: value false requires build_cutout to be enabled
+  allow_scenario_failure: false # If True, the workflow will continue even if a scenario in run_scnenario fails
+
+countries: ["Earth"]
+
+build_osm_network:
+  group_tolerance_buses: 20000 # [m] (default 5000) Tolerance in meters of the close buses to merge
+  force_ac: true # When true, it forces all components (lines and substation) to be AC-only. To be used if DC assets create problem.
+  split_overpassing_lines: false # When True, lines overpassing buses are splitted and connected to the bueses
+
+atlite:
+  nprocesses: 4
+  cutouts:
+    semi-coarse-2013-era5:
+      module: era5
+      dx: 0.7 # cutout resolution
+      dy: 0.7 # cutout resolution
+      # The cutout time is automatically set by the snapshot range. See `snapshot:` option above and 'build_cutout.py'.
+      time: ["2013-01-01", "2014-01-01"]  # to manually specify a different weather year (~70 years available)
+      # The cutout spatial extent [x,y] is automatically set by country selection. See `countires:` option above and 'build_cutout.py'.
+      x: [-180, 180]  # set cutout range manual, instead of automatic by boundaries of country
+      y: [-90, 90]    # manual set cutout range
+
+foresight: overnight # myopic
+
+enable:
+  retrieve_databundle: false #  Recommended 'true', for the first run. Otherwise data might be missing.
+  retrieve_databundle_sector: false
+  retrieve_cost_data: false # true: retrieves cost data from technology data and saves in resources/costs.csv, false: uses cost data in data/costs.csv
+  download_osm_data: false # If 'true', OpenStreetMap data will be downloaded for the above given countries
+  build_natura_raster: false # If True, then an exclusion raster will be build
+  build_cutout: true
+  # If "build_cutout" : true, then environmental data is extracted according to `snapshots` date range and `countries`
+  # requires cds API key https://cds.climate.copernicus.eu/api-how-to
+  # More information https://atlite.readthedocs.io/en/latest/introduction.html#datasets
+  progress_bar: true # show progress bar during downloading routines and other long-running tasks
+
+electricity:
+  extendable_carriers:
+      Generator: [solar, onwind, offwind-ac, offwind-dc, OCGT]
+      StorageUnit: [battery, H2] # battery, H2
+      Store: [battery, H2]
+      Link: [] # H2 pipeline
+  renewable_carriers: [solar, onwind, hydro, offwind-ac] # [solar, onwind, offwind-ac, offwind-dc, hydro] NEED TO ADD OFFWIND
+  powerplants_filter: (DateOut >= 2024 or DateOut != DateOut) and not (Country == 'Germany' and Fueltype == 'Nuclear') # (DateOut >= 2024 or DateOut != DateOut). SQL
+
+scenario:
+  simpl: [""]
+  ll: ["copt"]
+  clusters: [500]
+  opts: [6h]
+  planning_horizons: # investment years for myopic and perfect; or costs year for overnight
+  # - 2030
+  # - 2040
+  - 2050
+  sopts:
+  - "144h"
+  demand:
+  - "AB"
+
+load_options:
+  ssp: "ssp2-2.6" # shared socio-economic pathway (GDP and population growth) scenario to consider
+  weather_year: 2013 # Load scenarios available with different weather year (different renewable potentials)
+  prediction_year: 2050 # Load scenarios available with different prediction year (GDP, population)
+  scale: 1 # scales all load time-series, i.e. 2 = doubles load
+
+costs:
+  year: 2050 # for myopic 2020
+  version: v0.10.0
+  discountrate: [0.071] #, 0.086, 0.111]
+  # [EUR/USD] ECB: https://www.ecb.europa.eu/stats/exchange/eurofxref/html/eurofxref-graph-usd.en.html # noqa: E501
+  USD2013_to_EUR2013: 0.7532 # [EUR/USD] ECB: https://www.ecb.europa.eu/stats/exchange/eurofxref/html/eurofxref-graph-usd.en.html
+  rooftop_share: 0.14 # based on the potentials, assuming  (0.1 kW/m2 and 10 m2/person)
+  fill_values:
+    FOM: 0
+    VOM: 0
+    efficiency: 1
+    fuel: 0
+    investment: 0
+    lifetime: 25
+    CO2 intensity: 0
+    discount rate: 0.07
+  marginal_cost: # EUR/MWh
+    solar: 0.01
+    onwind: 0.015
+    offwind: 0.015
+    hydro: 0.
+    H2: 0.
+    electrolysis: 0.
+    fuel cell: 0.
+    battery: 0.
+    battery inverter: 0.
+  emission_prices: # in currency per tonne emission, only used with the option Ep
+    co2: 0.
+  # investment: # EUR/MW
+  #   CCGT: 830000
+  # FOM: # %/year
+  #   CCGT: 3.35
+  # VOM: # EUR/MWh
+  #   CCGT: 4.2
+  # fuel: # EUR/MWh
+  #   gas: 10.1
+  # lifetime: # years
+  #   CCGT: 25.0
+  # efficiency: # per unit
+  #   CCGT: 0.58
+  lines:
+    length_factor: 1.25 #to estimate offwind connection costs
+
+solving:
+  options:
+    formulation: kirchhoff
+    load_shedding: true
+    noisy_costs: true
+    min_iterations: 4
+    max_iterations: 6
+    clip_p_max_pu: 0.01
+    skip_iterations: true
+    track_iterations: false
+    # nhours: 10
+
+  solver:
+    name: gurobi
+    options: gurobi-default
+
+  solver_options:
+    highs-default:
+      # refer to https://ergo-code.github.io/HiGHS/dev/options/definitions/
+      threads: 4
+      solver: "ipm"
+      run_crossover: "off"
+      small_matrix_value: 1e-6
+      large_matrix_value: 1e9
+      primal_feasibility_tolerance: 1e-5
+      dual_feasibility_tolerance: 1e-5
+      ipm_optimality_tolerance: 1e-4
+      parallel: "on"
+      random_seed: 123
+    gurobi-default:
+      threads: 4
+      method: 2 # barrier
+      crossover: 0
+      BarConvTol: 1.e-6
+      Seed: 123
+      AggFill: 0
+      PreDual: 0
+      GURO_PAR_BARDENSETHRESH: 200
+    gurobi-numeric-focus:
+      NumericFocus: 3 # Favour numeric stability over speed
+      method: 2 # barrier
+      crossover: 0 # do not use crossover
+      BarHomogeneous: 1 # Use homogeneous barrier if standard does not converge
+      BarConvTol: 1.e-5
+      FeasibilityTol: 1.e-4
+      OptimalityTol: 1.e-4
+      ObjScale: -0.5
+      threads: 8
+      Seed: 123
+    gurobi-fallback: # Use gurobi defaults
+      crossover: 0
+      method: 2 # barrier
+      BarHomogeneous: 1 # Use homogeneous barrier if standard does not converge
+      BarConvTol: 1.e-5
+      FeasibilityTol: 1.e-5
+      OptimalityTol: 1.e-5
+      Seed: 123
+      threads: 8
+    cplex-default:
+      threads: 4
+      lpmethod: 4 # barrier
+      solutiontype: 2 # non basic solution, ie no crossover
+      barrier.convergetol: 1.e-5
+      feasopt.tolerance: 1.e-6
+    copt-default:
+      Threads: 8
+      LpMethod: 2
+      Crossover: 0
+    cbc-default: {} # Used in CI
+    glpk-default: {} # Used in CI
+
+  mem: 300000 #memory in MB; 20 GB enough for 50+B+I+H2; 100 GB for 181+B+I+H2
+
+renewable:
+  onwind:
+    cutout: semi-coarse-2013-era5
+  offwind-ac:
+    cutout: semi-coarse-2013-era5
+  offwind-dc:
+    cutout: semi-coarse-2013-era5
+  solar:
+    cutout: semi-coarse-2013-era5
+  hydro:
+    cutout: semi-coarse-2013-era5
+  csp:
+    cutout: semi-coarse-2013-era5
+
