@@ -279,7 +279,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
         carrier_label = generator + suffix
         name_suffix = f" {generator}{suffix}-{grouping_year}"
         asset_i = capacity.index + name_suffix
-        
+
         if generator in ["solar", "onwind", "offwind"]:
             # For renewables, check existing capacity vs external data (irena) for this specific grouping_year
             existing_renewable_gens = n.generators.index[
@@ -317,16 +317,9 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 new_capacity = capacity
                 logger.info(f"No existing {generator} generators found for year {grouping_year}, will add {len(new_capacity)} new generators")
             
-            # Get cost parameters from existing generators or fallback to cost database
-            remaining_gens = n.generators.index[n.generators.carrier == carrier_label]
-            if not remaining_gens.empty:
-                capital_cost = n.generators.loc[remaining_gens, "capital_cost"].mean()
-                marginal_cost = n.generators.loc[remaining_gens, "marginal_cost"].mean()
-            else:
-                # Fallback to cost database - use correct cost key for offshore wind
-                cost_key = get_cost_key(carrier_label)
-                capital_cost = costs.at[cost_key, "fixed"]
-                marginal_cost = costs.at[cost_key, "VOM"]
+            cost_key = get_cost_key(carrier_label)
+            capital_cost = costs.at[cost_key, "fixed"]
+            marginal_cost = costs.at[cost_key, "VOM"]
 
             # Only add new generators if there's new capacity to add
             if not new_capacity.empty:
@@ -338,27 +331,10 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                         # Build names once and reuse the exact list
                         names = [i + name_suffix for i in inv_ind]
                         
-                        # for offshore the splitting only includes coastal regions
-                        # Look for existing generators of the same type for p_max_pu reference
-                        existing_reference_gens = n.generators.index[
-                            (n.generators.carrier == carrier_label) & 
-                            (n.generators.index.str.startswith(tuple(inv_ind)))
+                        p_max_pu = n.generators_t.p_max_pu[
+                            capacity.index + f" {generator}{suffix}-{baseyear}"
                         ]
-                        
-                        # Create p_max_pu using reference generators or default
-                        if not existing_reference_gens.empty:
-                            ref = n.generators_t.p_max_pu[existing_reference_gens].mean(axis=1)
-                        else:
-                            ref = pd.Series(1.0, index=n.snapshots)
-                        
-                        p_max_pu = pd.concat([ref.rename(nm) for nm in names], axis=1)
 
-                        # Assert perfect alignment as suggested by friend
-                        assert list(p_max_pu.columns) == names, "p_max_pu names must equal Generator names"
-                        assert p_max_pu.index.equals(n.snapshots), "p_max_pu index must equal snapshots"
-                        p_max_pu = p_max_pu.clip(lower=0, upper=1)
-
-                        # Don't rely on broadcasting—pass lists as suggested
                         bus_list = [ind] * len(names)
                         p_nom_each = new_capacity[ind] / max(1, len(inv_ind))
                         p_nom_list = [p_nom_each] * len(names)
@@ -380,32 +356,24 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
 
                 else:
                     # For non-clustered case, use existing generators as reference for p_max_pu
-                    existing_reference_gens = n.generators.index[
-                        (n.generators.carrier == carrier_label)
-                    ]
-                    
-                    # Build names once and reuse the exact list
-                    names = [bus + name_suffix for bus in new_capacity.index]
-                    
-                    # Create p_max_pu using reference generators or default
-                    if not existing_reference_gens.empty:
-                        ref = n.generators_t.p_max_pu[existing_reference_gens].mean(axis=1)
-                    else:
-                        ref = pd.Series(1.0, index=n.snapshots)
-                    
-                    p_max_pu = pd.concat([ref.rename(nm) for nm in names], axis=1)
+                    #p_max_pu = n.generators_t.p_max_pu[
+                    #    capacity.index + f" {generator}{suffix}-{baseyear}"
+                    #]
 
-                    # Assert perfect alignment as suggested by friend
-                    assert list(p_max_pu.columns) == names, "p_max_pu names must equal Generator names"
-                    assert p_max_pu.index.equals(n.snapshots), "p_max_pu index must equal snapshots"
-                    p_max_pu = p_max_pu.clip(lower=0, upper=1)
+                    ref_cols = new_capacity.index + f" {generator}{suffix}-{baseyear}"
+                    ref = n.generators_t.p_max_pu[ref_cols]
+                    p_max_pu = ref.copy()
+                    p_max_pu.columns = [bus + f" {generator}{suffix}-{grouping_year}"
+                                        for bus in new_capacity.index] 
+                    
+                    names = [bus + name_suffix for bus in new_capacity.index]
 
                     n.madd(
                         "Generator",
                         names,
-                        bus=new_capacity.index,
+                        bus=list(new_capacity.index),
                         carrier=carrier_label,
-                        p_nom=new_capacity,
+                        p_nom=list(new_capacity.values),
                         marginal_cost=marginal_cost,
                         capital_cost=capital_cost,
                         efficiency=costs.at[get_cost_key(carrier_label), "efficiency"],
