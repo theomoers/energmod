@@ -18,7 +18,7 @@ from _helpers import BASE_DIR, mock_snakemake, read_csv_nafix
 _logger = logging.getLogger(__name__)
 
 
-def calculate_end_values(df):
+def calculate_end_values(df, no_years):
     return (1 + df) ** no_years
 
 
@@ -51,15 +51,25 @@ def country_to_nodal(industrial_production, keys):
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
+        
         snakemake = mock_snakemake(
             "build_industry_demand",
             simpl="",
-            clusters="4",
-            planning_horizons=2030,
+            network="elec",
+            clusters="200",
+            ll="copt",
+            opts="3h",
+            planning_horizons="2050",
+            sopts="72h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+            discountrate=0.071,
             demand="AB",
+            h2export="10"
         )
 
     countries = snakemake.params.countries
+
+    gadm_clustering = snakemake.params.alternative_clustering
 
     if snakemake.params.industry_demand:
         _logger.info(
@@ -120,7 +130,7 @@ if __name__ == "__main__":
 
         cagr = cagr[cagr.index.isin(countries)]
 
-        growth_factors = calculate_end_values(cagr)
+        growth_factors = calculate_end_values(cagr, no_years)
 
         industry_base_totals = read_csv_nafix(
             snakemake.input["base_industry_totals"], index_col=[0, 1]

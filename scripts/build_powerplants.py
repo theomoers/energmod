@@ -112,6 +112,7 @@ from _helpers import (
     configure_logging,
     create_logger,
     locate_bus,
+    locate_bus_alt_clust,
     read_csv_nafix,
     to_csv_nafix,
     two_digits_2_name_country,
@@ -296,8 +297,20 @@ def replace_natural_gas_technology(df: pd.DataFrame):
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
-
-        snakemake = mock_snakemake("build_powerplants")
+        
+        snakemake = mock_snakemake(
+            "build_powerplants",
+            simpl="",
+            clusters="200",
+            ll="copt",
+            opts="3h",
+            planning_horizons="2020",
+            sopts="72h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+            discountrate="0.071",
+            demand="AB",
+            h2export="10"
+        )
 
     configure_logging(snakemake)
 
@@ -353,6 +366,8 @@ if __name__ == "__main__":
         ppl_query
     )  # add carriers from own powerplant files
 
+    ppl = ppl.reset_index(drop=True)
+
     cntries_without_ppl = [c for c in countries_codes if c not in ppl.Country.unique()]
 
     for c in countries_codes:
@@ -375,7 +390,7 @@ if __name__ == "__main__":
         country_list = snakemake.params.countries
         geo_crs = snakemake.params.geo_crs
 
-        ppl = locate_bus(
+        ppl = locate_bus_alt_clust(
             ppl.rename(columns={"lon": "x", "lat": "y", "Country": "country"}),
             country_list,
             gadm_layer_id,

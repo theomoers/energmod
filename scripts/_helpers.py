@@ -1560,10 +1560,56 @@ def locate_bus(
             crs="EPSG:4326",
         )
 
-        gdf_merged = gpd.sjoin_nearest(gdf, gdf_shape, how="inner", rsuffix="right")
+        gdf_merged = gpd.sjoin_nearest(gdf, gdf_shape, how="inner", rsuffix="right") 
 
         df.loc[gdf_merged.index, col_out] = gdf_merged[col]
 
+    if dropnull:
+        df = df[df[col_out].notnull()]
+
+    return df
+
+
+def locate_bus_alt_clust(
+    df,
+    countries,
+    gadm_level,
+    path_to_gadm=None,
+    gadm_clustering=False,
+    dropnull=True,
+    col_out=None,
+):
+    """
+    Simplified version of locate_bus for alternative clustering.
+    Since alternative clustering operates at country level, we can simply
+    assign buses to their country's GADM region without spatial calculations.
+    
+    Parameters
+    ----------
+    df: pd.Dataframe
+        Dataframe with mandatory x, y and country columns
+    countries: list
+        List of target countries
+    gadm_level: int
+        GADM level to be used (ignored in this simplified version)
+    path_to_gadm: str (default None)
+        Path to the GADM shapefile (ignored in this simplified version)
+    gadm_clustering: bool (default False)
+        True if gadm clustering is adopted
+    dropnull: bool (default True)
+        True if the rows with null values should be dropped
+    col_out: str (default gadm_{gadm_level})
+        Name of the output column
+    """
+    if col_out is None:
+        col_out = "gadm_{}".format(gadm_level)
+    
+    df = df.copy()
+    
+    # Filter to only include buses from target countries
+    df = df[df.country.isin(countries)]
+    df[col_out] = df['country'] + '.'
+    
     if dropnull:
         df = df[df[col_out].notnull()]
 

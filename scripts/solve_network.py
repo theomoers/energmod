@@ -972,6 +972,107 @@ def add_lossy_bidirectional_link_constraints(n: pypsa.components.Network) -> Non
     n.model.add_constraints(lhs == 0, name="Link-bidirectional_sync")
 
 
+def add_baseyear_generation_band(n, planning_year, config):
+    """
+    Enforce: for each tech alias K in config['global_specific']['baseyear_generation']['targets'],
+    annual electricity generation in planning_year is within +- tolerance of the target.
+    Targets can aggregate several model carriers via 'carriers_map'.
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("baseyear_generation", {})
+    if not cfg:
+        return
+    
+    if not cfg.get("baseyear_generation_constraint", False):
+        return
+    
+    baseyear = str(cfg.get("year", 2020))
+    if str(planning_year) != baseyear:
+        logger.info(f"Skipping baseyear generation constraints for {planning_year} (configured for {baseyear})")
+        return
+
+    logger.info(f"Adding baseyear generation constraints for {planning_year}")
+
+    tol = float(cfg.get("tolerance", 0.05))
+    units = str(cfg.get("units", "TWh")).lower()
+    unit_scale = {"mwh": 1.0, "gwh": 1e3, "twh": 1e6}.get(units, 1e6)
+
+    # Map each reported tech alias -> list of underlying model carriers
+    carriers_map = cfg.get("carriers_map", {})
+    # Targets are given per alias (global totals)
+    targets = cfg.get("targets", {})
+
+    # Weightings (needs to be annuzalized if using TSAM/nhours)
+    w_gen = n.snapshot_weightings.generators
+    w_stores = n.snapshot_weightings.stores
+
+    # Generator energy (per generator carrier):  sum_t w_t * p[g,t]
+    gen_p = n.model["Generator-p"]  # dims: snapshot x Generator
+    if len(gen_p.indexes.get("Generator", [])) > 0:
+        gen_car = n.generators.carrier.rename_axis("Generator").to_xarray()
+        gen_energy_by_carrier = (
+            (gen_p * xr.DataArray(w_gen, dims=["snapshot"]))
+            .groupby(gen_car)  # group generators by their carrier
+            .sum()
+            .sum("snapshot")
+        )  # dims: carrier
+    else:
+        gen_energy_by_carrier = xr.DataArray([], dims=["carrier"])
+
+    # TODO: Link-based technologies (coal, oil, etc.) - currently doesn't work, so don't pass link restrictions.
+    link_p = n.model["Link-p"]  # dims: snapshot x Link
+    if len(link_p.indexes.get("Link", [])) > 0:
+        if hasattr(n.links, "efficiency") and len(n.links) > 0:
+            eff = xr.DataArray(n.links.efficiency, coords=[n.links.index], dims=["Link"])
+        else:
+            eff = xr.DataArray(1.0, coords=[n.links.index], dims=["Link"])
+
+        link_car = n.links.carrier.rename_axis("Link").to_xarray()
+        link_elec_by_carrier = (
+            ((link_p * eff) * xr.DataArray(w_stores, dims=["snapshot"]))
+            .groupby(link_car)  # group links by their carrier
+            .sum()
+            .sum("snapshot")
+        )  # dims: carrier
+    else:
+        link_elec_by_carrier = xr.DataArray([], dims=["carrier"])
+
+    for alias, target in targets.items():
+        if str(target).startswith("X"):
+            logger.info(f"Skipping constraint for {alias} as target is placeholder ({target})")
+            continue
+            
+        model_carriers = carriers_map.get(alias, [alias])
+
+        lhs_terms = []
+
+        if len(gen_energy_by_carrier.indexes.get("carrier", [])) > 0:
+            gens_sub = [c for c in model_carriers
+                        if c in gen_energy_by_carrier.indexes["carrier"]]
+            if gens_sub:
+                lhs_terms.append(gen_energy_by_carrier.sel(carrier=gens_sub).sum("carrier"))
+
+        if len(link_elec_by_carrier.indexes.get("carrier", [])) > 0:
+            links_sub = [c for c in model_carriers
+                         if c in link_elec_by_carrier.indexes["carrier"]]
+            if links_sub:
+                lhs_terms.append(link_elec_by_carrier.sel(carrier=links_sub).sum("carrier"))
+
+        if not lhs_terms:
+            logger.warning(f"No carriers found for constraint alias '{alias}' with carriers {model_carriers}")
+            continue
+
+        lhs = sum(lhs_terms)
+
+        lower = float(target) * (1.0 - tol) * unit_scale
+        upper = float(target) * (1.0 + tol) * unit_scale
+
+        logger.info(f"Adding baseyear constraint for {alias}: {lower/unit_scale:.2f} <= generation <= {upper/unit_scale:.2f} {units.upper()}")
+
+        n.model.add_constraints(lhs >= lower, name=f"baseyear_energy_min__{alias}")
+        n.model.add_constraints(lhs <= upper, name=f"baseyear_energy_max__{alias}")
+
+
 def extra_functionality(n, snapshots):
     """
     Collects supplementary constraints which will be passed to
@@ -1048,6 +1149,12 @@ def extra_functionality(n, snapshots):
         logger.info("setting H2 color mix")
         set_h2_colors(n)
 
+    add_baseyear_generation_band(
+        n,
+        planning_year=snakemake.wildcards.planning_horizons,
+        config=n.config if hasattr(n, "config") else snakemake.config,
+    )
+
     add_co2_sequestration_limit(n, snapshots)
 
 
@@ -1070,14 +1177,69 @@ def solve_network(n, config, solving, **kwargs):
     n.config = config
     n.opts = opts
 
-    # Preemptive cleanup of network components with undefined buses
+
+    logger.info(f"Network has {len(n.buses)} buses, {len(n.generators)} generators")
+    logger.info(f"Network has {len(n.loads)} loads, {len(n.stores)} stores, {len(n.links)} links")
+    valid_buses = set(n.buses.index)
+    
+    gen_bad_buses = n.generators[~n.generators.bus.isin(valid_buses)]
+    if len(gen_bad_buses) > 0:
+        logger.warning(f"Found {len(gen_bad_buses)} generators with invalid buses: {gen_bad_buses.index.tolist()}")
+        logger.warning(f"Invalid generator buses: {gen_bad_buses.bus.unique().tolist()}")
+    
+    load_bad_buses = n.loads[~n.loads.bus.isin(valid_buses)]
+    if len(load_bad_buses) > 0:
+        logger.warning(f"Found {len(load_bad_buses)} loads with invalid buses: {load_bad_buses.index.tolist()}")
+        logger.warning(f"Invalid load buses: {load_bad_buses.bus.unique().tolist()}")
+    
+    store_bad_buses = n.stores[~n.stores.bus.isin(valid_buses)]
+    if len(store_bad_buses) > 0:
+        logger.warning(f"Found {len(store_bad_buses)} stores with invalid buses: {store_bad_buses.index.tolist()}")
+        logger.warning(f"Invalid store buses: {store_bad_buses.bus.unique().tolist()}")
+    
+    link_bad_bus0 = n.links[~n.links.bus0.isin(valid_buses)]
+    link_bad_bus1 = n.links[~n.links.bus1.isin(valid_buses)]
+    if len(link_bad_bus0) > 0:
+        logger.warning(f"Found {len(link_bad_bus0)} links with invalid bus0: {link_bad_bus0.index.tolist()}")
+        logger.warning(f"Invalid link bus0 buses: {link_bad_bus0.bus0.unique().tolist()}")
+    if len(link_bad_bus1) > 0:
+        logger.warning(f"Found {len(link_bad_bus1)} links with invalid bus1: {link_bad_bus1.index.tolist()}")
+        logger.warning(f"Invalid link bus1 buses: {link_bad_bus1.bus1.unique().tolist()}")
+    
+    gen_capacity_issues = n.generators.query("p_nom_max < p_nom_min")
+    if len(gen_capacity_issues) > 0:
+        logger.warning(f"Found {len(gen_capacity_issues)} generators with p_nom_max < p_nom_min")
+        for idx, gen in gen_capacity_issues.iterrows():
+            logger.warning(f"  {idx}: p_nom_min={gen.p_nom_min}, p_nom_max={gen.p_nom_max}")
+    
+    zero_cost_gens = n.generators.query("marginal_cost <= 0 and p_nom_extendable == True")
+    if len(zero_cost_gens) > 0:
+        logger.warning(f"Found {len(zero_cost_gens)} extendable generators with zero/negative marginal costs")
+        logger.warning(f"Zero cost generators: {zero_cost_gens.index.tolist()}")
+    
+    if 'carrier' in n.buses.columns:
+        bus_carriers = n.buses.carrier.value_counts()
+        logger.info(f"Bus carriers: {bus_carriers.to_dict()}")
+        
+        h2_buses = n.buses[n.buses.carrier.str.contains('H2', na=False)]
+        if len(h2_buses) > 0:
+            logger.info(f"Found {len(h2_buses)} H2 buses: {h2_buses.index.tolist()}")
+            
+            h2_loads = n.loads[n.loads.carrier.str.contains('H2', na=False)] if not n.loads.empty else pd.DataFrame()
+            h2_stores = n.stores[n.stores.carrier.str.contains('H2', na=False)] if not n.stores.empty else pd.DataFrame()
+            h2_links = n.links[n.links.carrier.str.contains('H2', na=False)] if not n.links.empty else pd.DataFrame()
+            
+            logger.info(f"H2 components: {len(h2_loads)} loads, {len(h2_stores)} stores, {len(h2_links)} links")
+    
+
     logger.info("Performing preemptive network cleanup...")
     buses_to_keep = set(n.buses.index)
     
     # Clean generators with undefined buses
     generators_with_bad_buses = n.generators[~n.generators.bus.isin(buses_to_keep)]
     if len(generators_with_bad_buses) > 0:
-        logger.info(f"Removing {len(generators_with_bad_buses)} generators with undefined buses before solving")
+        logger.warning(f"Removing {len(generators_with_bad_buses)} generators with undefined buses before solving")
+        logger.info(f"Generators with bad buses:\n{generators_with_bad_buses}")
         n.generators = n.generators.drop(generators_with_bad_buses.index)
         
         # Clean time series data for removed generators
@@ -1091,10 +1253,10 @@ def solve_network(n, config, solving, **kwargs):
     # Clean loads with undefined buses
     loads_with_bad_buses = n.loads[~n.loads.bus.isin(buses_to_keep)]
     if len(loads_with_bad_buses) > 0:
-        logger.info(f"Removing {len(loads_with_bad_buses)} loads with undefined buses before solving")
+        logger.warning(f"Removing {len(loads_with_bad_buses)} loads with undefined buses before solving")
+        logger.info(f"Loads with bad buses:\n{loads_with_bad_buses}")
         n.loads = n.loads.drop(loads_with_bad_buses.index)
         
-        # Clean time series data for removed loads
         if hasattr(n.loads_t, 'p_set'):
             cols_to_remove = loads_with_bad_buses.index.intersection(n.loads_t.p_set.columns)
             if len(cols_to_remove) > 0:
@@ -1103,19 +1265,19 @@ def solve_network(n, config, solving, **kwargs):
     # Clean stores with undefined buses
     stores_with_bad_buses = n.stores[~n.stores.bus.isin(buses_to_keep)]
     if len(stores_with_bad_buses) > 0:
-        logger.info(f"Removing {len(stores_with_bad_buses)} stores with undefined buses before solving")
+        logger.warning(f"Removing {len(stores_with_bad_buses)} stores with undefined buses before solving")
+        logger.info(f"Stores with bad buses:\n{stores_with_bad_buses}")
         n.stores = n.stores.drop(stores_with_bad_buses.index)
     
-    # Clean links with undefined buses
     links_with_bad_bus0 = n.links[~n.links.bus0.isin(buses_to_keep)]
     links_with_bad_bus1 = n.links[~n.links.bus1.isin(buses_to_keep)]
     links_with_bad_buses = links_with_bad_bus0.index.union(links_with_bad_bus1.index)
     
     if len(links_with_bad_buses) > 0:
-        logger.info(f"Removing {len(links_with_bad_buses)} links with undefined buses before solving")
+        logger.warning(f"Removing {len(links_with_bad_buses)} links with undefined buses before solving")
+        logger.info(f"Links with bad buses:\n{n.links.loc[links_with_bad_buses]}")
         n.links = n.links.drop(links_with_bad_buses)
         
-        # Clean time series data for removed links
         for attr in n.links_t:
             if hasattr(n.links_t, attr):
                 attr_data = getattr(n.links_t, attr)
@@ -1124,24 +1286,68 @@ def solve_network(n, config, solving, **kwargs):
                     setattr(n.links_t, attr, attr_data.drop(columns=cols_to_remove))
 
     if skip_iterations:
-        status, condition = n.optimize(**kwargs)
+        logger.info("Solving network without transmission expansion iterations...")
+        try:
+            status, condition = n.optimize(**kwargs)
+            logger.info(f"Initial solve result: status='{status}', condition='{condition}'")
+        except Exception as e:
+            logger.error(f"Optimization failed with exception: {e}")
+            status, condition = "error", str(e)
     else:
+        logger.info("Solving network with transmission expansion iterations...")
         kwargs["track_iterations"] = (cf_solving.get("track_iterations", False),)
         kwargs["min_iterations"] = (cf_solving.get("min_iterations", 4),)
         kwargs["max_iterations"] = (cf_solving.get("max_iterations", 6),)
-        status, condition = n.optimize.optimize_transmission_expansion_iteratively(
-            **kwargs
-        )
+        try:
+            status, condition = n.optimize.optimize_transmission_expansion_iteratively(
+                **kwargs
+            )
+            logger.info(f"Iterative solve result: status='{status}', condition='{condition}'")
+        except Exception as e:
+            logger.error(f"Iterative optimization failed with exception: {e}")
+            status, condition = "error", str(e)
 
     if status != "ok":  # and not rolling_horizon:
         logger.warning(
             f"Solving status '{status}' with termination condition '{condition}'"
         )
+        
+        try:
+            if hasattr(n, 'model') and n.model is not None:
+                logger.info("Computing constraint infeasibilities...")
+                infeas = n.model.compute_infeasibilities()
+                if infeas is not None and len(infeas) > 0:
+                    logger.warning(f"Found {len(infeas)} infeasible constraints")
+
+                    for i, (name, value) in enumerate(infeas):
+                        logger.warning(f"  Infeasible constraint {i+1}: {name} = {value}")
+                else:
+                    logger.info("No constraint infeasibilities computed")
+            else:
+                logger.warning("No model available for infeasibility analysis")
+        except Exception as e:
+            logger.error(f"Error during infeasibility analysis: {e}")
     
     if "infeasible" in condition or "unbounded" in condition:
-        labels = n.model.compute_infeasibilities()
-        logger.info(f"Labels:\n{labels}")
-        n.model.print_infeasibilities()
+        logger.error("Infeasibility:")
+        logger.error(f"Solver status: {status}")
+        logger.error(f"Termination condition: {condition}")
+        
+        try:
+            logger.info("Computing infeasible constraint labels...")
+            labels = n.model.compute_infeasibilities()
+            logger.info(f"Infeasible constraint count: {len(labels) if labels is not None else 0}")
+            
+            if labels is not None and len(labels) > 0:
+                logger.info("Top 20 most infeasible constraints:")
+                for i, (constraint_name, violation) in enumerate(labels.head(20).items()):
+                    logger.info(f"  {i+1:2d}. {constraint_name}: violation = {violation:.6f}")
+            
+            logger.info("Printing detailed infeasibility information...")
+            n.model.print_infeasibilities()
+            
+        except Exception as e:
+            logger.error(f"Error during infeasibility analysis: {e}")
         
         # Try to fix common infeasibility issues
         logger.info("Attempting to resolve infeasibility by cleaning network components...")
@@ -1153,31 +1359,40 @@ def solve_network(n, config, solving, **kwargs):
         generators_with_bad_buses = n.generators.query("bus not in @buses_to_keep")
         if len(generators_with_bad_buses) > 0:
             logger.info(f"Removing {len(generators_with_bad_buses)} generators with undefined buses")
+            logger.info(f"Bad generator buses: {generators_with_bad_buses.bus.unique().tolist()}")
+            logger.info(f"Generators being removed: {generators_with_bad_buses.index.tolist()}")
             n.generators = n.generators.drop(generators_with_bad_buses.index)
             
             # Clean time series data for removed generators
             for attr in ['p_max_pu', 'p_min_pu']:
                 if hasattr(n.generators_t, attr):
-                    cols_to_remove = generators_with_bad_buses.index.intersection(getattr(n.generators_t, attr).columns)
+                    attr_data = getattr(n.generators_t, attr)
+                    cols_to_remove = generators_with_bad_buses.index.intersection(attr_data.columns)
                     if len(cols_to_remove) > 0:
-                        setattr(n.generators_t, attr, getattr(n.generators_t, attr).drop(columns=cols_to_remove))
+                        logger.info(f"Cleaning {attr} time series for {len(cols_to_remove)} generators")
+                        setattr(n.generators_t, attr, attr_data.drop(columns=cols_to_remove))
         
         # Clean loads with undefined buses
         loads_with_bad_buses = n.loads.query("bus not in @buses_to_keep")
         if len(loads_with_bad_buses) > 0:
             logger.info(f"Removing {len(loads_with_bad_buses)} loads with undefined buses")
+            logger.info(f"Bad load buses: {loads_with_bad_buses.bus.unique().tolist()}")
+            logger.info(f"Loads being removed: {loads_with_bad_buses.index.tolist()}")
             n.loads = n.loads.drop(loads_with_bad_buses.index)
             
             # Clean time series data for removed loads
             if hasattr(n.loads_t, 'p_set'):
                 cols_to_remove = loads_with_bad_buses.index.intersection(n.loads_t.p_set.columns)
                 if len(cols_to_remove) > 0:
+                    logger.info(f"Cleaning p_set time series for {len(cols_to_remove)} loads")
                     n.loads_t.p_set = n.loads_t.p_set.drop(columns=cols_to_remove)
         
         # Clean stores with undefined buses
         stores_with_bad_buses = n.stores.query("bus not in @buses_to_keep")
         if len(stores_with_bad_buses) > 0:
             logger.info(f"Removing {len(stores_with_bad_buses)} stores with undefined buses")
+            logger.info(f"Bad store buses: {stores_with_bad_buses.bus.unique().tolist()}")
+            logger.info(f"Stores being removed: {stores_with_bad_buses.index.tolist()}")
             n.stores = n.stores.drop(stores_with_bad_buses.index)
         
         # Clean links with undefined buses
@@ -1187,28 +1402,40 @@ def solve_network(n, config, solving, **kwargs):
         
         if len(links_with_bad_buses) > 0:
             logger.info(f"Removing {len(links_with_bad_buses)} links with undefined buses")
+            logger.info(f"Links being removed: {links_with_bad_buses.tolist()}")
+            
+            for link_id in links_with_bad_buses[:10]:
+                link = n.links.loc[link_id]
+                logger.info(f"  {link_id}: bus0={link.bus0}, bus1={link.bus1}, carrier={link.carrier}")
+            
             n.links = n.links.drop(links_with_bad_buses)
             
             # Clean time series data for removed links
-            for attr in n.links_t:
-                if hasattr(n.links_t, attr):
-                    attr_data = getattr(n.links_t, attr)
-                    cols_to_remove = links_with_bad_buses.intersection(attr_data.columns)
-                    if len(cols_to_remove) > 0:
-                        setattr(n.links_t, attr, attr_data.drop(columns=cols_to_remove))
+            for attr_name in dir(n.links_t):
+                if not attr_name.startswith('_'):
+                    attr_data = getattr(n.links_t, attr_name)
+                    if hasattr(attr_data, 'columns'):
+                        cols_to_remove = links_with_bad_buses.intersection(attr_data.columns)
+                        if len(cols_to_remove) > 0:
+                            logger.info(f"Cleaning {attr_name} time series for {len(cols_to_remove)} links")
+                            setattr(n.links_t, attr_name, attr_data.drop(columns=cols_to_remove))
         
         # Fix generator expansion limits that cause infeasibility
         problematic_gens = n.generators.query("p_nom_max < p_nom_min")
         if len(problematic_gens) > 0:
             logger.info(f"Fixing {len(problematic_gens)} generators with p_nom_max < p_nom_min")
+            for idx, gen in problematic_gens.iterrows():
+                logger.info(f"  {idx}: p_nom_min={gen.p_nom_min}, p_nom_max={gen.p_nom_max} -> setting p_nom_max = p_nom_min * 2")
+                logger.info(f"  {idx}: p_nom_min={gen.p_nom_min} -> p_nom_max={gen.p_nom_min * 2}")
             n.generators.loc[problematic_gens.index, "p_nom_max"] = n.generators.loc[problematic_gens.index, "p_nom_min"] * 2
         
-        # Additional fixes for common issues
-        # Check for generators with zero or negative costs
-        zero_cost_gens = n.generators.query("marginal_cost <= 0 and p_nom_max > 0")
-        if len(zero_cost_gens) > 0:
-            logger.info(f"Setting minimum marginal cost for {len(zero_cost_gens)} generators with zero/negative costs")
-            n.generators.loc[zero_cost_gens.index, "marginal_cost"] = 0.001
+        ## Check for generators with zero or negative costs
+        #zero_cost_gens = n.generators.query("marginal_cost <= 0 and p_nom_max > 0")
+        #if len(zero_cost_gens) > 0:
+        #    logger.info(f"Setting minimum marginal cost for {len(zero_cost_gens)} generators with zero/negative costs")
+        #    for idx, gen in zero_cost_gens.iterrows():
+        #        logger.info(f"  {idx}: marginal_cost={gen.marginal_cost} -> 0.001")
+        #    n.generators.loc[zero_cost_gens.index, "marginal_cost"] = 0.001
         
         # Ensure all extendable generators have reasonable limits
         extendable_gens = n.generators.query("p_nom_extendable == True")
@@ -1217,50 +1444,48 @@ def solve_network(n, config, solving, **kwargs):
             logger.info(f"Fixing {len(problematic_extendable)} extendable generators with problematic limits")
             # Set a reasonable maximum for problematic extendable generators
             n.generators.loc[problematic_extendable.index, "p_nom_max"] = 1e6  # Large but finite limit
+            for idx, gen in problematic_extendable.iterrows():
+                logger.info(f"  {idx}: p_nom_max set to 1e6 MW")
         
-        # Check for NaN values in critical columns
-        critical_cols = ['marginal_cost', 'p_nom_min', 'p_nom_max']
-        for col in critical_cols:
-            if col in n.generators.columns:
-                nan_gens = n.generators[n.generators[col].isna()]
-                if len(nan_gens) > 0:
-                    logger.info(f"Fixing {len(nan_gens)} generators with NaN values in {col}")
-                    if col == 'marginal_cost':
-                        n.generators.loc[nan_gens.index, col] = 0.001
-                    elif col in ['p_nom_min', 'p_nom_max']:
-                        n.generators.loc[nan_gens.index, col] = 0
+        ## Check for NaN values in critical columns
+        #critical_cols = ['marginal_cost', 'p_nom_min', 'p_nom_max']
+        #for col in critical_cols:
+        #    if col in n.generators.columns:
+        #        nan_gens = n.generators[n.generators[col].isna()]
+        #        if len(nan_gens) > 0:
+        #            logger.info(f"Fixing {len(nan_gens)} generators with NaN values in {col}")
+        #            if col == 'marginal_cost':
+        #                n.generators.loc[nan_gens.index, col] = 0.001
+        #            elif col in ['p_nom_min', 'p_nom_max']:
+        #                n.generators.loc[nan_gens.index, col] = 0
         
-        # Try solving again with cleaned network
+
+        logger.info(f"Removed generators: {len(generators_with_bad_buses) if 'generators_with_bad_buses' in locals() else 0}")
+        logger.info(f"Removed loads: {len(loads_with_bad_buses) if 'loads_with_bad_buses' in locals() else 0}")
+        logger.info(f"Removed stores: {len(stores_with_bad_buses) if 'stores_with_bad_buses' in locals() else 0}")
+        logger.info(f"Removed links: {len(links_with_bad_buses) if 'links_with_bad_buses' in locals() else 0}")
+        logger.info(f"Fixed generator capacity limits: {len(problematic_gens) if 'problematic_gens' in locals() else 0}")
+        logger.info(f"Fixed zero-cost generators: {len(zero_cost_gens) if 'zero_cost_gens' in locals() else 0}")
+        
         logger.info("Retrying solve with cleaned network...")
         try:
-            status, condition = n.optimize(**kwargs)
-            if status == "ok":
-                logger.info("Successfully resolved infeasibility!")
-                return n
-        except Exception as e:
-            logger.warning(f"Retry failed: {e}")
-        
-        # If still infeasible, try with even more relaxed constraints
-        logger.info("Trying with further relaxed constraints...")
-        
-        # Remove all minimum expansion constraints
-        n.generators.loc[n.generators.p_nom_extendable, "p_nom_min"] = 0
-        n.links.loc[n.links.p_nom_extendable, "p_nom_min"] = 0
-        n.stores.loc[n.stores.e_nom_extendable, "e_nom_min"] = 0
-        
-        try:
-            status, condition = n.optimize(**kwargs)
-            if status == "ok":
-                logger.info("Successfully resolved infeasibility with relaxed constraints!")
-                return n
-        except Exception as e:
-            logger.warning(f"Second retry failed: {e}")
-        
-        # Try with different solver settings if using Gurobi
-        if kwargs.get("solver_name", "").lower() == "gurobi":
-            logger.info("Trying with more robust Gurobi settings...")
+            if skip_iterations:
+                status, condition = n.optimize(**kwargs)
+            else:
+                status, condition = n.optimize.optimize_transmission_expansion_iteratively(**kwargs)
+                
+            logger.info(f"Retry result: status='{status}', condition='{condition}'")
             
-            # Use more robust solver options
+            if status == "ok":
+                return n
+            else:
+                logger.warning(f"Retry still failed: {status} / {condition}")
+        except Exception as e:
+            logger.warning(f"Retry failed with exception: {e}")
+        
+        if kwargs.get("solver_name", "").lower() == "gurobi":
+            logger.info("Trying with different solver settings for Gurobi...")
+            
             robust_solver_options = {
                 "NumericFocus": 3,
                 "Method": 2,  # barrier
@@ -1277,20 +1502,35 @@ def solve_network(n, config, solving, **kwargs):
                 "Seed": 123
             }
             
-            # Try with robust settings
+            logger.info(f"Using robust solver options: {robust_solver_options}")
+            
             kwargs_robust = kwargs.copy()
             kwargs_robust["solver_options"] = robust_solver_options
             
             try:
-                status, condition = n.optimize(**kwargs_robust)
+                if skip_iterations:
+                    status, condition = n.optimize(**kwargs_robust)
+                else:
+                    status, condition = n.optimize.optimize_transmission_expansion_iteratively(**kwargs_robust)
+                    
+                logger.info(f"Robust solver result: status='{status}', condition='{condition}'")
+                
                 if status == "ok":
                     logger.info("Successfully resolved infeasibility with robust solver settings!")
                     return n
+                else:
+                    logger.warning(f"Even robust solver settings failed: {status} / {condition}")
             except Exception as e:
-                logger.warning(f"Robust solver retry failed: {e}")
+                logger.warning(f"Robust solver retry failed with exception: {e}")
         
         # If still infeasible, save debug info and raise error
+        logger.error("All infeasibility checks failed")
         logger.error("Could not resolve infeasibility. Check network consistency.")
+        logger.error(f"Final status: {status}")
+        logger.error(f"Final condition: {condition}")
+        
+        logger.error(f"Final network state: {len(n.buses)} buses, {len(n.generators)} generators, {len(n.loads)} loads, {len(n.stores)} stores, {len(n.links)} links")
+        
         raise RuntimeError(f"Solving status '{status}' with termination condition '{condition}'")
 
     return n
@@ -1301,17 +1541,17 @@ if __name__ == "__main__":
         from _helpers import mock_snakemake
 
         snakemake = mock_snakemake(
-            "solve_sector_network",
+            "solve_network_myopic",
             simpl="",
-            clusters="4",
-            ll="c1",
-            opts="Co2L-4H",
-            planning_horizons="2030",
+            clusters="200",
+            ll="copt",
+            opts="3h",
+            planning_horizons="2020",
+            sopts="72h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate="0.071",
             demand="AB",
-            sopts="144H",
-            h2export="120",
-            configfile="config.tutorial.yaml",
+            h2export="10"
         )
 
     configure_logging(snakemake)

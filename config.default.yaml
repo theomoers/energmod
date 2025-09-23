@@ -37,6 +37,7 @@ custom_rules: [] # Default empty [] or link to custom rule file e.g. ["my_folder
 run:
   name: "" # use this to keep track of runs with different settings
   sector_name: "" # use this to keep track of sector scenario runs
+  permanent_storage: "" # keeping track of files that don't change
   shared_cutouts: true # set to true to share the default cutout(s) across runs
   # Note: value false requires build_cutout to be enabled
   allow_scenario_failure: false # If True, the workflow will continue even if a scenario in run_scnenario fails
@@ -65,6 +66,55 @@ crs:
   area_crs: ESRI:54009 # projection for area measurements only. Possible recommended values are Global Mollweide "ESRI:54009"
 
 # download_osm_data_nprocesses: 10  # (optional) number of threads used to download osm data
+
+global_specific:
+  baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
+  baseyear_generation:
+    baseyear_generation_constraint: true # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
+    tolerance: 0.05 # +- x% tolerance for baseyear generation constraint
+    units: TWh
+    targets: # in TWh -- for 2020 currently only
+      solar: 850
+      #onshore_wind: 1300
+      #offshore_wind: 100
+      #run_of_river: 200
+      #nuclear: 2700
+      #coal: 9500
+      #gas: 6000
+      #oil: 500
+      #biomass: 900
+    carriers_map:
+      solar: ["solar"]
+      #onshore_wind: ["onwind"]
+      #offshore_wind: ["offwind-ac","offwind-dc"]
+      #run_of_river: ["ror"]
+      #nuclear: ["nuclear"]          # Link carriers
+      #coal: ["coal"]             # Link
+      #lignite: ["coal"]          # Link
+      #gas: ["OCGT","CCGT"]      # Links
+      #oil: ["oil"]              # Link
+      #biomass: ["urban central solid biomass CHP"]  # Link (electric)
+
+permstore:
+  enable: true
+  path: /shared/share_cki25/energymodels/pypsa-earth/permstorage # keeping track of files that don't change -- "big beautiful run 1"
+  scenario: "baseA"
+  use:
+    shapes: true
+    base_network: true
+    bus_regions: true
+    demand_profiles: true
+    powerplants: true
+    pop_layouts: true
+    pop_layouts_clustered: true
+    temperatures: true
+    heat_demand: true
+    transport_data: true
+    gas_network: true
+    industry_distribution: true
+    elec_prepared: true
+    renewable_profiles: true
+    costs: true
 
 augmented_line_connection:
   add_to_snakefile: false # If True, includes this rule to the workflow

@@ -154,6 +154,13 @@ def simplify_network_to_base_voltage(n, linetype, base_voltage):
             if col.startswith("bus"):
                 df[col] = df[col].map(trafo_map)
 
+    if hasattr(n, 'loads_t') and hasattr(n.loads_t, 'p_set') and not n.loads_t.p_set.empty:
+        # Create mapping for load bus IDs
+        old_load_columns = n.loads_t.p_set.columns
+        new_load_columns = old_load_columns.map(trafo_map)
+        
+        n.loads_t.p_set.columns = new_load_columns
+
     n.mremove("Transformer", n.transformers.index)
     n.mremove("Bus", n.buses.index.difference(trafo_map))
 
@@ -662,6 +669,8 @@ def cluster(
         else "conservative"
     )
     clustering = clustering_for_n_clusters(
+        snakemake.input,
+        snakemake.config,
         n,
         n_clusters,
         alternative_clustering,
@@ -671,11 +680,14 @@ def cluster(
         distribution_cluster,
         build_shape_options,
         custom_busmap=False,
+        aggregate_carriers=None,
+        line_length_factor=1.25,
         aggregation_strategies=aggregation_strategies,
         potential_mode=potential_mode,
         solver_name=solver_name,
         algorithm=algorithm,
         feature=feature,
+        extended_link_costs=0,
         focus_weights=focus_weights,
     )
 
@@ -1011,7 +1023,13 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("simplify_network", simpl="")
+        snakemake = mock_snakemake(
+            "simplify_network",
+            simpl="",
+            network="elec",
+            planning_horizons="2020",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+        )
 
     configure_logging(snakemake)
 
@@ -1120,9 +1138,7 @@ if __name__ == "__main__":
             busmaps.append(busmap_hac)
 
     if snakemake.wildcards.simpl:
-        alternative_clustering = snakemake.params.cluster_options[
-            "alternative_clustering"
-        ]
+        alternative_clustering = snakemake.params.cluster_options.get("alternative_clustering", False)
         build_shape_options = snakemake.params.build_shape_options
         country_list = snakemake.params.countries
         distribution_cluster = snakemake.params.cluster_options["distribute_cluster"]
@@ -1213,4 +1229,6 @@ if __name__ == "__main__":
     busmap_s = reduce(lambda x, y: x.map(y), busmaps[1:], busmaps[0])
     busmap_s.to_csv(snakemake.output.busmap)
 
-    cluster_regions(busmaps, snakemake.input, snakemake.output)
+    # Get alternative_clustering for final cluster_regions call
+    alternative_clustering = snakemake.params.cluster_options.get("alternative_clustering", False)
+    cluster_regions(busmaps, snakemake.input, snakemake.output, alternative_clustering)

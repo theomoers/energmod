@@ -137,6 +137,7 @@ from _helpers import (
     locate_bus,
     update_config_dictionary,
     update_p_nom_max,
+    locate_bus_alt_clust,
 )
 from add_electricity import load_costs
 from build_shapes import add_gdp_data, add_population_data
@@ -237,6 +238,7 @@ def distribute_clusters(
     n_clusters,
     focus_weights=None,
     solver_name=None,
+    alternative_clustering=False,
 ):
     """
     Determine the number of clusters per country.
@@ -309,9 +311,15 @@ def distribute_clusters(
     # TODO: 1. Check if sub_networks can be added here i.e. ["country", "sub_network"]
     N = n.buses.groupby(["country", "sub_network"]).size()
 
+    # When using alternative clustering (GADM-based), allow fewer clusters than country-subnetwork combinations
+    if alternative_clustering:
+        min_clusters = len(n.buses.country.unique())
+    else:
+        min_clusters = len(N)
+    
     assert (
-        n_clusters >= len(N) and n_clusters <= N.sum()
-    ), f"Number of clusters must be {len(N)} <= n_clusters <= {N.sum()} for this selection of countries."
+        n_clusters >= min_clusters and n_clusters <= N.sum()
+    ), f"Number of clusters must be {min_clusters} <= n_clusters <= {N.sum()} for this selection of countries."
 
     if focus_weights is not None:
         total_focus = sum(list(focus_weights.values()))
@@ -358,21 +366,31 @@ def distribute_clusters(
     return m.solution["n"].to_series().astype(int)
 
 
-def busmap_for_gadm_clusters(inputs, n, gadm_layer_id, geo_crs, country_list):
+def busmap_for_gadm_clusters(inputs, n, gadm_layer_id, geo_crs, country_list, alternative_clustering=False):
 
-    buses = locate_bus(
-        n.buses,
-        country_list,
-        gadm_layer_id,
-        inputs.gadm_shapes,
-        gadm_clustering=True,
-    )
+    # Use simplified location function for alternative clustering
+    if alternative_clustering:
+        
+        buses = locate_bus_alt_clust(
+            n.buses,
+            country_list,
+            gadm_layer_id,
+            inputs.gadm_shapes,
+            gadm_clustering=True,
+        )
+    else:
+        buses = locate_bus(
+            n.buses,
+            country_list,
+            gadm_layer_id,
+            inputs.gadm_shapes,
+            gadm_clustering=True,
+        )
 
     buses["gadm_subnetwork"] = (
         buses["gadm_{}".format(gadm_layer_id)] + "_" + buses["carrier"].astype(str)
     )
     busmap = buses["gadm_subnetwork"]
-
     return busmap
 
 
@@ -387,6 +405,7 @@ def busmap_for_n_clusters(
     focus_weights=None,
     algorithm="kmeans",
     feature=None,
+    alternative_clustering=False,
     **algorithm_kwds,
 ):
     if algorithm == "kmeans":
@@ -455,6 +474,7 @@ def busmap_for_n_clusters(
             n_clusters,
             focus_weights=focus_weights,
             solver_name=solver_name,
+            alternative_clustering=alternative_clustering,
         )
 
     # TODO Check if `reduce_network()` is used
@@ -553,7 +573,7 @@ def clustering_for_n_clusters(
     if not isinstance(custom_busmap, pd.Series):
         if alternative_clustering:
             busmap = busmap_for_gadm_clusters(
-                inputs, n, gadm_layer_id, geo_crs, country_list
+                inputs, n, gadm_layer_id, geo_crs, country_list, alternative_clustering
             )
         else:
             busmap = busmap_for_n_clusters(
@@ -567,6 +587,7 @@ def clustering_for_n_clusters(
                 focus_weights,
                 algorithm,
                 feature,
+                alternative_clustering,
             )
     else:
         busmap = custom_busmap
@@ -603,17 +624,87 @@ def clustering_for_n_clusters(
     return clustering
 
 
-def cluster_regions(busmaps, inputs, output):
-    busmap = reduce(lambda x, y: x.map(y), busmaps[1:], busmaps[0])
+def cluster_regions(busmaps, inputs, output, alternative_clustering=False):
+    # Handle single busmap case (normal case)
+    if len(busmaps) == 1:
+        busmap = busmaps[0]
+    else:
+        busmap = reduce(lambda x, y: x.map(y), busmaps[1:], busmaps[0])
 
     for which in ("regions_onshore", "regions_offshore"):
-        # regions = gpd.read_file(getattr(input, which)).set_index("name")
         regions = gpd.read_file(getattr(inputs, which))
         regions = regions.reindex(columns=REGION_COLS).set_index("name")
-        aggfunc = dict(x="mean", y="mean", country="first")
-        regions_c = regions.dissolve(busmap, aggfunc=aggfunc)
+        
+        regions_in_busmap = regions.index.intersection(busmap.index)
+        
+        aggfunc = dict(x="mean", y="mean")
+        if alternative_clustering:
+            regions_with_country = regions.reset_index()
+            if 'country' in regions_with_country.columns:
+                region_busmap = regions_with_country.set_index('name')['country'] + '._AC'
+                
+                regions_to_dissolve = regions
+                busmap_to_use = region_busmap
+            else:
+                regions_to_dissolve = regions.loc[regions_in_busmap]
+                busmap_to_use = busmap.loc[regions_in_busmap]
+        else:
+            # Standard clustering: use bus-based busmap
+            regions_to_dissolve = regions.loc[regions_in_busmap]
+            busmap_to_use = busmap.loc[regions_in_busmap]
+        
+        regions_c = regions_to_dissolve.dissolve(busmap_to_use, aggfunc=aggfunc)
         regions_c.index.name = "name"
         regions_c = regions_c.reset_index()
+        
+        original_bus_country = {}
+        for idx, row in regions.iterrows():
+            if 'country' in row and pd.notna(row['country']):
+                original_bus_country[idx] = row['country']
+        
+        def get_majority_country_from_original(cluster_name):
+            """Find the country that has the majority area in this cluster."""
+            try:
+                if alternative_clustering:
+                    if "._" in cluster_name:
+                        country_code = cluster_name.split("._")[0]
+                    elif "_" in cluster_name:
+                        country_code = cluster_name.split("_")[0]
+                    else:
+                        country_code = None
+                    
+                    if country_code and len(country_code) == 2: 
+                        return country_code
+                
+                cluster_buses = busmap[busmap == cluster_name].index
+                
+                if len(cluster_buses) == 0:
+                    return "Unknown"
+                
+                country_areas = {}
+                for bus in cluster_buses:
+                    if bus in regions.index:
+                        country = original_bus_country.get(bus, "Unknown")
+                        area = regions.loc[bus, 'geometry'].area if hasattr(regions.loc[bus, 'geometry'], 'area') else 1.0
+                        
+                        if country != "Unknown" and area > 0:
+                            if country in country_areas:
+                                country_areas[country] += area
+                            else:
+                                country_areas[country] = area
+                
+                if not country_areas:
+                    return "Unknown"
+                
+                majority_country = max(country_areas, key=country_areas.get)
+                return majority_country
+                
+            except Exception as e:
+                logger.warning(f"Could not determine majority country for region {cluster_name}: {e}")
+                return "Unknown"
+        
+        regions_c['country'] = regions_c['name'].apply(get_majority_country_from_original)
+        
         regions_c.to_file(getattr(output, which))
 
 
@@ -622,7 +713,18 @@ if __name__ == "__main__":
         from _helpers import mock_snakemake
 
         snakemake = mock_snakemake(
-            "cluster_network", network="elec", simpl="", clusters="4"
+            "cluster_network",
+            simpl="",
+            network="elec",
+            clusters="200",
+            ll="copt",
+            opts="3h",
+            planning_horizons="2020",
+            sopts="144h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+            discountrate=0.071,
+            demand="AB",
+            h2export="10"
         )
     configure_logging(snakemake)
 
@@ -752,4 +854,4 @@ if __name__ == "__main__":
     ):  # also available: linemap_positive, linemap_negative
         getattr(clustering, attr).to_csv(outputs[attr])
 
-    cluster_regions((clustering.busmap,), inputs, outputs)
+    cluster_regions((clustering.busmap,), inputs, outputs, alternative_clustering)

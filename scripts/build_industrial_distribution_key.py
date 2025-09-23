@@ -14,7 +14,7 @@ from itertools import product
 
 import geopandas as gpd
 import pandas as pd
-from _helpers import locate_bus, three_2_two_digits_country
+from _helpers import locate_bus, locate_bus_alt_clust, three_2_two_digits_country
 from shapely.geometry import Point
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ gpd_version = StrictVersion(gpd.__version__)
 
 
 def build_nodal_distribution_key(
-    industrial_database, regions, industry, countries
+    industrial_database, regions, industry, countries, alternative_clustering=False
 ):  # returns percentage of co2 emissions
     """
     Build nodal distribution keys for each sector.
@@ -47,30 +47,74 @@ def build_nodal_distribution_key(
     )
 
     # pop["country"] = pop.index.str[:2]
-    keys["population"] = pop["total"].values / pop["total"].sum()
-
-    keys["gdp"] = gdp["total"].values / gdp["total"].sum()
+    if alternative_clustering:
+        # For alternative clustering (one node per country), each country node gets 1.0
+        keys["population"] = 1.0
+        keys["gdp"] = 1.0
+    else:
+        # For standard clustering, distribute proportionally within country
+        pop_country = pop.index.str[:2]
+        gdp_country = gdp.index.str[:2]
+        
+        pop_normalized = pop.groupby(pop_country)["total"].transform(lambda x: x / x.sum())
+        keys["population"] = pop_normalized.values
+        
+        gdp_normalized = gdp.groupby(gdp_country)["total"].transform(lambda x: x / x.sum())
+        keys["gdp"] = gdp_normalized.values
 
     for tech, country in product(industry, countries):
-        regions_ct = regions.name[regions.name.str.contains(country)]
+        if alternative_clustering:
+            # For alternative clustering, only one region per country
+            regions_ct = regions.name[regions.name.str.startswith(country + '.')]
+            
+            if len(regions_ct) == 0:
+                logger.warning(f"No regions found for country {country} with pattern '{country}.'")
+                logger.warning(f"Sample regions: {regions.name[:5].tolist()}")
+                regions_ct = regions.name[regions.name.str.contains(country)]
+                if len(regions_ct) == 0:
+                    logger.warning(f"No regions found even with broader search for {country}")
+                    continue
+        else:
+            regions_ct = regions.name[regions.name.str.contains(country)]
+
+        if len(regions_ct) == 0:
+            logger.warning(f"Skipping {tech} for {country} - no matching regions found")
+            continue
 
         facilities = industrial_database.query(
             "country == @country and industry == @tech"
         )
         # TODO adapt for facilities with production values not emissions
         if not facilities.empty:
-            indicator = facilities["capacity"]
-            if indicator.sum() == 0:
-                key = pd.Series(1 / len(facilities), facilities.index)
+            if alternative_clustering:
+                # For alternative clustering, assign all to the single country node
+                if len(regions_ct) > 0:
+                    key = pd.Series([1.0], index=regions_ct)
+                else:
+                    logger.warning(f"Cannot assign capacity for {tech} in {country} - no valid regions")
+                    continue
             else:
-                # TODO BEWARE: this is a strong assumption
-                # indicator = indicator.fillna(0)
-                key = indicator / indicator.sum()
-            key = (
-                key.groupby(facilities.index).sum().reindex(regions_ct, fill_value=0.0)
-            )
+                # For standard clustering, distribute based on actual capacity
+                indicator = facilities["capacity"]
+                if indicator.sum() == 0:
+                    key = pd.Series(1 / len(facilities), facilities.index)
+                else:
+                    # TODO: strong assumption
+                    # indicator = indicator.fillna(0)
+                    key = indicator / indicator.sum()
+                # For standard clustering, distribute across GADM regions
+                key = (
+                    key.groupby(facilities.index).sum().reindex(regions_ct, fill_value=0.0)
+                )
         else:
-            key = keys.loc[regions_ct, "gdp"]
+            if alternative_clustering:
+                # For alternative clustering with no facilities, still assign 1.0 to the country node
+                if len(regions_ct) > 0:
+                    key = pd.Series([1.0], index=regions_ct)
+                else:
+                    continue
+            else:
+                key = keys.loc[regions_ct, "gdp"]
 
         keys.loc[regions_ct, tech] = key
     keys["country"] = pop["ct"]
@@ -94,13 +138,21 @@ def match_technology(df):
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
-        from _helpers import mock_snakemake
+        from _helpers import mock_snakemake 
 
         snakemake = mock_snakemake(
             "build_industrial_distribution_key",
-            clusters="4",
-            planning_horizons=2050,
+            simpl="",
+            network="elec",
+            clusters="200",
+            ll="copt",
+            opts="3h",
+            planning_horizons="2020",
+            sopts="72h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+            discountrate=0.071,
             demand="AB",
+            h2export="10"
         )
 
     regions = gpd.read_file(snakemake.input.regions_onshore)
@@ -150,17 +202,25 @@ if __name__ == "__main__":
 
     industry = geo_locs.industry.unique()
 
-    # Map industries to gadm shapes
-    industrial_database = locate_bus(
-        geo_locs[geo_locs.quality != "unavailable"],
-        countries,
-        gadm_layer_id,
-        shapes_path,
-        gadm_clustering,
-    ).set_index("gadm_" + str(gadm_layer_id))
+    if gadm_clustering:
+        industrial_database = locate_bus_alt_clust(
+            geo_locs[geo_locs.quality != "unavailable"],
+            countries,
+            gadm_layer_id,
+            shapes_path,
+            gadm_clustering,
+        ).set_index("gadm_" + str(gadm_layer_id))
+    else:
+        industrial_database = locate_bus(
+            geo_locs[geo_locs.quality != "unavailable"],
+            countries,
+            gadm_layer_id,
+            shapes_path,
+            gadm_clustering,
+        ).set_index("gadm_" + str(gadm_layer_id))
 
     keys = build_nodal_distribution_key(
-        industrial_database, regions, industry, countries
+        industrial_database, regions, industry, countries, gadm_clustering
     )
 
     keys.to_csv(snakemake.output.industrial_distribution_key)

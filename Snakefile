@@ -38,6 +38,7 @@ configfile: "configs/bundle_config.yaml"
 configfile: "configs/powerplantmatching_config.yaml"
 configfile: "config.yaml"
 
+shell.executable("/bin/bash")
 
 check_config_version(config=config)
 
@@ -60,9 +61,37 @@ SECDIR = run["sector_name"] + "/" if run.get("sector_name") else ""
 SDIR = config["summary_dir"].strip("/") + f"/{SECDIR}"
 RESDIR = config["results_dir"].strip("/") + f"/{SECDIR}"
 
+# Permanent storage settings, added by CKI
+PS = config.get("permstore", {})
+PERM_ON = bool(PS.get("enable", False))
+PDIR = PS.get("path", "").rstrip("/") + "/" if PERM_ON else ""
+PERM_SCEN = PS.get("scenario", "default")
+PERM_ROOT = (PDIR + PERM_SCEN + "/") if PERM_ON else None
+
+def perm_src(rel):
+    assert PERM_ROOT, "permstore not enabled"
+    return PERM_ROOT + rel
+
+def need_perm(key):
+    return PERM_ON and PS.get("use", {}).get(key, False)
+
+def ln_cp():
+    return r'''__lncp() {{
+  if [ $# -ge 2 ]; then
+    src="$1"; dst="$2"
+  elif [ $# -eq 1 ]; then
+    dst="$1"; IFS= read -r src
+  else
+    IFS= read -r src && IFS= read -r dst
+  fi
+  ( ln -sf "$src" "$dst" 2>/dev/null ) || cp -a "$src" "$dst"
+}}; __lncp'''
+
 load_data_paths = get_load_paths_gegis("data", config)
 
 if config["enable"].get("retrieve_cost_data", True):
+    COSTS = "resources/" + RDIR + f"costs_{config['costs']['year']}.csv"
+elif config["costs"].get("customized", False):
     COSTS = "resources/" + RDIR + f"costs_{config['costs']['year']}.csv"
 else:
     COSTS = "data/costs.csv"
@@ -240,97 +269,137 @@ rule build_osm_network:
     script:
         "scripts/build_osm_network.py"
 
-
-rule build_shapes:
-    params:
-        build_shape_options=config["build_shape_options"],
-        crs=config["crs"],
-        countries=config["countries"],
-        subregion=config["subregion"],
-    input:
-        # naturalearth='data/bundle/naturalearth/ne_10m_admin_0_countries.shp',
-        # eez='data/bundle/eez/World_EEZ_v8_2014.shp',
-        # nuts3='data/bundle/NUTS_2013_60M_SH/data/NUTS_RG_60M_2013.shp',
-        # nuts3pop='data/bundle/nama_10r_3popgdp.tsv.gz',
-        # nuts3gdp='data/bundle/nama_10r_3gdp.tsv.gz',
-        eez="data/eez/eez_v11.gpkg",
-    output:
-        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
-        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
-        africa_shape="resources/" + RDIR + "shapes/africa_shape.geojson",
-        gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
-        subregion_shapes="resources/" + RDIR + "shapes/subregion_shapes.geojson",
-    log:
-        "logs/" + RDIR + "build_shapes.log",
-    benchmark:
-        "benchmarks/" + RDIR + "build_shapes"
-    threads: 1
-    resources:
-        mem_mb=51200, # used to be 3096
-    script:
-        "scripts/build_shapes.py"
-
-
-rule base_network:
-    params:
-        voltages=config["electricity"]["voltages"],
-        transformers=config["transformers"],
-        snapshots=config["snapshots"],
-        links=config["links"],
-        lines=config["lines"],
-        hvdc_as_lines=config["electricity"]["hvdc_as_lines"],
-        countries=config["countries"],
-        base_network=config["base_network"],
-    input:
-        osm_buses="resources/" + RDIR + "base_network/all_buses_build_network.csv",
-        osm_lines="resources/" + RDIR + "base_network/all_lines_build_network.csv",
-        osm_converters="resources/"
-        + RDIR
-        + "base_network/all_converters_build_network.csv",
-        osm_transformers="resources/"
-        + RDIR
-        + "base_network/all_transformers_build_network.csv",
-        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
-        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
-    output:
-        "networks/" + RDIR + "base.nc",
-    log:
-        "logs/" + RDIR + "base_network.log",
-    benchmark:
-        "benchmarks/" + RDIR + "base_network"
-    threads: 1
-    resources:
-        mem_mb=500,
-    script:
-        "scripts/base_network.py"
+if need_perm("shapes"):
+    rule shapes_from_perm:
+        input:
+            country_shapes = lambda w: perm_src("resources/shapes/country_shapes.geojson"),
+            offshore_shapes = lambda w: perm_src("resources/shapes/offshore_shapes.geojson"),
+            africa_shape   = lambda w: perm_src("resources/shapes/africa_shape.geojson"),
+            gadm_shapes    = lambda w: perm_src("resources/shapes/gadm_shapes.geojson"),
+            subregion_shapes = lambda w: perm_src("resources/shapes/subregion_shapes.geojson"),
+        output:
+            country_shapes = "resources/" + RDIR + "shapes/country_shapes.geojson",
+            offshore_shapes = "resources/" + RDIR + "shapes/offshore_shapes.geojson",
+            africa_shape   = "resources/" + RDIR + "shapes/africa_shape.geojson",
+            gadm_shapes    = "resources/" + RDIR + "shapes/gadm_shapes.geojson",
+            subregion_shapes = "resources/" + RDIR + "shapes/subregion_shapes.geojson",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.country_shapes}", "{output.country_shapes}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.offshore_shapes}", "{output.offshore_shapes}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.africa_shape}", "{output.africa_shape}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.gadm_shapes}", "{output.gadm_shapes}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.subregion_shapes}", "{output.subregion_shapes}")
+else:
+    rule build_shapes:
+        params:
+            build_shape_options=config["build_shape_options"],
+            crs=config["crs"],
+            countries=config["countries"],
+            subregion=config["subregion"],
+        input:
+            # naturalearth='data/bundle/naturalearth/ne_10m_admin_0_countries.shp',
+            # eez='data/bundle/eez/World_EEZ_v8_2014.shp',
+            # nuts3='data/bundle/NUTS_2013_60M_SH/data/NUTS_RG_60M_2013.shp',
+            # nuts3pop='data/bundle/nama_10r_3popgdp.tsv.gz',
+            # nuts3gdp='data/bundle/nama_10r_3gdp.tsv.gz',
+            eez="data/eez/eez_v11.gpkg",
+        output:
+            country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
+            offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
+            africa_shape="resources/" + RDIR + "shapes/africa_shape.geojson",
+            gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
+            subregion_shapes="resources/" + RDIR + "shapes/subregion_shapes.geojson",
+        log:
+            "logs/" + RDIR + "build_shapes.log",
+        benchmark:
+            "benchmarks/" + RDIR + "build_shapes"
+        threads: 1
+        resources:
+            mem_mb=51200, # used to be 3096
+        script:
+            "scripts/build_shapes.py"
 
 
-rule build_bus_regions:
-    params:
-        alternative_clustering=config["cluster_options"]["alternative_clustering"],
-        crs=config["crs"],
-        countries=config["countries"],
-    input:
-        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
-        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
-        base_network="networks/" + RDIR + "base.nc",
-        #gadm_shapes="resources/" + RDIR + "shapes/MAR2.geojson",
-        #using this line instead of the following will test updated gadm shapes for MA.
-        #To use: downlaod file from the google drive and place it in resources/" + RDIR + "shapes/
-        #Link: https://drive.google.com/drive/u/1/folders/1dkW1wKBWvSY4i-XEuQFFBj242p0VdUlM
-        gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
-    output:
-        regions_onshore="resources/" + RDIR + "bus_regions/regions_onshore.geojson",
-        regions_offshore="resources/" + RDIR + "bus_regions/regions_offshore.geojson",
-    log:
-        "logs/" + RDIR + "build_bus_regions.log",
-    benchmark:
-        "benchmarks/" + RDIR + "build_bus_regions"
-    threads: 1
-    resources:
-        mem_mb=1000,
-    script:
-        "scripts/build_bus_regions.py"
+if need_perm("base_network"):
+    rule base_network_from_perm:
+        input:
+            base_nc = lambda w: perm_src("networks/base.nc")
+        output:
+            base_nc = "networks/" + RDIR + "base.nc"
+        shell:
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.base_nc}", "{output.base_nc}")
+else:
+    rule base_network:
+        params:
+            voltages=config["electricity"]["voltages"],
+            transformers=config["transformers"],
+            snapshots=config["snapshots"],
+            links=config["links"],
+            lines=config["lines"],
+            hvdc_as_lines=config["electricity"]["hvdc_as_lines"],
+            countries=config["countries"],
+            base_network=config["base_network"],
+        input:
+            osm_buses="resources/" + RDIR + "base_network/all_buses_build_network.csv",
+            osm_lines="resources/" + RDIR + "base_network/all_lines_build_network.csv",
+            osm_converters="resources/"
+            + RDIR
+            + "base_network/all_converters_build_network.csv",
+            osm_transformers="resources/"
+            + RDIR
+            + "base_network/all_transformers_build_network.csv",
+            country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
+            offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
+        output:
+            "networks/" + RDIR + "base.nc",
+        log:
+            "logs/" + RDIR + "base_network.log",
+        benchmark:
+            "benchmarks/" + RDIR + "base_network"
+        threads: 1
+        resources:
+            mem_mb=500,
+        script:
+            "scripts/base_network.py"
+
+if need_perm("bus_regions"):
+    rule bus_regions_from_perm:
+        input:
+            onshore = lambda w: perm_src("resources/bus_regions/regions_onshore.geojson"),
+            offshore = lambda w: perm_src("resources/bus_regions/regions_offshore.geojson"),
+        output:
+            onshore = "resources/" + RDIR + "bus_regions/regions_onshore.geojson",
+            offshore = "resources/" + RDIR + "bus_regions/regions_offshore.geojson",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.onshore}", "{output.onshore}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.offshore}", "{output.offshore}")
+else:
+    rule build_bus_regions:
+        params:
+            alternative_clustering=config["cluster_options"]["alternative_clustering"],
+            crs=config["crs"],
+            countries=config["countries"],
+        input:
+            country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
+            offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
+            base_network="networks/" + RDIR + "base.nc",
+            #gadm_shapes="resources/" + RDIR + "shapes/MAR2.geojson",
+            #using this line instead of the following will test updated gadm shapes for MA.
+            #To use: downlaod file from the google drive and place it in resources/" + RDIR + "shapes/
+            #Link: https://drive.google.com/drive/u/1/folders/1dkW1wKBWvSY4i-XEuQFFBj242p0VdUlM
+            gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
+        output:
+            regions_onshore="resources/" + RDIR + "bus_regions/regions_onshore.geojson",
+            regions_offshore="resources/" + RDIR + "bus_regions/regions_offshore.geojson",
+        log:
+            "logs/" + RDIR + "build_bus_regions.log",
+        benchmark:
+            "benchmarks/" + RDIR + "build_bus_regions"
+        threads: 1
+        resources:
+            mem_mb=1000,
+        script:
+            "scripts/build_bus_regions.py"
 
 
 def terminate_if_cutout_exists(config=config):
@@ -444,101 +513,141 @@ if config["enable"].get("retrieve_cost_data", True):
                 mem_mb=5000,
             run:
                 move(input[0], output[0])
+else:
+    if config["costs"].get("customized", True): # True means customized --> cost data is retrieved
+        if need_perm("costs"):
+            rule costs_from_perm:
+                input:
+                    src = lambda w: perm_src(f"resources/costs_{w.planning_horizons}.csv")
+                output:
+                    dst = "resources/" + RDIR + "costs_{planning_horizons}.csv"
+                shell:
+                    ln_cp() + r' <<< "{input.src}" "{output.dst}"'
 
 
-rule build_demand_profiles:
-    params:
-        snapshots=config["snapshots"],
-        load_options=config["load_options"],
-        countries=config["countries"],
-    input:
-        base_network="networks/" + RDIR + "base.nc",
-        regions="resources/" + RDIR + "bus_regions/regions_onshore.geojson",
-        load=load_data_paths,
-        #gadm_shapes="resources/" + RDIR + "shapes/MAR2.geojson",
-        #using this line instead of the following will test updated gadm shapes for MA.
-        #To use: downlaod file from the google drive and place it in resources/" + RDIR + "shapes/
-        #Link: https://drive.google.com/drive/u/1/folders/1dkW1wKBWvSY4i-XEuQFFBj242p0VdUlM
-        gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
-    output:
-        "resources/" + RDIR + "demand_profiles.csv",
-    log:
-        "logs/" + RDIR + "build_demand_profiles.log",
-    benchmark:
-        "benchmarks/" + RDIR + "build_demand_profiles"
-    threads: 1
-    resources:
-        mem_mb=3000,
-    script:
-        "scripts/build_demand_profiles.py"
+if need_perm("demand_profiles"):
+    rule demand_profiles_from_perm:
+        input:
+            src = lambda w: perm_src("resources/demand_profiles.csv")
+        output:
+            dst = "resources/" + RDIR + "demand_profiles.csv"
+        shell:
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.src}", "{output.dst}")
+else:
+    rule build_demand_profiles:
+        params:
+            snapshots=config["snapshots"],
+            load_options=config["load_options"],
+            countries=config["countries"],
+        input:
+            base_network="networks/" + RDIR + "base.nc",
+            regions="resources/" + RDIR + "bus_regions/regions_onshore.geojson",
+            load=load_data_paths,
+            #gadm_shapes="resources/" + RDIR + "shapes/MAR2.geojson",
+            #using this line instead of the following will test updated gadm shapes for MA.
+            #To use: downlaod file from the google drive and place it in resources/" + RDIR + "shapes/
+            #Link: https://drive.google.com/drive/u/1/folders/1dkW1wKBWvSY4i-XEuQFFBj242p0VdUlM
+            gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
+        output:
+            "resources/" + RDIR + "demand_profiles.csv",
+        log:
+            "logs/" + RDIR + "build_demand_profiles.log",
+        benchmark:
+            "benchmarks/" + RDIR + "build_demand_profiles"
+        threads: 1
+        resources:
+            mem_mb=3000,
+        script:
+            "scripts/build_demand_profiles.py"
 
 
-#rule build_renewable_profiles:
-#    params:
-#        crs=config["crs"],
-#        renewable=config["renewable"],
-#        countries=config["countries"],
-#        alternative_clustering=config["cluster_options"]["alternative_clustering"],
-#    input:
-#        natura="resources/" + RDIR + "natura.tiff",
-#        copernicus="data/copernicus/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif",
-#        gebco="data/gebco/GEBCO_2021_TID.nc",
-#        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
-#        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
-#        hydro_capacities="data/hydro_capacities.csv",
-#        eia_hydro_generation="data/eia_hydro_annual_generation.csv",
-#        powerplants="resources/" + RDIR + "powerplants.csv",
-#        regions=lambda w: (
-#            "resources/" + RDIR + "bus_regions/regions_onshore.geojson"
-#            if w.technology in ("onwind", "solar", "hydro", "csp")
-#            else "resources/" + RDIR + "bus_regions/regions_offshore.geojson"
-#        ),
-#        cutout=lambda w: "cutouts/"
-#        + CDIR
-#        + config["renewable"][w.technology]["cutout"]
-#        + ".nc",
-#    output:
-#        profile="resources/" + RDIR + "renewable_profiles/profile_{technology}.nc",
-#    log:
-#        "logs/" + RDIR + "build_renewable_profile_{technology}.log",
-#    benchmark:
-#        "benchmarks/" + RDIR + "build_renewable_profiles_{technology}"
-#    threads: ATLITE_NPROCESSES
-#    resources:
-#        mem_mb=ATLITE_NPROCESSES * 5000,
-#    script:
-#        "scripts/build_renewable_profiles.py"
+if need_perm("renewable_profiles"):
+    rule renewable_profiles_from_perm:
+        input:
+            src = lambda w: perm_src(f"resources/renewable_profiles/profile_{w.technology}.nc")
+        output:
+            dst = "resources/" + RDIR + "renewable_profiles/profile_{technology}.nc"
+        shell:
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.src}", "{output.dst}")
 
+else:
+    rule build_renewable_profiles:
+        params:
+            crs=config["crs"],
+            renewable=config["renewable"],
+            countries=config["countries"],
+            alternative_clustering=config["cluster_options"]["alternative_clustering"],
+        input:
+            natura="resources/" + RDIR + "natura.tiff",
+            copernicus="data/copernicus/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif",
+            gebco="data/gebco/GEBCO_2021_TID.nc",
+            country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
+            offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
+            hydro_capacities="data/hydro_capacities.csv",
+            eia_hydro_generation="data/eia_hydro_annual_generation.csv",
+            powerplants="resources/" + RDIR + "powerplants.csv",
+            regions=lambda w: (
+                "resources/" + RDIR + "bus_regions/regions_onshore.geojson"
+                if w.technology in ("onwind", "solar", "hydro", "csp")
+                else "resources/" + RDIR + "bus_regions/regions_offshore.geojson"
+            ),
+            cutout=lambda w: "cutouts/"
+            + CDIR
+            + config["renewable"][w.technology]["cutout"]
+            + ".nc",
+        output:
+            profile="resources/" + RDIR + "renewable_profiles/profile_{technology}.nc",
+        log:
+            "logs/" + RDIR + "build_renewable_profile_{technology}.log",
+        benchmark:
+            "benchmarks/" + RDIR + "build_renewable_profiles_{technology}"
+        threads: ATLITE_NPROCESSES
+        resources:
+            mem_mb=ATLITE_NPROCESSES * 5000,
+        script:
+            "scripts/build_renewable_profiles.py"
 
-rule build_powerplants:
-    params:
-        geo_crs=config["crs"]["geo_crs"],
-        countries=config["countries"],
-        gadm_layer_id=config["build_shape_options"]["gadm_layer_id"],
-        alternative_clustering=config["cluster_options"]["alternative_clustering"],
-        powerplants_filter=config["electricity"]["powerplants_filter"],
-    input:
-        base_network="networks/" + RDIR + "base.nc",
-        pm_config="configs/powerplantmatching_config.yaml",
-        custom_powerplants="data/custom_powerplants.csv",
-        osm_powerplants="resources/" + RDIR + "osm/clean/all_clean_generators.csv",
-        #gadm_shapes="resources/" + RDIR + "shapes/MAR2.geojson",
-        #using this line instead of the following will test updated gadm shapes for MA.
-        #To use: downlaod file from the google drive and place it in resources/" + RDIR + "shapes/
-        #Link: https://drive.google.com/drive/u/1/folders/1dkW1wKBWvSY4i-XEuQFFBj242p0VdUlM
-        gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
-    output:
-        powerplants="resources/" + RDIR + "powerplants.csv",
-        powerplants_osm2pm="resources/" + RDIR + "powerplants_osm2pm.csv",
-    log:
-        "logs/" + RDIR + "build_powerplants.log",
-    benchmark:
-        "benchmarks/" + RDIR + "build_powerplants"
-    threads: 1
-    resources:
-        mem_mb=500,
-    script:
-        "scripts/build_powerplants.py"
+if need_perm("powerplants"):
+    rule powerplants_from_perm:
+        input:
+            pp = lambda w: perm_src("resources/powerplants.csv"),
+            osm2pm = lambda w: perm_src("resources/powerplants_osm2pm.csv")
+        output:
+            pp = "resources/" + RDIR + "powerplants.csv",
+            osm2pm = "resources/" + RDIR + "powerplants_osm2pm.csv"
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.pp}", "{output.pp}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.osm2pm}", "{output.osm2pm}")
+else:
+    rule build_powerplants:
+        params:
+            geo_crs=config["crs"]["geo_crs"],
+            countries=config["countries"],
+            gadm_layer_id=config["build_shape_options"]["gadm_layer_id"],
+            alternative_clustering=config["cluster_options"]["alternative_clustering"],
+            powerplants_filter=config["electricity"]["powerplants_filter"],
+        input:
+            base_network="networks/" + RDIR + "base.nc",
+            pm_config="configs/powerplantmatching_config.yaml",
+            custom_powerplants="data/custom_powerplants.csv",
+            osm_powerplants="resources/" + RDIR + "osm/clean/all_clean_generators.csv",
+            #gadm_shapes="resources/" + RDIR + "shapes/MAR2.geojson",
+            #using this line instead of the following will test updated gadm shapes for MA.
+            #To use: downlaod file from the google drive and place it in resources/" + RDIR + "shapes/
+            #Link: https://drive.google.com/drive/u/1/folders/1dkW1wKBWvSY4i-XEuQFFBj242p0VdUlM
+            gadm_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
+        output:
+            powerplants="resources/" + RDIR + "powerplants.csv",
+            powerplants_osm2pm="resources/" + RDIR + "powerplants_osm2pm.csv",
+        log:
+            "logs/" + RDIR + "build_powerplants.log",
+        benchmark:
+            "benchmarks/" + RDIR + "build_powerplants"
+        threads: 1
+        resources:
+            mem_mb=500,
+        script:
+            "scripts/build_powerplants.py"
 
 
 rule add_electricity:
@@ -795,31 +904,41 @@ rule add_extra_components:
         "scripts/add_extra_components.py"
 
 
-rule prepare_network:
-    params:
-        links=config["links"],
-        lines=config["lines"],
-        s_max_pu=config["lines"]["s_max_pu"],
-        electricity=config["electricity"],
-        costs=config["costs"],
-    input:
-        "networks/" + RDIR + "elec_s{simpl}_{clusters}_ec.nc",
-        tech_costs=COSTS,
-    output:
-        "networks/" + RDIR + "elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc",
-    log:
-        "logs/" + RDIR + "prepare_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.log",
-    benchmark:
-        (
-            "benchmarks/"
-            + RDIR
-            + "prepare_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}"
-        )
-    threads: 1
-    resources:
-        mem_mb=4000,
-    script:
-        "scripts/prepare_network.py"
+if need_perm("elec_prepared"):
+    rule elec_prepared_from_perm:
+        input:
+            src   = lambda w: perm_src(f"networks/elec_s{w.simpl}_{w.clusters}_ec_l{w.ll}_{w.opts}.nc"),
+            costs = "resources/" + RDIR + f"costs_{config['costs']['year']}.csv"  # couples to costs year
+        output:
+            dst = "networks/" + RDIR + "elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc"
+        shell:
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.src}", "{output.dst}")
+else:
+    rule prepare_network:
+        params:
+            links=config["links"],
+            lines=config["lines"],
+            s_max_pu=config["lines"]["s_max_pu"],
+            electricity=config["electricity"],
+            costs=config["costs"],
+        input:
+            "networks/" + RDIR + "elec_s{simpl}_{clusters}_ec.nc",
+            tech_costs=COSTS,
+        output:
+            "networks/" + RDIR + "elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc",
+        log:
+            "logs/" + RDIR + "prepare_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.log",
+        benchmark:
+            (
+                "benchmarks/"
+                + RDIR
+                + "prepare_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}"
+            )
+        threads: 1
+        resources:
+            mem_mb=4000,
+        script:
+            "scripts/prepare_network.py"
 
 
 def memory(w):
@@ -1073,32 +1192,41 @@ rule prepare_transport_data_input:
 
 if not config["custom_data"]["gas_network"]:
 
-    rule prepare_gas_network:
-        params:
-            gas_config=config["sector"]["gas"],
-            alternative_clustering=config["cluster_options"]["alternative_clustering"],
-            countries_list=config["countries"],
-            layer_id=config["build_shape_options"]["gadm_layer_id"],
-            update=config["build_shape_options"]["update_file"],
-            out_logging=config["build_shape_options"]["out_logging"],
-            year=config["build_shape_options"]["year"],
-            nprocesses=config["build_shape_options"]["nprocesses"],
-            contended_flag=config["build_shape_options"]["contended_flag"],
-            geo_crs=config["crs"]["geo_crs"],
-            custom_gas_network=config["custom_data"]["gas_network"],
-        input:
-            regions_onshore="resources/"
-            + RDIR
-            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-        output:
-            clustered_gas_network="resources/"
-            + SECDIR
-            + "gas_networks/gas_network_elec_s{simpl}_{clusters}.csv",
-            # TODO: Should be a own snakemake rule
-            # gas_network_fig_1="resources/gas_networks/existing_gas_pipelines_{simpl}_{clusters}.png",
-            # gas_network_fig_2="resources/gas_networks/clustered_gas_pipelines_{simpl}_{clusters}.png",
-        script:
-            "scripts/prepare_gas_network.py"
+    if need_perm("gas_network"):
+        rule gas_network_from_perm:
+            input:
+                src = lambda w: perm_src(f"resources/gas_networks/gas_network_elec_s{w.simpl}_{w.clusters}.csv")
+            output:
+                dst = "resources/" + SECDIR + "gas_networks/gas_network_elec_s{simpl}_{clusters}.csv"
+            shell:
+                ln_cp() + r' <<< "{}" "{}"'.format("{input.src}", "{output.dst}")
+    else:
+        rule prepare_gas_network:
+            params:
+                gas_config=config["sector"]["gas"],
+                alternative_clustering=config["cluster_options"]["alternative_clustering"],
+                countries_list=config["countries"],
+                layer_id=config["build_shape_options"]["gadm_layer_id"],
+                update=config["build_shape_options"]["update_file"],
+                out_logging=config["build_shape_options"]["out_logging"],
+                year=config["build_shape_options"]["year"],
+                nprocesses=config["build_shape_options"]["nprocesses"],
+                contended_flag=config["build_shape_options"]["contended_flag"],
+                geo_crs=config["crs"]["geo_crs"],
+                custom_gas_network=config["custom_data"]["gas_network"],
+            input:
+                regions_onshore="resources/"
+                + RDIR
+                + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+            output:
+                clustered_gas_network="resources/"
+                + SECDIR
+                + "gas_networks/gas_network_elec_s{simpl}_{clusters}.csv",
+                # TODO: Should be a own snakemake rule
+                # gas_network_fig_1="resources/gas_networks/existing_gas_pipelines_{simpl}_{clusters}.png",
+                # gas_network_fig_2="resources/gas_networks/clustered_gas_pipelines_{simpl}_{clusters}.png",
+            script:
+                "scripts/prepare_gas_network.py"
 
 
 rule prepare_sector_network:
@@ -1114,6 +1242,8 @@ rule prepare_sector_network:
         sector_options=config["sector"],
         foresight=config["foresight"],
         water_costs=config["custom_data"]["water_costs"],
+        planning_horizons_baseyear=config["scenario"]["planning_horizons"][0],
+        extendability=config["global_specific"],
     input:
         network=RESDIR
         + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_presec.nc",
@@ -1258,38 +1388,55 @@ rule override_respot:
     script:
         "scripts/override_respot.py"
 
-
-rule prepare_transport_data:
-    input:
-        network="networks/" + RDIR + "elec_s{simpl}_{clusters}.nc",
-        energy_totals_name="resources/"
-        + SECDIR
-        + "energy_totals_{demand}_{planning_horizons}.csv",
-        traffic_data_KFZ="data/emobility/KFZ__count",
-        traffic_data_Pkw="data/emobility/Pkw__count",
-        transport_name="resources/" + SECDIR + "transport_data.csv",
-        clustered_pop_layout="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
-        temp_air_total="resources/"
-        + SECDIR
-        + "temperatures/temp_air_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-    output:
-        # nodal_energy_totals="resources/nodal_energy_totals_s{simpl}_{clusters}.csv",
-        transport="resources/"
-        + SECDIR
-        + "demand/transport_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
-        avail_profile="resources/"
-        + SECDIR
-        + "pattern_profiles/avail_profile_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
-        dsm_profile="resources/"
-        + SECDIR
-        + "pattern_profiles/dsm_profile_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
-        nodal_transport_data="resources/"
-        + SECDIR
-        + "demand/nodal_transport_data_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
-    script:
-        "scripts/prepare_transport_data.py"
+if need_perm("transport_data"):
+    rule transport_from_perm:
+        input:
+            transport   = lambda w: perm_src(f"resources/demand/transport_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            avail_prof  = lambda w: perm_src(f"resources/pattern_profiles/avail_profile_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            dsm_prof    = lambda w: perm_src(f"resources/pattern_profiles/dsm_profile_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            nodal_trans = lambda w: perm_src(f"resources/demand/nodal_transport_data_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+        output:
+            transport   = "resources/" + SECDIR + "demand/transport_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            avail_prof  = "resources/" + SECDIR + "pattern_profiles/avail_profile_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            dsm_prof    = "resources/" + SECDIR + "pattern_profiles/dsm_profile_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            nodal_trans = "resources/" + SECDIR + "demand/nodal_transport_data_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.transport}",   "{output.transport}")   + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.avail_prof}",  "{output.avail_prof}")  + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.dsm_prof}",    "{output.dsm_prof}")    + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.nodal_trans}", "{output.nodal_trans}")
+else:
+    rule prepare_transport_data:
+        input:
+            network="networks/" + RDIR + "elec_s{simpl}_{clusters}.nc",
+            energy_totals_name="resources/"
+            + SECDIR
+            + "energy_totals_{demand}_{planning_horizons}.csv",
+            traffic_data_KFZ="data/emobility/KFZ__count",
+            traffic_data_Pkw="data/emobility/Pkw__count",
+            transport_name="resources/" + SECDIR + "transport_data.csv",
+            clustered_pop_layout="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+            temp_air_total="resources/"
+            + SECDIR
+            + "temperatures/temp_air_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+        output:
+            # nodal_energy_totals="resources/nodal_energy_totals_s{simpl}_{clusters}.csv",
+            transport="resources/"
+            + SECDIR
+            + "demand/transport_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            avail_profile="resources/"
+            + SECDIR
+            + "pattern_profiles/avail_profile_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            dsm_profile="resources/"
+            + SECDIR
+            + "pattern_profiles/dsm_profile_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            nodal_transport_data="resources/"
+            + SECDIR
+            + "demand/nodal_transport_data_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+        script:
+            "scripts/prepare_transport_data.py"
 
 
 rule build_cop_profiles:
@@ -1427,82 +1574,119 @@ rule prepare_energy_totals:
     script:
         "scripts/prepare_energy_totals.py"
 
-
-rule build_solar_thermal_profiles:
-    params:
-        solar_thermal_config=config["solar_thermal"],
-        snapshots=config["snapshots"],
-    input:
-        pop_layout_total="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_total_{planning_horizons}.nc",
-        pop_layout_urban="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_urban_{planning_horizons}.nc",
-        pop_layout_rural="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_rural_{planning_horizons}.nc",
-        regions_onshore="resources/"
-        + RDIR
-        + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-        cutout="cutouts/"
-        + CDIR
-        + [c["cutout"] for _, c in config["renewable"].items()][0]
-        + ".nc",
-        # default to first cutout found
-    output:
-        solar_thermal_total="resources/"
-        + SECDIR
-        + "demand/heat/solar_thermal_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        solar_thermal_urban="resources/"
-        + SECDIR
-        + "demand/heat/solar_thermal_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        solar_thermal_rural="resources/"
-        + SECDIR
-        + "demand/heat/solar_thermal_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-    resources:
-        mem_mb=20000,
-    benchmark:
-        (
-            "benchmarks/"
+if need_perm("solar_thermal_profile"):
+    rule solar_thermal_profiles_from_perm:
+        input:
+            total = lambda w: perm_src(
+                f"resources/demand/heat/solar_thermal_total_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"
+            ),
+            urban = lambda w: perm_src(
+                f"resources/demand/heat/solar_thermal_urban_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"
+            ),
+            rural = lambda w: perm_src(
+                f"resources/demand/heat/solar_thermal_rural_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"
+            ),
+        output:
+            total = "resources/" + SECDIR + "demand/heat/solar_thermal_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            urban = "resources/" + SECDIR + "demand/heat/solar_thermal_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            rural = "resources/" + SECDIR + "demand/heat/solar_thermal_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.total}", "{output.total}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.urban}", "{output.urban}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.rural}", "{output.rural}")
+else:
+    rule build_solar_thermal_profiles:
+        params:
+            solar_thermal_config=config["solar_thermal"],
+            snapshots=config["snapshots"],
+        input:
+            pop_layout_total="resources/"
             + SECDIR
-            + "build_solar_thermal_profiles/s{simpl}_{clusters}_{planning_horizons}"
-        )
-    script:
-        "scripts/build_solar_thermal_profiles.py"
+            + "population_shares/pop_layout_total_{planning_horizons}.nc",
+            pop_layout_urban="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_urban_{planning_horizons}.nc",
+            pop_layout_rural="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_rural_{planning_horizons}.nc",
+            regions_onshore="resources/"
+            + RDIR
+            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+            cutout="cutouts/"
+            + CDIR
+            + [c["cutout"] for _, c in config["renewable"].items()][0]
+            + ".nc",
+            # default to first cutout found
+        output:
+            solar_thermal_total="resources/"
+            + SECDIR
+            + "demand/heat/solar_thermal_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            solar_thermal_urban="resources/"
+            + SECDIR
+            + "demand/heat/solar_thermal_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            solar_thermal_rural="resources/"
+            + SECDIR
+            + "demand/heat/solar_thermal_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+        resources:
+            mem_mb=20000,
+        benchmark:
+            (
+                "benchmarks/"
+                + SECDIR
+                + "build_solar_thermal_profiles/s{simpl}_{clusters}_{planning_horizons}"
+            )
+        script:
+            "scripts/build_solar_thermal_profiles.py"
 
-
-rule build_population_layouts:
-    params:
-        planning_horizons=config["scenario"]["planning_horizons"][0],
-    input:
-        nuts3_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
-        urban_percent="resources/" + SECDIR + "urban_percent.csv",
-        cutout="cutouts/"
-        + CDIR
-        + [c["cutout"] for _, c in config["renewable"].items()][0]
-        + ".nc",
-        # default to first cutout found
-    output:
-        pop_layout_total="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_total_{planning_horizons}.nc",
-        pop_layout_urban="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_urban_{planning_horizons}.nc",
-        pop_layout_rural="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_rural_{planning_horizons}.nc",
-        gdp_layout="resources/"
-        + SECDIR
-        + "gdp_shares/gdp_layout_{planning_horizons}.nc",
-    resources:
-        mem_mb=20000,
-    benchmark:
-        ("benchmarks/" + SECDIR + "build_population_layouts_{planning_horizons}")
-    threads: 8
-    script:
-        "scripts/build_population_layouts.py"
+if need_perm("pop_layouts"):
+    rule pop_layouts_from_perm:
+        input:
+            total = lambda w: perm_src(f"resources/population_shares/pop_layout_total_{w.planning_horizons}.nc"),
+            urban = lambda w: perm_src(f"resources/population_shares/pop_layout_urban_{w.planning_horizons}.nc"),
+            rural = lambda w: perm_src(f"resources/population_shares/pop_layout_rural_{w.planning_horizons}.nc"),
+            gdp   = lambda w: perm_src(f"resources/gdp_shares/gdp_layout_{w.planning_horizons}.nc"),
+        output:
+            total = "resources/" + SECDIR + "population_shares/pop_layout_total_{planning_horizons}.nc",
+            urban = "resources/" + SECDIR + "population_shares/pop_layout_urban_{planning_horizons}.nc",
+            rural = "resources/" + SECDIR + "population_shares/pop_layout_rural_{planning_horizons}.nc",
+            gdp   = "resources/" + SECDIR + "gdp_shares/gdp_layout_{planning_horizons}.nc",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.total}", "{output.total}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.urban}", "{output.urban}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.rural}", "{output.rural}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.gdp}", "{output.gdp}")
+else:
+    rule build_population_layouts:
+        params:
+            planning_horizons=config["scenario"]["planning_horizons"][0],
+        input:
+            nuts3_shapes="resources/" + RDIR + "shapes/gadm_shapes.geojson",
+            urban_percent="resources/" + SECDIR + "urban_percent.csv",
+            cutout="cutouts/"
+            + CDIR
+            + [c["cutout"] for _, c in config["renewable"].items()][0]
+            + ".nc",
+            # default to first cutout found
+        output:
+            pop_layout_total="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_total_{planning_horizons}.nc",
+            pop_layout_urban="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_urban_{planning_horizons}.nc",
+            pop_layout_rural="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_rural_{planning_horizons}.nc",
+            gdp_layout="resources/"
+            + SECDIR
+            + "gdp_shares/gdp_layout_{planning_horizons}.nc",
+        resources:
+            mem_mb=20000,
+        benchmark:
+            ("benchmarks/" + SECDIR + "build_population_layouts_{planning_horizons}")
+        threads: 8
+        script:
+            "scripts/build_population_layouts.py"
 
 
 rule move_hardcoded_files_temp:
@@ -1513,157 +1697,213 @@ rule move_hardcoded_files_temp:
     shell:
         "cp -a data/temp_hard_coded/. resources"
 
-
-rule build_clustered_population_layouts:
-    input:
-        pop_layout_total="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_total_{planning_horizons}.nc",
-        pop_layout_urban="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_urban_{planning_horizons}.nc",
-        pop_layout_rural="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_rural_{planning_horizons}.nc",
-        gdp_layout="resources/"
-        + SECDIR
-        + "gdp_shares/gdp_layout_{planning_horizons}.nc",
-        regions_onshore="resources/"
-        + RDIR
-        + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-        cutout="cutouts/"
-        + CDIR
-        + [c["cutout"] for _, c in config["renewable"].items()][0]
-        + ".nc",
-        # default to first cutout found
-    output:
-        clustered_pop_layout="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
-        clustered_gdp_layout="resources/"
-        + SECDIR
-        + "gdp_shares/gdp_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
-    resources:
-        mem_mb=10000,
-    benchmark:
-        (
-            "benchmarks/"
+if need_perm("pop_layouts_clustered"):
+    rule pop_layouts_clustered_from_perm:
+        input:
+            pop_layout = lambda w: perm_src(f"resources/population_shares/pop_layout_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            gdp = lambda w: perm_src(f"resources/gdp_shares/gdp_layout_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+        output:
+            pop_layout = "resources/" + SECDIR + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+            gdp = "resources/" + SECDIR + "gdp_shares/gdp_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.pop_layout}", "{output.pop_layout}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.gdp}", "{output.gdp}")
+else:
+    rule build_clustered_population_layouts:
+        input:
+            pop_layout_total="resources/"
             + SECDIR
-            + "build_clustered_population_layouts/s{simpl}_{clusters}_{planning_horizons}"
-        )
-    script:
-        "scripts/build_clustered_population_layouts.py"
-
-
-rule build_heat_demand:
-    params:
-        snapshots=config["snapshots"],
-    input:
-        pop_layout_total="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_total_{planning_horizons}.nc",
-        pop_layout_urban="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_urban_{planning_horizons}.nc",
-        pop_layout_rural="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_rural_{planning_horizons}.nc",
-        regions_onshore="resources/"
-        + RDIR
-        + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-        cutout="cutouts/"
-        + CDIR
-        + [c["cutout"] for _, c in config["renewable"].items()][0]
-        + ".nc",
-        # default to first cutout found
-    output:
-        heat_demand_urban="resources/"
-        + SECDIR
-        + "demand/heat/heat_demand_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        heat_demand_rural="resources/"
-        + SECDIR
-        + "demand/heat/heat_demand_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        heat_demand_total="resources/"
-        + SECDIR
-        + "demand/heat/heat_demand_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-    resources:
-        mem_mb=20000,
-    benchmark:
-        (
-            "benchmarks/"
+            + "population_shares/pop_layout_total_{planning_horizons}.nc",
+            pop_layout_urban="resources/"
             + SECDIR
-            + "build_heat_demand/s{simpl}_{clusters}_{planning_horizons}"
-        )
-    script:
-        "scripts/build_heat_demand.py"
-
-
-rule build_temperature_profiles:
-    params:
-        snapshots=config["snapshots"],
-    input:
-        pop_layout_total="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_total_{planning_horizons}.nc",
-        pop_layout_urban="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_urban_{planning_horizons}.nc",
-        pop_layout_rural="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_rural_{planning_horizons}.nc",
-        regions_onshore="resources/"
-        + RDIR
-        + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-        cutout="cutouts/"
-        + CDIR
-        + [c["cutout"] for _, c in config["renewable"].items()][0]
-        + ".nc",
-        # default to first cutout found
-    output:
-        temp_soil_total="resources/"
-        + SECDIR
-        + "temperatures/temp_soil_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        temp_soil_rural="resources/"
-        + SECDIR
-        + "temperatures/temp_soil_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        temp_soil_urban="resources/"
-        + SECDIR
-        + "temperatures/temp_soil_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        temp_air_total="resources/"
-        + SECDIR
-        + "temperatures/temp_air_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        temp_air_rural="resources/"
-        + SECDIR
-        + "temperatures/temp_air_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-        temp_air_urban="resources/"
-        + SECDIR
-        + "temperatures/temp_air_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
-    resources:
-        mem_mb=20000,
-    benchmark:
-        (
-            "benchmarks/"
+            + "population_shares/pop_layout_urban_{planning_horizons}.nc",
+            pop_layout_rural="resources/"
             + SECDIR
-            + "build_temperature_profiles/s{simpl}_{clusters}_{planning_horizons}"
-        )
-    script:
-        "scripts/build_temperature_profiles.py"
+            + "population_shares/pop_layout_rural_{planning_horizons}.nc",
+            gdp_layout="resources/"
+            + SECDIR
+            + "gdp_shares/gdp_layout_{planning_horizons}.nc",
+            regions_onshore="resources/"
+            + RDIR
+            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+            cutout="cutouts/"
+            + CDIR
+            + [c["cutout"] for _, c in config["renewable"].items()][0]
+            + ".nc",
+            # default to first cutout found
+        output:
+            clustered_pop_layout="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+            clustered_gdp_layout="resources/"
+            + SECDIR
+            + "gdp_shares/gdp_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+        resources:
+            mem_mb=10000,
+        benchmark:
+            (
+                "benchmarks/"
+                + SECDIR
+                + "build_clustered_population_layouts/s{simpl}_{clusters}_{planning_horizons}"
+            )
+        script:
+            "scripts/build_clustered_population_layouts.py"
+
+if need_perm("heat_demand"):
+    rule heat_demand_from_perm:
+        input:
+            nodal_energy = lambda w: perm_src(f"resources/demand/heat/nodal_energy_heat_totals_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            heat_demand  = lambda w: perm_src(f"resources/demand/heat/heat_demand_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            ashp_cop     = lambda w: perm_src(f"resources/demand/heat/ashp_cop_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            gshp_cop     = lambda w: perm_src(f"resources/demand/heat/gshp_cop_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            solar_th     = lambda w: perm_src(f"resources/demand/heat/solar_thermal_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+            dh_share     = lambda w: perm_src(f"resources/demand/heat/district_heat_share_{w.demand}_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv"),
+        output:
+            nodal_energy = "resources/" + SECDIR + "demand/heat/nodal_energy_heat_totals_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            heat_demand  = "resources/" + SECDIR + "demand/heat/heat_demand_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            ashp_cop     = "resources/" + SECDIR + "demand/heat/ashp_cop_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            gshp_cop     = "resources/" + SECDIR + "demand/heat/gshp_cop_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            solar_th     = "resources/" + SECDIR + "demand/heat/solar_thermal_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            dh_share     = "resources/" + SECDIR + "demand/heat/district_heat_share_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.nodal_energy}", "{output.nodal_energy}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.heat_demand}",  "{output.heat_demand}")  + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.ashp_cop}",     "{output.ashp_cop}")     + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.gshp_cop}",     "{output.gshp_cop}")     + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.solar_th}",     "{output.solar_th}")     + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.dh_share}",     "{output.dh_share}")
+    ruleorder: heat_demand_from_perm > prepare_heat_data
+else:
+    rule build_heat_demand:
+        params:
+            snapshots=config["snapshots"],
+        input:
+            pop_layout_total="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_total_{planning_horizons}.nc",
+            pop_layout_urban="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_urban_{planning_horizons}.nc",
+            pop_layout_rural="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_rural_{planning_horizons}.nc",
+            regions_onshore="resources/"
+            + RDIR
+            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+            cutout="cutouts/"
+            + CDIR
+            + [c["cutout"] for _, c in config["renewable"].items()][0]
+            + ".nc",
+            # default to first cutout found
+        output:
+            heat_demand_urban="resources/"
+            + SECDIR
+            + "demand/heat/heat_demand_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            heat_demand_rural="resources/"
+            + SECDIR
+            + "demand/heat/heat_demand_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            heat_demand_total="resources/"
+            + SECDIR
+            + "demand/heat/heat_demand_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+        resources:
+            mem_mb=20000,
+        benchmark:
+            (
+                "benchmarks/"
+                + SECDIR
+                + "build_heat_demand/s{simpl}_{clusters}_{planning_horizons}"
+            )
+        script:
+            "scripts/build_heat_demand.py"
+
+if need_perm("temperatures"):
+    rule temperatures_from_perm:
+        input:
+            soil_total = lambda w: perm_src(f"resources/temperatures/temp_soil_total_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"),
+            soil_rural = lambda w: perm_src(f"resources/temperatures/temp_soil_rural_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"),
+            soil_urban = lambda w: perm_src(f"resources/temperatures/temp_soil_urban_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"),
+            air_total  = lambda w: perm_src(f"resources/temperatures/temp_air_total_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"),
+            air_rural  = lambda w: perm_src(f"resources/temperatures/temp_air_rural_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"),
+            air_urban  = lambda w: perm_src(f"resources/temperatures/temp_air_urban_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.nc"),
+        output:
+            soil_total = "resources/" + SECDIR + "temperatures/temp_soil_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            soil_rural = "resources/" + SECDIR + "temperatures/temp_soil_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            soil_urban = "resources/" + SECDIR + "temperatures/temp_soil_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            air_total  = "resources/" + SECDIR + "temperatures/temp_air_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            air_rural  = "resources/" + SECDIR + "temperatures/temp_air_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            air_urban  = "resources/" + SECDIR + "temperatures/temp_air_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.soil_total}", "{output.soil_total}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.soil_rural}", "{output.soil_rural}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.soil_urban}", "{output.soil_urban}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.air_total}",  "{output.air_total}")  + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.air_rural}",  "{output.air_rural}")  + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.air_urban}",  "{output.air_urban}")
+else:
+    rule build_temperature_profiles:
+        params:
+            snapshots=config["snapshots"],
+        input:
+            pop_layout_total="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_total_{planning_horizons}.nc",
+            pop_layout_urban="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_urban_{planning_horizons}.nc",
+            pop_layout_rural="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_rural_{planning_horizons}.nc",
+            regions_onshore="resources/"
+            + RDIR
+            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+            cutout="cutouts/"
+            + CDIR
+            + [c["cutout"] for _, c in config["renewable"].items()][0]
+            + ".nc",
+            # default to first cutout found
+        output:
+            temp_soil_total="resources/"
+            + SECDIR
+            + "temperatures/temp_soil_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            temp_soil_rural="resources/"
+            + SECDIR
+            + "temperatures/temp_soil_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            temp_soil_urban="resources/"
+            + SECDIR
+            + "temperatures/temp_soil_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            temp_air_total="resources/"
+            + SECDIR
+            + "temperatures/temp_air_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            temp_air_rural="resources/"
+            + SECDIR
+            + "temperatures/temp_air_rural_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            temp_air_urban="resources/"
+            + SECDIR
+            + "temperatures/temp_air_urban_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+        resources:
+            mem_mb=20000,
+        benchmark:
+            (
+                "benchmarks/"
+                + SECDIR
+                + "build_temperature_profiles/s{simpl}_{clusters}_{planning_horizons}"
+            )
+        script:
+            "scripts/build_temperature_profiles.py"
 
 
 rule copy_config:
-    params:
-        summary_dir=config["summary_dir"],
-        run=run,
     output:
-        folder=directory(SDIR + "configs"),
-        config=SDIR + "configs/config.yaml",
-    threads: 1
-    resources:
-        mem_mb=1000,
-    benchmark:
-        SDIR + "benchmarks/copy_config"
-    script:
-        "scripts/copy_config.py"
+        folder = directory(SDIR + "configs"),
+        config = SDIR + "configs/config.yaml",
+    log:
+        SDIR + "configs/copy_config.log"
+    run:
+        import os, yaml
+        os.makedirs(os.path.dirname(output.config), exist_ok=True)
+
+        with open(output.config, "w") as f:
+            yaml.safe_dump(dict(config), f, sort_keys=False)
 
 
 if config["foresight"] == "overnight":
@@ -1857,6 +2097,65 @@ rule build_industrial_database:
     script:
         "scripts/build_industrial_database.py"
 
+rule freeze_perm_artifacts:
+    message: "Copy selected build outputs into permstore"
+    output:
+        done = touch("logs/" + RDIR + "freeze_perm_artifacts.done")
+    log:
+        "logs/" + RDIR + "freeze_perm_artifacts.log"
+    run:
+        import shutil, os, sys, pathlib
+
+        if not PERM_ON:
+            raise ValueError("permstore not enabled")
+
+        def copy_any(src, dst):
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True, ignore_dangling_symlinks=True)
+            elif os.path.isfile(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            else:
+                print(f"[freeze] WARNING: source not found, skipped: {src}", file=sys.stderr)
+
+        to_copy = [
+            ("resources/" + RDIR + "shapes",                         "resources/shapes"),
+            ("networks/"  + RDIR + "base.nc",                        "networks/base.nc"),
+            ("resources/" + RDIR + "bus_regions",                    "resources/bus_regions"),
+            ("resources/" + RDIR + "demand_profiles.csv",            "resources/demand_profiles.csv"),
+            ("resources/" + RDIR + "renewable_profiles",             "resources/renewable_profiles"),
+            ("resources/" + SECDIR + "population_shares",            "resources/population_shares"),
+            ("resources/" + SECDIR + "gdp_shares",                   "resources/gdp_shares"),
+            ("resources/" + SECDIR + "temperatures",                 "resources/temperatures"),
+            ("resources/" + SECDIR + "demand",                       "resources/demand"),
+            ("resources/" + SECDIR + "pattern_profiles",             "resources/pattern_profiles"),
+            ("resources/" + SECDIR + "gas_networks",                 "resources/gas_networks"),
+            ("resources/" + RDIR + "powerplants.csv",                "resources/powerplants.csv"),
+            ("resources/" + RDIR + "powerplants_osm2pm.csv",         "resources/powerplants_osm2pm.csv"),
+        ]
+
+        for p in pathlib.Path(".").glob("networks/" + RDIR + "elec_s*_ec_l*.nc"):
+            rel = str(p).replace("\\", "/")
+            dst_rel = rel.replace("networks/" + RDIR, "networks/")
+            to_copy.append((rel, dst_rel))
+        
+        for ph in config["scenario"]["planning_horizons"]:
+            sr = "resources/" + RDIR + f"costs_{ph}.csv"
+            dr = f"resources/costs_{ph}.csv"
+            to_copy.append((sr, dr))
+
+        for p in pathlib.Path(".").glob("resources/" + SECDIR + "demand/heat/solar_thermal_*_elec_s*_*.nc"):
+            rel = str(p).replace("\\", "/")
+            dst_rel = rel.replace("resources/" + SECDIR, "resources/")
+            to_copy.append((rel, dst_rel))
+
+        for src_rel, dst_rel in to_copy:
+            src = src_rel
+            dst = PERM_ROOT + dst_rel
+            print(f"[PERM STORAGE INFO] PERM_ROOT: '{PERM_ROOT}', dst_rel: '{dst_rel}', dst: '{dst}'", file=sys.stderr)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            copy_any(src, dst)
+
 
 rule prepare_db:
     params:
@@ -1878,42 +2177,50 @@ rule prepare_db:
     script:
         "scripts/prepare_db.py"
 
-
-rule build_industrial_distribution_key:  #default data
-    params:
-        countries=config["countries"],
-        gadm_layer_id=config["build_shape_options"]["gadm_layer_id"],
-        alternative_clustering=config["cluster_options"]["alternative_clustering"],
-        industry_database=config["custom_data"]["industry_database"],
-    input:
-        regions_onshore="resources/"
-        + RDIR
-        + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-        clustered_pop_layout="resources/"
-        + SECDIR
-        + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
-        clustered_gdp_layout="resources/"
-        + SECDIR
-        + "gdp_shares/gdp_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
-        industrial_database="data/industrial_database.csv",
-        shapes_path="resources/"
-        + RDIR
-        + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
-    output:
-        industrial_distribution_key="resources/"
-        + SECDIR
-        + "demand/industrial_distribution_key_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
-    threads: 1
-    resources:
-        mem_mb=1000,
-    benchmark:
-        (
-            "benchmarks/"
+if need_perm("industry_distribution"):
+    rule industry_distribution_from_perm:
+        input:
+            src = lambda w: perm_src(f"resources/demand/industrial_distribution_key_elec_s{w.simpl}_{w.clusters}_{w.planning_horizons}.csv")
+        output:
+            dst = "resources/" + SECDIR + "demand/industrial_distribution_key_elec_s{simpl}_{clusters}_{planning_horizons}.csv"
+        shell:
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.src}", "{output.dst}")
+else:
+    rule build_industrial_distribution_key:  #default data
+        params:
+            countries=config["countries"],
+            gadm_layer_id=config["build_shape_options"]["gadm_layer_id"],
+            alternative_clustering=config["cluster_options"]["alternative_clustering"],
+            industry_database=config["custom_data"]["industry_database"],
+        input:
+            regions_onshore="resources/"
             + RDIR
-            + "build_industrial_distribution_key_elec_s{simpl}_{clusters}_{planning_horizons}"
-        )
-    script:
-        "scripts/build_industrial_distribution_key.py"
+            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+            clustered_pop_layout="resources/"
+            + SECDIR
+            + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+            clustered_gdp_layout="resources/"
+            + SECDIR
+            + "gdp_shares/gdp_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+            industrial_database="data/industrial_database.csv",
+            shapes_path="resources/"
+            + RDIR
+            + "bus_regions/regions_onshore_elec_s{simpl}_{clusters}.geojson",
+        output:
+            industrial_distribution_key="resources/"
+            + SECDIR
+            + "demand/industrial_distribution_key_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
+        threads: 1
+        resources:
+            mem_mb=1000,
+        benchmark:
+            (
+                "benchmarks/"
+                + RDIR
+                + "build_industrial_distribution_key_elec_s{simpl}_{clusters}_{planning_horizons}"
+            )
+        script:
+            "scripts/build_industrial_distribution_key.py"
 
 
 rule build_base_industry_totals:  #default data
@@ -1951,6 +2258,7 @@ rule build_industry_demand:  #default data
         base_year=config["demand_data"]["base_year"],
         industry_util_factor=config["sector"]["industry_util_factor"],
         aluminium_year=config["demand_data"]["aluminium_year"],
+        alternative_clustering=config["cluster_options"]["alternative_clustering"],
     input:
         industrial_distribution_key="resources/"
         + SECDIR
@@ -2022,6 +2330,7 @@ if config["foresight"] == "myopic":
             sector=config["sector"],
             existing_capacities=config["existing_capacities"],
             costs=config["costs"],
+            extendability=config["global_specific"],
         input:
             network=RESDIR
             + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",

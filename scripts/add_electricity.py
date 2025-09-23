@@ -529,16 +529,26 @@ def attach_hydro(n, costs, ppl):
         )
         ppl.loc[ppl.technology.isna(), "technology"] = "Run-Of-River"
 
-    ror = ppl.query('technology == "Run-Of-River"')
+    ror = ppl.query('technology in ["Run-Of-River", "ror"]')
     phs = ppl.query('technology == "Pumped Storage"')
     hydro = ppl.query('technology == "Reservoir"')
+    logger.info(
+        f"Identified {len(ror)} ROR, {len(phs)} PHS and {len(hydro)} reservoir hydro plants.\n"
+        f"Capacities: {ror.p_nom.sum()/1e3:.2f} GW, {phs.p_nom.sum()/1e3:.2f} GW, {hydro.p_nom.sum()/1e3:.2f} GW respectively."
+    )
+
 
     inflow_idx = ror.index.union(hydro.index)
+    logger.info(f"inflow_idx length: {len(inflow_idx)}")
+    
     if not inflow_idx.empty:
+        logger.info(f"Opening hydro profile")
         with xr.open_dataarray(snakemake.input.profile_hydro) as inflow:
             found_plants = ppl.ppl_id[ppl.ppl_id.isin(inflow.indexes["plant"])]
             missing_plants_idxs = ppl.index.difference(found_plants.index)
 
+            logger.info(f"Found inflow time series for {len(found_plants)} hydro plants.")
+            logger.info(f"Missing inflow time series for {len(missing_plants_idxs)} hydro plants.")
             # if missing time series are found, notify the user and exclude missing hydro plants
             if not missing_plants_idxs.empty:
                 # original total p_nom
@@ -565,6 +575,7 @@ def attach_hydro(n, costs, ppl):
                 )
 
     if "ror" in carriers and not ror.empty:
+        logger.info(f"Adding {len(ror)} run-of-river plants")
         n.madd(
             "Generator",
             ror.index,
@@ -582,6 +593,7 @@ def attach_hydro(n, costs, ppl):
         )
 
     if "PHS" in carriers and not phs.empty:
+        logger.info(f"Adding {len(phs)} pumped hydro storage plants")
         # fill missing max hours to config value and
         # assume no natural inflow due to lack of data
         phs = phs.replace({"max_hours": {0: c["PHS_max_hours"]}})
@@ -599,6 +611,7 @@ def attach_hydro(n, costs, ppl):
         )
 
     if "hydro" in carriers and not hydro.empty:
+        logger.info(f"Adding {len(hydro)} reservoir hydro plants")
         hydro_max_hours = c.get("hydro_max_hours")
         hydro_stats = (
             pd.read_csv(
@@ -842,7 +855,19 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("add_electricity")
+        snakemake = mock_snakemake(
+            "add_electricity",
+            simpl="",
+            clusters="200",
+            ll="copt",
+            opts="3h",
+            planning_horizons="2020",
+            sopts="72h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+            discountrate="0.071",
+            demand="AB",
+            h2export="10"
+        )
 
     configure_logging(snakemake)
 
@@ -860,7 +885,7 @@ if __name__ == "__main__":
     )
     ppl = load_powerplants(snakemake.input.powerplants)
     if "renewable_carriers" in snakemake.params.electricity:
-        renewable_carriers = set(snakemake.params.electricity["renewable_carriers"])
+        renewable_carriers = set(snakemake.params.electricity["renewable_carriers"]) # includes hydro
     else:
         logger.warning(
             "Missing key `renewable_carriers` under config entry `electricity`. "
@@ -869,7 +894,7 @@ if __name__ == "__main__":
         )
         renewable_carriers = set(snakemake.params.renewable)
 
-    extendable_carriers = snakemake.params.electricity["extendable_carriers"]
+    extendable_carriers = snakemake.params.electricity["extendable_carriers"] # includes generator ror
     if not (set(renewable_carriers) & set(extendable_carriers["Generator"])):
         logger.warning(
             "No renewables found in config entry `extendable_carriers`. "
@@ -877,7 +902,7 @@ if __name__ == "__main__":
             "Falling back to all renewables."
         )
 
-    conventional_carriers = snakemake.params.electricity["conventional_carriers"]
+    conventional_carriers = snakemake.params.electricity["conventional_carriers"] # [nuclear, oil, OCGT, CCGT, coal, lignite, geothermal, biomass]
     attach_load(n, demand_profiles)
     update_transmission_costs(n, costs, snakemake.params.length_factor)
     conventional_inputs = {
