@@ -6,6 +6,7 @@ import sys
 import os
 import warnings
 import pathlib
+import shutil
 
 sys.path.append("./scripts")
 
@@ -2097,6 +2098,7 @@ rule build_industrial_database:
     script:
         "scripts/build_industrial_database.py"
 
+
 rule freeze_perm_artifacts:
     message: "Copy selected build outputs into permstore"
     output:
@@ -2110,13 +2112,29 @@ rule freeze_perm_artifacts:
             raise ValueError("permstore not enabled")
 
         def copy_any(src, dst):
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True, ignore_dangling_symlinks=True)
-            elif os.path.isfile(src):
+
+            src_resolved = os.path.realpath(src)
+
+            if not os.path.exists(src_resolved):
+                if os.path.islink(src):
+                    print(f"[freeze] WARNING: dangling symlink skipped: {src} -> {os.readlink(src)}", file=sys.stderr)
+                else:
+                    print(f"[freeze] WARNING: source not found, skipped: {src}", file=sys.stderr)
+                return
+
+            if os.path.isdir(src_resolved):
+                shutil.copytree(
+                    src_resolved, dst,
+                    dirs_exist_ok=True,
+                    symlinks=False,
+                    ignore_dangling_symlinks=False
+                )
+            elif os.path.isfile(src_resolved):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
+                shutil.copy2(src_resolved, dst, follow_symlinks=True)
             else:
-                print(f"[freeze] WARNING: source not found, skipped: {src}", file=sys.stderr)
+                print(f"[freeze] WARNING: unsupported source type, skipped: {src}", file=sys.stderr)
+
 
         to_copy = [
             ("resources/" + RDIR + "shapes",                         "resources/shapes"),
