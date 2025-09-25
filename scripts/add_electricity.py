@@ -1,3 +1,4 @@
+#!/apps/anaconda3/bin/python
 # -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText:  PyPSA-Earth and PyPSA-Eur Authors
 #
@@ -104,6 +105,11 @@ from _helpers import (
     update_p_nom_max,
 )
 from powerplantmatching.export import map_country_bus
+
+import psutil, os
+def print_memory(note=""):
+    mem = psutil.Process(os.getpid()).memory_info().rss / 1e9
+    print(f"[MEM] {note}: {mem:.2f} GB")
 
 idx = pd.IndexSlice
 
@@ -637,23 +643,26 @@ def attach_hydro(n, costs, ppl):
             max_hours_country = (
                 hydro_stats["E_store[TWh]"] * 1e3 / hydro_stats["p_nom_discharge[GW]"]
             )
+        
+        elif hydro_max_hours == "default":
+            logger.info(f"Using default hydro_max_hours from config for all hydro reservoirs")
 
         max_hours_country.clip(lower=0, inplace=True)
 
         missing_countries = pd.Index(hydro["country"].unique()).difference(
             max_hours_country.dropna().index
         )
+        hydro_max_hours_default = c.get("hydro_max_hours_default", 6.0)
         if not missing_countries.empty:
             logger.warning(
-                "Assuming max_hours=6 for hydro reservoirs in the countries: {}".format(
-                    ", ".join(missing_countries)
-                )
+                f"Assuming max_hours={hydro_max_hours_default} for hydro reservoirs in the countries: "
+                + ", ".join(missing_countries)
             )
-        hydro_max_hours_default = c.get("hydro_max_hours_default", 6.0)
+        
         hydro_max_hours = hydro.max_hours.where(
             hydro.max_hours > 0, hydro.country.map(max_hours_country)
         ).fillna(hydro_max_hours_default)
-
+    
         n.madd(
             "StorageUnit",
             hydro.index,
