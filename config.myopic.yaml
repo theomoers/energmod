@@ -38,15 +38,17 @@ enable:
 
 global_specific:
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
+  redistribute_hydro_over_countries: true # If true, hydro generation of missing countries in the powerplants dataset is redistributed to countries with plants according to EIA data
+
   baseyear_generation:
-    baseyear_generation_constraint: false # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
+    baseyear_generation_constraint: true # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
     tolerance: 0.1 # +- x% tolerance for baseyear generation constraint
     units: TWh
     targets: # in TWh -- for 2020 currently only, currently from owid
       solar: 855
       onshore_wind: 1400
       #offshore_wind: 191
-      #run_of_river: 4348
+      #hydro: 4348
       nuclear: 2648
       #coal: 9437
       #gas: 6386
@@ -56,7 +58,7 @@ global_specific:
       solar: ["solar"]
       onshore_wind: ["onwind"]
       #offshore_wind: ["offwind-ac","offwind-dc"]
-      #run_of_river: ["ror"]
+      #hydro: ["ror", "hydro"]
       nuclear: ["nuclear"]
       #coal: ["coal"]
       #lignite: ["coal"]
@@ -70,7 +72,7 @@ permstore:
   scenario: "default_2"
   use:
     shapes: true
-    base_network: false
+    base_network: true
     bus_regions: true
     demand_profiles: true # elec only
     powerplants: true
@@ -448,6 +450,23 @@ renewable:
     cutout: cutout-2013-era5
   hydro:
     cutout: cutout-2013-era5
+    hydrobasins_level: 6
+    resource:
+      method: hydro
+      hydrobasins: data/hydrobasins/hybas_world.shp
+      flowspeed: 1.0 # m/s
+      # weight_with_height: false
+      # show_progress: true
+    carriers: [ror, PHS, hydro]
+    PHS_max_hours: 6
+    hydro_max_hours: "energy_capacity_totals_by_country" #energy_capacity_totals_by_country
+    hydro_max_hours_default: 6.0 # (optional, default 6) Default value of max_hours for hydro when NaN values are found
+    clip_min_inflow: 1.0
+    extendable: true
+    normalization:
+      method: eia # 'hydro_capacities' to rescale country hydro production by using hydro_capacities, 'eia' to rescale by eia data, false for no rescaling
+      year: 2020 # (optional) year of statistics used to rescale the runoff time series. When not provided, the cutout weather year is used
+    multiplier: 1.0
   csp:
     cutout: cutout-2013-era5
 

@@ -578,6 +578,7 @@ else:
             renewable=config["renewable"],
             countries=config["countries"],
             alternative_clustering=config["cluster_options"]["alternative_clustering"],
+            redistribute_hydro_over_countries=config["global_specific"]["redistribute_hydro_over_countries"],
         input:
             natura="resources/" + RDIR + "natura.tiff",
             copernicus="data/copernicus/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif",
