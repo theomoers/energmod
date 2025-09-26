@@ -23,7 +23,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pypsa
-from _helpers import locate_bus, override_component_attrs, prepare_costs
+from _helpers import locate_bus, override_component_attrs, prepare_costs, locate_bus_alt_clust
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +41,22 @@ def select_ports(n):
 
     gadm_layer_id = snakemake.params.gadm_layer_id
 
-    ports = locate_bus(
-        ports,
-        countries,
-        gadm_layer_id,
-        snakemake.input.shapes_path,
-        snakemake.params.alternative_clustering,
-    )
+    if snakemake.params.alternative_clustering:
+        ports = locate_bus_alt_clust(
+            ports,
+            countries,
+            gadm_layer_id,
+            snakemake.input.shapes_path,
+            snakemake.params.alternative_clustering,
+        )
+    else:
+        ports = locate_bus(
+            ports,
+            countries,
+            gadm_layer_id,
+            snakemake.input.shapes_path,
+            snakemake.params.alternative_clustering,
+        )
 
     # TODO: revise if ports quantity and property by shape become relevant
     # drop duplicated entries
