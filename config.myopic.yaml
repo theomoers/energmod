@@ -212,8 +212,8 @@ sector:
 
   biomass_transport: true # biomass transport between nodes
   biomass_transport_default_cost: 0.1 #EUR/km/MWh
-  solid_biomass_potential: 685 # TWh/a, Potential of whole modelled area (= Global elec generation in 2020)
-  biogas_potential: 0.5 # TWh/a, Potential of whole modelled area
+  solid_biomass_potential: 455 # TWh/a, Potential of whole modelled area
+  biogas_potential: 195 # TWh/a, Potential of whole modelled area
 
   efficiency_heat_oil_to_elec: 0.9
   efficiency_heat_biomass_to_elec: 0.9
