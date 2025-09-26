@@ -1,3 +1,4 @@
+#!/apps/anaconda3/bin/python
 # -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText:  PyPSA-Earth and PyPSA-Eur Authors
 #
@@ -9,6 +10,7 @@ horizon.
 
 import logging
 import os
+import re
 from types import SimpleNamespace
 
 import country_converter as coco
@@ -194,7 +196,9 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
     if biomass_i.empty:
         mean = 0
     else:
+        logger.info(f"Filling missing DateIn for biomass CHP with mean build year of existing biomass CHP plants")
         mean = df_agg.loc[biomass_i, "DateIn"].mean()
+        logger.info(f"Mean build year for biomass CHP: {mean:.1f} based on {len(biomass_i) - df_agg.loc[biomass_i, 'DateIn'].isna().sum()} plants with valid data")
     df_agg.loc[biomass_i, "DateIn"] = df_agg.loc[biomass_i, "DateIn"].fillna(int(mean))
     # Fill missing DateOut
     dateout = (
@@ -294,6 +298,16 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 
                 buses_to_adjust = capacity.index.intersection(existing_capacity_by_bus.index)
                 buses_to_add = capacity.index.difference(existing_capacity_by_bus.index)
+                buses_to_remove = existing_capacity_by_bus.index.difference(capacity.index)
+                
+                # Remove existing generators that don't have IRENA
+                if not buses_to_remove.empty:
+                    gens_to_remove = existing_renewable_gens[n.generators.loc[existing_renewable_gens, 'bus'].isin(buses_to_remove)]
+                    logger.debug(f"Removing {len(gens_to_remove)} existing {generator} generators without IRENA data for year {grouping_year}")
+                    n.mremove("Generator", gens_to_remove)
+
+                    existing_renewable_gens = existing_renewable_gens.difference(gens_to_remove)
+                    existing_capacity_by_bus = existing_capacity_by_bus.drop(buses_to_remove)
                 
                 for bus in buses_to_adjust:
                     external_capacity = capacity[bus]
@@ -388,9 +402,11 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 logger.debug(f"Carrier type {generator} not in spatial data, skipping")
                 continue
 
-            # Helper function to create country-level fuel buses
+            # Helper: construct fuel bus name correctly for spatial vs non-spatial fuels
             def fuel_bus(elec_bus, fuel):
-                return f"{n.buses.at[elec_bus, 'country']} {fuel}"
+                if "Earth" in vars(spatial)[fuel].locations:
+                    return vars(spatial)[fuel].nodes[0]
+                return f"{elec_bus} {fuel}"
 
             # For spatial carriers, ensure we have bus names for all capacity locations
             if "Earth" not in vars(spatial)[carrier[generator]].locations:
@@ -408,7 +424,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 # Extract corresponding locations for the buses being added
                 if "Earth" not in vars(spatial)[carrier[generator]].locations:
                     # For country-level fuel buses, extract country codes
-                    bus_locations = [bus.split()[0] for bus in missing_bus]  # country code
+                    bus_locations = [bus.split()[0] for bus in missing_bus]
                 else:
                     # For non-spatial carriers, use the single Earth location
                     bus_locations = vars(spatial)[carrier[generator]].locations
@@ -426,11 +442,42 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
             new_build = asset_i.difference(n.links.index)
             lifetime_assets = lifetime.loc[grouping_year, generator].dropna()
 
-            # this is for the year 2020
+            # Handle already built links - adjust capacity to match powerplant data
             if not already_build.empty:
-                n.links.loc[already_build, "p_nom_min"] = capacity.loc[
-                    already_build.str.replace(name_suffix, "")
-                ].values
+                # Safer: preserve order of already_build and avoid regex surprises
+                bases = already_build.str.replace(name_suffix, "", regex=False)
+                target_fuel = (
+                    capacity.reindex(bases).fillna(0.0) / costs.at[generator, "efficiency"]
+                )
+
+                # Find links of this generator type and grouping year that don't have powerplant data
+                links_of_year = n.links.index[
+                    (n.links.carrier == generator) & 
+                    (n.links.build_year == grouping_year)
+                ]
+                
+                links_without_data = links_of_year.difference(already_build)
+
+                # Remove links that don't correspond to any external capacity data
+                if not links_without_data.empty:
+                    logger.debug(f"Removing {len(links_without_data)} {generator} links without external capacity data for year {grouping_year}")
+                    n.mremove("Link", links_without_data)
+
+                if not already_build.empty:
+                    # Resize the already-built links to match the cohort
+                    n.links.loc[already_build, "p_nom"] = target_fuel.to_numpy()
+
+                    # Make the minimum equal to the cohort
+                    n.links.loc[already_build, "p_nom_min"] = target_fuel.to_numpy()
+
+                    n.links.loc[already_build, "p_nom_extendable"] = False
+
+                    # Update lifetime on these to match the external data if available
+                    if not lifetime_assets.empty:
+                        bases = already_build.str.replace(name_suffix, "", regex=False)
+                        mask = bases.isin(lifetime_assets.index)
+                        if mask.any():
+                            n.links.loc[already_build[mask], "lifetime"] = lifetime_assets.loc[bases[mask]].to_numpy()
 
             if not new_build.empty:
                 new_capacity = capacity.loc[new_build.str.replace(name_suffix, "")]
@@ -542,6 +589,13 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
             n.generators.loc[existing_large, "p_nom_max"] = n.generators.loc[
                 existing_large, "p_nom_min"
             ]
+
+    thermal_carriers = set(carrier.values()) & set(n.links.carrier.unique())
+    
+    assert n.links.index[
+        n.links.carrier.isin(thermal_carriers)
+        & ~n.links.index.str.contains(r"-\d{4}$")
+    ].empty, "Found thermal power plant links without proper year suffixes"
 
 
 def add_heating_capacities_installed_before_baseyear(
