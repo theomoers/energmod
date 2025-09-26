@@ -634,6 +634,8 @@ def attach_hydro(n, costs, ppl):
         e_missing = e_target - e_installed
         missing_mh_i = hydro.query("max_hours.isnull()").index
 
+        max_hours_country = pd.Series(dtype=float)
+
         if hydro_max_hours == "energy_capacity_totals_by_country":
             max_hours_country = (
                 e_missing / hydro.loc[missing_mh_i].groupby("country").p_nom.sum()
@@ -662,6 +664,8 @@ def attach_hydro(n, costs, ppl):
         hydro_max_hours = hydro.max_hours.where(
             hydro.max_hours > 0, hydro.country.map(max_hours_country)
         ).fillna(hydro_max_hours_default)
+
+        logger.info(f"Full list of hydro_max_hours: {hydro_max_hours}")
     
         n.madd(
             "StorageUnit",
