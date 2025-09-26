@@ -201,49 +201,88 @@ if config["enable"].get("retrieve_databundle", True):
         script:
             "scripts/retrieve_databundle_light.py"
 
-
-if config["enable"].get("download_osm_data", True):
-
-    rule download_osm_data:
-        params:
-            countries=config["countries"],
+if need_perm("raw_osm"):
+    rule raw_osm_from_perm:
+        input:
+            cables        = lambda w: perm_src("resources/osm/raw/all_raw_cables.geojson"),
+            generators    = lambda w: perm_src("resources/osm/raw/all_raw_generators.geojson"),
+            generators_csv= lambda w: perm_src("resources/osm/raw/all_raw_generators.csv"),
+            lines         = lambda w: perm_src("resources/osm/raw/all_raw_lines.geojson"),
+            substations   = lambda w: perm_src("resources/osm/raw/all_raw_substations.geojson"),
         output:
+            cables        = "resources/" + RDIR + "osm/raw/all_raw_cables.geojson",
+            generators    = "resources/" + RDIR + "osm/raw/all_raw_generators.geojson",
+            generators_csv= "resources/" + RDIR + "osm/raw/all_raw_generators.csv",
+            lines         = "resources/" + RDIR + "osm/raw/all_raw_lines.geojson",
+            substations   = "resources/" + RDIR + "osm/raw/all_raw_substations.geojson",
+        # Try to symlink, fallback to copy
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.cables}",         "{output.cables}")         + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.generators}",     "{output.generators}")     + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.generators_csv}", "{output.generators_csv}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.lines}",          "{output.lines}")          + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.substations}",     "{output.substations}")
+else:
+    if config["enable"].get("download_osm_data", True):
+
+        rule download_osm_data:
+            params:
+                countries=config["countries"],
+            output:
+                cables="resources/" + RDIR + "osm/raw/all_raw_cables.geojson",
+                generators="resources/" + RDIR + "osm/raw/all_raw_generators.geojson",
+                generators_csv="resources/" + RDIR + "osm/raw/all_raw_generators.csv",
+                lines="resources/" + RDIR + "osm/raw/all_raw_lines.geojson",
+                substations="resources/" + RDIR + "osm/raw/all_raw_substations.geojson",
+            log:
+                "logs/" + RDIR + "download_osm_data.log",
+            benchmark:
+                "benchmarks/" + RDIR + "download_osm_data"
+            script:
+                "scripts/download_osm_data.py"
+
+if need_perm("clean_osm"):
+    rule clean_osm_from_perm:
+        input:
+            generators     = lambda w: perm_src("resources/osm/clean/all_clean_generators.geojson"),
+            generators_csv = lambda w: perm_src("resources/osm/clean/all_clean_generators.csv"),
+            lines          = lambda w: perm_src("resources/osm/clean/all_clean_lines.geojson"),
+            substations    = lambda w: perm_src("resources/osm/clean/all_clean_substations.geojson"),
+        output:
+            generators     = "resources/" + RDIR + "osm/clean/all_clean_generators.geojson",
+            generators_csv = "resources/" + RDIR + "osm/clean/all_clean_generators.csv",
+            lines          = "resources/" + RDIR + "osm/clean/all_clean_lines.geojson",
+            substations    = "resources/" + RDIR + "osm/clean/all_clean_substations.geojson",
+        # Link if possible, copy otherwise
+        shell:
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.generators}", "{output.generators}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.generators_csv}", "{output.generators_csv}") + \
+            ln_cp() + r' <<< "{}" "{}"; '.format("{input.lines}", "{output.lines}") + \
+            ln_cp() + r' <<< "{}" "{}"'.format("{input.substations}", "{output.substations}")
+else:
+    rule clean_osm_data:
+        params:
+            crs=config["crs"],
+            clean_osm_data_options=config["clean_osm_data_options"],
+        input:
             cables="resources/" + RDIR + "osm/raw/all_raw_cables.geojson",
             generators="resources/" + RDIR + "osm/raw/all_raw_generators.geojson",
-            generators_csv="resources/" + RDIR + "osm/raw/all_raw_generators.csv",
             lines="resources/" + RDIR + "osm/raw/all_raw_lines.geojson",
             substations="resources/" + RDIR + "osm/raw/all_raw_substations.geojson",
+            country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
+            offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
+            africa_shape="resources/" + RDIR + "shapes/africa_shape.geojson",
+        output:
+            generators="resources/" + RDIR + "osm/clean/all_clean_generators.geojson",
+            generators_csv="resources/" + RDIR + "osm/clean/all_clean_generators.csv",
+            lines="resources/" + RDIR + "osm/clean/all_clean_lines.geojson",
+            substations="resources/" + RDIR + "osm/clean/all_clean_substations.geojson",
         log:
-            "logs/" + RDIR + "download_osm_data.log",
+            "logs/" + RDIR + "clean_osm_data.log",
         benchmark:
-            "benchmarks/" + RDIR + "download_osm_data"
+            "benchmarks/" + RDIR + "clean_osm_data"
         script:
-            "scripts/download_osm_data.py"
-
-
-rule clean_osm_data:
-    params:
-        crs=config["crs"],
-        clean_osm_data_options=config["clean_osm_data_options"],
-    input:
-        cables="resources/" + RDIR + "osm/raw/all_raw_cables.geojson",
-        generators="resources/" + RDIR + "osm/raw/all_raw_generators.geojson",
-        lines="resources/" + RDIR + "osm/raw/all_raw_lines.geojson",
-        substations="resources/" + RDIR + "osm/raw/all_raw_substations.geojson",
-        country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
-        offshore_shapes="resources/" + RDIR + "shapes/offshore_shapes.geojson",
-        africa_shape="resources/" + RDIR + "shapes/africa_shape.geojson",
-    output:
-        generators="resources/" + RDIR + "osm/clean/all_clean_generators.geojson",
-        generators_csv="resources/" + RDIR + "osm/clean/all_clean_generators.csv",
-        lines="resources/" + RDIR + "osm/clean/all_clean_lines.geojson",
-        substations="resources/" + RDIR + "osm/clean/all_clean_substations.geojson",
-    log:
-        "logs/" + RDIR + "clean_osm_data.log",
-    benchmark:
-        "benchmarks/" + RDIR + "clean_osm_data"
-    script:
-        "scripts/clean_osm_data.py"
+            "scripts/clean_osm_data.py"
 
 
 rule build_osm_network:
@@ -607,7 +646,7 @@ else:
         resources:
             mem_mb=ATLITE_NPROCESSES * 5000,
         script:
-            "scripts/build_renewable_profiles.py"
+            "scripts/build_renewable_profiles_opt.py" if config["global_specific"]["renewable_profiles"].get("optimize_renewable_profiles", False) else "scripts/build_renewable_profiles.py"
 
 if need_perm("powerplants"):
     rule powerplants_from_perm:
@@ -2144,6 +2183,8 @@ rule freeze_perm_artifacts:
             ("resources/" + RDIR + "demand_profiles.csv",            "resources/demand_profiles.csv"),
             ("resources/" + RDIR + "renewable_profiles",             "resources/renewable_profiles"),
             ("resources/" + SECDIR + "population_shares",            "resources/population_shares"),
+            ("resources/" + RDIR + "osm/raw",                        "resources/osm/raw"),
+            ("resources/" + RDIR + "osm/clean",                      "resources/osm/clean"),
             ("resources/" + SECDIR + "gdp_shares",                   "resources/gdp_shares"),
             ("resources/" + SECDIR + "temperatures",                 "resources/temperatures"),
             ("resources/" + SECDIR + "demand",                       "resources/demand"),
