@@ -152,7 +152,7 @@ def add_generation(
 
     Returns:
         _type_: _description_
-    """ """"""
+    """
 
     logger.info("adding electricity generation")
 
@@ -756,19 +756,19 @@ def add_hydrogen(n, costs):
     if snakemake.params.sector_options["hydrogen"]["network"]:
         h2_links = pd.read_csv(snakemake.input.pipelines)
 
-        def map_h2_node(x):
+        def map_h2_node(x, gadm_clustering=False):
             try:
                 iso3 = x[:3]
                 iso2 = three_2_two_digits_country(iso3)
-                return f"{iso2}_AC"
+                return f"{iso2}_AC" if not gadm_clustering else f"{iso2}._AC"
             except Exception as e:
                 logger.warning(f"Failed to map H2 pipeline node '{x}': {e}")
                 return x
     
         original_bus0 = h2_links["bus0"].copy()
         original_bus1 = h2_links["bus1"].copy()
-        h2_links["bus0"] = h2_links["bus0"].apply(map_h2_node)
-        h2_links["bus1"] = h2_links["bus1"].apply(map_h2_node)
+        h2_links["bus0"] = h2_links["bus0"].apply(map_h2_node, gadm_clustering=snakemake.params.alternative_clustering)
+        h2_links["bus1"] = h2_links["bus1"].apply(map_h2_node, gadm_clustering=snakemake.params.alternative_clustering)
         
         logger.info(f"Mapped H2 pipeline buses from ISO3 format to ISO2_AC format:")
         logger.info(f"Example mappings: {original_bus0.iloc[0]} -> {h2_links['bus0'].iloc[0]}, "
@@ -1156,7 +1156,8 @@ def add_biomass(n, costs):
             biomass_transport.index,
             bus0=biomass_transport.bus0 + " solid biomass",
             bus1=biomass_transport.bus1 + " solid biomass",
-            p_nom_extendable=True,
+            p_nom_extendable=False,
+            p_nom=5e4, # 50 GW
             length=biomass_transport.length.values,
             marginal_cost=biomass_transport.costs * biomass_transport.length.values,
             capital_cost=1,
