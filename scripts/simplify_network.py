@@ -1,3 +1,4 @@
+#!/apps/anaconda3/bin/python
 # -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText:  PyPSA-Earth and PyPSA-Eur Authors
 #
@@ -113,7 +114,6 @@ sys.settrace
 
 logger = create_logger(__name__)
 
-
 def simplify_network_to_base_voltage(n, linetype, base_voltage):
     """
     Fix all lines to a voltage level of base voltage level and remove all
@@ -148,11 +148,39 @@ def simplify_network_to_base_voltage(n, linetype, base_voltage):
     missing_buses_i = n.buses.index.difference(trafo_map.index)
     trafo_map = pd.concat([trafo_map, pd.Series(missing_buses_i, missing_buses_i)])
 
+    # Store original country information for generators before remapping
+    generator_original_countries = n.generators.bus.map(n.buses.country)
+
+    # Apply standard remapping to all components
     for c in n.one_port_components | n.branch_components:
         df = n.df(c)
         for col in df.columns:
             if col.startswith("bus"):
                 df[col] = df[col].map(trafo_map)
+    
+    # Fix generators that were mapped to different countries during transformer simplification
+    generator_new_countries = n.generators.bus.map(n.buses.country)
+    wrong_country_mask = generator_original_countries != generator_new_countries
+    
+    if wrong_country_mask.any():
+        logger.info(f"Preserving country assignments for {wrong_country_mask.sum()} generators that were remapped across borders during transformer simplification")
+        
+        # For each generator in wrong country, find a bus in the correct country
+        for gen_idx in n.generators[wrong_country_mask].index:
+            original_country = generator_original_countries[gen_idx]
+            
+            # Skip generators that originally had no country (nan), likely offwind
+            if pd.isna(original_country):
+                continue
+            
+            # Find all buses in the original country that will survive the transformation
+            country_buses = n.buses[n.buses.country == original_country].index
+            surviving_country_buses = country_buses.intersection(trafo_map.values)
+            
+            if len(surviving_country_buses) > 0:
+                # Reassign to first available surviving bus in the original country 
+                # (since we cluster at country level, doesn't matter which one)
+                n.generators.loc[gen_idx, 'bus'] = surviving_country_buses[0]
 
     if hasattr(n, 'loads_t') and hasattr(n.loads_t, 'p_set') and not n.loads_t.p_set.empty:
         # Create mapping for load bus IDs
