@@ -41,22 +41,13 @@ def select_ports(n):
 
     gadm_layer_id = snakemake.params.gadm_layer_id
 
-    if snakemake.params.alternative_clustering:
-        ports = locate_bus_alt_clust(
-            ports,
-            countries,
-            gadm_layer_id,
-            snakemake.input.shapes_path,
-            snakemake.params.alternative_clustering,
-        )
-    else:
-        ports = locate_bus(
-            ports,
-            countries,
-            gadm_layer_id,
-            snakemake.input.shapes_path,
-            snakemake.params.alternative_clustering,
-        )
+    ports = locate_bus(
+        ports,
+        countries,
+        gadm_layer_id,
+        snakemake.input.shapes_path,
+        snakemake.params.alternative_clustering,
+    )
 
     # TODO: revise if ports quantity and property by shape become relevant
     # drop duplicated entries

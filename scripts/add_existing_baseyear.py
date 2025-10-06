@@ -298,16 +298,16 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 
                 buses_to_adjust = capacity.index.intersection(existing_capacity_by_bus.index)
                 buses_to_add = capacity.index.difference(existing_capacity_by_bus.index)
-                buses_to_remove = existing_capacity_by_bus.index.difference(capacity.index)
-                
-                # Remove existing generators that don't have IRENA
-                if not buses_to_remove.empty:
-                    gens_to_remove = existing_renewable_gens[n.generators.loc[existing_renewable_gens, 'bus'].isin(buses_to_remove)]
-                    logger.debug(f"Removing {len(gens_to_remove)} existing {generator} generators without IRENA data for year {grouping_year}")
-                    n.mremove("Generator", gens_to_remove)
-
-                    existing_renewable_gens = existing_renewable_gens.difference(gens_to_remove)
-                    existing_capacity_by_bus = existing_capacity_by_bus.drop(buses_to_remove)
+#                buses_to_remove = existing_capacity_by_bus.index.difference(capacity.index)
+#                
+#                # Remove existing generators that don't have IRENA
+#                if not buses_to_remove.empty:
+#                    gens_to_remove = existing_renewable_gens[n.generators.loc[existing_renewable_gens, 'bus'].isin(buses_to_remove)]
+#                    logger.debug(f"Removing {len(gens_to_remove)} existing {generator} generators without IRENA data for year {grouping_year}")
+#                    n.mremove("Generator", gens_to_remove)
+#
+#                    existing_renewable_gens = existing_renewable_gens.difference(gens_to_remove)
+#                    existing_capacity_by_bus = existing_capacity_by_bus.drop(buses_to_remove)
                 
                 for bus in buses_to_adjust:
                     external_capacity = capacity[bus]
@@ -776,7 +776,7 @@ if __name__ == "__main__":
             ll="copt",
             opts="3h",
             planning_horizons="2020",
-            sopts="72h",
+            sopts="48h",
             configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate="0.071",
             demand="AB",

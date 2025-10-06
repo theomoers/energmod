@@ -239,9 +239,18 @@ def distribute_clusters(
     focus_weights=None,
     solver_name=None,
     alternative_clustering=False,
+    global_clustering=False,
+    min_clusters_per_country=None,
 ):
     """
     Determine the number of clusters per country.
+    
+    Parameters
+    ----------
+    min_clusters_per_country : dict, optional
+        Dictionary mapping country codes to minimum number of clusters.
+        Example: {"NG": 5, "ZA": 3} ensures Nigeria gets at least 5 clusters
+        and South Africa gets at least 3 clusters.
     """
 
     year = build_shape_options["year"]
@@ -252,13 +261,16 @@ def distribute_clusters(
     if solver_name is None:
         solver_name = snakemake.config["solving"]["solver"]["name"]
 
+    # Determine groupby columns based on clustering mode
+    groupby_cols = ["country"] if global_clustering else ["country", "sub_network"]
+
     if distribution_cluster == ["load"]:
         L = (
             n.loads_t.p_set.mean()
             .groupby(n.loads.bus)
             .sum()
             .reindex(n.buses.index, fill_value=0.0)
-            .groupby([n.buses.country, n.buses.sub_network])
+            .groupby([n.buses[col] for col in groupby_cols])
             .sum()
             .pipe(normed)
         )
@@ -277,13 +289,13 @@ def distribute_clusters(
             df_pop_c, country_list, "standard", year, update, out_logging
         )
         P = df_pop_c.loc[:, ("country", "pop")]
-        n_df = n.buses.copy()[["country", "sub_network"]]
+        n_df = n.buses.copy()[groupby_cols]
 
         pop_dict = P.set_index("country")["pop"].to_dict()
         n_df["pop"] = n_df["country"].map(pop_dict)
 
         distribution_factor = (
-            n_df.groupby(["country", "sub_network"]).sum().pipe(normed).squeeze()
+            n_df.groupby(groupby_cols).sum().pipe(normed).squeeze()
         )
 
     if distribution_cluster == ["gdp"]:
@@ -299,23 +311,28 @@ def distribute_clusters(
         )
 
         G = df_gdp_c.loc[:, ("country", "gdp")]
-        n_df = n.buses.copy()[["country", "sub_network"]]
+        n_df = n.buses.copy()[groupby_cols]
 
         gdp_dict = G.set_index("country")["gdp"].to_dict()
         n_df["gdp"] = n_df["country"].map(gdp_dict)
 
         distribution_factor = (
-            n_df.groupby(["country", "sub_network"]).sum().pipe(normed).squeeze()
+            n_df.groupby(groupby_cols).sum().pipe(normed).squeeze()
         )
 
-    # TODO: 1. Check if sub_networks can be added here i.e. ["country", "sub_network"]
-    N = n.buses.groupby(["country", "sub_network"]).size()
+    # Calculate N based on grouping mode
+    N = n.buses.groupby(groupby_cols).size()
 
     # When using alternative clustering (GADM-based), allow fewer clusters than country-subnetwork combinations
     if alternative_clustering:
         min_clusters = len(n.buses.country.unique())
+        logger.info(f"Alternative clustering: minimum {min_clusters} clusters (one per country)")
+    elif global_clustering:
+        min_clusters = len(n.buses.country.unique())
+        logger.info(f"Global clustering: minimum {min_clusters} clusters (one per country)")
     else:
         min_clusters = len(N)
+        logger.info(f"Standard clustering: minimum {min_clusters} clusters (one per country-subnetwork combination)")
     
     assert (
         n_clusters >= min_clusters and n_clusters <= N.sum()
@@ -345,9 +362,47 @@ def distribute_clusters(
         distribution_factor.sum(), 1.0, rtol=1e-3
     ), f"Country weights L must sum up to 1.0 when distributing clusters. Is {distribution_factor.sum()}."
 
+    # Set up lower bounds for clusters per country
+    lower_bounds = pd.Series(1, index=distribution_factor.index)
+    
+    if min_clusters_per_country is not None:
+        if not global_clustering:
+            logger.warning(
+                "min_clusters_per_country is only supported with global_clustering=True. "
+                "Ignoring minimum cluster constraints."
+            )
+        else:
+            for country_code, min_clusters in min_clusters_per_country.items():
+                # Find all entries in distribution_factor that match this country
+                if global_clustering:
+                    # For global clustering, index is just country code
+                    if country_code in lower_bounds.index:
+                        lower_bounds.loc[country_code] = min_clusters
+                        logger.info(
+                            f"Setting minimum of {min_clusters} clusters for country {country_code}"
+                        )
+                else:
+                    # For normal clustering, index is (country, sub_network) tuple
+                    matching_indices = [
+                        idx for idx in lower_bounds.index 
+                        if (isinstance(idx, tuple) and idx[0] == country_code) or idx == country_code
+                    ]
+                    for idx in matching_indices:
+                        lower_bounds.loc[idx] = min_clusters
+                        logger.info(
+                            f"Setting minimum of {min_clusters} clusters for {idx}"
+                        )
+            
+            # Validate that total minimum clusters don't exceed requested clusters
+            total_min_clusters = lower_bounds.sum()
+            assert n_clusters >= total_min_clusters, (
+                f"Requested {n_clusters} clusters but minimum clusters per country "
+                f"sum to {total_min_clusters}. Please increase n_clusters or reduce minimums."
+            )
+
     m = linopy.Model()
     clusters = m.add_variables(
-        lower=1, upper=N, coords=[distribution_factor.index], name="n", integer=True
+        lower=lower_bounds, upper=N, coords=[distribution_factor.index], name="n", integer=True
     )
 
     m.add_constraints(clusters.sum() == n_clusters, name="tot")
@@ -406,6 +461,8 @@ def busmap_for_n_clusters(
     algorithm="kmeans",
     feature=None,
     alternative_clustering=False,
+    global_clustering=False,
+    min_clusters_per_country=None,
     **algorithm_kwds,
 ):
     if algorithm == "kmeans":
@@ -475,6 +532,8 @@ def busmap_for_n_clusters(
             focus_weights=focus_weights,
             solver_name=solver_name,
             alternative_clustering=alternative_clustering,
+            global_clustering=global_clustering,
+            min_clusters_per_country=min_clusters_per_country,
         )
 
     # TODO Check if `reduce_network()` is used
@@ -494,12 +553,19 @@ def busmap_for_n_clusters(
         if isinstance(n_clusters, pd.Series):
             n_cluster_c = n_clusters[x.name]
             if isinstance(x.name, tuple):
+                # Normal clustering with country+sub_network
                 prefix = x.name[0] + x.name[1] + " "
             else:
+                # Global clustering with country only, or single country case
                 prefix = x.name + " "
         else:
             n_cluster_c = n_clusters
-            prefix = x.name[0] + x.name[1] + " "
+            if isinstance(x.name, tuple):
+                # Normal clustering with country+sub_network
+                prefix = x.name[0] + x.name[1] + " "
+            else:
+                # Global clustering with country only
+                prefix = x.name + " "
 
         logger.debug(f"Determining busmap for country {prefix[:-1]}")
         if len(x) == 1:
@@ -532,10 +598,12 @@ def busmap_for_n_clusters(
                 f"`algorithm` must be one of 'kmeans' or 'hac'. Is {algorithm}."
             )
 
+    # Use only country grouping for global clustering, or country+sub_network otherwise
+    groupby_cols = ["country"] if global_clustering else ["country", "sub_network"]
+    
     return (
         n.buses.groupby(
-            # ["country"],
-            ["country", "sub_network"],  # TODO: 2. Add sub_networks (see previous TODO)
+            groupby_cols,
             group_keys=False,
         )
         .apply(busmap_for_country, include_groups=False)
@@ -564,6 +632,8 @@ def clustering_for_n_clusters(
     feature=None,
     extended_link_costs=0,
     focus_weights=None,
+    global_clustering=False,
+    min_clusters_per_country=None,
 ):
     line_strategies = aggregation_strategies.get("lines", dict())
     bus_strategies = aggregation_strategies.get("buses", dict())
@@ -588,6 +658,8 @@ def clustering_for_n_clusters(
                 algorithm,
                 feature,
                 alternative_clustering,
+                global_clustering,
+                min_clusters_per_country,
             )
     else:
         busmap = custom_busmap
@@ -656,6 +728,32 @@ def cluster_regions(busmaps, inputs, output, alternative_clustering=False):
         regions_c = regions_to_dissolve.dissolve(busmap_to_use, aggfunc=aggfunc)
         regions_c.index.name = "name"
         regions_c = regions_c.reset_index()
+        
+        # Fix bus coordinates: use representative_point of largest sub-polygon
+        # This prevents buses from landing in the ocean or on small islands when distant regions are clustered
+        # (e.g., Alaska+Hawaii forming one US cluster - bus should be in Alaska, not Hawaii)
+        if global_clustering or alternative_clustering:
+            logger.info(f"Calculating representative points for {which} regions to ensure buses are on largest landmass")
+            
+            for idx, row in regions_c.iterrows():
+                geom = row['geometry']
+                
+                # Handle MultiPolygon: find the largest polygon by area
+                if geom.geom_type == 'MultiPolygon':
+                    # Get the polygon with the largest area
+                    largest_polygon = max(geom.geoms, key=lambda p: p.area)
+                    representative_point = largest_polygon.representative_point()
+                    logger.debug(f"Region {row['name']}: Using largest polygon (area: {largest_polygon.area:.2e}) out of {len(geom.geoms)} polygons")
+                elif geom.geom_type == 'Polygon':
+                    representative_point = geom.representative_point()
+                else:
+                    logger.warning(f"Region {row['name']}: Unexpected geometry type {geom.geom_type}, using centroid")
+                    representative_point = geom.centroid
+                
+                regions_c.at[idx, 'x'] = representative_point.x
+                regions_c.at[idx, 'y'] = representative_point.y
+            
+            logger.info(f"Updated {len(regions_c)} bus coordinates using representative points from largest landmasses")
         
         original_bus_country = {}
         for idx, row in regions.iterrows():
@@ -733,6 +831,25 @@ if __name__ == "__main__":
     n = pypsa.Network(inputs.network)
 
     alternative_clustering = snakemake.params.cluster_options["alternative_clustering"]
+    
+    # Get global_clustering from params (passed directly from Snakefile)
+    global_clustering = snakemake.params.get("global_clustering", False)
+    
+    # Get minimum clusters per country - only valid when global_clustering is enabled
+    min_clusters_per_country = None
+    if global_clustering:
+        logger.info("Using global clustering: each country gets at least 1 cluster node")
+        min_clusters_per_country = snakemake.params.get("minimum_clustering_per_countries", None)
+        if min_clusters_per_country:
+            logger.info(f"Minimum clusters per country enforced: {min_clusters_per_country}")
+        else:
+            logger.info("No country-specific minimum clusters set (each country gets at least 1)")
+    elif snakemake.params.get("minimum_clustering_per_countries", None):
+        logger.warning(
+            "minimum_clustering_per_countries is set but global_clustering is disabled. "
+            "This parameter only works when global_clustering is True. Ignoring it."
+        )
+    
     distribution_cluster = snakemake.params.cluster_options["distribute_cluster"]
     gadm_layer_id = snakemake.params.build_shape_options["gadm_layer_id"]
     focus_weights = snakemake.params.get("focus_weights", None)
@@ -841,6 +958,8 @@ if __name__ == "__main__":
             cluster_config.get("feature", "solar+onwind-time"),
             extended_link_costs=hvac_overhead_cost,
             focus_weights=focus_weights,
+            global_clustering=global_clustering,
+            min_clusters_per_country=min_clusters_per_country,
         )
 
     update_p_nom_max(clustering.network)
