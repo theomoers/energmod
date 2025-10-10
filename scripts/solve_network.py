@@ -971,21 +971,79 @@ def add_lossy_bidirectional_link_constraints(n: pypsa.components.Network) -> Non
     # add the constraint to the PySPA model
     n.model.add_constraints(lhs == 0, name="Link-bidirectional_sync")
 
+def _generator_output_energy_by_buscarrier(n, bus_carrier="AC"):
+    """
+    Annual generator output (MWh) grouped by GENERATOR carrier, but only from
+    generators whose bus has carrier == bus_carrier (e.g. "AC").
+    """
+    # pick only generators connected to the requested bus carrier
+    ac_gen_i = n.generators.index[
+        n.generators.bus.map(n.buses.carrier).fillna("").eq(bus_carrier)
+    ]
+    if len(ac_gen_i) == 0:
+        return xr.DataArray([], dims=["carrier"])
+
+    p_g = n.model["Generator-p"].loc[:, ac_gen_i]                      # [snapshot, Generator]
+    w   = xr.DataArray(n.snapshot_weightings.generators, dims=["snapshot"])
+    g_car = n.generators.loc[ac_gen_i, "carrier"].rename_axis("Generator").to_xarray()
+
+    # MWh by generator carrier
+    return (p_g * w).sum("snapshot").groupby(g_car).sum("Generator")
+
+
+def _link_output_energy_by_buscarrier(n, bus_carrier="AC"):
+    """
+    Annual link *output-side* energy (MWh) grouped by LINK carrier, restricted
+    to links whose OUTPUT bus (bus1) sits on a bus with carrier == bus_carrier.
+    Energy at the output side is p[t,link] * efficiency[link].
+    """
+    if n.links.empty:
+        return xr.DataArray([], dims=["carrier"])
+
+    out_bus_carrier = n.links.bus1.map(n.buses.carrier).fillna("")
+    link_i = n.links.index[out_bus_carrier.eq(bus_carrier)]
+    if len(link_i) == 0:
+        return xr.DataArray([], dims=["carrier"])
+
+    p_l  = n.model["Link-p"].loc[:, link_i]                             # [snapshot, Link]
+    eta  = xr.DataArray(n.links.loc[link_i, "efficiency"].fillna(1.0),
+                        coords=[link_i], dims=["Link"])
+    w    = xr.DataArray(n.snapshot_weightings.generators, dims=["snapshot"])
+    lcar = n.links.loc[link_i, "carrier"].rename_axis("Link").to_xarray()
+
+    # MWh by link carrier at AC output
+    return (p_l * eta * w).sum("snapshot").groupby(lcar).sum("Link")
+
+def _storageunit_output_energy_by_buscarrier(n, bus_carrier="AC"):
+    """
+    Annual StorageUnit *output-side* energy (MWh) grouped by STORAGE UNIT carrier,
+    restricted to storage units whose bus sits on a bus with carrier == bus_carrier.
+    Output is the electric dispatch variable p_dispatch (already AC-side).
+    Weighted with snapshot_weightings.stores (consistent with PyPSA stats).
+    """
+    if n.storage_units.empty:
+        return xr.DataArray([], dims=["carrier"])
+
+    ac_su_i = n.storage_units.index[
+        n.storage_units.bus.map(n.buses.carrier).fillna("").eq(bus_carrier)
+    ]
+    if len(ac_su_i) == 0:
+        return xr.DataArray([], dims=["carrier"])
+
+    p_su = n.model["StorageUnit-p_dispatch"].loc[:, ac_su_i]  # [snapshot, StorageUnit]
+    w    = xr.DataArray(n.snapshot_weightings.stores, dims=["snapshot"])
+    su_car = n.storage_units.loc[ac_su_i, "carrier"].rename_axis("StorageUnit").to_xarray()
+
+    # MWh by storage-unit carrier at AC output
+    return (p_su * w).sum("snapshot").groupby(su_car).sum("StorageUnit")
+
 
 def add_baseyear_generation_band(n, planning_year, config):
-    """
-    Enforce: for each tech alias K in config['global_specific']['baseyear_generation']['targets'],
-    annual electricity generation in planning_year is within +- tolerance of the target.
-    Targets can aggregate several model carriers via 'carriers_map'.
-    """
     global_cfg = config.get("global_specific", {})
     cfg = global_cfg.get("baseyear_generation", {})
-    if not cfg:
+    if not cfg or not cfg.get("baseyear_generation_constraint", False):
         return
-    
-    if not cfg.get("baseyear_generation_constraint", False):
-        return
-    
+
     baseyear = str(cfg.get("year", 2020))
     if str(planning_year) != baseyear:
         logger.info(f"Skipping baseyear generation constraints for {planning_year} (configured for {baseyear})")
@@ -993,82 +1051,63 @@ def add_baseyear_generation_band(n, planning_year, config):
 
     logger.info(f"Adding baseyear generation constraints for {planning_year}")
 
-    tol = float(cfg.get("tolerance", 0.05))
+    tol   = float(cfg.get("tolerance", 0.05))
     units = str(cfg.get("units", "TWh")).lower()
-    unit_scale = {"mwh": 1.0, "gwh": 1e3, "twh": 1e6}.get(units, 1e6)
+    unit_scale = {"mwh":1.0, "gwh":1e3, "twh":1e6}.get(units, 1e6)
 
-    # Map each reported tech alias -> list of underlying model carriers
-    carriers_map = cfg.get("carriers_map", {})
-    # Targets are given per alias (global totals)
-    targets = cfg.get("targets", {})
+    carriers_map     = cfg.get("carriers_map", {})
+    targets          = cfg.get("targets", {})
+    link_bus_carrier = cfg.get("link_bus_carrier", "AC") # should be "AC"
+    gen_bus_carrier  = cfg.get("gen_bus_carrier",  "AC") # allows override; default "AC"
 
-    # Weightings (needs to be annuzalized if using TSAM/nhours)
-    w_gen = n.snapshot_weightings.generators
-    w_stores = n.snapshot_weightings.stores
+    gen_E  = _generator_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
+    link_E = _link_output_energy_by_buscarrier(n, bus_carrier=link_bus_carrier) # [carrier] MWh
+    su_E = _storageunit_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
 
-    # Generator energy (per generator carrier):  sum_t w_t * p[g,t]
-    gen_p = n.model["Generator-p"]  # dims: snapshot x Generator
-    if len(gen_p.indexes.get("Generator", [])) > 0:
-        gen_car = n.generators.carrier.rename_axis("Generator").to_xarray()
-        gen_energy_by_carrier = (
-            (gen_p * xr.DataArray(w_gen, dims=["snapshot"]))
-            .groupby(gen_car)  # group generators by their carrier
-            .sum()
-            .sum("snapshot")
-        )  # dims: carrier
-    else:
-        gen_energy_by_carrier = xr.DataArray([], dims=["carrier"])
+    def _sum_tokens(tokens):
+        toks = tokens if isinstance(tokens, (list, tuple)) else [tokens]
+        pieces = []
 
-    # TODO: Link-based technologies (coal, oil, etc.) - currently doesn't work, so don't pass link restrictions.
-    link_p = n.model["Link-p"]  # dims: snapshot x Link
-    if len(link_p.indexes.get("Link", [])) > 0:
-        if hasattr(n.links, "efficiency") and len(n.links) > 0:
-            eff = xr.DataArray(n.links.efficiency, coords=[n.links.index], dims=["Link"])
-        else:
-            eff = xr.DataArray(1.0, coords=[n.links.index], dims=["Link"])
+        gen_list  = list(gen_E.indexes.get("carrier", []))  if gen_E.size  else []
+        link_list = list(link_E.indexes.get("carrier", [])) if link_E.size else []
+        su_list   = list(su_E.indexes.get("carrier", []))   if su_E.size   else []
 
-        link_car = n.links.carrier.rename_axis("Link").to_xarray()
-        link_elec_by_carrier = (
-            ((link_p * eff) * xr.DataArray(w_stores, dims=["snapshot"]))
-            .groupby(link_car)  # group links by their carrier
-            .sum()
-            .sum("snapshot")
-        )  # dims: carrier
-    else:
-        link_elec_by_carrier = xr.DataArray([], dims=["carrier"])
+        for t in toks:
+            if isinstance(t, str) and t.startswith("re:"):
+                pat = re.compile(t[3:])
+                g = [c for c in gen_list  if pat.search(c)]
+                l = [c for c in link_list if pat.search(c)]
+                s = [c for c in su_list   if pat.search(c)]
+                if g: pieces.append(gen_E.sel(carrier=g).sum("carrier"))
+                if l: pieces.append(link_E.sel(carrier=l).sum("carrier"))
+                if s: pieces.append(su_E.sel(carrier=s).sum("carrier"))
+            else:
+                if t in gen_list:  pieces.append(gen_E.sel(carrier=t))
+                if t in link_list: pieces.append(link_E.sel(carrier=t))
+                if t in su_list:   pieces.append(su_E.sel(carrier=t))
+
+        if not pieces:
+            return None
+        out = pieces[0]
+        for p in pieces[1:]:
+            out = out + p
+        return out
 
     for alias, target in targets.items():
-        if str(target).startswith("X"):
-            logger.info(f"Skipping constraint for {alias} as target is placeholder ({target})")
-            continue
-            
-        model_carriers = carriers_map.get(alias, [alias])
-
-        lhs_terms = []
-
-        if len(gen_energy_by_carrier.indexes.get("carrier", [])) > 0:
-            gens_sub = [c for c in model_carriers
-                        if c in gen_energy_by_carrier.indexes["carrier"]]
-            if gens_sub:
-                lhs_terms.append(gen_energy_by_carrier.sel(carrier=gens_sub).sum("carrier"))
-
-        if len(link_elec_by_carrier.indexes.get("carrier", [])) > 0:
-            links_sub = [c for c in model_carriers
-                         if c in link_elec_by_carrier.indexes["carrier"]]
-            if links_sub:
-                lhs_terms.append(link_elec_by_carrier.sel(carrier=links_sub).sum("carrier"))
-
-        if not lhs_terms:
-            logger.warning(f"No carriers found for constraint alias '{alias}' with carriers {model_carriers}")
+        if isinstance(target, str) and target.upper().startswith("X"):
+            logger.info(f"Skipping {alias} (placeholder target '{target}')")
             continue
 
-        lhs = sum(lhs_terms)
+        tokens = carriers_map.get(alias, [alias])  # e.g., ["coal"] or ["coal","lignite"]
+        lhs = _sum_tokens(tokens)
+        if lhs is None:
+            logger.warning(f"No carriers matched for alias '{alias}' with tokens {tokens}")
+            continue
 
         lower = float(target) * (1.0 - tol) * unit_scale
         upper = float(target) * (1.0 + tol) * unit_scale
 
-        logger.info(f"Adding baseyear constraint for {alias}: {lower/unit_scale:.2f} <= generation <= {upper/unit_scale:.2f} {units.upper()}")
-
+        logger.info(f"{alias}: {lower/unit_scale:.2f} ≤ AC-side energy ≤ {upper/unit_scale:.2f} {units.upper()} (tokens={tokens})")
         n.model.add_constraints(lhs >= lower, name=f"baseyear_energy_min__{alias}")
         n.model.add_constraints(lhs <= upper, name=f"baseyear_energy_max__{alias}")
 
