@@ -828,24 +828,27 @@ def read_geojson(fn, cols=[], dtype=None, crs="EPSG:4326"):
 
 def create_country_list(input, iso_coding=True):
     """
-    Create a country list for defined regions..
+    Create a country list for defined regions, continents, custom sets, or ISO codes.
 
     Parameters
     ----------
-    input : str
-        Any two-letter country name, regional name, or continent given in the regions config file.
-        Country name duplications won't distort the result.
-        Examples are:
-        ["NG","ZA"], downloading osm data for Nigeria and South Africa
-        ["africa"], downloading data for Africa
-        ["NAR"], downloading data for the North African Power Pool
-        ["TEST"], downloading data for a customized test set.
-        ["NG","ZA","NG"], won't distort result.
+    input : Iterable[str]
+        A list-like of tokens. Each token can be:
+          - "Earth"
+          - A continent name (as in world_iso keys, e.g. "Europe")
+          - A region key (as in continent_regions keys, e.g. "NAR", "ASEAN")
+          - A custom set name (defined in config.custom_country_sets, e.g. "Global")
+          - A 2-letter ISO code (e.g., "DE", "US")
+          - Any of the above prefixed with "!" to exclude (e.g., "!Europe", "!DE")
+
+    iso_coding : bool
+        If True, returns only ISO-2 codes (and warns if non-ISO slipped in).
 
     Returns
     -------
-    full_codes_list : list
-        Example ["NG","ZA"]
+    list[str]
+        De-duplicated ISO-2 country codes (if iso_coding=True), otherwise
+        the mixed set you constructed (though typically you want ISO-2).
     """
     import logging
 
@@ -857,54 +860,95 @@ def create_country_list(input, iso_coding=True):
         Filter list according to the specified coding.
 
         When iso code are implemented (iso_coding=True), then remove the
-        geofabrik-specific ones. When geofabrik codes are
-        selected(iso_coding=False), ignore iso-specific names.
+        geofabrik-specific ones. When geofabrik codes are selected
+        (iso_coding=False), ignore iso-specific names.
         """
-        if (
-            iso_coding
-        ):  # if country lists are in iso coding, then check if they are 2-string
-            # 2-code countries
-            ret_list = [c for c in c_list if len(c) == 2]
-
-            # check if elements have been removed and return a working if so
+        if iso_coding:
+            ret_list = [c for c in c_list if isinstance(c, str) and len(c) == 2]
             if len(ret_list) < len(c_list):
                 _logger.warning(
                     "Specified country list contains the following non-iso codes: "
-                    + ", ".join(list(set(c_list) - set(ret_list)))
+                    + ", ".join(sorted(list(set(c_list) - set(ret_list))))
                 )
-
             return ret_list
         else:
-            return c_list  # [c for c in c_list if c not in iso_to_geofk_dict]
+            return c_list
 
-    full_codes_list = []
-
+    # Load config fragments. custom_country_sets is optional -> default {}
     world_iso, continent_regions = read_osm_config("world_iso", "continent_regions")
+    try:
+        custom_country_sets = read_osm_config("custom_country_sets")
+        if custom_country_sets is None:
+            custom_country_sets = {}
+    except KeyError:
+        custom_country_sets = {}
 
-    for value1 in input:
-        codes_list = []
-        # extract countries in world
-        if value1 == "Earth":
+    # Helper to expand a single positive token (no leading "!") into a set of ISO codes
+    def expand_positive(token, _stack):
+        """
+        Expand a single positive token into a set of ISO-2 codes.
+        _stack tracks recursion to prevent infinite loops.
+        """
+        # Guard recursion
+        if token in _stack:
+            raise ValueError(f"Cyclic reference in custom_country_sets: {' -> '.join(list(_stack)+[token])}")
+        _stack = _stack | {token}
+
+        codes = set()
+
+        if token == "Earth":
             for continent in world_iso.keys():
-                codes_list.extend(list(world_iso[continent]))
+                codes.update(list(world_iso[continent].keys()))
+            return codes
 
-        # extract countries in continent
-        elif value1 in world_iso.keys():
-            codes_list = list(world_iso[value1])
+        # 2) Continent (e.g., "Europe")
+        if token in world_iso:
+            codes.update(list(world_iso[token].keys()))
+            return codes
 
-        # extract countries in regions
-        elif value1 in continent_regions.keys():
-            codes_list = continent_regions[value1]
+        # 3) Region (e.g., "NAR", "ASEAN")
+        if token in continent_regions:
+            # region entries are already ISO codes in your config
+            codes.update(continent_regions[token])
+            return codes
 
-        # extract countries
+        # 4) Custom set (e.g., "Global")
+        if token in custom_country_sets:
+            for entry in custom_country_sets[token]:
+                if isinstance(entry, str) and entry.startswith("!"):
+                    # Exclusion inside a custom set: expand and subtract
+                    pos = entry[1:]
+                    codes -= expand_positive(pos, _stack)
+                else:
+                    codes |= expand_positive(entry, _stack) if not (isinstance(entry, str) and len(entry) == 2) else {entry}
+            return codes
+
+        # 5) Fallback: assume it's a single ISO-2 (or unknown -> keep as is)
+        # We keep any 2-char code; if it's unknown, the downstream filter will warn.
+        if isinstance(token, str) and len(token) == 2:
+            return {token}
+
+        # If we get here, it's an unknown token that isn't ISO-2. Log and ignore.
+        _logger.warning(f"Unknown token '{token}' not resolved to any country code(s).")
+        return set()
+
+    # Main expansion: positives union, then subtract all negatives
+    positive = set()
+    negative = set()
+
+    for value in input:
+        if not isinstance(value, str):
+            _logger.warning(f"Ignoring non-string token in input: {value!r}")
+            continue
+        if value.startswith("!"):
+            negative |= expand_positive(value[1:], set())
         else:
-            codes_list.extend([value1])
+            positive |= expand_positive(value, set())
 
-        # create a list with all countries
-        full_codes_list.extend(codes_list)
+    full_codes_set = positive - negative
 
     # Removing duplicates and filter outputs by coding
-    full_codes_list = filter_codes(list(set(full_codes_list)), iso_coding=iso_coding)
+    full_codes_list = filter_codes(sorted(full_codes_set), iso_coding=iso_coding)
 
     return full_codes_list
 

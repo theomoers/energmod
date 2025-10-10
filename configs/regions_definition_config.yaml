@@ -57,6 +57,70 @@ continents:
   AF: Africa
   EU: Europe
 
+custom_country_sets:
+  # Exclusion sets:
+  SmallPacificIslands:
+    - WS   # Samoa
+    - AS   # American Samoa
+    - TO   # Tonga
+    - NU   # Niue
+    - FJ   # Fiji
+    - KI   # Kiribati
+    - TV   # Tuvalu
+    - VU   # Vanuatu
+    - MH   # Marshall Islands
+    - FM   # Micronesia (Federated States)
+    - NR   # Nauru
+    - PW   # Palau
+    - CK   # Cook Islands
+    - WF   # Wallis & Futuna
+    - TK   # Tokelau
+    - PN   # Pitcairn Islands
+    - NC   # New Caledonia (FR)
+    - PF   # French Polynesia (FR)
+    - MP   # Northern Mariana Islands (US)
+    - GU   # Guam (US)
+
+  SmallIndianAtlanticIslands:
+    - MV   # Maldives
+    - SC   # Seychelles
+    - MU   # Mauritius
+    - KM   # Comoros
+    - CV   # Cabo Verde (Cape Verde)
+    - ST   # São Tomé and Príncipe
+    - RE   # Réunion (FR)
+    - YT   # Mayotte (FR)
+    - IO   # British Indian Ocean Territory
+
+  SmallCaribbeanIslands:
+    - AG   # Antigua & Barbuda
+    - DM   # Dominica
+    - LC   # Saint Lucia
+    - VC   # Saint Vincent & Grenadines
+    - KN   # Saint Kitts & Nevis
+    - GD   # Grenada
+    - BB   # Barbados
+    - SX   # Sint Maarten
+    - CW   # Curaçao
+    - AW   # Aruba
+    - TC   # Turks & Caicos
+    - BQ   # Bonaire / Saba / Statia
+    - BM   # Bermuda
+
+  RemoteTerritories:
+    - FK   # Falkland Islands (UK)
+    - GS   # South Georgia & South Sandwich (UK)
+    - SH   # Saint Helena / Ascension / Tristan da Cunha (UK)
+
+  # Including all countries except exclusion sets
+  Global:
+    - Earth
+    - "!SmallPacificIslands"
+    - "!SmallIndianAtlanticIslands"
+    - "!SmallCaribbeanIslands"
+    - "!RemoteTerritories"
+
+
 world_iso:
   Africa:
     DZ: "algeria"  # Algeria
