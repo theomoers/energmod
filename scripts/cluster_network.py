@@ -696,7 +696,7 @@ def clustering_for_n_clusters(
     return clustering
 
 
-def cluster_regions(busmaps, inputs, output, alternative_clustering=False):
+def cluster_regions(busmaps, inputs, output, alternative_clustering=False, global_clustering=False):
     # Handle single busmap case (normal case)
     if len(busmaps) == 1:
         busmap = busmaps[0]
@@ -973,4 +973,4 @@ if __name__ == "__main__":
     ):  # also available: linemap_positive, linemap_negative
         getattr(clustering, attr).to_csv(outputs[attr])
 
-    cluster_regions((clustering.busmap,), inputs, outputs, alternative_clustering)
+    cluster_regions((clustering.busmap,), inputs, outputs, alternative_clustering, global_clustering)
