@@ -618,6 +618,7 @@ else:
             countries=config["countries"],
             alternative_clustering=config["cluster_options"]["alternative_clustering"],
             redistribute_hydro_over_countries=config["global_specific"]["redistribute_hydro_over_countries"],
+            global_specific=config["global_specific"],
         input:
             natura="resources/" + RDIR + "natura.tiff",
             copernicus="data/copernicus/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif",
@@ -646,7 +647,7 @@ else:
         resources:
             mem_mb=ATLITE_NPROCESSES * 5000,
         script:
-            "scripts/build_renewable_profiles_opt.py" if config["global_specific"]["renewable_profiles"].get("optimize_renewable_profiles", False) else "scripts/build_renewable_profiles.py"
+            "scripts/build_renewable_profiles.py"
 
 if need_perm("powerplants"):
     rule powerplants_from_perm:
@@ -795,6 +796,8 @@ if config["augmented_line_connection"].get("add_to_snakefile", False) == True:
             countries=config["countries"],
             cluster_options=config["cluster_options"],
             focus_weights=config.get("focus_weights", None),
+            global_clustering=config["global_specific"].get("global_clustering", False),
+            minimum_clustering_per_countries=config["global_specific"].get("minimum_clustering_per_countries", None),
             #custom_busmap=config["enable"].get("custom_busmap", False)
         input:
             network="networks/" + RDIR + "elec_s{simpl}.nc",
@@ -882,6 +885,8 @@ if config["augmented_line_connection"].get("add_to_snakefile", False) == False:
             gadm_layer_id=config["build_shape_options"]["gadm_layer_id"],
             cluster_options=config["cluster_options"],
             focus_weights=config.get("focus_weights", None),
+            global_clustering=config["global_specific"].get("global_clustering", False),
+            minimum_clustering_per_countries=config["global_specific"].get("minimum_clustering_per_countries", None),
         input:
             network="networks/" + RDIR + "elec_s{simpl}.nc",
             country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
@@ -2391,6 +2396,7 @@ if config["foresight"] == "myopic":
             existing_capacities=config["existing_capacities"],
             costs=config["costs"],
             extendability=config["global_specific"],
+            baseyear_generation_constraint=config["global_specific"]["baseyear_generation"]["baseyear_generation_constraint"],
         input:
             network=RESDIR
             + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
