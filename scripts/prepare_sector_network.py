@@ -30,8 +30,12 @@ from _helpers import (
     two_2_three_digits_country,
 )
 from prepare_transport_data import prepare_transport_data
+from temporal_clustering import aggregate_snapshots
 
 logger = logging.getLogger(__name__)
+
+# Historical load scaling factor to match observed generation from IEA 2020
+hist_load_scaling = 1.043582
 
 spatial = SimpleNamespace()
 
@@ -136,6 +140,183 @@ def add_carrier_buses(n, carrier, nodes=None):
         marginal_cost=costs.at[carrier, "fuel"],
     )
 
+def match_geothermal_capacity_from_csv(n, baseyear, geothermal_csv_path, costs=None, 
+                                        create_synthetic=False, 
+                                        regions_shapefile=None):
+    """
+    Match geothermal capacity in the network to values from a CSV file by country.
+    Optionally create synthetic generators for countries not in the network.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+    baseyear : int
+        Year to match capacities for
+    geothermal_csv_path : str
+        Path to CSV file with columns: Entity, Code, Year, Geothermal capacity (total)
+    costs : pd.DataFrame, optional
+        Cost data for generator parameters (required if create_synthetic=True)
+    create_synthetic : bool, default True
+        Whether to create synthetic generators for countries not in network
+    regions_shapefile : str, optional
+        Path to shapefile with bus regions for determining centroids
+    """
+    # Read geothermal capacity data
+    try:
+        geo_df = pd.read_csv(geothermal_csv_path)
+    except FileNotFoundError:
+        logger.warning(f"Geothermal capacity CSV not found at {geothermal_csv_path}, skipping geothermal capacity matching")
+        return
+    
+    # Filter for the baseyear
+    geo_df = geo_df[geo_df['Year'] == baseyear]
+    
+    if geo_df.empty:
+        logger.warning(f"No geothermal capacity data found for year {baseyear}, skipping geothermal capacity matching")
+        return
+    
+    # Get geothermal generators from network
+    geo_gens = n.generators[n.generators.carrier == "geothermal"]
+    
+    logger.info(f"Matching geothermal capacity from CSV for year {baseyear}")
+    
+    # Extract country from generator bus names (format: "XX 0" where XX is 2-digit country code)
+    if not geo_gens.empty:
+        geo_gens_country = geo_gens.bus.str[:2]
+        # Aggregate current geothermal capacity by country
+        current_capacity_by_country = geo_gens.groupby(geo_gens_country)['p_nom'].sum()
+    else:
+        logger.info("No existing geothermal generators found in network")
+        current_capacity_by_country = pd.Series(dtype=float)
+    
+    # Process each country in the CSV
+    countries_matched = 0
+    countries_not_in_network = []
+    countries_with_synthetic = []
+    
+    for _, row in geo_df.iterrows():
+        country_code_3 = row['Code']
+        target_capacity_mw = row['Geothermal capacity (total)']
+        
+        # Skip rows without country codes (e.g., regional aggregates)
+        if pd.isna(country_code_3) or country_code_3 == '':
+            continue
+        
+        # Skip if capacity is zero or negligible
+        if target_capacity_mw < 0.1:
+            continue
+        
+        # Convert 3-digit to 2-digit country code
+        try:
+            country_code_2 = three_2_two_digits_country(country_code_3)
+        except Exception as e:
+            logger.warning(f"Could not convert country code {country_code_3} to 2-digit: {e}")
+            continue
+        
+        # Check if country exists in network
+        if country_code_2 not in current_capacity_by_country.index:
+            countries_not_in_network.append((row['Entity'], country_code_3, country_code_2, target_capacity_mw))
+            continue
+        
+        current_capacity = current_capacity_by_country[country_code_2]
+        
+        # Get all geothermal generators for this country
+        country_geo_gens = geo_gens[geo_gens_country == country_code_2]
+        
+        if len(country_geo_gens) == 0:
+            continue
+        
+        # Adjust p_nom to match target capacity, distributed proportionally
+        if current_capacity > 0:
+            scaling_factor = target_capacity_mw / current_capacity
+            n.generators.loc[country_geo_gens.index, 'p_nom'] *= scaling_factor
+            n.generators.loc[country_geo_gens.index, 'p_nom_min'] *= scaling_factor
+            
+            logger.info(
+                f"  {row['Entity']} ({country_code_2}): {current_capacity:.1f} MW -> {target_capacity_mw:.1f} MW "
+                f"(scaling factor: {scaling_factor:.3f}, {len(country_geo_gens)} generators)"
+            )
+            countries_matched += 1
+        else:
+            logger.warning(
+                f"  {row['Entity']} ({country_code_2}): Current capacity is 0, cannot scale to {target_capacity_mw:.1f} MW"
+            )
+    
+    logger.info(f"Matched geothermal capacity for {countries_matched} countries")
+    
+    # Create synthetic generators for countries not in network
+    if create_synthetic and countries_not_in_network and costs is not None:
+        logger.info(f"Creating synthetic geothermal generators for {len(countries_not_in_network)} countries not in network")
+        
+        # Try to load shapefile for centroids
+        regions_gdf = None
+        if regions_shapefile and os.path.exists(regions_shapefile):
+            try:
+                import geopandas as gpd
+                regions_gdf = gpd.read_file(regions_shapefile)
+                logger.info(f"Loaded regions shapefile with {len(regions_gdf)} regions")
+            except Exception as e:
+                logger.warning(f"Could not load regions shapefile: {e}. Will skip synthetic generator creation.")
+                regions_gdf = None
+        
+        if regions_gdf is not None:
+            for entity, code_3, code_2, capacity_mw in countries_not_in_network:
+                # Find all regions for this country
+                country_regions = regions_gdf[regions_gdf['country'] == code_2]
+                
+                if country_regions.empty:
+                    logger.debug(f"No regions found for {entity} ({code_2}) in shapefile, skipping")
+                    continue
+                
+                # Divide capacity evenly among regions
+                n_regions = len(country_regions)
+                capacity_per_region = capacity_mw / n_regions
+                
+                for idx, region in country_regions.iterrows():
+                    bus_name = region['name']
+                    
+                    # Check if bus already exists
+                    if bus_name not in n.buses.index:
+                        # Create new AC bus with coordinates from shapefile
+                        n.add("Bus",
+                              bus_name,
+                              carrier="AC",
+                              country=code_2,
+                              x=region['x'],
+                              y=region['y'])
+                        logger.debug(f"Created bus {bus_name} at ({region['x']:.3f}, {region['y']:.3f})")
+                    
+                    # Create geothermal generator
+                    gen_name = f"{bus_name} geothermal-{baseyear}"
+                    
+                    n.add("Generator",
+                          gen_name,
+                          bus=bus_name,
+                          carrier="geothermal",
+                          p_nom=capacity_per_region,
+                          p_nom_min=capacity_per_region,
+                          marginal_cost=costs.at["geothermal", "VOM"],
+                          capital_cost=costs.at["geothermal", "fixed"],
+                          efficiency=costs.at["geothermal", "efficiency"],
+                          build_year=baseyear,
+                          lifetime=costs.at["geothermal", "lifetime"],
+                          p_nom_extendable=False)
+                
+                countries_with_synthetic.append(entity)
+                logger.info(
+                    f"  {entity} ({code_2}): Created {n_regions} synthetic generator(s) "
+                    f"with {capacity_per_region:.1f} MW each (total: {capacity_mw:.1f} MW)"
+                )
+        
+        if countries_with_synthetic:
+            logger.info(f"Created synthetic geothermal generators for {len(countries_with_synthetic)} countries")
+    
+    elif countries_not_in_network:
+        logger.warning(
+            f"Countries in CSV but not in network ({len(countries_not_in_network)}): "
+            f"{', '.join([f'{e} ({c})' for e, c, _, _ in countries_not_in_network[:10]])}"
+            + (f" and {len(countries_not_in_network) - 10} more" if len(countries_not_in_network) > 10 else "")
+        )
 
 def add_generation(
     n, costs, existing_capacities=0, existing_efficiencies=None, existing_nodes=None
@@ -1882,6 +2063,9 @@ def add_industry(n, costs):
 
     ########################################################### CARRIER = HEAT
     # TODO simplify bus expression
+    p_set_ind_heat = industrial_demand.loc[spatial.nodes, "low-temperature heat"] / W
+    logger.info(f"Scaling industry heat load by {hist_load_scaling}: original sum = {p_set_ind_heat.sum():.2f} MW, scaled sum = {(p_set_ind_heat * hist_load_scaling).sum():.2f} MW")
+    
     n.madd(
         "Load",
         spatial.nodes,
@@ -1895,7 +2079,7 @@ def add_industry(n, costs):
             for node in spatial.nodes
         ],
         carrier="low-temperature heat for industry",
-        p_set=industrial_demand.loc[spatial.nodes, "low-temperature heat"] / W,
+        p_set=p_set_ind_heat * hist_load_scaling,
     )
 
     ################################################## CARRIER = ELECTRICITY
@@ -1926,6 +2110,7 @@ def add_industry(n, costs):
 
     # else:
     industrial_elec = industrial_demand["electricity"] / W # converting to TWh per hour
+    logger.info(f"Scaling industry electricity load by {hist_load_scaling}: original sum = {industrial_elec.sum():.2f} MW, scaled sum = {(industrial_elec * hist_load_scaling).sum():.2f} MW")
 
     n.madd(
         "Load",
@@ -1933,7 +2118,7 @@ def add_industry(n, costs):
         suffix=" industry electricity",
         bus=spatial.nodes,
         carrier="industry electricity",
-        p_set=industrial_elec,
+        p_set=industrial_elec * hist_load_scaling,
     )
 
     n.add("Bus", "process emissions", location="Earth", carrier="process emissions")
@@ -2052,7 +2237,7 @@ def add_land_transport(n, costs):
             y=n.buses.loc[list(spatial.nodes)].y.values,
         )
 
-        p_set = (
+        p_set_base = (
             electric_share
             * (
                 transport[spatial.nodes]
@@ -2061,6 +2246,8 @@ def add_land_transport(n, costs):
             )
             / 3
         )
+        logger.info(f"Scaling land transport EV load by {hist_load_scaling}: original sum = {p_set_base.sum().sum():.2f} MW, scaled sum = {(p_set_base * hist_load_scaling).sum().sum():.2f} MW")
+        p_set = p_set_base * hist_load_scaling
 
         n.madd(
             "Load",
@@ -2131,15 +2318,20 @@ def add_land_transport(n, costs):
             snakemake.params.h2_policy["is_reference"]
             and snakemake.params.h2_policy["remove_h2_load"]
         ):
+            p_set_fc_base = (
+                fuel_cell_share
+                / options["transport_fuel_cell_efficiency"]
+                * transport[spatial.nodes]
+            )
+            logger.info(f"Scaling land transport fuel cell load by {hist_load_scaling}: original sum = {p_set_fc_base.sum().sum():.2f} MW, scaled sum = {(p_set_fc_base * hist_load_scaling).sum().sum():.2f} MW")
+            
             n.madd(
                 "Load",
                 spatial.nodes,
                 suffix=" land transport fuel cell",
                 bus=spatial.nodes + " H2",
                 carrier="land transport fuel cell",
-                p_set=fuel_cell_share
-                / options["transport_fuel_cell_efficiency"]
-                * transport[spatial.nodes],
+                p_set=p_set_fc_base * hist_load_scaling,
             )
 
     if ice_share > 0:
@@ -2149,17 +2341,20 @@ def add_land_transport(n, costs):
             )
         ice_efficiency = options["transport_internal_combustion_efficiency"]
 
+        p_set_oil_base = ice_share / ice_efficiency * transport[spatial.nodes]
+        logger.info(f"Scaling land transport oil load by {hist_load_scaling}: original sum = {p_set_oil_base.sum().sum():.2f} MW, scaled sum = {(p_set_oil_base * hist_load_scaling).sum().sum():.2f} MW")
+        
         n.madd(
             "Load",
             spatial.nodes,
             suffix=" land transport oil",
             bus=spatial.oil.nodes,
             carrier="land transport oil",
-            p_set=ice_share / ice_efficiency * transport[spatial.nodes],
+            p_set=p_set_oil_base * hist_load_scaling,
         )
 
         # Use the robust emissions helper for land transport oil
-        p_set_oil_transport = ice_share / ice_efficiency * transport[spatial.nodes]
+        p_set_oil_transport = p_set_oil_base * hist_load_scaling
         add_emissions_from_weighted_energy(
             n,
             "land transport oil emissions",
@@ -2286,13 +2481,15 @@ def add_heat(n, costs):
                 )
             )
 
+        logger.info(f"Scaling {name} heat load by {hist_load_scaling}: original sum = {heat_load.sum().sum():.2f} MW, scaled sum = {(heat_load * hist_load_scaling).sum().sum():.2f} MW")
+        
         n.madd(
             "Load",
             h_nodes[name],
             suffix=f" {name} heat",
             bus=h_nodes[name] + f" {name} heat",
             carrier=name + " heat",
-            p_set=heat_load,
+            p_set=heat_load * hist_load_scaling,
         )
 
         ## Add heat pumps
@@ -2566,6 +2763,7 @@ def add_services(n, costs):
     p_set_elec = p_set_from_scaling(
         "services electricity", profile_residential, energy_totals, temporal_resolution
     )
+    logger.info(f"Scaling services electricity load by {hist_load_scaling}: original sum = {p_set_elec.sum().sum():.2f} MW, scaled sum = {(p_set_elec * hist_load_scaling).sum().sum():.2f} MW")
 
     n.madd(
         "Load",
@@ -2573,7 +2771,7 @@ def add_services(n, costs):
         suffix=" services electricity",
         bus=spatial.nodes,
         carrier="services electricity",
-        p_set=p_set_elec,
+        p_set=p_set_elec * hist_load_scaling,
     )
     p_set_biomass = p_set_from_scaling(
         "services biomass", profile_residential, energy_totals, temporal_resolution
@@ -2650,15 +2848,16 @@ def add_agriculture(n, costs):
     # Get total weighted hours (replaces hardcoded 8760)
     W = n.snapshot_weightings.generators.sum()
     
+    p_set_agri_elec = nodal_energy_totals.loc[spatial.nodes, "agriculture electricity"] * 1e6 / W
+    logger.info(f"Scaling agriculture electricity load by {hist_load_scaling}: original sum = {p_set_agri_elec.sum():.2f} MW, scaled sum = {(p_set_agri_elec * hist_load_scaling).sum():.2f} MW")
+    
     n.madd(
         "Load",
         spatial.nodes,
         suffix=" agriculture electricity",
         bus=spatial.nodes,
         carrier="agriculture electricity",
-        p_set=nodal_energy_totals.loc[spatial.nodes, "agriculture electricity"]
-        * 1e6
-        / W,
+        p_set=p_set_agri_elec * hist_load_scaling,
     )
 
     n.madd(
@@ -2751,7 +2950,7 @@ def add_residential(n, costs):
     )
     heat_shape = heat_shape.T.groupby(level=[0, 1]).sum().T
 
-    n.loads_t.p_set[heat_ind] = 1e6 * heat_shape_raw.mul(
+    res_heat_load = 1e6 * heat_shape_raw.mul(
         energy_totals["total residential space"]
         + energy_totals["total residential water"]
         - energy_totals["residential heat biomass"]
@@ -2759,6 +2958,8 @@ def add_residential(n, costs):
         - energy_totals["residential heat gas"],
         level=0,
     ).droplevel(level=0, axis=1).div(temporal_resolution, axis=0)
+    logger.info(f"Scaling residential heat load by {hist_load_scaling}: original sum = {res_heat_load.sum().sum():.2f} MW, scaled sum = {(res_heat_load * hist_load_scaling).sum().sum():.2f} MW")
+    n.loads_t.p_set[heat_ind] = res_heat_load * hist_load_scaling
 
     heat_oil_demand = p_set_from_scaling(
         "residential heat oil", heat_shape, energy_totals, temporal_resolution
@@ -2873,9 +3074,11 @@ def add_residential(n, costs):
     buses = n.buses[n.buses.carrier == "AC"].index.intersection(n.loads_t.p_set.columns)
 
     profile_pu = normalize_by_country(n.loads_t.p_set[buses]).fillna(0)
-    n.loads_t.p_set.loc[:, buses] = p_set_from_scaling(
+    res_elec_load = p_set_from_scaling(
         "electricity residential", profile_pu, energy_totals, temporal_resolution
     )
+    logger.info(f"Scaling residential electricity load by {hist_load_scaling}: original sum = {res_elec_load.sum().sum():.2f} MW, scaled sum = {(res_elec_load * hist_load_scaling).sum().sum():.2f} MW")
+    n.loads_t.p_set.loc[:, buses] = res_elec_load * hist_load_scaling
 
 
 def add_electricity_distribution_grid(n, costs):
@@ -3089,13 +3292,16 @@ def add_rail_transport(n, costs):
         p_set=p_set_oil * 1e6 / W,
     )
 
+    p_set_rail_elec = p_set_elec * 1e6 / W
+    logger.info(f"Scaling rail transport electricity load by {hist_load_scaling}: original sum = {p_set_rail_elec.sum():.2f} MW, scaled sum = {(p_set_rail_elec * hist_load_scaling).sum():.2f} MW")
+    
     n.madd(
         "Load",
         spatial.nodes,
         suffix=" rail transport electricity",
         bus=spatial.nodes,
         carrier="rail transport electricity",
-        p_set=p_set_elec * 1e6 / W,
+        p_set=p_set_rail_elec * hist_load_scaling,
     )
 
 
@@ -3195,13 +3401,14 @@ def add_direct_electric_loads(n, energy_totals, columns, temporal_resolution):
         if col not in energy_totals.columns:
             continue
         p_set = p_set_from_scaling(col, profile_residential, energy_totals, temporal_resolution)
+        logger.info(f"Scaling {col} load by {hist_load_scaling}: original sum = {p_set.sum().sum():.2f} MW, scaled sum = {(p_set * hist_load_scaling).sum().sum():.2f} MW")
         n.madd(
             "Load",
             spatial.nodes,                     # use spatial nodes 
             suffix=f" {col}",
             bus=spatial.nodes,                 # AC buses
             carrier=col,
-            p_set=p_set,
+            p_set=p_set * hist_load_scaling,
         )
 
 
@@ -3408,11 +3615,37 @@ if __name__ == "__main__":
 
     sopts = snakemake.wildcards.sopts.split("-")
 
+    m = None  # Initialize m to handle case where no pattern matches
+    downsampled = False
     for o in sopts:
         m = re.match(r"^\d+h$", o, re.IGNORECASE)
-        if m is not None:
+        if m is not None and m.group(0).lower() != "1h":
+            logger.info("Applying snapshot averaging...")
             n = average_every_nhours(n, m.group(0))
+            downsampled = True
             break
+
+    temporal_cfg = snakemake.params.get("temporal_clustering", {}) or {}
+    tc_activated = bool(temporal_cfg.get("activate", False))
+    if tc_activated:
+        if downsampled:
+            raise ValueError("Temporal clustering (TSAM) and snapshot averaging cannot be applied together. Please choose only one temporal reduction method.")
+        else:
+            logger.info("Applying temporal clustering (TSAM) during prepare_sector_network...")
+            logger.info(f"TSAM parameters: n_periods={temporal_cfg.get('n_periods', 10)}, hours={temporal_cfg.get('hours', 24)}, method={temporal_cfg.get('clusterMethod', 'hierarchical')}")
+            
+            aggregate_snapshots(
+                n,
+                n_periods=temporal_cfg.get("n_periods", 10),
+                hours=temporal_cfg.get("hours", 24),
+                normed=temporal_cfg.get("normed", True),
+                solver=temporal_cfg.get("solver", "glpk"),
+                extremePeriodMethod=temporal_cfg.get("extremePeriodMethod", "None"),
+                clusterMethod=temporal_cfg.get("clusterMethod", "hierarchical"),
+                predefClusterOrder=None,
+                overwrite_time_dfs=temporal_cfg.get("overwrite_time_dfs", False),
+            )
+            logger.info(f"TSAM aggregation complete. Network now has {len(n.snapshots)} snapshots; period_id persisted.")
 
     # TODO add co2 limit here, if necessary
     # co2_limit_pu = eval(sopts[0][5:])
@@ -3433,6 +3666,35 @@ if __name__ == "__main__":
     if snakemake.params.water_costs:
         add_custom_water_cost(n)
 
+    
+    # Match geothermal capacity to CSV data by country
+    geothermal_csv = snakemake.input.geothermal_capacity
+   
+    regions_shapefile = snakemake.input.shapes_path
+    
+    match_geothermal_capacity_from_csv(
+        n, 2020, geothermal_csv, 
+        costs=costs,
+        create_synthetic=False,
+        regions_shapefile=regions_shapefile
+    ) # based on owid data
+    
+
+    # Match historical data
+    s_factor = ((4348 - 708.68) / 2056.70) * 0.939688716
+    n.storage_units.loc[n.storage_units.carrier == "hydro", "max_hours"] *= s_factor
+    n.storage_units_t.inflow *= s_factor
+    logger.info(f"Match historical hydro flow data to match IEA by factor {s_factor}")
+
+    # Match historical data
+    onwind_factor = (1484 / 1295)
+    onwind_idx = n.generators[n.generators.carrier == 'onwind'].index
+    onwind_time_idx = n.generators_t.p_max_pu.columns
+    onwind_idx = onwind_idx.intersection(onwind_time_idx)
+    n.generators_t.p_max_pu[onwind_idx] *= onwind_factor
+    logger.info(f"Match historical onwind availability to match IRENA data by factor {onwind_factor}")
+
+    n.links.loc[n.links.carrier == 'OCGT', 'p_nom'] *= 2
+
     n.export_to_netcdf(snakemake.output[0])
 
-    # TODO changes in case of myopic oversight

@@ -30,7 +30,17 @@ enable:
   # More information https://atlite.readthedocs.io/en/latest/introduction.html#datasets
   progress_bar: true # show progress bar during downloading routines and other long-running tasks
 
-
+temporal_clustering:
+  activate: true
+  n_periods: 10
+  hours: 24
+  clusterMethod: 'k_medoids'
+  extremePeriodMethod: 'new_cluster_center' 
+  solver: 'glpk'
+  normed: true
+  storage_constraints: false
+  use_dt_in_intra: false # Set to true for dt-scaled intra recursion
+  include_inflow_in_intra: false  # Set to true to include inflow/spill in intra
 
 custom_rules: [] # Default empty [] or link to custom rule file e.g. ["my_folder/my_rules.smk"] that add rules to Snakefile
 

@@ -1,6 +1,6 @@
 run:
-  name: "Earth_myopic_15" # use this to keep track of runs with different settings
-  sector_name: "Global_sect_15" # use this to keep track of sector scenario runs
+  name: "Earth_myopic_19" # use this to keep track of runs with different settings
+  sector_name: "Global_sect_19" # use this to keep track of sector scenario runs
   shared_cutouts: true # set to true to share the default cutout(s) across runs
   # Note: value false requires build_cutout to be enabled
   allow_scenario_failure: false # If True, the workflow will continue even if a scenario in run_scenario fails
@@ -10,19 +10,35 @@ countries: ["Global"]
 scenario:
   simpl: [""]
   ll: ["copt"]
-  clusters: [190] 
-  opts: [3h] # [3h-solar+c0.5-wind+c0.5]
-  planning_horizons: # investment years for myopic and perfect; or costs year for overnight
+  clusters: [110] 
+  opts: [1h] 
+  planning_horizons:
   - 2020
+  - 2025
   - 2030
+  - 2035
   - 2040
+  - 2045
   - 2050
   sopts:
-  - "48h"
+  - "1h"
   demand:
   - "AB"
 
-foresight: myopic # myopic, perfect, overnight 
+foresight: myopic
+
+temporal_clustering:
+  activate: true
+  n_periods: 10 # number of typical periods (e.g., typical days)
+  hours: 24 # hours per period (24 for daily clustering)
+  clusterMethod: 'k_medoids'  # clustering algorithm: 'hierarchical', 'k_means', 'k_medoids'
+  extremePeriodMethod: 'new_cluster_center'  # how to handle extreme periods
+  normed: true # normalize timeseries before clustering
+  overwrite_time_dfs: false  # whether to overwrite time-dependent data with clustered values
+  use_dt_in_intra: false   # Set to true for dt-scaled intra recursion
+  include_inflow_in_intra: false  # Set to true to include inflow/spill in intra
+  #constrain_stores: true
+  #solver: "gurobi" # not used currently, highs default works
 
 enable:
   retrieve_databundle: false 
@@ -47,30 +63,31 @@ global_specific:
     BR: 2
     AU: 3
     CA: 2
+  countries_to_merge: ['LT', 'AO', 'LA', 'KE', 'ET', 'GE', 'ZM', 'HN', 'CR', 'GT', 'EE', 'PA', 'CM', 'NP', 'CI', 'MN', 'BO', 'PS', 'TZ', 'LV', 'AL', 'MD', 'MK', 'BT', 'SN', 'ZW', 'AF', 'BN', 'AM', 'SV', 'NA', 'NI', 'BW', 'ML', 'TT', 'PG', 'UG', 'JM', 'CG', 'GA', 'ME', 'MT', 'GN', 'SR', 'BS', 'BF', 'MR', 'CY', 'BJ', 'MG', 'NE', 'TG', 'RW', 'SZ', 'MW', 'GQ', 'GY', 'GF', 'YE', 'DJ', 'SS', 'HT', 'TL', 'GM', 'GL', 'BI', 'LR', 'SO', 'LS', 'TD', 'BZ', 'ER', 'SL', 'CF', 'SB', 'GW', 'XK', 'AD']
 
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_generation:
     baseyear_generation_constraint: true # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
-    tolerance: 0.05 # +- x% tolerance for baseyear generation constraint
+    tolerance: 0.03 # +- x% tolerance for baseyear generation constraint
     units: TWh
     link_bus_carrier: AC
     gen_bus_carrier: AC
     targets:
-      solar: 855.23
-      onshore_wind: 1591.37
-      #offshore_wind: 191 # TODO: need to make extendable, otherwise infeasible optimization!
-      #hydro: 4348
-      nuclear: 2648
+      solar: 855.23 # could be
+      onshore_wind: 1484 # could be
+      offshore_wind: 104
+      hydro: 4348.0
+      nuclear: 2648.0
       coal_lignite_power: 9437.0
-      gas_power: 6386.34
-      oil_power: 775.3
+      gas_power: 6386.34 # could be but extendable
+      oil_power: 775.3 # could be but extendable
       biomass: 615.21
-      #geothermal: 86.12 # TODO: need to make extendable, otherwise infeasible optimization!
+      geothermal: 86.12
     carriers_map:
       solar: ["solar"]
       onshore_wind: ["onwind"]
-      #offshore_wind: ["offwind-ac","offwind-dc"]
-      #hydro: ["ror", "hydro"]
+      offshore_wind: ["offwind-ac","offwind-dc"]
+      hydro: ["ror", "hydro"]
       nuclear: ["nuclear"]
       coal_lignite_power: ["coal", "lignite"]
       gas_power: ["CCGT","OCGT"]
@@ -80,42 +97,85 @@ global_specific:
         - "urban central solid biomass CHP"
         - "biomass"
         - "biomass EOP"
-      #geothermal: ["geothermal"]
+      geothermal: ["geothermal"]
+
+  year2025_generation: 
+    year2025_generation_constraint: true
+    year: 2025 # numbers below are 2024 but we have 10% tolerance
+    tolerance: 0.1
+    units: TWh
+    link_bus_carrier: AC
+    gen_bus_carrier: AC
+    targets:
+      solar: 2130.0
+      onshore_wind: 2350.0
+      #offshore_wind: 250.0
+      hydro: 4418.0
+      nuclear: 2760.0
+      coal_lignite_power: 10587.0
+      gas_power: 6795.0
+      oil_power: 857.0
+      biomass: 712.0
+      geothermal: 88.0
+    carriers_map:
+      solar: ["solar"]
+      onshore_wind: ["onwind"]
+      #offshore_wind: ["offwind-ac","offwind-dc"]
+      hydro: ["ror", "hydro"]
+      nuclear: ["nuclear"]
+      coal_lignite_power: ["coal", "lignite"]
+      gas_power: ["CCGT","OCGT"]
+      oil_power: ["oil"]
+      biomass: 
+        - "urban central solid biomass CHP CC"
+        - "urban central solid biomass CHP"
+        - "biomass"
+        - "biomass EOP"
+      geothermal: ["geothermal"]
+
+  year2025_capacity:
+    year2025_capacity_constraint: true
+    year: 2025
+    tolerance: 0.1 
+    units: GW
+    targets:
+      solar: 2130.64 # Target installed capacity in GW from 2024
+      onwind: 1136.0 # Target installed capacity in GW from 2024
 
 permstore:
   enable: true
-  path: /shared/share_cki25/energymodels/pypsa-earth/permstorage # keeping track of files that don't change -- "big beautiful run 1"
-  scenario: "190nodes_48h"
+  path: /shared/share_cki25/energymodels/pypsa-earth/permstorage
+  scenario: "110nodes_1h_7ph"
   use:
-    shapes: false
-    base_network: false
-    bus_regions: false # should be false if base_network is false !
-    demand_profiles: false # elec only
-    powerplants: false 
-    pop_layouts: false
-    pop_layouts_clustered: false
-    temperatures: false
-    heat_demand: false
-    transport_data: false
-    gas_network: false
-    industry_distribution: false # adjusted for gadm clustering
-    elec_prepared: false
-    renewable_profiles: false
-    solar_thermal_profile: false
+    shapes: true
+    base_network: true
+    bus_regions: true # should be false if base_network is false !
+    demand_profiles: true # elec only
+    powerplants: true 
+    pop_layouts: true
+    pop_layouts_clustered: true
+    temperatures: true
+    heat_demand: true
+    transport_data: true
+    gas_network: true
+    industry_distribution: true # adjusted for gadm clustering
+    elec_prepared: true
+    renewable_profiles: true
+    solar_thermal_profile: true
     costs: true
     raw_osm: true
-    clean_osm: false 
+    clean_osm: true 
 
 electricity:
   extendable_carriers:
       Generator: [solar, onwind, offwind-ac, offwind-dc, OCGT, CCGT]
-      StorageUnit: [battery, H2] # battery, H2
+      StorageUnit: [] # battery, H2
       Store: [battery, H2]
       Link: [H2 pipeline] # H2 pipeline
   conventional_carriers: [nuclear, oil, OCGT, CCGT, coal, lignite, geothermal, biomass]
   renewable_carriers: [solar, onwind, hydro, offwind-ac, offwind-dc] 
   
-  powerplants_filter: (DateOut > 2020 or DateOut != DateOut) and not (Country == 'Germany' and Fueltype == 'Nuclear') 
+  powerplants_filter: (DateOut > 2020 or DateOut != DateOut) and not (Country == 'Germany' and Fueltype == 'Nuclear') # not actively used
   custom_powerplants: replace #  "false" use only powerplantmatching (ppm) data, "merge" combines ppm and custom powerplants, "replace" use only custom powerplants
   
   estimate_renewable_capacities:
@@ -142,15 +202,33 @@ build_shape_options:
   year: 2020 # reference year used to derive shapes, info on population and info on GDP
   nprocesses: 10 # number of processes to be used in build_shapes
 
+# ------------------- SECTOR OPTIONS -------------------
+
+fossil_reserves:
+  oil: 100 #TWh Maybe redundant
+
+export:
+  endogenous: false # If true, the export demand is endogenously determined by the model
+  endogenous_price: 400 # EUR/MWh # Market price, for wich the hydrogen for endogenous exports is sold. Only considered, if ["export"]["endogenous"] is set to true.
+  store: true # [True, False] # specifies whether an export store to balance demand is implemented
+  store_capital_costs: "no_costs" # ["standard_costs", "no_costs"] # specifies the costs of the export store. "standard_costs" takes CAPEX of "hydrogen storage tank type 1 including compressor"
+  h2export: [0.0] # Yearly export demand in TWh. Only considered, if ["export"]["endogenous"] is set to false
+  export_profile: "ship" # use "ship" or "constant". Only considered, if ["export"]["endogenous"] is set to false
+  ship:
+    ship_capacity: 0.4 # TWh # 0.05 TWh for new ones, 0.003 TWh for Susio Frontier, 0.4 TWh according to Hampp2021: "Corresponds to 11360 t H2 (l) with LHV of 33.3333 Mwh/t_H2. Cihlar et al 2020 based on IEA 2019, Table 3-B"
+    travel_time: 288 # hours # From Agadir to Rotterdam and back (12*24)
+    fill_time: 24 # hours, for 48h see Hampp2021
+    unload_time: 24 # hours for 48h see Hampp2021
 
 sector:
+  include_heat: true # If false, disables all heat demand and heat infrastructure (heat pumps, thermal storage, district heating, etc.)
   gas:
     spatial_gas: true # ALWAYS TRUE
     network: false # ALWAYS FALSE for now (NOT USED)
     network_data: GGIT # Global dataset -> 'GGIT' , European dataset -> 'IGGIELGN'
     network_data_GGIT_status: ["Construction", "Operating", "Idle", "Shelved", "Mothballed", "Proposed"]
   hydrogen:
-    network: true
+    network: false
     H2_retrofit_capacity_per_CH4: 0.6
     network_limit: 2000 #GWkm
     network_routes: gas # "gas or "greenfield". If "gas"  ->  the network data are fetched from ["sector"]["gas"]["network_data"]. If "greenfield"  -> the network follows the topology of electrical transmission lines
@@ -166,7 +244,7 @@ sector:
     spatial_coal: true
     shift_to_elec: true # If true, residential and services demand of coal is shifted to electricity. If false, the final energy demand of coal is disregarded
   lignite:
-    spatial_lignite: false
+    spatial_lignite: true
 
   international_bunkers: false # Whether or not to count the emissions of international aviation and navigation
 
@@ -183,7 +261,7 @@ sector:
     # 2040: 0.6
     # 2050: 1.0
     district_heating_loss: 0.15
-  reduce_space_heat_exogenously: true # reduces space heat demand by a given factor (applied before losses in DH)
+  reduce_space_heat_exogenously: false # reduces space heat demand by a given factor (applied before losses in DH)
   # this can represent e.g. building renovation, building demolition, or if
   # the factor is negative: increasing floor area, increased thermal comfort, population growth
   reduce_space_heat_exogenously_factor: 0.29 # per unit reduction in space heat demand
@@ -230,8 +308,8 @@ sector:
 
   biomass_transport: true # biomass transport between nodes
   biomass_transport_default_cost: 0.1 #EUR/km/MWh
-  solid_biomass_potential: 455 # TWh/a, Potential of whole modelled area
-  biogas_potential: 195 # TWh/a, Potential of whole modelled area
+  solid_biomass_potential: 100.0 # TWh/a, Potential of whole modelled area
+  biogas_potential: 40.0 # TWh/a, Potential of whole modelled area
 
   efficiency_heat_oil_to_elec: 0.9
   efficiency_heat_biomass_to_elec: 0.9
@@ -247,115 +325,164 @@ sector:
       efficiency_per_1000km: 1
       compression_per_1000km: 0.017 # DEA technology data. Mean of  Energy losses, lines 5000-20000 MW and lines >20000 MW for 2020, 2030 and 2050, [%/1000 km]
 
-dynamic_transport:
-  enable: false # If "True", then the BEV and FCEV shares are obtained depending on the "Co2L"-wildcard (e.g. "Co2L0.70: 0.10"). If "False", then the shares are obtained depending on the "demand" wildcard and "planning_horizons" wildcard as listed below (e.g. "DF_2050: 0.08")
-  land_transport_electric_share:
-    Co2L2.0: 0.00
-    Co2L1.0: 0.01
-    Co2L0.90: 0.03
-    Co2L0.80: 0.06
-    Co2L0.70: 0.10
-    Co2L0.60: 0.17
-    Co2L0.50: 0.27
-    Co2L0.40: 0.40
-    Co2L0.30: 0.55
-    Co2L0.20: 0.69
-    Co2L0.10: 0.80
-    Co2L0.00: 0.88
-  land_transport_fuel_cell_share:
-    Co2L2.0: 0.01
-    Co2L1.0: 0.01
-    Co2L0.90: 0.01
-    Co2L0.80: 0.01
-    Co2L0.70: 0.01
-    Co2L0.60: 0.01
-    Co2L0.50: 0.01
-    Co2L0.40: 0.01
-    Co2L0.30: 0.01
-    Co2L0.20: 0.01
-    Co2L0.10: 0.01
-    Co2L0.00: 0.01
+  dynamic_transport:
+    enable: false # If "True", then the BEV and FCEV shares are obtained depending on the "Co2L"-wildcard (e.g. "Co2L0.70: 0.10"). If "False", then the shares are obtained depending on the "demand" wildcard and "planning_horizons" wildcard as listed below (e.g. "DF_2050: 0.08")
+    land_transport_electric_share:
+      Co2L2.0: 0.00
+      Co2L1.0: 0.01
+      Co2L0.90: 0.03
+      Co2L0.80: 0.06
+      Co2L0.70: 0.10
+      Co2L0.60: 0.17
+      Co2L0.50: 0.27
+      Co2L0.40: 0.40
+      Co2L0.30: 0.55
+      Co2L0.20: 0.69
+      Co2L0.10: 0.80
+      Co2L0.00: 0.88
 
-  land_transport_fuel_cell_share: # 1 means all FCEVs HERE
+    land_transport_fuel_cell_share: # shares of fuel cell vehicles in land transport
+      Co2L2.0: 0.01
+      Co2L1.0: 0.01
+      Co2L0.90: 0.01
+      Co2L0.80: 0.01
+      Co2L0.70: 0.01
+      Co2L0.60: 0.01
+      Co2L0.50: 0.01
+      Co2L0.40: 0.01
+      Co2L0.30: 0.01
+      Co2L0.20: 0.01
+      Co2L0.10: 0.01
+      Co2L0.00: 0.01
+
+  land_transport_fuel_cell_share: # deprecated, use land_transport_fuel_cell_share instead
     BU_2020: 0.00
-    AP_2020: 0.001   # tiny pilot deployments
-    NZ_2020: 0.010   # larger pilot programs
-    DF_2020: 0.0005  # near zero
-    AB_2020: 0.001   # realistic: same as AP pilots
-
+    BU_2025: 0.00
     BU_2030: 0.00
-    AP_2030: 0.006   # niche heavy-duty market uptake
-    NZ_2030: 0.030   # net-zero pushes hydrogen corridors
-    DF_2030: 0.002
-    AB_2030: 0.004   # early adoption for freight
-
+    BU_2035: 0.00
     BU_2040: 0.00
-    AP_2040: 0.020   # expanding to some light-duty use
-    NZ_2040: 0.060   # strong ramp-up
-    DF_2040: 0.005
-    AB_2040: 0.015   # steady but not explosive growth
-
+    BU_2045: 0.00
     BU_2050: 0.00
-    AP_2050: 0.040   # significant but still below BEVs
-    NZ_2050: 0.100   # complementing near-total BEV adoption
+
+    AP_2020: 0.001
+    AP_2025: 0.0035
+    AP_2030: 0.006
+    AP_2035: 0.013
+    AP_2040: 0.020
+    AP_2045: 0.030
+    AP_2050: 0.040
+
+    NZ_2020: 0.010
+    NZ_2025: 0.020
+    NZ_2030: 0.030
+    NZ_2035: 0.045
+    NZ_2040: 0.060
+    NZ_2045: 0.080
+    NZ_2050: 0.100
+
+    DF_2020: 0.0005
+    DF_2025: 0.00125
+    DF_2030: 0.002
+    DF_2035: 0.0035
+    DF_2040: 0.005
+    DF_2045: 0.0075
     DF_2050: 0.010
-    AB_2050: 0.050   # realistic: trucks, buses, niche LDVs on hydrogen
 
-  land_transport_electric_share: # 1 means 100% EV adoption
-    BU_2020: 0.00    # BAU: negligible EV penetration
-    AP_2020: 0.03    # AP: 3% of fleet already EV
-    NZ_2020: 0.06    # NZ: faster early rollout
-    DF_2020: 0.005   # DF: almost no EVs
-    AB_2020: 0.005   # AB: similar to DF, early pilots only
+    AB_2020: 0.001
+    AB_2025: 0.0025
+    AB_2030: 0.004
+    AB_2035: 0.0095
+    AB_2040: 0.015
+    AB_2045: 0.0325
+    AB_2050: 0.050
 
+  land_transport_electric_share: # shares of electric vehicles in land transport
+    BU_2020: 0.00
+    BU_2025: 0.00
     BU_2030: 0.00
-    AP_2030: 0.10    # ~10% fleet share under moderate policies
-    NZ_2030: 0.25    # strong net-zero trajectory
-    DF_2030: 0.01    # very limited
-    AB_2030: 0.02    # realistic: small but visible growth
+    BU_2035: 0.01
+    BU_2040: 0.02
+    BU_2045: 0.035
+    BU_2050: 0.05
 
-    BU_2040: 0.02    # small natural market adoption
-    AP_2040: 0.35    # >1/3 of fleet electric
-    NZ_2040: 0.65    # aggressive transition
-    DF_2040: 0.03    # still lagging
-    AB_2040: 0.08    # realistic, moderate growth
+    AP_2020: 0.03
+    AP_2025: 0.065
+    AP_2030: 0.10
+    AP_2035: 0.225
+    AP_2040: 0.35
+    AP_2045: 0.45
+    AP_2050: 0.55
 
-    BU_2050: 0.05    # still mostly ICE
-    AP_2050: 0.55    # just over half fleet electric
-    NZ_2050: 0.90    # near full electrification
-    DF_2050: 0.05    # some uptake but ICE still dominates
-    AB_2050: 0.25    # realistic: 1 in 4 vehicles electric
+    NZ_2020: 0.06
+    NZ_2025: 0.155
+    NZ_2030: 0.25
+    NZ_2035: 0.45
+    NZ_2040: 0.65
+    NZ_2045: 0.775
+    NZ_2050: 0.90
+
+    DF_2020: 0.005
+    DF_2025: 0.0075
+    DF_2030: 0.01
+    DF_2035: 0.02
+    DF_2040: 0.03
+    DF_2045: 0.04
+    DF_2050: 0.05
+
+    AB_2020: 0.005
+    AB_2025: 0.0125
+    AB_2030: 0.02
+    AB_2035: 0.05
+    AB_2040: 0.08
+    AB_2045: 0.165
+    AB_2050: 0.25
 
   co2_network: true
-  co2_sequestration_potential: 200 #MtCO2/a sequestration potential for Europe
+  co2_sequestration_potential: 1000 #MtCO2/a sequestration potential for Europe
   co2_sequestration_cost: 10 #EUR/tCO2 for sequestration of CO2
   shipping_hydrogen_liquefaction: false
   shipping_average_efficiency: 0.4 #For conversion of fuel oil to propulsion in 2011
 
   shipping_hydrogen_share: #1.0
     BU_2020: 0.00
-    AP_2020: 0.00
-    NZ_2020: 0.05
-    DF_2020: 0.02
-    AB_2020: 0.01   # realistic: some pilots, less than DF’s optimistic early start
-
+    BU_2025: 0.00
     BU_2030: 0.00
-    AP_2030: 0.00
-    NZ_2030: 0.10
-    DF_2030: 0.05
-    AB_2030: 0.03   # sits between AP (0) and DF (0.05)
-
+    BU_2035: 0.00
     BU_2040: 0.00
-    AP_2040: 0.12
-    NZ_2040: 0.23
-    DF_2040: 0.08
-    AB_2040: 0.10   # realistic mid-case between DF and AP
-
+    BU_2045: 0.00
     BU_2050: 0.00
+
+    AP_2020: 0.00
+    AP_2025: 0.00
+    AP_2030: 0.00
+    AP_2035: 0.06
+    AP_2040: 0.12
+    AP_2045: 0.185
     AP_2050: 0.25
+
+    NZ_2020: 0.05
+    NZ_2025: 0.075
+    NZ_2030: 0.10
+    NZ_2035: 0.165
+    NZ_2040: 0.23
+    NZ_2045: 0.295
     NZ_2050: 0.36
+
+    DF_2020: 0.02
+    DF_2025: 0.035
+    DF_2030: 0.05
+    DF_2035: 0.065
+    DF_2040: 0.08
+    DF_2045: 0.10
     DF_2050: 0.12
-    AB_2050: 0.18   # comfortably between DF and AP; plausible infrastructure scale-up
+
+    AB_2020: 0.01
+    AB_2025: 0.02
+    AB_2030: 0.03
+    AB_2035: 0.065
+    AB_2040: 0.10
+    AB_2045: 0.14
+    AB_2050: 0.18
 
   h2_cavern: true
   marginal_cost_storage: 0
@@ -397,7 +524,7 @@ demand_data: # this is sector-coupled
 costs:
   year: 2020 
   customized: true # added by Theo // set to true to skip downloading costs but still use resources/ + RDIR + costs_{planning_horizons/year}.csv
-  version: v0.10.0
+  version: v0.13.2
   discountrate: [0.071] #, 0.086, 0.111]
   # [EUR/USD] ECB: https://www.ecb.europa.eu/stats/exchange/eurofxref/html/eurofxref-graph-usd.en.html # noqa: E501
   USD2013_to_EUR2013: 0.7532 # [EUR/USD] ECB: https://www.ecb.europa.eu/stats/exchange/eurofxref/html/eurofxref-graph-usd.en.html
@@ -503,7 +630,7 @@ solving:
 
   solver:
     name: gurobi
-    options: gurobi-numeric-focus
+    options: gurobi-default # gurobi-nocross # gurobi-high-precision
 
   solver_options:
     highs-default:
@@ -519,10 +646,10 @@ solving:
       parallel: "on"
       random_seed: 123
     gurobi-default:
-      threads: 8 # 4 
+      threads: 32 
       method: 2 # barrier
       crossover: 0
-      BarConvTol: 1.e-4 # 1.e-6
+      BarConvTol: 1.e-5 # 1.e-6
       Seed: 123
       AggFill: 0
       PreDual: 0
@@ -532,11 +659,78 @@ solving:
       method: 2 # barrier
       crossover: 0 # do not use crossover
       BarHomogeneous: 1 # Use homogeneous barrier if standard does not converge
-      BarConvTol: 1.e-5 # 1.e-5
-      FeasibilityTol: 1.e-4 # 1.e-4
-      OptimalityTol: 1.e-4 # 1.e-4 
-      ObjScale: -0.5
-      threads: 12
+      BarConvTol: 1.e-5
+      FeasibilityTol: 1.e-4 
+      OptimalityTol: 1.e-4 
+      ScaleFlag: -1 
+      threads: 32
+      Seed: 123
+      DualReductions: 0
+      InfUnbdInfo: 1
+    gurobi-tested:
+      FeasibilityTol: 0.0001
+      OptimalityTol: 0.0001
+      Method: 2
+      BarConvTol: 1.e-5
+      Crossover: 0
+      AggFill: 10
+      PreDual: 0
+      NumericFocus: 3
+      PrePasses: 2
+      Presolve: 2
+      Threads: 24
+    gurobi-high-precision:
+      NumericFocus: 3
+      Method: 2
+      Crossover: 1
+      FeasibilityTol: 1.e-6
+      OptimalityTol: 1.e-6
+      ScaleFlag: 2
+      Quad: 1
+      Threads: 32
+      ObjScale: 1
+      Seed: 123
+      BarHomogeneous: 1
+      BarConvTol: 1e-8
+      BarOrder: 2
+    gurobi-cross:
+      NumericFocus: 3          # Favor numeric stability over speed
+      Method: 2                # Barrier
+      Crossover: 1             # Force crossover on
+      BarConvTol: 1.e-8        # Tighter barrier stop -> cleaner handoff to crossover
+      BarHomogeneous: -1       # Let Gurobi choose (only use 1 if it picks it)
+      BarCorrectors: 2         # More robust barrier steps
+      FeasibilityTol: 1.e-6    # Cleaner feasibility for tough models
+      OptimalityTol: 1.e-6     # Cleaner optimality for tough models
+      ObjScale: 0              # Auto (avoid negative scaling)
+      ScaleFlag: -1            # Auto scaling
+      Quad: 1                  # Quad precision in sensitive areas
+      Threads: 12
+      Seed: 123
+    gurobi-nocross:
+      Method: 2            # Barrier
+      Crossover: 0         # Skip crossover big walltime win
+      Threads: 32          # Try 32 first; also test 48 or 64 and keep the best
+      NumericFocus: 2      # Still cautious, but a bit faster than 3
+      BarConvTol: 1.e-7    # Slightly looser; fewer barrier iters, typically same quality
+      BarCorrectors: -1    # Let Gurobi pick adaptively
+      BarHomogeneous: -1   # Auto
+      FeasibilityTol: 1.e-6
+      OptimalityTol: 1.e-6
+      ObjScale: 0
+      ScaleFlag: -1
+      Quad: 1
+      Seed: 123
+    gurobi-dual-simplex:
+      NumericFocus: 3
+      Method: 1                # Dual simplex (no barrier, no crossover needed)
+      Crossover: 0
+      FeasibilityTol: 1.e-6
+      OptimalityTol: 1.e-6
+      ObjScale: 0
+      ScaleFlag: -1
+      Quad: 0                  # Not used by simplex; can leave 0
+      Threads: 12
       Seed: 123
     gurobi-fallback: # Use gurobi defaults
       crossover: 0

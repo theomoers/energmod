@@ -88,15 +88,40 @@ import pypsa
 import xarray as xr
 from _helpers import configure_logging, create_logger, override_component_attrs
 from linopy import merge
+from temporal_clustering import aggregate_snapshots, temporal_aggregation_storage_constraints
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
-from pypsa.optimization.optimize import optimize
+#from pypsa.optimization.optimize import optimize
 
 logger = create_logger(__name__)
 pypsa.pf.logger.setLevel(logging.WARNING)
 
+def _safe_solver_log(smk):
+    """Return a usable log filename if present (named 'solver' or first log), else None."""
+    lf = None
+    if hasattr(smk, "log") and smk.log is not None:
+        # if rule used a single unnamed path: log: "path.log"
+        if isinstance(smk.log, (str, os.PathLike)):
+            return str(smk.log)
 
-def prepare_network(n, solve_opts, config):
+        # prefer a named log 'solver'
+        lf = getattr(smk.log, "solver", None)
+
+        # fall back to first item if it's a sequence
+        if lf is None:
+            try:
+                lf = smk.log[0]
+            except Exception:
+                pass
+
+        # if someone provided a list/tuple, take the first string
+        if isinstance(lf, (list, tuple)) and lf:
+            lf = lf[0]
+
+    return str(lf) if lf else None
+
+
+def prepare_network(n, solve_opts):
     if "clip_p_max_pu" in solve_opts:
         for df in (
             n.generators_t.p_max_pu,
@@ -116,7 +141,7 @@ def prepare_network(n, solve_opts, config):
             n.buses.index,
             " load",
             bus=n.buses.index,
-            carrier="load",
+            carrier="Load",
             sign=1,
             marginal_cost=solve_opts.get("load_shedding") * 1000,  # convert to Eur/MWh
             p_nom=1e12,
@@ -307,7 +332,10 @@ def add_BAU_constraints(n, config):
     """
     mincaps = pd.Series(config["electricity"]["BAU_mincapacities"])
     p_nom = n.model["Generator-p_nom"]
-    ext_i = n.generators.query("p_nom_extendable")
+    ext_i = n.generators.query("p_nom_extendable == True")
+
+    if ext_i.empty:
+        return
     ext_carrier_i = xr.DataArray(ext_i.carrier.rename_axis("Generator-ext"))
     lhs = p_nom.groupby(ext_carrier_i).sum()
     rhs = mincaps[lhs.indexes["carrier"]].rename_axis("carrier")
@@ -338,15 +366,13 @@ def add_SAFE_constraints(n, config):
     margin = 1.0 + config["electricity"]["SAFE_reservemargin"]
     reserve_margin = peakdemand * margin
     conventional_carriers = config["electricity"]["conventional_carriers"]
-    ext_gens_i = n.generators.query(
-        "carrier in @conventional_carriers & p_nom_extendable"
-    ).index
+    ext_gens_i = n.generators.query("(carrier in @conventional_carriers) and p_nom_extendable").index
+
     capacity_variable = n.model["Generator-p_nom"]
     p_nom = n.model["Generator-p_nom"].loc[ext_gens_i]
     lhs = p_nom.sum()
-    exist_conv_caps = n.generators.query(
-        "~p_nom_extendable & carrier in @conventional_carriers"
-    ).p_nom.sum()
+    exist_conv_caps = n.generators.query("not p_nom_extendable and (carrier in @conventional_carriers)").p_nom.sum()
+
     rhs = reserve_margin - exist_conv_caps
     n.model.add_constraints(lhs >= rhs, name="safe_mintotalcap")
 
@@ -371,20 +397,26 @@ def add_operational_reserve_margin_constraint(n, sns, config):
     )
     reserve = n.model["Generator-r"]
     summed_reserve = reserve.sum("Generator")
+    lhs = summed_reserve
+
 
     # Share of extendable renewable capacities
     ext_i = n.generators.query("p_nom_extendable").index
     vres_i = n.generators_t.p_max_pu.columns
+
     if not ext_i.empty and not vres_i.empty:
-        capacity_factor = n.generators_t.p_max_pu[vres_i.intersection(ext_i)]
-        p_nom_vres = (
-            n.model["Generator-p_nom"]
-            .loc[vres_i.intersection(ext_i)]
-            .rename({"Generator-ext": "Generator"})
-        )
-        lhs = summed_reserve + (
-            p_nom_vres * (-EPSILON_VRES * xr.DataArray(capacity_factor))
-        ).sum("Generator")
+        active = vres_i.intersection(ext_i)
+        if len(active) > 0:
+            capacity_factor = n.generators_t.p_max_pu[active]
+            p_nom_vres = (
+                n.model["Generator-p_nom"]
+                .loc[active]
+                .rename({"Generator-ext": "Generator"})
+            )
+            lhs = lhs + (
+                p_nom_vres * (-EPSILON_VRES * xr.DataArray(capacity_factor))
+            ).sum("Generator")
+
 
     # Total demand per t
     demand = get_as_dense(n, "Load", "p_set").sum(axis=1)
@@ -506,52 +538,51 @@ def add_RES_constraints(n, res_share, config):
     charger_i = ren_charger.index
     discharger_i = ren_discharger.index
 
-    stores_t_weights = n.snapshot_weightings.stores
+    # weights as xarray
+    w_gen = xr.DataArray(n.snapshot_weightings.generators, dims=["snapshot"])
+    w_sto = xr.DataArray(n.snapshot_weightings.stores,     dims=["snapshot"])
 
-    lgrouper = n.loads.bus.map(n.buses.country)
-    ggrouper = ren_gen.bus.map(n.buses.country)
-    sgrouper = ren_stores.bus.map(n.buses.country)
-    cgrouper = ren_charger.bus0.map(n.buses.country)
-    dgrouper = ren_discharger.bus0.map(n.buses.country)
+    # --- LHS: total renewable energy (MWh), annual scalar ---
+    lhs = 0
 
-    load = (
-        n.snapshot_weightings.generators
-        @ n.loads_t.p_set.groupby(lgrouper, axis=1).sum()
-    )
-    rhs = res_share * load
+    if len(gens_i) > 0:
+        lhs_gen = (n.model["Generator-p"].loc[:, gens_i] * w_gen).sum()
+        lhs = lhs + lhs_gen
 
-    # Generators
-    lhs_gen = (
-        (n.model["Generator-p"].loc[:, gens_i] * n.snapshot_weightings.generators)
-        .groupby(ggrouper.to_xarray())
-        .sum()
-    )
+    if len(stores_i) > 0:
+        lhs_dispatch = (n.model["StorageUnit-p_dispatch"].loc[:, stores_i] * w_sto).sum()
+        lhs_store    = (n.model["StorageUnit-p_store"   ].loc[:, stores_i] * w_sto).sum()
+        lhs = lhs + lhs_dispatch - lhs_store
 
-    # StorageUnits
-    store_disp_expr = (
-        n.model["StorageUnit-p_dispatch"].loc[:, stores_i] * stores_t_weights
-    )
-    store_expr = n.model["StorageUnit-p_store"].loc[:, stores_i] * stores_t_weights
-    charge_expr = n.model["Link-p"].loc[:, charger_i] * stores_t_weights.apply(
-        lambda r: r * n.links.loc[charger_i].efficiency
-    )
-    discharge_expr = n.model["Link-p"].loc[:, discharger_i] * stores_t_weights.apply(
-        lambda r: r * n.links.loc[discharger_i].efficiency
-    )
+    if len(charger_i) > 0 or len(discharger_i) > 0:
+        charge    = n.model["Link-p"].loc[:, charger_i]    if len(charger_i)    > 0 else None
+        discharge = n.model["Link-p"].loc[:, discharger_i] if len(discharger_i) > 0 else None
 
-    lhs_dispatch = store_disp_expr.groupby(sgrouper).sum()
-    lhs_store = store_expr.groupby(sgrouper).sum()
+        if charge is not None and charge.size > 0:
+            eta_ch = xr.DataArray(n.links.loc[charger_i, "efficiency"].fillna(1.0),
+                                  coords=[charger_i], dims=["Link"])
+            lhs = lhs - (charge * eta_ch * w_sto).sum()
 
-    # Stores (or their resp. Link components)
-    # Note that the variables "p0" and "p1" currently do not exist.
-    # Thus, p0 and p1 must be derived from "p" (which exists), taking into account the link efficiency.
-    lhs_charge = charge_expr.groupby(cgrouper).sum()
+        if discharge is not None and discharge.size > 0:
+            eta_dc = xr.DataArray(n.links.loc[discharger_i, "efficiency"].fillna(1.0),
+                                  coords=[discharger_i], dims=["Link"])
+            lhs = lhs + (discharge * eta_dc * w_sto).sum()
 
-    lhs_discharge = discharge_expr.groupby(cgrouper).sum()
+    # --- RHS: required renewable share of net consumption (annual scalar) ---
+    # Load energy (MWh):
+    total_load = 0.0
+    if not n.loads_t.p_set.empty:
+        total_load = float((n.loads_t.p_set.sum(axis=1) * n.snapshot_weightings["generators"]).sum())
 
-    lhs = lhs_gen + lhs_dispatch - lhs_store - lhs_charge + lhs_discharge
+    # Storage inflow energy (MWh) subtracts from net load, following add_EQ_constraints logic:
+    inflow_energy = 0.0
+    if not n.storage_units_t.inflow.empty:
+        inflow_energy = float((n.storage_units_t.inflow.sum(axis=1) * n.snapshot_weightings["stores"]).sum())
 
-    n.model.add_constraints(lhs == rhs, name="res_share")
+    rhs = res_share * (total_load - inflow_energy)
+
+    n.model.add_constraints(lhs >= rhs, name="res_share")
+
 
 
 def add_land_use_constraint(n):
@@ -571,7 +602,18 @@ def _add_land_use_constraint(n):
             .sum()
         )
         existing.index += " " + carrier + "-" + snakemake.wildcards.planning_horizons
-        n.generators.loc[existing.index, "p_nom_max"] -= existing
+        
+        # Find intersection and missing entries
+        valid_idx = existing.index.intersection(n.generators.index)
+        missing_idx = existing.index.difference(n.generators.index)
+        
+        if len(missing_idx) > 0:
+            logger.warning(f"Land use constraint for {carrier}: {len(missing_idx)} generators not found in network")
+            logger.debug(f"Missing generators: {list(missing_idx)}")
+        
+        # Only apply constraint to existing generators
+        if len(valid_idx) > 0:
+            n.generators.loc[valid_idx, "p_nom_max"] -= existing.loc[valid_idx]
 
     # Fix pandas FutureWarning: use direct assignment instead of inplace
     n.generators["p_nom_max"] = n.generators["p_nom_max"].clip(lower=0)
@@ -607,9 +649,22 @@ def _add_land_use_constraint_m(n):
             ]
             sel_current = [i + " " + carrier + "-" + current_horizon for i in ind2]
             sel_p_year = [i + " " + carrier + "-" + p_year for i in ind2]
-            n.generators.loc[sel_current, "p_nom_max"] -= existing.loc[
-                sel_p_year
-            ].rename(lambda x: x[:-4] + current_horizon)
+            
+            # Find intersection and missing entries
+            valid_current = pd.Index(sel_current).intersection(n.generators.index)
+            missing_current = pd.Index(sel_current).difference(n.generators.index)
+            
+            if len(missing_current) > 0:
+                logger.warning(f"Land use constraint for {carrier} year {p_year}: {len(missing_current)} generators not found in network")
+                logger.debug(f"Missing generators: {list(missing_current)}")
+            
+            # Only apply constraint to existing generators
+            if len(valid_current) > 0:
+                # Map valid current generators back to their corresponding previous year generators
+                valid_p_year = [sel_p_year[sel_current.index(c)] for c in valid_current]
+                n.generators.loc[valid_current, "p_nom_max"] -= existing.loc[
+                    valid_p_year
+                ].rename(lambda x: x[:-4] + current_horizon)
 
     # Fix pandas FutureWarning: use direct assignment instead of inplace
     n.generators["p_nom_max"] = n.generators["p_nom_max"].clip(lower=0)
@@ -653,9 +708,9 @@ def H2_export_yearly_constraint(n):
         columns=res_index,
     )
     capacity_variable = n.model["Generator-p"]
+    # annual RES energy (MWh)
+    res = (weightings * capacity_variable.loc[:, res_index].to_pandas()).sum().sum()
 
-    # single line sum
-    res = (weightings * capacity_variable.loc[res_index]).sum()
 
     load_ind = n.loads[n.loads.carrier == "AC"].index.intersection(
         n.loads_t.p_set.columns
@@ -709,56 +764,55 @@ def monthly_constraints(n, n_ref):
     capacity_variable = n.model["Generator-p"]
 
     # single line sum
-    res = (weightings * capacity_variable[res_index]).sum(axis=1)
+    res = (weightings * capacity_variable.loc[:, res_index].to_pandas()).sum(axis=1)
     res = res.groupby(res.index.month).sum()
 
     link_p = n.model["Link-p"]
-    electrolysis = link_p.loc[
-        n.links.index[n.links.index.str.contains("H2 Electrolysis")]
-    ]
+    elec_i = n.links.index[n.links.index.str.contains("H2 Electrolysis")]
+    electrolysis = link_p.loc[:, elec_i]  # xarray [snapshot, Link]
 
-    weightings_electrolysis = pd.DataFrame(
-        np.outer(
-            n.snapshot_weightings["generators"], [1.0] * len(electrolysis.columns)
-        ),
-        index=n.snapshots,
-        columns=electrolysis.columns,
+    w_gen = xr.DataArray(n.snapshot_weightings["generators"], dims=["snapshot"])
+    elec_eff = xr.DataArray(
+        n.links.loc[elec_i, "efficiency"],
+        coords=[elec_i],
+        dims=["Link"],
     )
 
-    elec_input = ((-allowed_excess * weightings_electrolysis) * electrolysis).sum(
-        axis=1
-    )
+    elec_input = (-allowed_excess) * (electrolysis * w_gen * elec_eff).sum("Link")
+    elec_input = elec_input.to_pandas().groupby(elec_input.index.month).sum()
 
-    elec_input = elec_input.groupby(elec_input.index.month).sum()
 
     if snakemake.config["policy_config"]["hydrogen"]["additionality"]:
-        res_ref = n_ref.generators_t.p[res_index] * weightings
+        # ref RES by month (MWh)
+        res_ref = (n_ref.generators_t.p[res_index] * weightings)
         res_ref = res_ref.groupby(n_ref.generators_t.p.index.month).sum().sum(axis=1)
 
-        elec_input_ref = (
-            n_ref.links_t.p0.loc[
-                :, n_ref.links_t.p0.columns.str.contains("H2 Electrolysis")
-            ]
-            * weightings_electrolysis
-        )
-        elec_input_ref = (
-            -elec_input_ref.groupby(elec_input_ref.index.month).sum().sum(axis=1)
-        )
+        # ref electrolysis input by month (MWh); p0 at electrolyzers is negative on the power side
+        elec_cols_ref = n_ref.links_t.p0.columns[n_ref.links_t.p0.columns.str.contains("H2 Electrolysis")]
+        if len(elec_cols_ref) > 0:
+            elec_series_ref = n_ref.links_t.p0[elec_cols_ref].sum(axis=1)  # negative
+            elec_input_ref = ( -elec_series_ref * n_ref.snapshot_weightings["generators"] )
+            elec_input_ref = elec_input_ref.groupby(elec_input_ref.index.month).sum()
+        else:
+            elec_input_ref = pd.Series(0.0, index=res_ref.index)
+
 
         for i in range(len(res.index)):
-            lhs = res.iloc[i] + "\n" + elec_input.iloc[i]
+            lhs = res.iloc[i] + elec_input.iloc[i]
             rhs = res_ref.iloc[i] + elec_input_ref.iloc[i]
             n.model.add_constraints(
                 lhs >= rhs, name=f"RESconstraints_{i}-REStarget_{i}"
             )
 
+
     else:
         for i in range(len(res.index)):
-            lhs = res.iloc[i] + "\n" + elec_input.iloc[i]
+            lhs = res.iloc[i] + elec_input.iloc[i]
 
             n.model.add_constraints(
                 lhs >= 0.0, name=f"RESconstraints_{i}-REStarget_{i}"
             )
+
     # else:
     #     logger.info("ignoring H2 export constraint as wildcard is set to 0")
 
@@ -812,12 +866,13 @@ def add_chp_constraints(n):
         n.model.add_constraints(lhs <= rhs, name="chplink-top_iso_fuel_line_fix")
 
     # back-pressure
-    if not electric.empty:
+    if not electric.empty and not heat.empty:
         lhs = (
             p.loc[:, heat] * (n.links.efficiency[heat] * n.links.c_b[electric].values)
             - p.loc[:, electric] * n.links.efficiency[electric]
         )
-        n.model.add_constraints(lhs <= rhs, name="chplink-backpressure")
+        n.model.add_constraints(lhs <= 0, name="chplink-backpressure")
+
 
 
 def add_co2_sequestration_limit(n, sns):
@@ -859,7 +914,8 @@ def set_h2_colors(n):
         n.loads_t.p_set[fuelcell_ind].sum(axis=1) * n.snapshot_weightings["generators"]
     ).sum()
 
-    load_other_h2 = n.loads.loc[other_ind].p_set.sum() * 8760
+    load_other_h2 = (n.loads_t.p_set[other_ind].sum(axis=1) * n.snapshot_weightings["generators"]).sum()
+
 
     load_h2 = load_fuelcell + load_other_h2
 
@@ -919,57 +975,48 @@ def add_existing(n):
             n.generators.loc[tech_index, tech] = existing_res
 
 
-def add_lossy_bidirectional_link_constraints(n: pypsa.components.Network) -> None:
+def add_lossy_bidirectional_link_constraints(n: pypsa.Network) -> None:
     """
     Ensures that the two links simulating a bidirectional_link are extended the same amount.
     """
-
     if not n.links.p_nom_extendable.any() or "reversed" not in n.links.columns:
         return
 
-    # ensure that the 'reversed' column is boolean and identify all link carriers that have 'reversed' links
     n.links["reversed"] = n.links.reversed.fillna(0).astype(bool)
-    carriers = n.links.loc[n.links.reversed, "carrier"].unique()  # noqa: F841
+    carriers = n.links.loc[n.links.reversed, "carrier"].unique()
 
-    # get the indices of all forward links (non-reversed), that have a reversed counterpart
     forward_i = n.links.query(
         "carrier in @carriers and ~reversed and p_nom_extendable"
     ).index
 
-    # function to get backward (reversed) indices corresponding to forward links
-    # this function is required to properly interact with the myopic naming scheme
     def get_backward_i(forward_i):
-        return pd.Index(
-            [
-                (
-                    re.sub(r"-(\d{4})$", r"-reversed-\1", s)
-                    if re.search(r"-\d{4}$", s)
-                    else s + "-reversed"
-                )
-                for s in forward_i
-            ]
-        )
+        return pd.Index([
+            (re.sub(r"-(\d{4})$", r"-reversed-\1", s)
+             if re.search(r"-\d{4}$", s) else s + "-reversed")
+            for s in forward_i
+        ])
 
-    # get the indices of all backward links (reversed)
-    backward_i = get_backward_i(forward_i)
-
-    # get the p_nom optimization variables for the links using the get_var function
+    # --- replacement block starts here ---
     links_p_nom = n.model["Link-p_nom"]
+    var_index   = links_p_nom.indexes["Link-ext"]
 
-    # only consider forward and backward links that are present in the optimization variables
-    subset_forward = forward_i.intersection(links_p_nom.indexes["Link-ext"])
-    subset_backward = backward_i.intersection(links_p_nom.indexes["Link-ext"])
+    pairs = []
+    for fwd in forward_i:
+        bwd = get_backward_i(pd.Index([fwd]))[0]
+        if fwd in var_index and bwd in var_index:
+            pairs.append((fwd, bwd))
 
-    # ensure we have a matching number of forward and backward links
-    if len(subset_forward) != len(subset_backward):
-        raise ValueError("Mismatch between forward and backward links.")
+    if not pairs:
+        return
 
-    # define the lefthand side of the constrain p_nom (forward) - p_nom (backward) = 0
-    # this ensures that the forward links always have the same maximum nominal power as their backward counterpart
-    lhs = links_p_nom.loc[backward_i] - links_p_nom.loc[forward_i]
+    subset_forward  = pd.Index([f for f, _ in pairs])
+    subset_backward = pd.Index([b for _, b in pairs])
 
-    # add the constraint to the PySPA model
+    lhs = links_p_nom.loc[subset_backward] - links_p_nom.loc[subset_forward]
+    # --- replacement block ends here ---
+
     n.model.add_constraints(lhs == 0, name="Link-bidirectional_sync")
+
 
 def _generator_output_energy_by_buscarrier(n, bus_carrier="AC"):
     """
@@ -983,9 +1030,23 @@ def _generator_output_energy_by_buscarrier(n, bus_carrier="AC"):
     if len(ac_gen_i) == 0:
         return xr.DataArray([], dims=["carrier"])
 
-    p_g = n.model["Generator-p"].loc[:, ac_gen_i]                      # [snapshot, Generator]
-    w   = xr.DataArray(n.snapshot_weightings.generators, dims=["snapshot"])
-    g_car = n.generators.loc[ac_gen_i, "carrier"].rename_axis("Generator").to_xarray()
+    # Use integer-based indexing for temporal clustering compatibility
+    p_g_full = n.model["Generator-p"]
+    gen_idx = p_g_full.indexes.get("Generator", pd.Index([]))
+    gen_mask = gen_idx.isin(ac_gen_i)
+    p_g = p_g_full.isel(Generator=gen_mask)                            # [snapshot, Generator]
+    
+    # Get the actual generator indices after filtering
+    filtered_gen_i = gen_idx[gen_mask]
+    
+    # snapshot_weightings.generators is a Series (column from DataFrame)
+    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
+    w = xr.DataArray(
+        n.snapshot_weightings.generators.values,
+        coords=[n.snapshots],
+        dims=["snapshot"]
+    )
+    g_car = n.generators.loc[filtered_gen_i, "carrier"].rename_axis("Generator").to_xarray()
 
     # MWh by generator carrier
     return (p_g * w).sum("snapshot").groupby(g_car).sum("Generator")
@@ -1005,11 +1066,25 @@ def _link_output_energy_by_buscarrier(n, bus_carrier="AC"):
     if len(link_i) == 0:
         return xr.DataArray([], dims=["carrier"])
 
-    p_l  = n.model["Link-p"].loc[:, link_i]                             # [snapshot, Link]
-    eta  = xr.DataArray(n.links.loc[link_i, "efficiency"].fillna(1.0),
-                        coords=[link_i], dims=["Link"])
-    w    = xr.DataArray(n.snapshot_weightings.generators, dims=["snapshot"])
-    lcar = n.links.loc[link_i, "carrier"].rename_axis("Link").to_xarray()
+    # Use integer-based indexing for temporal clustering compatibility
+    p_l_full = n.model["Link-p"]
+    link_idx = p_l_full.indexes.get("Link", pd.Index([]))
+    link_mask = link_idx.isin(link_i)
+    p_l = p_l_full.isel(Link=link_mask)                                # [snapshot, Link]
+    
+    # Get the actual link indices after filtering
+    filtered_link_i = link_idx[link_mask]
+    
+    eta  = xr.DataArray(n.links.loc[filtered_link_i, "efficiency"].fillna(1.0),
+                        coords=[filtered_link_i], dims=["Link"])
+    # snapshot_weightings.generators is a Series (column from DataFrame)
+    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
+    w = xr.DataArray(
+        n.snapshot_weightings.generators.values,
+        coords=[n.snapshots],
+        dims=["snapshot"]
+    )
+    lcar = n.links.loc[filtered_link_i, "carrier"].rename_axis("Link").to_xarray()
 
     # MWh by link carrier at AC output
     return (p_l * eta * w).sum("snapshot").groupby(lcar).sum("Link")
@@ -1030,9 +1105,23 @@ def _storageunit_output_energy_by_buscarrier(n, bus_carrier="AC"):
     if len(ac_su_i) == 0:
         return xr.DataArray([], dims=["carrier"])
 
-    p_su = n.model["StorageUnit-p_dispatch"].loc[:, ac_su_i]  # [snapshot, StorageUnit]
-    w    = xr.DataArray(n.snapshot_weightings.stores, dims=["snapshot"])
-    su_car = n.storage_units.loc[ac_su_i, "carrier"].rename_axis("StorageUnit").to_xarray()
+    # Use integer-based indexing for temporal clustering compatibility
+    p_su_full = n.model["StorageUnit-p_dispatch"]
+    su_idx = p_su_full.indexes.get("StorageUnit", pd.Index([]))
+    su_mask = su_idx.isin(ac_su_i)
+    p_su = p_su_full.isel(StorageUnit=su_mask)                         # [snapshot, StorageUnit]
+    
+    # Get the actual storage unit indices after filtering
+    filtered_su_i = su_idx[su_mask]
+    
+    # snapshot_weightings.stores is a Series (column from DataFrame)
+    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
+    w = xr.DataArray(
+        n.snapshot_weightings.stores.values,
+        coords=[n.snapshots],
+        dims=["snapshot"]
+    )
+    su_car = n.storage_units.loc[filtered_su_i, "carrier"].rename_axis("StorageUnit").to_xarray()
 
     # MWh by storage-unit carrier at AC output
     return (p_su * w).sum("snapshot").groupby(su_car).sum("StorageUnit")
@@ -1112,6 +1201,151 @@ def add_baseyear_generation_band(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"baseyear_energy_max__{alias}")
 
 
+def add_year2025_generation_band(n, planning_year, config):
+    """
+    Add 2025 generation constraints similar to baseyear constraints.
+    Constrains annual generation by carrier to match 2025 targets +/- tolerance.
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_generation", {})
+    if not cfg or not cfg.get("year2025_generation_constraint", False):
+        return
+
+    target_year = str(cfg.get("year", 2025))
+    if str(planning_year) != target_year:
+        logger.info(f"Skipping 2025 generation constraints for {planning_year} (configured for {target_year})")
+        return
+
+    logger.info(f"Adding 2025 generation constraints for {planning_year}")
+
+    tol   = float(cfg.get("tolerance", 0.15))
+    units = str(cfg.get("units", "TWh")).lower()
+    unit_scale = {"mwh":1.0, "gwh":1e3, "twh":1e6}.get(units, 1e6)
+
+    carriers_map     = cfg.get("carriers_map", {})
+    targets          = cfg.get("targets", {})
+    link_bus_carrier = cfg.get("link_bus_carrier", "AC")
+    gen_bus_carrier  = cfg.get("gen_bus_carrier",  "AC")
+
+    gen_E  = _generator_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
+    link_E = _link_output_energy_by_buscarrier(n, bus_carrier=link_bus_carrier) # [carrier] MWh
+    su_E = _storageunit_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
+
+    def _sum_tokens(tokens):
+        toks = tokens if isinstance(tokens, (list, tuple)) else [tokens]
+        pieces = []
+
+        gen_list  = list(gen_E.indexes.get("carrier", []))  if gen_E.size  else []
+        link_list = list(link_E.indexes.get("carrier", [])) if link_E.size else []
+        su_list   = list(su_E.indexes.get("carrier", []))   if su_E.size   else []
+
+        for t in toks:
+            if isinstance(t, str) and t.startswith("re:"):
+                pat = re.compile(t[3:])
+                g = [c for c in gen_list  if pat.search(c)]
+                l = [c for c in link_list if pat.search(c)]
+                s = [c for c in su_list   if pat.search(c)]
+                if g: pieces.append(gen_E.sel(carrier=g).sum("carrier"))
+                if l: pieces.append(link_E.sel(carrier=l).sum("carrier"))
+                if s: pieces.append(su_E.sel(carrier=s).sum("carrier"))
+            else:
+                if t in gen_list:  pieces.append(gen_E.sel(carrier=t))
+                if t in link_list: pieces.append(link_E.sel(carrier=t))
+                if t in su_list:   pieces.append(su_E.sel(carrier=t))
+
+        if not pieces:
+            return None
+        out = pieces[0]
+        for p in pieces[1:]:
+            out = out + p
+        return out
+
+    for alias, target in targets.items():
+        if isinstance(target, str) and target.upper().startswith("X"):
+            logger.info(f"Skipping {alias} (placeholder target '{target}')")
+            continue
+
+        tokens = carriers_map.get(alias, [alias])  # e.g., ["coal"] or ["coal","lignite"]
+        lhs = _sum_tokens(tokens)
+        if lhs is None:
+            logger.warning(f"No carriers matched for alias '{alias}' with tokens {tokens}")
+            continue
+
+        lower = float(target) * (1.0 - tol) * unit_scale
+        upper = float(target) * (1.0 + tol) * unit_scale
+
+        logger.info(f"{alias}: {lower/unit_scale:.2f} ≤ AC-side energy ≤ {upper/unit_scale:.2f} {units.upper()} (tokens={tokens})")
+        n.model.add_constraints(lhs >= lower, name=f"year2025_energy_min__{alias}")
+        n.model.add_constraints(lhs <= upper, name=f"year2025_energy_max__{alias}")
+
+
+def add_year2025_capacity_targets(n, planning_year, config):
+    """
+    Add 2025 capacity targets for solar and onwind technologies.
+    Constrains installed capacity (p_nom) by carrier to match 2025 targets +/- tolerance.
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+
+    target_year = str(cfg.get("year", 2025))
+    if str(planning_year) != target_year:
+        logger.info(f"Skipping 2025 capacity constraints for {planning_year} (configured for {target_year})")
+        return
+
+    logger.info(f"Adding 2025 capacity constraints for {planning_year}")
+
+    tol   = float(cfg.get("tolerance", 0.15))
+    units = str(cfg.get("units", "GW")).lower()
+    unit_scale = {"mw":1.0, "gw":1e3, "tw":1e6}.get(units, 1e3)
+
+    targets = cfg.get("targets", {})
+
+    # Get extendable generators by carrier
+    ext_gens = n.generators.query("p_nom_extendable")
+    
+    if ext_gens.empty:
+        logger.warning("No extendable generators found for capacity constraints")
+        return
+
+    # Get the capacity variable
+    p_nom = n.model["Generator-p_nom"]
+    
+    for carrier, target in targets.items():
+        if isinstance(target, str) and target.upper().startswith("X"):
+            logger.info(f"Skipping {carrier} (placeholder target '{target}')")
+            continue
+
+        # Find generators matching this carrier
+        carrier_gens = ext_gens[ext_gens.carrier == carrier].index
+        
+        if len(carrier_gens) == 0:
+            logger.warning(f"No extendable generators found for carrier '{carrier}'")
+            continue
+
+        # Sum of p_nom for this carrier
+        lhs = p_nom.loc[carrier_gens].sum()
+        
+        # Add existing non-extendable capacity
+        existing_capacity = n.generators.query(
+            "carrier == @carrier and not p_nom_extendable"
+        ).p_nom.sum()
+        
+        lower = float(target) * (1.0 - tol) * unit_scale - existing_capacity
+        upper = float(target) * (1.0 + tol) * unit_scale - existing_capacity
+
+        logger.info(
+            f"{carrier}: {(lower + existing_capacity)/unit_scale:.2f} ≤ total capacity ≤ "
+            f"{(upper + existing_capacity)/unit_scale:.2f} {units.upper()} "
+            f"(existing: {existing_capacity/unit_scale:.2f} {units.upper()}, "
+            f"new: {lower/unit_scale:.2f}-{upper/unit_scale:.2f} {units.upper()})"
+        )
+        
+        n.model.add_constraints(lhs >= lower, name=f"year2025_capacity_min__{carrier}")
+        n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
+
+
 def extra_functionality(n, snapshots):
     """
     Collects supplementary constraints which will be passed to
@@ -1142,6 +1376,30 @@ def extra_functionality(n, snapshots):
     add_battery_constraints(n)
     add_lossy_bidirectional_link_constraints(n)
 
+    # Temporal clustering storage constraints
+    # Check if temporal clustering is active via period_id in n.temporal_cluster
+    tc_config = config.get("temporal_clustering", {})
+    
+    if tc_config.get("activate", False):
+        logger.info("Adding temporal aggregation storage constraints (Kotzur et al. 2018)")
+        
+        # Get optional parameters from config (with defaults for Pyomo parity)
+        
+        use_dt_in_intra = tc_config.get("use_dt_in_intra", False)
+        include_inflow_in_intra = tc_config.get("include_inflow_in_intra", False)
+        
+        logger.info(f"  use_dt_in_intra: {use_dt_in_intra}")
+        logger.info(f"  include_inflow_in_intra: {include_inflow_in_intra}")
+        
+        temporal_aggregation_storage_constraints(
+            n,
+            use_dt_in_intra=use_dt_in_intra,
+            include_inflow_in_intra=include_inflow_in_intra,
+        )
+    else:
+        logger.info("No temporal clustering detected, skipping temporal storage constraints")
+
+
     if snakemake.config["sector"]["chp"]:
         logger.info("setting CHP constraints")
         add_chp_constraints(n)
@@ -1163,9 +1421,12 @@ def extra_functionality(n, snapshots):
     ):
         if not snakemake.config["policy_config"]["hydrogen"]["is_reference"]:
             logger.info("setting h2 export to monthly greenness constraint")
-            monthly_constraints(n, n_ref)
-        else:
-            logger.info("preparing reference case for additionality constraint")
+            n_ref_local = getattr(n, "n_ref", None)
+            if n_ref_local is not None:
+                monthly_constraints(n, n_ref_local)
+            else:
+                logger.warning("monthly matching requested but n_ref not provided; skipping")
+
 
     elif (
         snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
@@ -1194,7 +1455,23 @@ def extra_functionality(n, snapshots):
         config=n.config if hasattr(n, "config") else snakemake.config,
     )
 
+    add_year2025_generation_band(
+        n,
+        planning_year=snakemake.wildcards.planning_horizons,
+        config=n.config if hasattr(n, "config") else snakemake.config,
+    )
+
     add_co2_sequestration_limit(n, snapshots)
+
+    # Add 2025 capacity targets
+    add_year2025_capacity_targets(
+        n,
+        planning_year=snakemake.wildcards.planning_horizons,
+        config=n.config if hasattr(n, "config") else snakemake.config,
+    )
+
+    logger.info('Model after adding extra functionality:')
+    logger.info(n.model)
 
 
 def solve_network(n, config, solving, **kwargs):
@@ -1214,7 +1491,12 @@ def solve_network(n, config, solving, **kwargs):
 
     # add to network for extra_functionality
     n.config = config
-    n.opts = opts
+    if not hasattr(n, "opts"):
+        if "snakemake" in globals():
+            n.opts = snakemake.wildcards.opts.split("-")
+        else:
+            n.opts = globals().get("opts", [])
+
 
 
     logger.info(f"Network has {len(n.buses)} buses, {len(n.generators)} generators")
@@ -1250,7 +1532,13 @@ def solve_network(n, config, solving, **kwargs):
         logger.warning(f"Found {len(gen_capacity_issues)} generators with p_nom_max < p_nom_min")
         for idx, gen in gen_capacity_issues.iterrows():
             logger.warning(f"  {idx}: p_nom_min={gen.p_nom_min}, p_nom_max={gen.p_nom_max}")
-    
+
+        # Fix the issue by setting p_nom_max to accommodate the minimum requirement
+        logger.info(f"Fixing {len(gen_capacity_issues)} generators with p_nom_max < p_nom_min")
+        for idx, gen in gen_capacity_issues.iterrows():
+            logger.info(f"  {idx}: p_nom_min={gen.p_nom_min}, p_nom_max={gen.p_nom_max} -> setting p_nom_max = p_nom_min * 2")
+        n.generators.loc[gen_capacity_issues.index, "p_nom_max"] = n.generators.loc[gen_capacity_issues.index, "p_nom_min"] * 2
+
     zero_cost_gens = n.generators.query("marginal_cost <= 0 and p_nom_extendable == True")
     if len(zero_cost_gens) > 0:
         logger.warning(f"Found {len(zero_cost_gens)} extendable generators with zero/negative marginal costs")
@@ -1317,12 +1605,13 @@ def solve_network(n, config, solving, **kwargs):
         logger.info(f"Links with bad buses:\n{n.links.loc[links_with_bad_buses]}")
         n.links = n.links.drop(links_with_bad_buses)
         
-        for attr in n.links_t:
+        for attr in ["p0", "p1", "p", "r", "p_min_pu", "p_max_pu", "efficiency", "marginal_cost"]:
             if hasattr(n.links_t, attr):
                 attr_data = getattr(n.links_t, attr)
-                cols_to_remove = links_with_bad_buses.intersection(attr_data.columns)
-                if len(cols_to_remove) > 0:
-                    setattr(n.links_t, attr, attr_data.drop(columns=cols_to_remove))
+                if hasattr(attr_data, "columns"):
+                    cols_to_remove = links_with_bad_buses.intersection(attr_data.columns)
+                    if len(cols_to_remove) > 0:
+                        setattr(n.links_t, attr, attr_data.drop(columns=cols_to_remove))
 
     if skip_iterations:
         logger.info("Solving network without transmission expansion iterations...")
@@ -1332,64 +1621,54 @@ def solve_network(n, config, solving, **kwargs):
         except Exception as e:
             logger.error(f"Optimization failed with exception: {e}")
             status, condition = "error", str(e)
+            raise RuntimeError(f"Optimization failed with exception: {e}") from e
+        
+        logger.info(f"Saving linopy model to {snakemake.output.lpfile.replace('.lp', '.nc')}")
+        try:
+            n.model.to_netcdf(snakemake.output.lpfile.replace('.lp', '.nc'))
+            logger.info("Linopy model saved successfully")
+        except Exception as e:
+            logger.warning(f"Could not save linopy model: {e}")
+        
+        logger.info(f"Saving LP file to {snakemake.output.lpfile}")
+        try:
+            n.model.to_file(snakemake.output.lpfile)
+            logger.info("LP file saved successfully")
+        except Exception as e:
+            logger.warning(f"Could not save LP file: {e}")
     else:
         logger.info("Solving network with transmission expansion iterations...")
-        kwargs["track_iterations"] = (cf_solving.get("track_iterations", False),)
-        kwargs["min_iterations"] = (cf_solving.get("min_iterations", 4),)
-        kwargs["max_iterations"] = (cf_solving.get("max_iterations", 6),)
+        kwargs["track_iterations"] = cf_solving.get("track_iterations", False)
+        kwargs["min_iterations"]   = cf_solving.get("min_iterations", 4)
+        kwargs["max_iterations"]   = cf_solving.get("max_iterations", 6)
+
         try:
-            status, condition = n.optimize.optimize_transmission_expansion_iteratively(
-                **kwargs
-            )
+            kwargs_iter = dict(kwargs)
+            kwargs_iter.pop("log_fn", None)
+            status, condition = optimize_transmission_expansion_iteratively(n, **kwargs_iter)
+
             logger.info(f"Iterative solve result: status='{status}', condition='{condition}'")
         except Exception as e:
             logger.error(f"Iterative optimization failed with exception: {e}")
             status, condition = "error", str(e)
-
-    if status != "ok":  # and not rolling_horizon:
-        logger.warning(
-            f"Solving status '{status}' with termination condition '{condition}'"
-        )
+            raise RuntimeError(f"Iterative optimization failed with exception: {e}") from e
         
         try:
-            if hasattr(n, 'model') and n.model is not None:
-                logger.info("Computing constraint infeasibilities...")
-                infeas = n.model.compute_infeasibilities()
-                if infeas is not None and len(infeas) > 0:
-                    logger.warning(f"Found {len(infeas)} infeasible constraints")
-
-                    for i, (name, value) in enumerate(infeas):
-                        logger.warning(f"  Infeasible constraint {i+1}: {name} = {value}")
-                else:
-                    logger.info("No constraint infeasibilities computed")
-            else:
-                logger.warning("No model available for infeasibility analysis")
+            n.model.to_netcdf(snakemake.output.lpfile.replace('.lp', '.nc'))
+            logger.info("Linopy model saved successfully")
         except Exception as e:
-            logger.error(f"Error during infeasibility analysis: {e}")
-    
-    if "infeasible" in condition or "unbounded" in condition:
-        logger.error("Infeasibility:")
+            logger.warning(f"Could not save linopy model: {e}")
+        
+        logger.info(f"Saving LP file to {snakemake.output.lpfile}")
+        try:
+            n.model.to_file(snakemake.output.lpfile)
+            logger.info("LP file saved successfully")
+        except Exception as e:
+            logger.warning(f"Could not save LP file: {e}")
+        
+    if "infeasible" in condition or "unbounded" in condition or status != 'ok':
         logger.error(f"Solver status: {status}")
         logger.error(f"Termination condition: {condition}")
-        
-        try:
-            logger.info("Computing infeasible constraint labels...")
-            labels = n.model.compute_infeasibilities()
-            logger.info(f"Infeasible constraint count: {len(labels) if labels is not None else 0}")
-            
-            if labels is not None and len(labels) > 0:
-                logger.info("Top 20 most infeasible constraints:")
-                for i, (constraint_name, violation) in enumerate(labels.head(20).items()):
-                    logger.info(f"  {i+1:2d}. {constraint_name}: violation = {violation:.6f}")
-            
-            logger.info("Printing detailed infeasibility information...")
-            n.model.print_infeasibilities()
-            
-        except Exception as e:
-            logger.error(f"Error during infeasibility analysis: {e}")
-        
-        # Try to fix common infeasibility issues
-        logger.info("Attempting to resolve infeasibility by cleaning network components...")
         
         # Remove components with undefined buses first
         buses_to_keep = set(n.buses.index)
@@ -1450,10 +1729,11 @@ def solve_network(n, config, solving, **kwargs):
             n.links = n.links.drop(links_with_bad_buses)
             
             # Clean time series data for removed links
-            for attr_name in dir(n.links_t):
-                if not attr_name.startswith('_'):
+            # Clean time series data for removed links (explicit safe list)
+            for attr_name in ["p0", "p1", "p", "r", "p_min_pu", "p_max_pu", "efficiency", "marginal_cost"]:
+                if hasattr(n.links_t, attr_name):
                     attr_data = getattr(n.links_t, attr_name)
-                    if hasattr(attr_data, 'columns'):
+                    if hasattr(attr_data, "columns"):
                         cols_to_remove = links_with_bad_buses.intersection(attr_data.columns)
                         if len(cols_to_remove) > 0:
                             logger.info(f"Cleaning {attr_name} time series for {len(cols_to_remove)} links")
@@ -1507,25 +1787,10 @@ def solve_network(n, config, solving, **kwargs):
         logger.info(f"Fixed zero-cost generators: {len(zero_cost_gens) if 'zero_cost_gens' in locals() else 0}")
         
         logger.info("Retrying solve with cleaned network...")
-        try:
-            if skip_iterations:
-                status, condition = n.optimize(**kwargs)
-            else:
-                status, condition = n.optimize.optimize_transmission_expansion_iteratively(**kwargs)
-                
-            logger.info(f"Retry result: status='{status}', condition='{condition}'")
-            
-            if status == "ok":
-                return n
-            else:
-                logger.warning(f"Retry still failed: {status} / {condition}")
-        except Exception as e:
-            logger.warning(f"Retry failed with exception: {e}")
-        
-        if kwargs.get("solver_name", "").lower() == "gurobi":
-            logger.info("Trying with different solver settings for Gurobi...")
-            
-            robust_solver_options = {
+
+        logger.info("Setting numeric focus parameters for solver...")
+
+        robust_solver_options = {
                 "NumericFocus": 3,
                 "Method": 2,  # barrier
                 "Crossover": 0,
@@ -1533,44 +1798,35 @@ def solve_network(n, config, solving, **kwargs):
                 "BarConvTol": 1e-3,
                 "FeasibilityTol": 1e-3,
                 "OptimalityTol": 1e-3,
-                "ObjScale": -0.5,
-                "Presolve": 2,  # aggressive presolve
+                "Presolve": 2,
                 "Aggregate": 1,
-                "PreDual": 0,
-                "Threads": kwargs.get("solver_options", {}).get("threads", 12),
+                "Threads": 12,
                 "Seed": 123
             }
-            
-            logger.info(f"Using robust solver options: {robust_solver_options}")
-            
-            kwargs_robust = kwargs.copy()
-            kwargs_robust["solver_options"] = robust_solver_options
-            
-            try:
-                if skip_iterations:
-                    status, condition = n.optimize(**kwargs_robust)
-                else:
-                    status, condition = n.optimize.optimize_transmission_expansion_iteratively(**kwargs_robust)
-                    
-                logger.info(f"Robust solver result: status='{status}', condition='{condition}'")
+        
+        logger.info(f"Using robust solver options: {robust_solver_options}")
+        kwargs_robust = kwargs.copy()
+        kwargs_robust["solver_options"] = robust_solver_options
+
+
+        try:
+            if skip_iterations:
+                status, condition = n.optimize(**kwargs_robust)
+            else:
+                status, condition = optimize_transmission_expansion_iteratively(n, **kwargs_robust)
                 
-                if status == "ok":
-                    logger.info("Successfully resolved infeasibility with robust solver settings!")
-                    return n
-                else:
-                    logger.warning(f"Even robust solver settings failed: {status} / {condition}")
-            except Exception as e:
-                logger.warning(f"Robust solver retry failed with exception: {e}")
+            logger.info(f"Retry result: status='{status}', condition='{condition}'")
+            
+            if status != "ok":
+                logger.error(f"Retry still failed: {status} / {condition}")
+                raise RuntimeError(f"Solving status '{status}' with termination condition '{condition}' after retry")
+                
+        except Exception as e:
+            logger.error(f"Retry failed with exception: {e}")
+            raise RuntimeError(f"Retry failed with exception: {e}") from e
         
-        # If still infeasible, save debug info and raise error
-        logger.error("All infeasibility checks failed")
-        logger.error("Could not resolve infeasibility. Check network consistency.")
-        logger.error(f"Final status: {status}")
-        logger.error(f"Final condition: {condition}")
-        
-        logger.error(f"Final network state: {len(n.buses)} buses, {len(n.generators)} generators, {len(n.loads)} loads, {len(n.stores)} stores, {len(n.links)} links")
-        
-        raise RuntimeError(f"Solving status '{status}' with termination condition '{condition}'")
+        # If we reach here, retry was successful
+        return n
 
     return n
 
@@ -1627,15 +1883,48 @@ if __name__ == "__main__":
     else:
         n_ref = None
 
-    n = prepare_network(n, solve_opts, config=solve_opts)
+    # attach to network so extra_functionality can access safely
+    # (works whether additionality/monthly is on or off)
+    # Will be replaced when we rebuild/modify n later in this file.
+    # We set it again just before solve, after we have the final 'n'.
+
+    n = prepare_network(n, solve_opts)
+    # ensure monthly constraints can access reference network if present
+    n.n_ref = n_ref
+
+    # ---- TSAM: aggregate to typical periods (ONLY if enabled) ----
+    skip = True
+    if skip:
+        logger.info("Temporal clustering in prepare_sector_network")
+    else:
+        temporal_cfg = snakemake.config.get("temporal_clustering", {})
+        if temporal_cfg.get("activate", False):
+            # Guard against accidentally using both nhours and TSAM
+            if solve_opts.get("nhours"):
+                logger.warning("Both 'nhours' and TSAM requested. Proceeding with TSAM; ignoring nhours downsampling semantics.")
+            
+            logger.info("Applying temporal clustering (TSAM) after network preparation...")
+            logger.info(f"TSAM parameters: n_periods={temporal_cfg.get('n_periods', 10)}, hours={temporal_cfg.get('hours', 24)}, method={temporal_cfg.get('clusterMethod', 'hierarchical')}")
+            
+            aggregate_snapshots(
+                n,
+                n_periods=temporal_cfg.get("n_periods", 10),
+                hours=temporal_cfg.get("hours", 24),
+                normed=temporal_cfg.get("normed", True),
+                solver=temporal_cfg.get("solver", "glpk"),
+                extremePeriodMethod=temporal_cfg.get("extremePeriodMethod", "None"),
+                clusterMethod=temporal_cfg.get("clusterMethod", "hierarchical"),
+                predefClusterOrder=None,
+                overwrite_time_dfs=temporal_cfg.get("overwrite_time_dfs", False),
+            )
+            logger.info(f"TSAM aggregation complete. Network now has {len(n.snapshots)} snapshots; period_id persisted.")
 
     n = solve_network(
         n,
         config=snakemake.config,
         solving=snakemake.params.solving,
-        log_fn=snakemake.log.solver,
+        log_fn=_safe_solver_log(snakemake),
     )
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output[0])
-    logger.info(f"Objective function: {n.objective}")
     logger.info(f"Objective constant: {n.objective_constant}")
