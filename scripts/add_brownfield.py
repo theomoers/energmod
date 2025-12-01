@@ -28,6 +28,28 @@ def add_brownfield(n, n_p, year):
     dc_i = n.links[n.links.carrier == "DC"].index
     n.links.loc[dc_i, "p_nom_min"] = n_p.links.loc[dc_i, "p_nom_opt"]
 
+    # Update p_nom_min for extendable generators and links with build_year=0 (e.g., CCGT)
+    # to prevent capacity from shrinking relative to previous horizon
+    for c_name in ["Generator", "Link"]:
+        if c_name == "Generator":
+            component_n = n.generators
+            component_n_p = n_p.generators
+        else:
+            component_n = n.links
+            component_n_p = n_p.links
+        
+        # Find extendable assets with build_year=0 that exist in both networks
+        extendable_zero_build = component_n.index[
+            (component_n.build_year == 0) & 
+            (component_n.p_nom_extendable == True)
+        ]
+        common_assets = extendable_zero_build.intersection(component_n_p.index)
+        
+        if not common_assets.empty:
+            # Set p_nom_min to the optimized capacity from previous horizon
+            component_n.loc[common_assets, "p_nom_min"] = component_n_p.loc[common_assets, "p_nom_opt"].values
+            logger.info(f"Updated p_nom_min for {len(common_assets)} extendable {c_name}s with build_year=0 from previous horizon")
+
     for c in n_p.iterate_components(["Link", "Generator", "Store"]):
         attr = "e" if c.name == "Store" else "p"
 
@@ -60,7 +82,7 @@ def add_brownfield(n, n_p, year):
                 chp_heat[c.df.loc[chp_heat, f"{attr}_nom_opt"] < threshold_chp_heat],
             )
 
-        n_p.mremove(
+        n_p.mremove( # remove assets below threshold
             c.name,
             c.df.index[
                 (c.df[f"{attr}_nom_extendable"] & ~c.df.index.isin(chp_heat))
@@ -232,14 +254,15 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "add_brownfield",
             simpl="",
-            clusters="4",
-            ll="c1",
-            opts="Co2L-4H",
+            clusters="110",
+            ll="copt",
+            opts="1h",
             planning_horizons="2030",
-            sopts="144H",
+            sopts="1h",
+            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate=0.071,
             demand="AB",
-            h2export="120",
+            h2export="10"
         )
 
     logger.info(f"Preparing brownfield from the file {snakemake.input.network_p}")
@@ -257,7 +280,46 @@ if __name__ == "__main__":
 
     add_brownfield(n, n_p, year)
 
+    # Reset capacity of current year assets to 0 and make them extendable
+    # The brownfield constraint will be enforced via imported assets from previous year
+    # Biomass/biogas assets: reset capacity to 0 but keep them non-extendable (resource-limited)
+    for c in n.iterate_components(["Link", "Generator", "Store"]):
+        attr = "e" if c.name == "Store" else "p"
+        current_year_assets = c.df.index[c.df.build_year == year]
+        
+        if not current_year_assets.empty:
+            # Identify biomass/biogas assets
+            biomass_biogas_mask = c.df.carrier.str.contains("biomass|biogas", case=False, na=False)
+            biomass_biogas_current = current_year_assets[biomass_biogas_mask[current_year_assets]]
+            other_current = current_year_assets[~biomass_biogas_mask[current_year_assets]]
+            
+            # Reset biomass/biogas to 0 but keep non-extendable
+            if not biomass_biogas_current.empty:
+                c.df.loc[biomass_biogas_current, f"{attr}_nom"] = 0
+                c.df.loc[biomass_biogas_current, f"{attr}_nom_min"] = 0
+                #c.df.loc[biomass_biogas_current, f"{attr}_nom_extendable"] = False
+                logger.info(f"Reset {len(biomass_biogas_current)} {c.name} biomass/biogas assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0, {attr}_nom_extendable=False")
+            
+            # Reset other assets to 0 and make extendable
+            if not other_current.empty:
+                c.df.loc[other_current, f"{attr}_nom"] = 0
+                c.df.loc[other_current, f"{attr}_nom_min"] = 0
+                c.df.loc[other_current, f"{attr}_nom_extendable"] = True
+                logger.info(f"Reset {len(other_current)} {c.name} assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0, {attr}_nom_extendable=True")
+
+    # Make geothermal and nuclear generators extendable to allow capacity expansion in future years
+    #geothermal_gens = n.generators.index[n.generators.carrier == "geothermal"]
+    #if not geothermal_gens.empty:
+    #    n.generators.loc[geothermal_gens, "p_nom_extendable"] = True
+    #    logger.info(f"Set {len(geothermal_gens)} geothermal generators to p_nom_extendable=True")
+    
+    #nuclear_gens = n.generators.index[n.generators.carrier == "nuclear"]
+    #if not nuclear_gens.empty:
+    #    n.generators.loc[nuclear_gens, "p_nom_extendable"] = True
+    #    logger.info(f"Set {len(nuclear_gens)} nuclear generators to p_nom_extendable=True")
+
     disable_grid_expansion_if_limit_hit(n)
 
-    n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    n.meta.update(dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards))))
+    
     n.export_to_netcdf(snakemake.output[0])

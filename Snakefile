@@ -29,6 +29,45 @@ from retrieve_databundle_light import (
 from pathlib import Path
 
 
+def get_previous_horizon_year(planning_horizons, current_year):
+    """
+    Get the previous horizon year for learning curve state lookup.
+    
+    Args:
+        planning_horizons: List of planning horizon years
+        current_year: Current horizon year
+    
+    Returns:
+        Previous horizon year, or None if current_year is the first horizon
+    """
+    horizons = sorted(planning_horizons)
+    if current_year not in horizons:
+        return None
+    
+    idx = horizons.index(current_year)
+    if idx == 0:
+        return None
+    
+    return horizons[idx - 1]
+
+
+def get_learning_enabled():
+    """
+    Check if learning is enabled in the configuration.
+    
+    Returns:
+        True if learning is enabled, False otherwise
+    """
+    import yaml
+    
+    try:
+        with open("config.learning.yaml", "r") as f:
+            learning_config = yaml.safe_load(f)
+        return learning_config.get("learning", {}).get("enabled", False)
+    except FileNotFoundError:
+        return False
+
+
 HTTP = HTTPRemoteProvider()
 
 copy_default_files()
@@ -798,6 +837,7 @@ if config["augmented_line_connection"].get("add_to_snakefile", False) == True:
             focus_weights=config.get("focus_weights", None),
             global_clustering=config["global_specific"].get("global_clustering", False),
             minimum_clustering_per_countries=config["global_specific"].get("minimum_clustering_per_countries", None),
+            countries_to_merge=config["global_specific"].get("countries_to_merge", None),
             #custom_busmap=config["enable"].get("custom_busmap", False)
         input:
             network="networks/" + RDIR + "elec_s{simpl}.nc",
@@ -887,6 +927,7 @@ if config["augmented_line_connection"].get("add_to_snakefile", False) == False:
             focus_weights=config.get("focus_weights", None),
             global_clustering=config["global_specific"].get("global_clustering", False),
             minimum_clustering_per_countries=config["global_specific"].get("minimum_clustering_per_countries", None),
+            countries_to_merge=config["global_specific"].get("countries_to_merge", None),
         input:
             network="networks/" + RDIR + "elec_s{simpl}.nc",
             country_shapes="resources/" + RDIR + "shapes/country_shapes.geojson",
@@ -1290,6 +1331,7 @@ rule prepare_sector_network:
         water_costs=config["custom_data"]["water_costs"],
         planning_horizons_baseyear=config["scenario"]["planning_horizons"][0],
         extendability=config["global_specific"],
+        temporal_clustering=config["temporal_clustering"],
     input:
         network=RESDIR
         + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_presec.nc",
@@ -1348,6 +1390,7 @@ rule prepare_sector_network:
             + SECDIR
             + "gas_networks/gas_network_elec_s{simpl}_{clusters}.csv"
         ),
+        geothermal_capacity="data/installed-geothermal-capacity.csv",
     output:
         RESDIR
         + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}.nc",
@@ -2397,6 +2440,7 @@ if config["foresight"] == "myopic":
             costs=config["costs"],
             extendability=config["global_specific"],
             baseyear_generation_constraint=config["global_specific"]["baseyear_generation"]["baseyear_generation_constraint"],
+            year2025_generation_constraint=config["global_specific"]["year2025_generation"]["year2025_generation_constraint"],
         input:
             network=RESDIR
             + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
@@ -2418,6 +2462,7 @@ if config["foresight"] == "myopic":
             existing_heating_distribution="resources/"
             + SECDIR
             + "heating/existing_heating_distribution_{demand}_s{simpl}_{clusters}_{planning_horizons}.csv",
+            n_pre_cluster="networks/" + RDIR + "elec_s{simpl}.nc",
         output:
             RESDIR
             + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
@@ -2450,6 +2495,10 @@ if config["foresight"] == "myopic":
     def solved_previous_horizon(w):
         planning_horizons = config["scenario"]["planning_horizons"]
         i = planning_horizons.index(int(w.planning_horizons))
+
+        if i == 0:
+            return []   # <- no previous horizon, no dependency edge
+
         planning_horizon_p = str(planning_horizons[i - 1])
 
         return (
@@ -2458,6 +2507,7 @@ if config["foresight"] == "myopic":
             + planning_horizon_p
             + "_{discountrate}_{demand}_{h2export}export.nc"
         )
+
 
     rule add_brownfield:
         params:
@@ -2504,6 +2554,49 @@ if config["foresight"] == "myopic":
 
     ruleorder: add_existing_baseyear > add_brownfield
 
+    # LEARNING CURVES IMPLEMENTATION
+    
+    rule apply_learning_costs:
+        params:
+            planning_horizons=config["scenario"]["planning_horizons"],
+        input:
+            network=RESDIR
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            network_p=solved_previous_horizon,  # solved network at previous time step - prevents execution for first horizon
+            params="data/learning-data/params/learning_params.csv",  # Static template
+            state=lambda w: (
+                f"{SDIR}learning/state/learning_state_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{get_previous_horizon_year(config['scenario']['planning_horizons'], int(w.planning_horizons))}_{w.discountrate}_{w.demand}_{w.h2export}export.csv"
+                if get_previous_horizon_year(config["scenario"]["planning_horizons"], int(w.planning_horizons)) is not None
+                else "data/learning-data/state/learning_state_2020.csv"  # Initial template
+            ),
+            learning_config="config.learning.yaml",
+            costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
+            basecost="resources/" + RDIR + "costs_2020.csv",
+        output:
+            network=RESDIR
+            + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            cost_log=RESDIR
+            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            pred_state=RESDIR
+            + "learning/prediction_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            cost_params=RESDIR
+            + "learning/cost_params_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+        threads: 1
+        resources:
+            mem_mb=5000,
+        log:
+            RESDIR
+            + "logs/apply_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.log",
+        benchmark:
+            (
+                RESDIR
+                + "benchmarks/apply_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+            )
+        script:
+            "./scripts/apply_learning_costs.py"
+
+    #ruleorder: add_brownfield > apply_learning_costs
+
     rule solve_network_myopic:
         params:
             solving=config["solving"],
@@ -2515,13 +2608,19 @@ if config["foresight"] == "myopic":
             augmented_line_connection=config["augmented_line_connection"],
         input:
             overrides=BASE_DIR + "/data/override_component_attrs",
-            network=RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            # Use learning-enabled network if learning is enabled AND not the first horizon, otherwise use brownfield network
+            network=lambda w: (
+                RESDIR + f"prenetworks-learning/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export.nc"
+                if get_learning_enabled() and get_previous_horizon_year(config["scenario"]["planning_horizons"], int(w.planning_horizons)) is not None
+                else RESDIR + f"prenetworks-brownfield/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export.nc"
+            ),
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             configs=SDIR + "configs/config.yaml",  # included to trigger copy_config rule
         output:
             network=RESDIR
             + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            lpfile=RESDIR
+            + "postnetworks/lpfiles/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.lp",
             # config=RESDIR
             # + "configs/config.elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.yaml",
         shadow:
@@ -2544,6 +2643,72 @@ if config["foresight"] == "myopic":
         script:
             "./scripts/solve_network.py"
 
+    # LEARNING CURVES IMPLEMENTATION
+    
+    rule capture_learning_state:
+        params:
+            planning_horizons=config["scenario"]["planning_horizons"],
+        input:
+            network=RESDIR
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            network_p=solved_previous_horizon,  # solved network at previous time step - prevents execution for first horizon
+            prev_state=lambda w: (
+                f"{SDIR}learning/state/learning_state_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{get_previous_horizon_year(config['scenario']['planning_horizons'], int(w.planning_horizons))}_{w.discountrate}_{w.demand}_{w.h2export}export.csv"
+                if get_previous_horizon_year(config["scenario"]["planning_horizons"], int(w.planning_horizons)) is not None
+                else "data/learning-data/state/learning_state_2020.csv"  # Initial template
+            ),
+            pred_state=RESDIR
+            + "learning/prediction_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            learning_config="config.learning.yaml",
+        output:
+            state=SDIR + "learning/state/learning_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            comparison=RESDIR
+            + "learning/forecast_comparison_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+        threads: 1
+        resources:
+            mem_mb=3000,
+        log:
+            RESDIR
+            + "logs/capture_learning_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.log",
+        benchmark:
+            (
+                RESDIR
+                + "benchmarks/capture_learning_state/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+            )
+        script:
+            "./scripts/capture_learning_state.py"
+
+    rule plot_learning_results:
+        params:
+            planning_horizons=config["scenario"]["planning_horizons"],
+        input:
+            cost_logs=expand(
+                RESDIR
+                + "learning/cost_log_elec_s{{simpl}}_{{clusters}}_l{{ll}}_{{opts}}_{{sopts}}_{planning_horizons}_{{discountrate}}_{{demand}}_{{h2export}}export.csv",
+                planning_horizons=config["scenario"]["planning_horizons"],
+            ),
+            forecast_comparisons=expand(
+                RESDIR
+                + "learning/forecast_comparison_elec_s{{simpl}}_{{clusters}}_l{{ll}}_{{opts}}_{{sopts}}_{planning_horizons}_{{discountrate}}_{{demand}}_{{h2export}}export.csv",
+                planning_horizons=config["scenario"]["planning_horizons"],
+            ),
+            basecost="resources/" + RDIR + "costs_2020.csv",
+        output:
+            cost_trajectories=RESDIR
+            + "learning/plots/cost_trajectories_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+            forecast_comparison=RESDIR
+            + "learning/plots/forecast_comparison_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+            cumulative_deployment=RESDIR
+            + "learning/plots/cumulative_deployment_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+        threads: 1
+        resources:
+            mem_mb=4000,
+        log:
+            RESDIR
+            + "logs/plot_learning_results_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.log",
+        script:
+            "./scripts/plot_learning_results.py"
+
     rule solve_sector_networks_myopic:
         input:
             networks=expand(
@@ -2553,6 +2718,13 @@ if config["foresight"] == "myopic":
                 **config["costs"],
                 **config["export"],
             ),
+            learning_plots=expand(
+                RESDIR
+                + "learning/plots/cost_trajectories_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+                **config["scenario"],
+                **config["costs"],
+                **config["export"],
+            ) if get_learning_enabled() else [],
 
 
 rule run_scenario:
