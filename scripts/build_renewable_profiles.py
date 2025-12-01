@@ -622,6 +622,15 @@ if __name__ == "__main__":
         "disable the corresponding renewable technology"
     )
 
+    # Remove faulty offshore shapes before availability matrix calculation
+    if snakemake.wildcards.technology.startswith("offwind") and snakemake.params.global_specific.get("remove_faulty_offshore_shapes", False):
+        logger.info(f"Original regions length: {len(regions)}")
+        to_remove = [545, 1343]
+        logger.info(f"Removing faulty offshore shapes with indices: {to_remove}. Not relevant for energy model (polar regions)")
+        logger.info(f"Removing regions: {regions.iloc[to_remove][['name', 'geometry']]}")
+        regions = regions.drop(to_remove).reset_index(drop=True)
+        logger.info(f"New regions length: {len(regions)}")
+
     # do not pull up, set_index does not work if geo dataframe is empty
     regions = regions.set_index("name").rename_axis("bus")
 

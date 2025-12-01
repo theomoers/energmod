@@ -75,6 +75,32 @@ def add_existing_renewables(df_agg, n, costs):
     irena = irena.groupby(["Technology", "Country", "Year"]).Capacity.sum()
 
     irena = irena.unstack().reset_index()
+    
+    # Create country-to-cluster mapping from busmap
+    # This ensures capacities from merged countries are preserved
+    n_pre_cluster = pypsa.Network(snakemake.input.n_pre_cluster)
+    bm = pd.read_csv(snakemake.input.busmap)
+    # ensure comparable types: convert busmap Bus ids to strings to match n.buses.index (which are strings)
+    bm['Bus'] = bm['Bus'].astype(str)
+
+    clustered = bm.set_index('Bus').reindex(n_pre_cluster.buses.index)['busmap'].values
+
+    busmapping = pd.DataFrame({
+        "bus": n_pre_cluster.buses.index,
+        "country_before_clustering": n_pre_cluster.buses['country'].values,
+        "clustered_country": clustered
+    })
+
+    country_to_cluster = busmapping.groupby('country_before_clustering')['clustered_country'].first().to_dict()
+    
+    # Also create a mapping from cluster bus to all buses that belong to it in the clustered network
+    # We'll use this to distribute capacity
+    cluster_to_buses = busmapping.groupby('clustered_country')['bus'].apply(set).to_dict()
+    
+    # Get AC/DC buses from the network
+    elec_buses = n.buses.index[n.buses.carrier == "AC"].union(
+        n.buses.index[n.buses.carrier == "DC"]
+    )
 
     for carrier_key, (tech, carrier_label) in tech_map.items():
         df = (
@@ -89,12 +115,27 @@ def add_existing_renewables(df_agg, n, costs):
         # calculate yearly differences
         df.insert(loc=0, value=0.0, column="1999")
         df = df.diff(axis=1).drop("1999", axis=1).clip(lower=0)
+        
+        # Aggregate capacity by cluster country (this preserves capacity from merged countries)
+        df['cluster_country'] = df.index.map(country_to_cluster)
+        
+        # Check for countries in IRENA data but not in network
+        missing_countries = df[df['cluster_country'].isna()].index.tolist()
+        if missing_countries:
+            missing_capacities = df.loc[missing_countries].drop(columns=['cluster_country'])
+            total_missing = missing_capacities.sum(axis=1)
+            logger.warning(f"Found {len(missing_countries)} countries in IRENA {carrier_key} data not in network mapping:")
+            for country in missing_countries:
+                total_cap = total_missing[country]
+                if total_cap > 0:
+                    logger.warning(f"  {country}: {total_cap:.1f} MW total capacity")
+        
+        # Drop countries not in mapping before grouping, and exclude cluster_country column from sum
+        df_to_cluster = df[df['cluster_country'].notna()].copy()
+        df_clustered = df_to_cluster.drop(columns=['cluster_country']).groupby(df_to_cluster['cluster_country']).sum()
 
         # distribute capacities among nodes according to capacity factor
         # weighting with nodal_fraction
-        elec_buses = n.buses.index[n.buses.carrier == "AC"].union(
-            n.buses.index[n.buses.carrier == "DC"]
-        )
         nodal_fraction = pd.Series(0.0, elec_buses)
 
         for country in n.buses.loc[elec_buses, "country"].unique():
@@ -112,9 +153,51 @@ def add_existing_renewables(df_agg, n, costs):
                 n.generators.loc[gens, "bus"]
             ).sum()
 
-        nodal_df = df.loc[n.buses.loc[elec_buses, "country"]]
-        nodal_df.index = elec_buses
-        nodal_df = nodal_df.multiply(nodal_fraction, axis=0)
+        # Use clustered capacity dataframe
+        # For each bus, look up its country's cluster country to get total capacity
+        # Then distribute among all buses of that country weighted by nodal_fraction
+        nodal_df = pd.DataFrame(0.0, index=elec_buses, columns=df_clustered.columns)
+        
+        # Track which cluster countries have been distributed
+        distributed_clusters = set()
+        
+        # Iterate over all cluster countries that have capacity, then find which buses belong to that cluster
+        for cluster_country in df_clustered.index:
+            # The cluster_country (e.g., "AE 0") IS a bus in the post-cluster network
+            # Check if it exists as an elec bus
+            if cluster_country in elec_buses:
+                # This cluster country is itself a bus in the post-cluster network
+                country_buses = [cluster_country]
+            else:
+                countries_for_cluster = [c for c, cc in country_to_cluster.items() if cc == cluster_country]
+                raise ValueError(f"Cluster country {cluster_country} not found in post-cluster elec buses. Original countries mapping to it: {countries_for_cluster}")
+            
+            distributed_clusters.add(cluster_country)
+            
+            # Get nodal fractions for these buses and normalize them to sum to 1 within the country
+            country_nodal_fraction = nodal_fraction.loc[country_buses]
+            total_fraction = country_nodal_fraction.sum()
+            
+            # If total fraction is 0, distribute equally; otherwise normalize
+            if total_fraction > 0:
+                country_nodal_fraction = country_nodal_fraction / total_fraction
+            else:
+                country_nodal_fraction = pd.Series(1.0 / len(country_buses), index=country_buses)
+            
+            # Distribute cluster country capacity among country buses weighted by normalized nodal_fraction
+            for bus in country_buses:
+                nodal_df.loc[bus] = df_clustered.loc[cluster_country] * country_nodal_fraction.loc[bus]
+        
+        # Verify all cluster countries were distributed
+        undistributed_clusters = set(df_clustered.index) - distributed_clusters
+        if undistributed_clusters:
+            undistributed_capacity = df_clustered.loc[list(undistributed_clusters)].sum().sum()
+            error_msg = f"Found {len(undistributed_clusters)} cluster countries in IRENA {carrier_key} data not distributed to any network buses (total: {undistributed_capacity:.1f} MW):\n"
+            for cluster in undistributed_clusters:
+                total_cap = df_clustered.loc[cluster].sum()
+                if total_cap > 0:
+                    error_msg += f"  {cluster}: {total_cap:.1f} MW\n"
+            raise ValueError(error_msg)
 
         for year in nodal_df.columns:
             for node in nodal_df.index:
@@ -286,28 +369,29 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
 
         if generator in ["solar", "onwind", "offwind"]:
             # For renewables, check existing capacity vs external data (irena) for this specific grouping_year
+            # Only process if this grouping_year is at or before the baseyear
+            # (future years don't have existing generators yet)
             existing_renewable_gens = n.generators.index[
                 (n.generators.build_year == grouping_year) & 
                 (n.generators.carrier == carrier_label)
             ]
             
-            if not existing_renewable_gens.empty:
+            if not existing_renewable_gens.empty and grouping_year <= baseyear:
                 logger.info(f"Found {len(existing_renewable_gens)} existing {generator} generators from {grouping_year}, comparing with external data")
                 
                 existing_capacity_by_bus = n.generators.loc[existing_renewable_gens].groupby('bus')['p_nom'].sum()
                 
                 buses_to_adjust = capacity.index.intersection(existing_capacity_by_bus.index)
                 buses_to_add = capacity.index.difference(existing_capacity_by_bus.index)
-#                buses_to_remove = existing_capacity_by_bus.index.difference(capacity.index)
-#                
-#                # Remove existing generators that don't have IRENA
-#                if not buses_to_remove.empty:
-#                    gens_to_remove = existing_renewable_gens[n.generators.loc[existing_renewable_gens, 'bus'].isin(buses_to_remove)]
-#                    logger.debug(f"Removing {len(gens_to_remove)} existing {generator} generators without IRENA data for year {grouping_year}")
-#                    n.mremove("Generator", gens_to_remove)
-#
-#                    existing_renewable_gens = existing_renewable_gens.difference(gens_to_remove)
-#                    existing_capacity_by_bus = existing_capacity_by_bus.drop(buses_to_remove)
+                buses_to_remove = existing_capacity_by_bus.index.difference(capacity.index)
+                
+                # Scale down existing generators that don't have IRENA data (set to 0 instead of removing)
+                if not buses_to_remove.empty:
+                    gens_to_zero = existing_renewable_gens[n.generators.loc[existing_renewable_gens, 'bus'].isin(buses_to_remove)]
+                    total_removed_capacity = n.generators.loc[gens_to_zero, 'p_nom'].sum()
+                    logger.info(f"Setting {len(gens_to_zero)} existing {generator} generators to zero capacity (no IRENA data for year {grouping_year}, total: {total_removed_capacity:.1f} MW)")
+                    n.generators.loc[gens_to_zero, 'p_nom'] = 0.0
+                    n.generators.loc[gens_to_zero, 'p_nom_min'] = 0.0
                 
                 for bus in buses_to_adjust:
                     external_capacity = capacity[bus]
@@ -370,15 +454,47 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
 
                 else:
                     # For non-clustered case, use existing generators as reference for p_max_pu
-                    #p_max_pu = n.generators_t.p_max_pu[
-                    #    capacity.index + f" {generator}{suffix}-{baseyear}"
-                    #]
-
                     ref_cols = new_capacity.index + f" {generator}{suffix}-{baseyear}"
-                    ref = n.generators_t.p_max_pu[ref_cols]
-                    p_max_pu = ref.copy()
-                    p_max_pu.columns = [bus + f" {generator}{suffix}-{grouping_year}"
-                                        for bus in new_capacity.index] 
+                    available_cols = ref_cols.intersection(n.generators_t.p_max_pu.columns)
+                    missing_cols = ref_cols.difference(available_cols)
+                    
+                    if not missing_cols.empty:
+                        logger.warning(f"Missing p_max_pu data for {len(missing_cols)} {generator} buses from baseyear {baseyear}")
+                        logger.debug(f"Missing buses: {list(missing_cols)}")
+                    
+                    if available_cols.empty:
+                        # Fall back to using any available generator of this type
+                        fallback_cols = [c for c in n.generators_t.p_max_pu.columns if f" {generator}{suffix}-" in c]
+                        if fallback_cols:
+                            logger.info(f"Using fallback p_max_pu from {fallback_cols[0]} for {len(new_capacity)} {generator} generators")
+                            p_max_pu = n.generators_t.p_max_pu[fallback_cols[:1]].copy()
+                            p_max_pu = pd.concat([p_max_pu] * len(new_capacity), axis=1)
+                            p_max_pu.columns = [bus + f" {generator}{suffix}-{grouping_year}" for bus in new_capacity.index]
+                        else:
+                            # Ultimate fallback: use 1.0 for all timesteps
+                            logger.warning(f"No p_max_pu reference data found for {generator}, using 1.0 for all timesteps")
+                            p_max_pu = pd.DataFrame(1.0, index=n.snapshots, 
+                                                    columns=[bus + f" {generator}{suffix}-{grouping_year}" for bus in new_capacity.index])
+                    else:
+                        # Use available reference data
+                        ref = n.generators_t.p_max_pu[available_cols]
+                        p_max_pu = ref.copy()
+                        # Map available columns to new capacity buses
+                        bus_mapping = {col: col.replace(f" {generator}{suffix}-{baseyear}", "") for col in available_cols}
+                        p_max_pu.columns = [bus + f" {generator}{suffix}-{grouping_year}" for bus in [bus_mapping[col] for col in available_cols]]
+                        
+                        # For missing buses, use fallback or 1.0
+                        if not missing_cols.empty:
+                            missing_buses = [col.replace(f" {generator}{suffix}-{baseyear}", "") for col in missing_cols]
+                            if available_cols.size > 0:
+                                # Use the first available column as template
+                                template = n.generators_t.p_max_pu[available_cols[0]]
+                                for bus in missing_buses:
+                                    p_max_pu[bus + f" {generator}{suffix}-{grouping_year}"] = template.values
+                            else:
+                                # Use 1.0
+                                for bus in missing_buses:
+                                    p_max_pu[bus + f" {generator}{suffix}-{grouping_year}"] = 1.0
                     
                     names = [bus + name_suffix for bus in new_capacity.index]
 
@@ -772,15 +888,15 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "add_existing_baseyear",
             simpl="",
-            clusters="200",
+            clusters="110",
             ll="copt",
-            opts="3h",
+            opts="1h",
             planning_horizons="2020",
-            sopts="48h",
+            sopts="1h",
             configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate="0.071",
             demand="AB",
-            h2export="10"
+            h2export="0.0"
         )
 
     # configure_logging(snakemake)
@@ -840,7 +956,7 @@ if __name__ == "__main__":
     )
     
     if not baseyear_extendable: # for myopic runs with baseyear <= 2020 (today)
-        for c in n.iterate_components(["Generator"]):
+        for c in n.iterate_components(["Generator", "StorageUnit"]):
             col = "p_nom_extendable"
 
             if col not in c.df.columns:
@@ -862,7 +978,15 @@ if __name__ == "__main__":
         # ensure boolean dtype
         c.df[col] = c.df[col].fillna(False).astype(bool)
 
+        for c in n.iterate_components(["Generator", "Link", "StorageUnit"]):
+            if "build_year" in c.df.columns:
+                assets = c.df.index[c.df.build_year <= baseyear]
+                c.df.loc[assets, "p_nom_min"] = c.df.loc[assets, "p_nom"]
+            else:
+                logger.warning(f"Component {c.name} has no build_year column, cannot set p_nom_min for existing assets")    
+
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_extendable/e_nom_extendable = False")
+        logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_min = p_nom (and e_nom_min = e_nom for storage) to prevent capacity reduction")
 
     # TODO: not implemented in -sec yet
     # if options["heating"]:
@@ -894,7 +1018,10 @@ if __name__ == "__main__":
     # if options.get("cluster_heat_buses", False):
     #     cluster_heat_buses(n)
 
-    n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    # Preserve existing n.meta entries (e.g., temporal_cluster_period_id) before updating
+    if not hasattr(n, 'meta') or n.meta is None:
+        n.meta = {}
+    n.meta.update(dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards))))
 
     # sanitize_carriers(n, snakemake.config)
 

@@ -241,6 +241,7 @@ def distribute_clusters(
     alternative_clustering=False,
     global_clustering=False,
     min_clusters_per_country=None,
+    countries_to_merge=None,
 ):
     """
     Determine the number of clusters per country.
@@ -251,6 +252,9 @@ def distribute_clusters(
         Dictionary mapping country codes to minimum number of clusters.
         Example: {"NG": 5, "ZA": 3} ensures Nigeria gets at least 5 clusters
         and South Africa gets at least 3 clusters.
+    countries_to_merge : list, optional
+        List of country codes that are allowed to have 0 clusters (merged with neighbors).
+        Example: ["LT", "EE", "LV"] allows these countries to be merged with other countries.
     """
 
     year = build_shape_options["year"]
@@ -325,18 +329,14 @@ def distribute_clusters(
 
     # When using alternative clustering (GADM-based), allow fewer clusters than country-subnetwork combinations
     if alternative_clustering:
-        min_clusters = len(n.buses.country.unique())
-        logger.info(f"Alternative clustering: minimum {min_clusters} clusters (one per country)")
+        initial_min_clusters = len(n.buses.country.unique())
+        logger.info(f"Alternative clustering: initial minimum {initial_min_clusters} clusters (one per country)")
     elif global_clustering:
-        min_clusters = len(n.buses.country.unique())
-        logger.info(f"Global clustering: minimum {min_clusters} clusters (one per country)")
+        initial_min_clusters = len(n.buses.country.unique())
+        logger.info(f"Global clustering: initial minimum {initial_min_clusters} clusters (one per country)")
     else:
-        min_clusters = len(N)
-        logger.info(f"Standard clustering: minimum {min_clusters} clusters (one per country-subnetwork combination)")
-    
-    assert (
-        n_clusters >= min_clusters and n_clusters <= N.sum()
-    ), f"Number of clusters must be {min_clusters} <= n_clusters <= {N.sum()} for this selection of countries."
+        initial_min_clusters = len(N)
+        logger.info(f"Standard clustering: initial minimum {initial_min_clusters} clusters (one per country-subnetwork combination)")
 
     if focus_weights is not None:
         total_focus = sum(list(focus_weights.values()))
@@ -364,6 +364,23 @@ def distribute_clusters(
 
     # Set up lower bounds for clusters per country
     lower_bounds = pd.Series(1, index=distribution_factor.index)
+    
+    # Apply countries_to_merge: set minimum to 0 for mergeable countries
+    if countries_to_merge is not None:
+        if not global_clustering:
+            logger.warning(
+                "countries_to_merge is only supported with global_clustering=True. "
+                "Ignoring mergeable countries list."
+            )
+        else:
+            countries_to_merge_set = set(countries_to_merge)
+            for country_code in countries_to_merge_set:
+                if country_code in lower_bounds.index:
+                    lower_bounds.loc[country_code] = 0
+                    logger.info(
+                        f"Country {country_code} is mergeable (minimum clusters = 0)"
+                    )
+            logger.info(f"Total mergeable countries: {len(countries_to_merge_set)}")
     
     if min_clusters_per_country is not None:
         if not global_clustering:
@@ -399,6 +416,15 @@ def distribute_clusters(
                 f"Requested {n_clusters} clusters but minimum clusters per country "
                 f"sum to {total_min_clusters}. Please increase n_clusters or reduce minimums."
             )
+    
+    # Calculate actual minimum clusters based on lower_bounds (after applying countries_to_merge and min_clusters_per_country)
+    min_clusters = int(lower_bounds.sum())
+    logger.info(f"Final minimum clusters required: {min_clusters} (after applying mergeable countries and country-specific minimums)")
+    
+    # Validate n_clusters is within valid range
+    assert (
+        n_clusters >= min_clusters and n_clusters <= N.sum()
+    ), f"Number of clusters must be {min_clusters} <= n_clusters <= {N.sum()} for this selection of countries."
 
     m = linopy.Model()
     clusters = m.add_variables(
@@ -463,6 +489,7 @@ def busmap_for_n_clusters(
     alternative_clustering=False,
     global_clustering=False,
     min_clusters_per_country=None,
+    countries_to_merge=None,
     **algorithm_kwds,
 ):
     if algorithm == "kmeans":
@@ -534,6 +561,7 @@ def busmap_for_n_clusters(
             alternative_clustering=alternative_clustering,
             global_clustering=global_clustering,
             min_clusters_per_country=min_clusters_per_country,
+            countries_to_merge=countries_to_merge,
         )
 
     # TODO Check if `reduce_network()` is used
@@ -567,7 +595,14 @@ def busmap_for_n_clusters(
                 # Global clustering with country only
                 prefix = x.name + " "
 
-        logger.debug(f"Determining busmap for country {prefix[:-1]}")
+        logger.debug(f"Determining busmap for country {prefix[:-1]} with {n_cluster_c} clusters")
+        
+        # Handle countries with 0 clusters (mergeable countries)
+        if n_cluster_c == 0:
+            logger.debug(f"Country {prefix[:-1]} has 0 clusters - buses will be merged with neighbors")
+            # Return NaN values - these will be assigned to nearest neighbor clusters later
+            return pd.Series(np.nan, index=x.index)
+        
         if len(x) == 1:
             return pd.Series(prefix + "0", index=x.index)
         weight = weighting_for_country(n, x)
@@ -601,15 +636,45 @@ def busmap_for_n_clusters(
     # Use only country grouping for global clustering, or country+sub_network otherwise
     groupby_cols = ["country"] if global_clustering else ["country", "sub_network"]
     
-    return (
+    busmap = (
         n.buses.groupby(
             groupby_cols,
             group_keys=False,
         )
         .apply(busmap_for_country, include_groups=False)
         .squeeze(axis=0)
-        .rename("busmap")
     )
+    
+    # Handle buses from countries with 0 clusters (mergeable countries)
+    # These buses need to be assigned to clusters from neighboring countries
+    unassigned_buses = busmap[busmap.isna()].index
+    
+    if len(unassigned_buses) > 0:
+        logger.info(f"Assigning {len(unassigned_buses)} buses from mergeable countries to neighboring clusters")
+        
+        # Get buses that have been assigned to clusters
+        assigned_busmap = busmap.dropna()
+        
+        # For each unassigned bus, find the nearest assigned bus and use its cluster
+        for bus_id in unassigned_buses:
+            bus_coords = n.buses.loc[bus_id, ['x', 'y']].values
+            
+            # Calculate distances to all assigned buses
+            assigned_coords = n.buses.loc[assigned_busmap.index, ['x', 'y']].values
+            distances = np.sqrt(
+                (assigned_coords[:, 0] - bus_coords[0])**2 + 
+                (assigned_coords[:, 1] - bus_coords[1])**2
+            )
+            
+            # Find nearest assigned bus
+            nearest_bus_idx = distances.argmin()
+            nearest_bus = assigned_busmap.index[nearest_bus_idx]
+            
+            # Assign to the same cluster as the nearest bus
+            busmap.loc[bus_id] = assigned_busmap.loc[nearest_bus]
+            logger.debug(f"Bus {bus_id} assigned to cluster {assigned_busmap.loc[nearest_bus]}")
+    
+    return busmap.rename("busmap")
 
 
 def clustering_for_n_clusters(
@@ -634,6 +699,7 @@ def clustering_for_n_clusters(
     focus_weights=None,
     global_clustering=False,
     min_clusters_per_country=None,
+    countries_to_merge=None,
 ):
     line_strategies = aggregation_strategies.get("lines", dict())
     bus_strategies = aggregation_strategies.get("buses", dict())
@@ -660,6 +726,7 @@ def clustering_for_n_clusters(
                 alternative_clustering,
                 global_clustering,
                 min_clusters_per_country,
+                countries_to_merge,
             )
     else:
         busmap = custom_busmap
@@ -837,6 +904,7 @@ if __name__ == "__main__":
     
     # Get minimum clusters per country - only valid when global_clustering is enabled
     min_clusters_per_country = None
+    countries_to_merge = None
     if global_clustering:
         logger.info("Using global clustering: each country gets at least 1 cluster node")
         min_clusters_per_country = snakemake.params.get("minimum_clustering_per_countries", None)
@@ -844,6 +912,14 @@ if __name__ == "__main__":
             logger.info(f"Minimum clusters per country enforced: {min_clusters_per_country}")
         else:
             logger.info("No country-specific minimum clusters set (each country gets at least 1)")
+        
+        # Get countries that are allowed to be merged with others (0 minimum clusters)
+        countries_to_merge = snakemake.params.get("countries_to_merge", None)
+        if countries_to_merge:
+            logger.info(f"Countries allowed to merge with neighbors (0 minimum): {len(countries_to_merge)} countries")
+            logger.info(f"Mergeable countries: {countries_to_merge}")
+        else:
+            logger.info("No mergeable countries specified")
     elif snakemake.params.get("minimum_clustering_per_countries", None):
         logger.warning(
             "minimum_clustering_per_countries is set but global_clustering is disabled. "
@@ -960,6 +1036,7 @@ if __name__ == "__main__":
             focus_weights=focus_weights,
             global_clustering=global_clustering,
             min_clusters_per_country=min_clusters_per_country,
+            countries_to_merge=countries_to_merge,
         )
 
     update_p_nom_max(clustering.network)
