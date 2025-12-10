@@ -28,6 +28,7 @@ from _helpers import (
     safe_divide,
     three_2_two_digits_country,
     two_2_three_digits_country,
+    annuity
 )
 from prepare_transport_data import prepare_transport_data
 from temporal_clustering import aggregate_snapshots
@@ -38,6 +39,226 @@ logger = logging.getLogger(__name__)
 hist_load_scaling = 1.043582
 
 spatial = SimpleNamespace()
+
+
+def load_country_fuel_prices(fuelprices_path, investment_year, costs):
+    """
+    Load country-specific fuel prices from CSV for a given investment year.
+    
+    Parameters
+    ----------
+    fuelprices_path : str
+        Path to the fuel prices CSV file
+    investment_year : int
+        Investment year to filter prices for
+    costs : pd.DataFrame
+        Default costs DataFrame for fallback values
+    
+    Returns
+    -------
+    dict
+        Nested dictionary: {fuel_type: {country_code: price_eur_mwh}}
+    """
+    try:
+        fuel_prices_df = pd.read_csv(fuelprices_path)
+    except FileNotFoundError:
+        logger.warning(f"Fuel prices file not found at {fuelprices_path}. Using global defaults.")
+        return {}
+    
+    # Filter for the investment year
+    year_data = fuel_prices_df[fuel_prices_df['year'] == int(investment_year)]
+    
+    if year_data.empty:
+        logger.warning(f"No fuel price data for year {investment_year}. Using global defaults.")
+        return {}
+    
+    # Build nested dictionary: {fuel: {country: price}}
+    fuel_price_dict = {}
+    for fuel_type in ['oil', 'gas', 'coal']:
+        fuel_data = year_data[year_data['fuel_type'] == fuel_type]
+        fuel_price_dict[fuel_type] = dict(zip(
+            fuel_data['country'],
+            fuel_data['price_eur_mwh']
+        ))
+    
+    logger.info(f"Loaded country-specific fuel prices for year {investment_year}")
+    logger.info(f"  Oil prices: {len(fuel_price_dict.get('oil', {}))} countries")
+    logger.info(f"  Gas prices: {len(fuel_price_dict.get('gas', {}))} countries")
+    logger.info(f"  Coal prices: {len(fuel_price_dict.get('coal', {}))} countries")
+    
+    return fuel_price_dict
+
+
+def load_country_waccs(wacc_path, costs):
+    """
+    Load country-specific WACCs for renewable technologies.
+    
+    Parameters
+    ----------
+    wacc_path : str
+        Path to the WACC CSV file
+    costs : pd.DataFrame
+        Default costs DataFrame for fallback values
+    
+    Returns
+    -------
+    dict
+        Nested dictionary: {technology: {country_code: wacc_decimal}}
+        Technologies: 'solar', 'onwind', 'offwind'
+    """
+    try:
+        wacc_df = pd.read_csv(wacc_path)
+    except FileNotFoundError:
+        logger.warning(f"WACC file not found at {wacc_path}. Using global default discount rate.")
+        return {}
+    
+    # Build nested dictionary: {tech: {country: wacc}}
+    wacc_dict = {}
+    for tech in ['solar', 'onwind', 'offwind']:
+        if tech not in wacc_df.columns:
+            logger.warning(f"Technology '{tech}' not found in WACC file. Using default.")
+            continue
+        
+        # Convert percentage to decimal (e.g., 4.2 -> 0.042)
+        wacc_dict[tech] = dict(zip(
+            wacc_df['country'],
+            wacc_df[tech] / 100.0
+        ))
+    
+    logger.info(f"Loaded country-specific WACCs for renewable technologies")
+    logger.info(f"  Solar WACC: {len(wacc_dict.get('solar', {}))} countries")
+    logger.info(f"  Onwind WACC: {len(wacc_dict.get('onwind', {}))} countries")
+    logger.info(f"  Offwind WACC: {len(wacc_dict.get('offwind', {}))} countries")
+    
+    return wacc_dict
+
+
+def apply_regional_waccs(n, costs, wacc_dict, Nyears):
+    """
+    Apply country-specific WACCs to renewable generators and recalculate capital costs.
+    
+    Only applies to solar, onwind, offwind-ac, and offwind-dc technologies.
+    Other technologies keep their default discount rate from costs.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network with generators to update
+    costs : pd.DataFrame
+        Cost assumptions with default discount rates
+    wacc_dict : dict
+        Country-specific WACCs from load_country_waccs()
+    Nyears : float
+        Number of years for annualization
+    """
+    
+    if not wacc_dict:
+        logger.info("No regional WACC data loaded. Using default discount rates.")
+        return
+    
+    # Map carriers to WACC technology names
+    carrier_to_wacc_tech = {
+        'solar': 'solar',
+        'onwind': 'onwind',
+        'offwind-ac': 'offwind',
+        'offwind-dc': 'offwind',
+    }
+    
+    updated_generators = 0
+    
+    for carrier, wacc_tech in carrier_to_wacc_tech.items():
+        if wacc_tech not in wacc_dict:
+            continue
+        
+        # Get generators with this carrier
+        gen_mask = n.generators.carrier == carrier
+        if not gen_mask.any():
+            continue
+        
+        country_waccs = wacc_dict[wacc_tech]
+        
+        # Get cost parameters for this technology
+        if carrier not in costs.index:
+            logger.warning(f"Carrier '{carrier}' not found in costs. Skipping WACC update.")
+            continue
+        
+        investment = costs.at[carrier, 'investment']
+        lifetime = costs.at[carrier, 'lifetime']
+        fom = costs.at[carrier, 'FOM']
+        default_discount = costs.at[carrier, 'discount rate']
+        
+        # Update each generator based on its country
+        for gen_idx in n.generators.index[gen_mask]:
+            # Extract country code from generator bus name (e.g., "NG 0" -> "NG")
+            bus_name = n.generators.at[gen_idx, 'bus']
+            country_code = str(bus_name).split(" ")[0][:2]
+            
+            # Get country-specific WACC or use default
+            if country_code in country_waccs:
+                wacc = country_waccs[country_code]
+                
+                # Recalculate capital cost with country-specific WACC
+                annuity_factor = annuity(lifetime, wacc) + fom / 100.0
+                new_capital_cost = annuity_factor * investment * Nyears
+                
+                n.generators.at[gen_idx, 'capital_cost'] = new_capital_cost
+                updated_generators += 1
+    
+    logger.info(f"Applied regional WACCs to {updated_generators} renewable generators")
+    logger.info(f"  Updated carriers: {', '.join(carrier_to_wacc_tech.keys())}")
+
+
+def get_fuel_price_by_node(nodes, carrier, costs, fuel_price_dict):
+    """
+    Get fuel prices for each node based on country-specific data.
+    
+    Parameters
+    ----------
+    nodes : pd.Index
+        Node names (e.g., ['NG 0 oil', 'KE 1 oil', ...])
+    carrier : str
+        Fuel carrier type ('oil', 'gas', or 'coal')
+    costs : pd.DataFrame
+        Default costs DataFrame for fallback values
+    fuel_price_dict : dict
+        Nested dictionary from load_country_fuel_prices()
+    
+    Returns
+    -------
+    pd.Series or float
+        Fuel prices indexed by nodes, or single default price if no data
+    """
+    # Default global price
+    default_price = costs.at[carrier, "fuel"]
+    
+    # If no country-specific data, return default for all nodes
+    if not fuel_price_dict or carrier not in fuel_price_dict:
+        return default_price
+    
+    country_prices = fuel_price_dict[carrier]
+    
+    # Extract country codes from node names (format: "XX 0 oil" -> "XX")
+    prices = []
+    missing_countries = set()
+    
+    for node in nodes:
+        # Extract 2-letter country code from node name
+        country_code = str(node).split(" ")[0][:2]
+        
+        if country_code in country_prices:
+            prices.append(country_prices[country_code])
+        else:
+            prices.append(default_price)
+            missing_countries.add(country_code)
+    
+    # Log warning for missing countries
+    if missing_countries:
+        logger.warning(
+            f"Fuel '{carrier}': No country-specific prices found for {sorted(missing_countries)}. "
+            f"Using default price {default_price:.2f} EUR/MWh"
+        )
+    
+    return pd.Series(prices, index=nodes)
 
 import psutil, os
 def print_memory(note=""):
@@ -98,7 +319,7 @@ def add_lifetime_wind_solar(n, costs):
         n.generators.loc[gen_i, "lifetime"] = costs.at[carrier, "lifetime"]
 
 
-def add_carrier_buses(n, carrier, nodes=None):
+def add_carrier_buses(n, carrier, nodes=None, fuel_price_dict=None):
     """
     Add buses to connect e.g. coal, nuclear and oil plants.
     """
@@ -131,13 +352,19 @@ def add_carrier_buses(n, carrier, nodes=None):
         e_initial=e_initial,
     )
 
+    # Use country-specific fuel prices for oil, gas, and coal
+    if carrier in ['oil', 'gas', 'coal'] and fuel_price_dict is not None:
+        marginal_cost = get_fuel_price_by_node(nodes, carrier, costs, fuel_price_dict)
+    else:
+        marginal_cost = costs.at[carrier, "fuel"]
+
     n.madd(
         "Generator",
         nodes,
         bus=nodes,
         p_nom_extendable=True,
         carrier=carrier,
-        marginal_cost=costs.at[carrier, "fuel"],
+        marginal_cost=marginal_cost,
     )
 
 def match_geothermal_capacity_from_csv(n, baseyear, geothermal_csv_path, costs=None, 
@@ -178,7 +405,6 @@ def match_geothermal_capacity_from_csv(n, baseyear, geothermal_csv_path, costs=N
     # Get geothermal generators from network
     geo_gens = n.generators[n.generators.carrier == "geothermal"]
     
-    logger.info(f"Matching geothermal capacity from CSV for year {baseyear}")
     
     # Extract country from generator bus names (format: "XX 0" where XX is 2-digit country code)
     if not geo_gens.empty:
@@ -232,21 +458,15 @@ def match_geothermal_capacity_from_csv(n, baseyear, geothermal_csv_path, costs=N
             n.generators.loc[country_geo_gens.index, 'p_nom'] *= scaling_factor
             n.generators.loc[country_geo_gens.index, 'p_nom_min'] *= scaling_factor
             
-            logger.info(
-                f"  {row['Entity']} ({country_code_2}): {current_capacity:.1f} MW -> {target_capacity_mw:.1f} MW "
-                f"(scaling factor: {scaling_factor:.3f}, {len(country_geo_gens)} generators)"
-            )
             countries_matched += 1
         else:
             logger.warning(
                 f"  {row['Entity']} ({country_code_2}): Current capacity is 0, cannot scale to {target_capacity_mw:.1f} MW"
             )
-    
-    logger.info(f"Matched geothermal capacity for {countries_matched} countries")
+
     
     # Create synthetic generators for countries not in network
     if create_synthetic and countries_not_in_network and costs is not None:
-        logger.info(f"Creating synthetic geothermal generators for {len(countries_not_in_network)} countries not in network")
         
         # Try to load shapefile for centroids
         regions_gdf = None
@@ -319,7 +539,7 @@ def match_geothermal_capacity_from_csv(n, baseyear, geothermal_csv_path, costs=N
         )
 
 def add_generation(
-    n, costs, existing_capacities=0, existing_efficiencies=None, existing_nodes=None
+    n, costs, existing_capacities=0, existing_efficiencies=None, existing_nodes=None, fuel_price_dict=None
 ):
     """
     Adds conventional generation as specified in config.
@@ -330,6 +550,7 @@ def add_generation(
         existing_capacities: dictionary containing installed capacities for conventional_generation technologies
         existing_efficiencies: dictionary containing efficiencies for conventional_generation technologies
         existing_nodes: dictionary containing nodes for conventional_generation technologies
+        fuel_price_dict: dictionary of country-specific fuel prices
 
     Returns:
         _type_: _description_
@@ -344,7 +565,7 @@ def add_generation(
     conventionals = options.get("conventional_generation", fallback)
 
     for generator, carrier in conventionals.items():
-        add_carrier_buses(n, carrier)
+        add_carrier_buses(n, carrier, fuel_price_dict=fuel_price_dict)
         carrier_nodes = vars(spatial)[carrier].nodes
         link_names = spatial.nodes + " " + generator
         n.madd(
@@ -384,6 +605,12 @@ def add_generation(
             efficiency2=costs.at[carrier, "CO2 intensity"],
             lifetime=costs.at[generator, "lifetime"],
         )
+
+        # remove newly added links that have no capacity and are not extendable
+        to_remove = n.links.query(
+            "carrier == @carrier & p_nom == 0 & not p_nom_extendable"
+        ).index
+        n.mremove("Link", to_remove)
 
         # set the "co2_emissions" of the carrier to 0, as emissions are accounted by link efficiency separately (efficiency to 'co2 atmosphere' bus)
         n.carriers.loc[carrier, "co2_emissions"] = 0
@@ -1512,7 +1739,68 @@ def add_co2(n, costs, co2_network):
         )
 
 
-def add_aviation(n, costs, gadm_clustering=False):
+def load_existing_battery_capacities(nodes):
+    """
+    Load existing battery capacities from CSV file and distribute to network nodes.
+    
+    Parameters
+    ----------
+    nodes : pd.Index
+        Network nodes
+    
+    Returns
+    -------
+    dict
+        Dictionary with 'e_nom' (energy capacity in MWh) and 'p_nom' (power capacity in MW) as pd.Series
+    """
+    battery_csv_path = snakemake.input.get("battery_capacities", None)
+
+    try:
+        battery_df = pd.read_csv(battery_csv_path, index_col=0)
+    except FileNotFoundError:
+        logger.warning(f"Battery capacity file not found at {battery_csv_path}. Setting all capacities to 0.")
+        return {
+            'e_nom': pd.Series(0.0, index=nodes),
+            'p_nom': pd.Series(0.0, index=nodes)
+        }
+    
+    # Initialize capacity series with zeros
+    e_nom = pd.Series(0.0, index=nodes)
+    p_nom = pd.Series(0.0, index=nodes)
+    
+    # Extract country codes from node names (format: "XX 0" where XX is 2-digit country code)
+    node_countries = pd.Series({node: node.split()[0][:2] for node in nodes})
+    
+    # Count nodes per country
+    nodes_per_country = node_countries.value_counts()
+    
+    # Distribute battery capacity equally among nodes in each country
+    for country_code, node_count in nodes_per_country.items():
+        if country_code in battery_df.index:
+            # Get capacity for this country and divide equally among its nodes
+            country_e_nom = battery_df.loc[country_code, 'capa_2020'] / node_count  
+            country_p_nom = battery_df.loc[country_code, 'power_2020_MW'] / node_count 
+            
+            # Assign to all nodes in this country
+            country_nodes = node_countries[node_countries == country_code].index
+            e_nom.loc[country_nodes] = country_e_nom
+            p_nom.loc[country_nodes] = country_p_nom
+            
+            logger.info(f"Added {battery_df.loc[country_code, 'capa_2020']:.1f} MWh (store) / {battery_df.loc[country_code, 'power_2020_MW']:.1f} MW (power) battery capacity for {country_code} ({node_count} nodes)")
+        else:
+            logger.debug(f"No battery data for country {country_code}")
+    
+    total_e = e_nom.sum()
+    total_p = p_nom.sum()
+    logger.info(f"Total existing battery capacity: {total_e:.1f} MWh energy, {total_p:.1f} MW power across {len(nodes)} nodes")
+    
+    return {'e_nom': e_nom, 'p_nom': p_nom}
+
+
+def add_aviation(n, cost, gadm_clustering=False):
+    # Load data required for aviation and navigation
+    # TODO follow the same structure as land transport and heat
+
     all_aviation = ["total international aviation", "total domestic aviation"]
 
     aviation_ctry_TWh = energy_totals.loc[:, all_aviation].sum(axis=1)
@@ -1581,14 +1869,15 @@ def add_aviation(n, costs, gadm_clustering=False):
         ).fillna(0.0)
         co2_MWh = float((energy_by_country_MWh * domestic_to_total.reindex(energy_by_country_MWh.index).fillna(0.0)).sum())
 
-    co2 = co2_MWh * float(costs.at["oil", "CO2 intensity"])  # tCO2 (since intensity is tCO2/MWh_th)
-
-    n.add(
-        "Load",
+    # Use helper function for proper temporal weighting
+    add_emissions_from_weighted_energy(
+        n,
         "aviation oil emissions",
-        bus="co2 atmosphere",
-        carrier="oil emissions",
-        p_set=-co2,
+        p_set_by_bus,
+        costs.at["oil", "CO2 intensity"],
+        "co2 atmosphere",
+        "oil emissions",
+        flat=True
     )
 
 
@@ -1607,15 +1896,21 @@ def add_storage(n, costs):
         y=n.buses.loc[list(spatial.nodes)].y.values,
     )
 
+    # Load existing battery capacities from CSV
+    battery_data = load_existing_battery_capacities(spatial.nodes)
+    
     n.madd(
         "Store",
         spatial.nodes + " battery",
         bus=spatial.nodes + " battery",
         e_cyclic=True,
         e_nom_extendable=True,
+        e_nom=battery_data['e_nom'].values,
+        e_nom_min=battery_data['e_nom'].values,
         carrier="battery",
         capital_cost=costs.at["battery storage", "fixed"],
         lifetime=costs.at["battery storage", "lifetime"],
+        build_year=0,  # Will be set to baseyear in add_existing_baseyear.py
     )
 
     n.madd(
@@ -1627,7 +1922,10 @@ def add_storage(n, costs):
         efficiency=costs.at["battery inverter", "efficiency"] ** 0.5,
         capital_cost=costs.at["battery inverter", "fixed"],
         p_nom_extendable=True,
+        p_nom=battery_data['p_nom'].values,
+        p_nom_min=battery_data['p_nom'].values,
         lifetime=costs.at["battery inverter", "lifetime"],
+        build_year=0,  # Will be set to baseyear in add_existing_baseyear.py
     )
 
     n.madd(
@@ -1639,7 +1937,10 @@ def add_storage(n, costs):
         efficiency=costs.at["battery inverter", "efficiency"] ** 0.5,
         marginal_cost=options["marginal_cost_storage"],
         p_nom_extendable=True,
+        p_nom=battery_data['p_nom'].values,
+        p_nom_min=battery_data['p_nom'].values,
         lifetime=costs.at["battery inverter", "lifetime"],
+        build_year=0,  # Will be set to baseyear in add_existing_baseyear.py
     )
 
 
@@ -1684,7 +1985,7 @@ def h2_hc_conversions(n, costs):
         )
 
 
-def add_shipping(n, costs, gadm_clustering=False):
+def add_shipping(n, costs, gadm_clustering=False, fuel_price_dict=None):
     ports = pd.read_csv(
         snakemake.input.ports, index_col=None, keep_default_na=False
     ).squeeze()
@@ -1694,7 +1995,7 @@ def add_shipping(n, costs, gadm_clustering=False):
 
     all_navigation = ["total international navigation", "total domestic navigation"]
 
-    navigation_ctry_TWh = energy_totals.loc[:, all_navigation].sum(axis=1)
+    navigation_demand = energy_totals.loc[countries, all_navigation].sum(axis=1)
 
     efficiency = (
         options["shipping_average_efficiency"] / costs.at["fuel cell", "efficiency"]
@@ -1705,49 +2006,31 @@ def add_shipping(n, costs, gadm_clustering=False):
         options["shipping_hydrogen_share"], demand_sc + "_" + str(investment_year)
     )
 
-    if gadm_clustering:
-        # For alternative clustering, use simplified assignment (one node per country)
-        ports = locate_bus_alt_clust(
-            ports,
-            countries,
-            gadm_layer_id,
-            snakemake.input.shapes_path,
-            snakemake.params.alternative_clustering,
-        ).set_index("gadm_{}".format(gadm_layer_id))
-    else:
-        ports = locate_bus(
-            ports,
-            countries,
-            gadm_layer_id,
-            snakemake.input.shapes_path,
-            snakemake.params.alternative_clustering,
-        ).set_index("gadm_{}".format(gadm_layer_id))
+    ports = locate_bus(
+        ports,
+        countries,
+        gadm_layer_id,
+        snakemake.input.shapes_path,
+        snakemake.params.alternative_clustering,
+    ).set_index("gadm_{}".format(gadm_layer_id))
 
-    ports["fraction_ctry"] = ports.groupby("country")["fraction"].transform(
-        lambda s: s / s.sum() if s.sum() > 0 else 0.0
-    )
-
-    W = float(n.snapshot_weightings.generators.sum())  # total weighted hours
-    SCALE = 1e6  # TWh -> MWh
-
-    ports["country_TWh"] = ports["country"].map(navigation_ctry_TWh).fillna(0.0)
+    ind = pd.DataFrame(n.buses.index[n.buses.carrier == "AC"])
+    ind = ind.set_index(n.buses.index[n.buses.carrier == "AC"])
 
     ports["p_set"] = (
         shipping_hydrogen_share
-        * ports["fraction_ctry"]
-        * ports["country_TWh"]
+        * ports["fraction"]
+        * ports["country"].map(navigation_demand)
         * efficiency
-        * SCALE
-        / W
-    )
+        * 1e6
+        / 8760
+        # TODO double check the use of efficiency
+    )  # TODO use real data here
 
-    # Aggregate ports by index to handle potential duplicates
-    ports_aggregated = ports.groupby(ports.index)["p_set"].sum().to_frame()
-    
-    ind = pd.DataFrame(index=n.buses.index[n.buses.carrier == "AC"])
-    # keep only p_set for grouping; concat ensures all AC buses exist
-    to_group = pd.concat([ports_aggregated[["p_set"]], ind], axis=1).fillna(0.0)
-    p_set_by_bus = to_group.groupby(to_group.index)["p_set"].sum()
+    ports = pd.concat([ports, ind]).drop("Bus", axis=1)
+
+    # ports = ports.fillna(0.0)
+    ports = ports.groupby(ports.index).sum()
 
     if options["shipping_hydrogen_liquefaction"]:
         n.madd(
@@ -1785,26 +2068,19 @@ def add_shipping(n, costs, gadm_clustering=False):
             suffix=" H2 for shipping",
             bus=shipping_bus,
             carrier="H2 for shipping",
-            p_set=p_set_by_bus,
+            p_set=ports["p_set"],
         )
 
     if shipping_hydrogen_share < 1:
         shipping_oil_share = 1 - shipping_hydrogen_share
 
-        ports["p_set_oil"] = (
+        ports["p_set"] = (
             shipping_oil_share
-            * ports["fraction_ctry"]
-            * ports["country_TWh"]
-            * SCALE
-            / W
+            * ports["fraction"]
+            * ports["country"].map(navigation_demand)
+            * 1e6
+            / 8760
         )
-
-        # Aggregate ports by index for oil demand to handle potential duplicates
-        ports_oil_aggregated = ports.groupby(ports.index)["p_set_oil"].sum().to_frame()
-
-        # Aggregate oil demand by bus
-        to_group_oil = pd.concat([ports_oil_aggregated[["p_set_oil"]], ind], axis=1).fillna(0.0)
-        p_set_oil_by_bus = to_group_oil.groupby(to_group_oil.index)["p_set_oil"].sum()
 
         n.madd(
             "Load",
@@ -1812,26 +2088,22 @@ def add_shipping(n, costs, gadm_clustering=False):
             suffix=" shipping oil",
             bus=spatial.oil.nodes,
             carrier="shipping oil",
-            p_set=p_set_oil_by_bus,
+            p_set=ports["p_set"],
         )
 
-        # need to convert back to MWh for total energy
-        bus_countries = n.buses.loc[n.buses.carrier == "AC", "country"]
-        bus_energy_MWh = (p_set_oil_by_bus * W).reindex(bus_countries.index).fillna(0.0)
-        energy_by_country_MWh = bus_energy_MWh.groupby(bus_countries).sum()
-
         if snakemake.params.sector_options["international_bunkers"]:
-            # Count all navigation (domestic + international)
-            co2_MWh = float(energy_by_country_MWh.sum())
+            co2 = ports["p_set"].sum() * costs.at["oil", "CO2 intensity"]
         else:
-            # Apply domestic share per country
-            domestic_to_total = (
-                energy_totals["total domestic navigation"] /
-                (energy_totals["total international navigation"] + energy_totals["total domestic navigation"])
-            ).fillna(0.0)
-            co2_MWh = float((energy_by_country_MWh * domestic_to_total.reindex(energy_by_country_MWh.index).fillna(0.0)).sum())
+            domestic_to_total = energy_totals["total domestic navigation"] / (
+                energy_totals["total domestic navigation"]
+                + energy_totals["total international navigation"]
+            )
 
-        co2 = co2_MWh * float(costs.at["oil", "CO2 intensity"])  # tCO2 (since intensity is tCO2/MWh_th)
+            co2 = (
+                ports["p_set"].sum()
+                * domestic_to_total
+                * costs.at["oil", "CO2 intensity"]
+            ).sum()
 
         n.add(
             "Load",
@@ -1841,8 +2113,6 @@ def add_shipping(n, costs, gadm_clustering=False):
             p_set=-co2,
         )
 
-    # Add oil infrastructure if not already present
-    # Oil generator provides unlimited oil supply at marginal cost to meet demand from shipping and other sectors
     if "oil" not in n.buses.carrier.unique():
         n.madd("Bus", spatial.oil.nodes, location=spatial.oil.locations, carrier="oil")
     if "oil" not in n.stores.carrier.unique():
@@ -1857,13 +2127,19 @@ def add_shipping(n, costs, gadm_clustering=False):
         )
 
     if "oil" not in n.generators.carrier.unique():
+        # Use country-specific fuel prices for oil
+        if fuel_price_dict is not None and 'oil' in fuel_price_dict:
+            oil_marginal_cost = get_fuel_price_by_node(spatial.oil.nodes, 'oil', costs, fuel_price_dict)
+        else:
+            oil_marginal_cost = costs.at["oil", "fuel"]
+        
         n.madd(
             "Generator",
             spatial.oil.nodes,
             bus=spatial.oil.nodes,
             p_nom_extendable=True,
             carrier="oil",
-            marginal_cost=costs.at["oil", "fuel"],
+            marginal_cost=oil_marginal_cost,
         )
 
 
@@ -2031,34 +2307,32 @@ def add_industry(n, costs):
     co2_release = [" naphtha for industry"]
     # check land transport
 
-    co2 = (
-        n.loads.loc[spatial.nodes + co2_release, "p_set"].sum()
-        * costs.at["oil", "CO2 intensity"]
-        # - industrial_demand["process emission from feedstock"].sum()
-        # / 8760
-    )
-
-    n.add(
-        "Load",
+    # Get p_set for industry oil (already a scalar per node, not time-varying)
+    p_set_industry_oil = industrial_demand["oil"] / W
+    
+    # Use helper function for proper temporal weighting
+    add_emissions_from_weighted_energy(
+        n,
         "industry oil emissions",
-        bus="co2 atmosphere",
-        carrier="industry oil emissions",
-        p_set=-co2,
+        p_set_industry_oil,
+        costs.at["oil", "CO2 intensity"],
+        "co2 atmosphere",
+        "industry oil emissions",
+        flat=True
     )
 
-    co2 = (
-        industrial_demand["coal"].sum()
-        * costs.at["coal", "CO2 intensity"]
-        # - industrial_demand["process emission from feedstock"].sum()
-        / W
-    )
-
-    n.add(
-        "Load",
+    # Get p_set for industry coal
+    p_set_industry_coal = industrial_demand["coal"] / W
+    
+    # Use helper function for proper temporal weighting
+    add_emissions_from_weighted_energy(
+        n,
         "industry coal emissions",
-        bus="co2 atmosphere",
-        carrier="industry coal emissions",
-        p_set=-co2,
+        p_set_industry_coal,
+        costs.at["coal", "CO2 intensity"],
+        "co2 atmosphere",
+        "industry coal emissions",
+        flat=True
     )
 
     ########################################################### CARRIER = HEAT
@@ -2341,27 +2615,27 @@ def add_land_transport(n, costs):
             )
         ice_efficiency = options["transport_internal_combustion_efficiency"]
 
-        p_set_oil_base = ice_share / ice_efficiency * transport[spatial.nodes]
-        logger.info(f"Scaling land transport oil load by {hist_load_scaling}: original sum = {p_set_oil_base.sum().sum():.2f} MW, scaled sum = {(p_set_oil_base * hist_load_scaling).sum().sum():.2f} MW")
-        
         n.madd(
             "Load",
             spatial.nodes,
             suffix=" land transport oil",
             bus=spatial.oil.nodes,
             carrier="land transport oil",
-            p_set=p_set_oil_base * hist_load_scaling,
+            p_set=ice_share / ice_efficiency * transport[spatial.nodes],
         )
 
-        # Use the robust emissions helper for land transport oil
-        p_set_oil_transport = p_set_oil_base * hist_load_scaling
+        # Get p_set for land transport oil (already time-varying DataFrame)
+        p_set_transport_oil = ice_share / ice_efficiency * transport[spatial.nodes]
+        
+        # Use helper function for proper temporal weighting
         add_emissions_from_weighted_energy(
             n,
             "land transport oil emissions",
-            p_set_oil_transport,
+            p_set_transport_oil,
             costs.at["oil", "CO2 intensity"],
             "co2 atmosphere",
-            "land transport oil emissions"
+            "land transport oil emissions",
+            flat=True
         )
 
 
@@ -2810,14 +3084,15 @@ def add_services(n, costs):
         p_set=p_set_oil,
     )
 
-    # Use robust emissions calculation for services oil
+    # Use helper function for proper temporal weighting
     add_emissions_from_weighted_energy(
         n,
         "services oil emissions",
         p_set_oil,
         costs.at["oil", "CO2 intensity"],
         "co2 atmosphere",
-        "oil emissions"
+        "oil emissions",
+        flat=True
     )
 
     p_set_gas = p_set_from_scaling(
@@ -2833,14 +3108,15 @@ def add_services(n, costs):
         p_set=p_set_gas,
     )
 
-    # Use robust emissions calculation for services gas
+    # Use helper function for proper temporal weighting
     add_emissions_from_weighted_energy(
         n,
         "services gas emissions",
         p_set_gas,
         costs.at["gas", "CO2 intensity"],
         "co2 atmosphere",
-        "gas emissions"
+        "gas emissions",
+        flat=True
     )
 
 
@@ -3012,14 +3288,15 @@ def add_residential(n, costs):
         p_set=p_set_oil,
     )
 
-    # Use robust emissions calculation for residential oil
+    # Use helper function for proper temporal weighting
     add_emissions_from_weighted_energy(
         n,
         "residential oil emissions",
         p_set_oil,
         costs.at["oil", "CO2 intensity"],
         "co2 atmosphere",
-        "oil emissions"
+        "oil emissions",
+        flat=True
     )
     n.madd(
         "Load",
@@ -3039,14 +3316,15 @@ def add_residential(n, costs):
         p_set=p_set_gas,
     )
 
-    # Use robust emissions calculation for residential gas
+    # Use helper function for proper temporal weighting
     add_emissions_from_weighted_energy(
         n,
         "residential gas emissions",
         p_set_gas,
         costs.at["gas", "CO2 intensity"],
         "co2 atmosphere",
-        "gas emissions"
+        "gas emissions",
+        flat=True
     )
 
     for country in countries:
@@ -3477,6 +3755,19 @@ if __name__ == "__main__":
         snakemake.params.costs["custom_future_exchange_rate"],
     )
 
+    # Load country-specific fuel prices
+    fuel_price_dict = load_country_fuel_prices(
+        snakemake.input.fuelprices,
+        investment_year,
+        costs
+    )
+
+    # Load country-specific WACCs for renewable technologies
+    wacc_dict = load_country_waccs(
+        snakemake.input.waccs,
+        costs
+    )
+
     # Define spatial for biomass and co2. They require the same spatial definition
     elec_nodes = set(n.buses.index[n.buses.carrier == "AC"])
     pop_layout = pop_layout[pop_layout.index.isin(elec_nodes)]
@@ -3485,8 +3776,6 @@ if __name__ == "__main__":
 
     if snakemake.params.foresight in ["myopic", "perfect"]:
         add_lifetime_wind_solar(n, costs)
-
-    # TODO logging
 
     nodal_energy_totals = pd.read_csv(
         snakemake.input.nodal_energy_totals,
@@ -3570,7 +3859,7 @@ if __name__ == "__main__":
     # remove conventional generators built in elec-only model
     remove_elec_base_techs(n)
 
-    add_generation(n, costs, existing_capacities, existing_efficiencies, existing_nodes)
+    add_generation(n, costs, existing_capacities, existing_efficiencies, existing_nodes, fuel_price_dict)
 
     # remove H2 and battery technologies added in elec-only model
     remove_carrier_related_components(n, carriers_to_drop=["H2", "battery"])
@@ -3587,7 +3876,7 @@ if __name__ == "__main__":
 
     add_industry(n, costs)
 
-    add_shipping(n, costs, gadm_clustering=snakemake.params.alternative_clustering)
+    add_shipping(n, costs, gadm_clustering=snakemake.params.alternative_clustering, fuel_price_dict=fuel_price_dict)
 
     # Add_aviation runs with dummy data
     add_aviation(n, costs, gadm_clustering=snakemake.params.alternative_clustering)
@@ -3675,26 +3964,25 @@ if __name__ == "__main__":
     match_geothermal_capacity_from_csv(
         n, 2020, geothermal_csv, 
         costs=costs,
-        create_synthetic=False,
         regions_shapefile=regions_shapefile
     ) # based on owid data
     
 
-    # Match historical data
     s_factor = ((4348 - 708.68) / 2056.70) * 0.939688716
     n.storage_units.loc[n.storage_units.carrier == "hydro", "max_hours"] *= s_factor
     n.storage_units_t.inflow *= s_factor
-    logger.info(f"Match historical hydro flow data to match IEA by factor {s_factor}")
+    logger.info(f"Scaling inflow data to match IEA historical hydro data. Scaling by {s_factor}")
 
-    # Match historical data
     onwind_factor = (1484 / 1295)
     onwind_idx = n.generators[n.generators.carrier == 'onwind'].index
     onwind_time_idx = n.generators_t.p_max_pu.columns
     onwind_idx = onwind_idx.intersection(onwind_time_idx)
     n.generators_t.p_max_pu[onwind_idx] *= onwind_factor
-    logger.info(f"Match historical onwind availability to match IRENA data by factor {onwind_factor}")
+    logger.info(f"Scaling onwind p_max_pu to match IRENA data by factor {onwind_factor}")
 
-    n.links.loc[n.links.carrier == 'OCGT', 'p_nom'] *= 2
+    # Apply country-specific WACCs to ALL renewable generators (must be last to catch all generators)
+    logger.info("Applying regional WACCs to all renewable generators...")
+    apply_regional_waccs(n, costs, wacc_dict, Nyears)
 
     n.export_to_netcdf(snakemake.output[0])
 

@@ -1,0 +1,175 @@
+country,region,onwind,offwind,solar
+AD,Europe,3.7,4.7,4.2
+AE,Asia,3.8,6.2,4.0
+AF,Africa,10.8,12.0,12.0
+AL,Europe,3.7,4.7,4.2
+AM,Asia,3.8,6.2,4.0
+AO,Africa,10.8,12.0,12.0
+AR,South America,7.7,7.7,7.7
+AT,Europe,3.7,4.7,4.2
+AU,Oceania,3.9,3.9,3.9
+AZ,Asia,3.8,6.2,4.0
+BA,Europe,3.7,4.7,4.2
+BD,Asia,3.8,6.2,4.0
+BE,Europe,3.7,4.7,4.2
+BF,Africa,10.8,12.0,12.0
+BG,Europe,3.7,4.7,4.2
+BH,Asia,3.8,6.2,4.0
+BI,Africa,10.8,12.0,12.0
+BJ,Africa,10.8,12.0,12.0
+BN,Asia,3.8,6.2,4.0
+BO,South America,7.7,7.7,7.7
+BR,South America,7.7,7.7,7.7
+BS,North America,4.1,5.4,5.5
+BT,Asia,3.8,6.2,4.0
+BW,Africa,10.8,12.0,12.0
+BY,Europe,3.7,4.7,4.2
+BZ,North America,4.1,5.4,5.5
+CA,North America,4.1,5.4,5.5
+CD,Africa,10.8,12.0,12.0
+CF,Africa,10.8,12.0,12.0
+CG,Africa,10.8,12.0,12.0
+CH,Europe,3.7,4.7,4.2
+CI,Africa,10.8,12.0,12.0
+CL,South America,7.7,7.7,7.7
+CM,Africa,10.8,12.0,12.0
+CN,Asia,3.8,6.2,4.0
+CO,South America,7.7,7.7,7.7
+CR,North America,4.1,5.4,5.5
+CU,North America,4.1,5.4,5.5
+CY,Europe,3.7,4.7,4.2
+CZ,Europe,3.7,4.7,4.2
+DE,Europe,3.7,4.7,4.2
+DJ,Africa,10.8,12.0,12.0
+DK,Europe,3.7,4.7,4.2
+DO,North America,4.1,5.4,5.5
+DZ,Africa,10.8,12.0,12.0
+EC,South America,7.7,7.7,7.7
+EE,Europe,3.7,4.7,4.2
+EG,Africa,10.8,12.0,12.0
+EH,Africa,10.8,12.0,12.0
+ER,Africa,10.8,12.0,12.0
+ES,Europe,3.7,4.7,4.2
+ET,Africa,10.8,12.0,12.0
+FI,Europe,3.7,4.7,4.2
+FR,Europe,3.7,4.7,4.2
+GA,Africa,10.8,12.0,12.0
+GB,Europe,3.7,4.7,4.2
+GE,Asia,3.8,6.2,4.0
+GF,South America,7.7,7.7,7.7
+GH,Africa,10.8,12.0,12.0
+GL,North America,4.1,5.4,5.5
+GM,Africa,10.8,12.0,12.0
+GN,Africa,10.8,12.0,12.0
+GQ,Africa,10.8,12.0,12.0
+GR,Europe,3.7,4.7,4.2
+GT,North America,4.1,5.4,5.5
+GW,Africa,10.8,12.0,12.0
+GY,South America,7.7,7.7,7.7
+HN,North America,4.1,5.4,5.5
+HR,Europe,3.7,4.7,4.2
+HT,North America,4.1,5.4,5.5
+HU,Europe,3.7,4.7,4.2
+ID,Asia,3.8,6.2,4.0
+IE,Europe,3.7,4.7,4.2
+IL,Asia,3.8,6.2,4.0
+IN,Asia,3.8,6.2,4.0
+IQ,Asia,3.8,6.2,4.0
+IR,Asia,3.8,6.2,4.0
+IS,Europe,3.7,4.7,4.2
+IT,Europe,3.7,4.7,4.2
+JM,North America,4.1,5.4,5.5
+JO,Asia,3.8,6.2,4.0
+JP,Asia,3.8,6.2,4.0
+KE,Africa,10.8,12.0,12.0
+KG,Asia,3.8,6.2,4.0
+KH,Asia,3.8,6.2,4.0
+KP,Asia,3.8,6.2,4.0
+KR,Asia,3.8,6.2,4.0
+KW,Asia,3.8,6.2,4.0
+KZ,Asia,3.8,6.2,4.0
+LA,Asia,3.8,6.2,4.0
+LB,Asia,3.8,6.2,4.0
+LK,Asia,3.8,6.2,4.0
+LR,Africa,10.8,12.0,12.0
+LS,Africa,10.8,12.0,12.0
+LT,Europe,3.7,4.7,4.2
+LU,Europe,3.7,4.7,4.2
+LV,Europe,3.7,4.7,4.2
+LY,Africa,10.8,12.0,12.0
+MA,Africa,10.8,12.0,12.0
+MD,Europe,3.7,4.7,4.2
+ME,Europe,3.7,4.7,4.2
+MG,Africa,10.8,12.0,12.0
+MK,Europe,3.7,4.7,4.2
+ML,Africa,10.8,12.0,12.0
+MM,Asia,3.8,6.2,4.0
+MN,Asia,3.8,6.2,4.0
+MR,Africa,10.8,12.0,12.0
+MT,Europe,3.7,4.7,4.2
+MW,Africa,10.8,12.0,12.0
+MX,North America,4.1,5.4,5.5
+MY,Asia,3.8,6.2,4.0
+MZ,Africa,10.8,12.0,12.0
+NA,Africa,10.8,12.0,12.0
+NE,Africa,10.8,12.0,12.0
+NG,Africa,10.8,12.0,12.0
+NI,North America,4.1,5.4,5.5
+NL,Europe,3.7,4.7,4.2
+NO,Europe,3.7,4.7,4.2
+NP,Asia,3.8,6.2,4.0
+NZ,Oceania,3.9,3.9,3.9
+OM,Asia,3.8,6.2,4.0
+PA,North America,4.1,5.4,5.5
+PE,South America,7.7,7.7,7.7
+PG,Oceania,3.9,3.9,3.9
+PH,Asia,3.8,6.2,4.0
+PK,Asia,3.8,6.2,4.0
+PL,Europe,3.7,4.7,4.2
+PR,North America,4.1,5.4,5.5
+PS,Asia,3.8,6.2,4.0
+PT,Europe,3.7,4.7,4.2
+PY,South America,7.7,7.7,7.7
+QA,Asia,3.8,6.2,4.0
+RO,Europe,3.7,4.7,4.2
+RS,Europe,3.7,4.7,4.2
+RU,Europe,3.7,4.7,4.2
+RW,Africa,10.8,12.0,12.0
+SA,Asia,3.8,6.2,4.0
+SB,Oceania,3.9,3.9,3.9
+SD,Africa,10.8,12.0,12.0
+SE,Europe,3.7,4.7,4.2
+SG,Asia,3.8,6.2,4.0
+SI,Europe,3.7,4.7,4.2
+SK,Europe,3.7,4.7,4.2
+SL,Africa,10.8,12.0,12.0
+SN,Africa,10.8,12.0,12.0
+SO,Africa,10.8,12.0,12.0
+SR,South America,7.7,7.7,7.7
+SS,Africa,10.8,12.0,12.0
+SV,North America,4.1,5.4,5.5
+SY,Asia,3.8,6.2,4.0
+SZ,Africa,10.8,12.0,12.0
+TD,Africa,10.8,12.0,12.0
+TG,Africa,10.8,12.0,12.0
+TH,Asia,3.8,6.2,4.0
+TJ,Asia,3.8,6.2,4.0
+TL,Asia,3.8,6.2,4.0
+TM,Asia,3.8,6.2,4.0
+TN,Africa,10.8,12.0,12.0
+TR,Asia,3.8,6.2,4.0
+TT,North America,4.1,5.4,5.5
+TW,Asia,3.8,6.2,4.0
+TZ,Africa,10.8,12.0,12.0
+UA,Europe,3.7,4.7,4.2
+UG,Africa,10.8,12.0,12.0
+US,North America,4.1,5.4,5.5
+UY,South America,7.7,7.7,7.7
+UZ,Asia,3.8,6.2,4.0
+VE,South America,7.7,7.7,7.7
+VN,Asia,3.8,6.2,4.0
+XK,Europe,3.7,4.7,4.2
+YE,Asia,3.8,6.2,4.0
+ZA,Africa,10.8,12.0,12.0
+ZM,Africa,10.8,12.0,12.0
+ZW,Africa,10.8,12.0,12.0

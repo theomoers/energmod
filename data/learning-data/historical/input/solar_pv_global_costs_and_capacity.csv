@@ -1,0 +1,27 @@
+year,country,segment,usd_per_w_low,usd_per_w_high,notes,usd_per_w,region,cumulative_capacity_mw,source,log_cost,log_capacity
+1995,Global,grid_utility,8.5,8.5,Global median from IEA PVPS Annual Trends Report 1995,8.5,Global,103.0,IEA PVPS Table 2 Total,2.1400661634962708,4.634728988229636
+1997,Global,grid_utility,8.7,8.7,Global median from IEA PVPS Annual Trends Report 1997,8.7,Global,151.0,IEA PVPS Table 2 Total,2.163323025660538,5.017279836814924
+2000,Global,grid_utility,6.8,6.8,Global median from IEA PVPS Annual Trends Report 2000,6.8,Global,1105.1,AR6/BP Solar Capacity Data,1.916922612182061,7.007691107594736
+2001,Global,grid_utility,6.55,6.55,Global median from IEA PVPS Annual Trends Report 2001,6.55,Global,1275.635,AR6/BP Solar Capacity Data,1.8794650496471605,7.151199372827846
+2002,Global,grid_utility,6.8,6.8,Global median from IEA PVPS Annual Trends Report 2002,6.8,Global,1556.459,AR6/BP Solar Capacity Data,1.916922612182061,7.350168648384713
+2003,Global,grid_utility,6.9,6.9,Global median from IEA PVPS Annual Trends Report 2003,6.9,Global,2342.085,AR6/BP Solar Capacity Data,1.9315214116032138,7.758796837265072
+2004,Global,grid_utility,7.475,7.475,Global median from IEA PVPS Annual Trends Report 2004,7.475,Global,3426.466,AR6/BP Solar Capacity Data,2.01156411927675,8.13928468831504
+2005,Global,grid_utility,7.25,7.25,Global median from IEA PVPS Annual Trends Report 2005,7.25,Global,4936.451,AR6/BP Solar Capacity Data,1.9810014688665833,8.504401930941267
+2006,Global,grid_utility,6.9,6.9,Global median from IEA PVPS Annual Trends Report 2006,6.9,Global,6486.789,AR6/BP Solar Capacity Data,1.9315214116032138,8.77752292609241
+2007,Global,grid_utility,7.5,7.5,Global median from IEA PVPS Annual Trends Report 2007,7.5,Global,8959.092,AR6/BP Solar Capacity Data,2.0149030205422647,9.100424161548089
+2008,Global,grid_utility,7.4,7.4,Global median from IEA PVPS Annual Trends Report 2008,7.4,Global,15233.347,AR6/BP Solar Capacity Data,2.0014800002101243,9.631242185369144
+2009,Global,grid_utility,6.0,6.0,Global median from IEA PVPS Annual Trends Report 2009,6.0,Global,23556.506,AR6/BP Solar Capacity Data,1.791759469228055,10.067157324560533
+2010,Global,grid_utility,5.31,5.31,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),5.31,Global,41398.892,AR6/BP Solar Capacity Data,1.6695918352538475,10.631009396170239
+2011,Global,grid_utility,4.553,4.553,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),4.553,Global,72550.606,AR6/BP Solar Capacity Data,1.515786356352645,11.192039611137545
+2012,Global,grid_utility,3.466,3.466,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),3.466,Global,102511.57,AR6/BP Solar Capacity Data,1.2430011912934145,11.537730949239133
+2013,Global,grid_utility,3.042,3.042,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),3.042,Global,139477.919,AR6/BP Solar Capacity Data,1.112515193837101,11.845661580976538
+2014,Global,grid_utility,2.749,2.749,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),2.749,Global,179060.168,AR6/BP Solar Capacity Data,1.0112372091831088,12.095477162420702
+2015,Global,grid_utility,2.09,2.09,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),2.09,Global,227236.408,AR6/BP Solar Capacity Data,0.7371640659767196,12.33374619946991
+2016,Global,grid_utility,1.901,1.901,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),1.901,Global,299167.332,AR6/BP Solar Capacity Data,0.6423800635062922,12.60875833462942
+2017,Global,grid_utility,1.644,1.644,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),1.644,Global,394311.531,AR6/BP Solar Capacity Data,0.4971322966339881,12.884896563668397
+2018,Global,grid_utility,1.405,1.405,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),1.405,Global,490288.668,AR6/BP Solar Capacity Data,0.3400373027857091,13.102749614992055
+2019,Global,grid_utility,1.161,1.161,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),1.161,Global,592653.616,AR6/BP Solar Capacity Data,0.14928170271575447,13.29236538589796
+2020,Global,grid_utility,1.019,1.019,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),1.019,Global,723638.287,AR6/BP Solar Capacity Data,0.018821754240587667,13.492046942933236
+2021,Global,grid_utility,0.95,0.95,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),0.95,Global,866829.746,AR6/BP Solar Capacity Data,-0.05129329438755058,13.672597865083675
+2022,Global,grid_utility,0.908,0.908,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),0.908,Global,1060522.281,AR6/BP Solar Capacity Data,-0.09651090038084373,13.87427206266716
+2023,Global,grid_utility,0.758,0.758,IRENA Figure 3.3 Weighted Average Utility-Scale Installed Cost (2023 USD/W),0.758,Global,1413548.284,AR6/BP Solar Capacity Data,-0.2770718933397654,14.161613614711714

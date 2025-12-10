@@ -33,6 +33,29 @@ from forecast_deployment import (
     get_historical_datafile,
 )
 
+
+def load_country_waccs(wacc_file):
+    """
+    Load country-specific WACCs from CSV file.
+    
+    Args:
+        wacc_file: Path to WACC CSV with columns: country, region, onwind, offwind, solar
+    
+    Returns:
+        Dict of {tech: {country: wacc}} where wacc is decimal (e.g., 0.042 for 4.2%)
+    """
+    df = pd.read_csv(wacc_file)
+    
+    wacc_dict = {}
+    for tech in ['onwind', 'offwind', 'solar']:
+        wacc_dict[tech] = {}
+        for _, row in df.iterrows():
+            country = row['country']
+            wacc_pct = row[tech]
+            wacc_dict[tech][country] = wacc_pct / 100.0  # Convert percentage to decimal
+    
+    return wacc_dict
+
 logger = create_logger(__name__)
 
 # Mapping from learning tech names to cost file technology names
@@ -44,6 +67,134 @@ TECH_TO_COST_NAME = {
     'electrolyser_power': 'electrolysis',
     'h2_energy': 'H2 Store',
 }
+
+
+def parse_learning_rate_wildcard(learning_rate_str):
+    """
+    Parse learning rate wildcard into beta adjustment configuration.
+    
+    Format: tech.method-value or "base" for no adjustment
+    Examples:
+        - "base": No adjustment
+        - "s.m1.2": Solar multiplier ×1.2
+        - "w.o-0.1": Wind offset -0.1
+        - "all.m1.5": All technologies multiplier ×1.5
+        - "b.m0.8_w.m1.2": Battery multiplier ×0.8 AND wind multiplier ×1.2
+    
+    Tech codes:
+        - s: solar_power
+        - w: onwind_power (wind)
+        - b: battery_energy
+        - bi: battery_power (battery inverter)
+        - e: electrolyser_power
+        - h: h2_energy
+        - all: all technologies
+    
+    Method codes:
+        - m: multiplier (multiply base β)
+        - o: offset (add to base β)
+    
+    Args:
+        learning_rate_str: Wildcard string from scenario config
+    
+    Returns:
+        Dict with beta adjustment settings compatible with config.learning.yaml format
+    """
+    if learning_rate_str == "base" or not learning_rate_str:
+        return {
+            "enabled": False,
+            "method": "multiplier",
+            "multiplier": 1.0,
+            "offset": 0.0,
+            "tech_specific": {},
+        }
+    
+    tech_map = {
+        's': 'solar_power',
+        'w': 'onwind_power',
+        'b': 'battery_energy',
+        'bi': 'battery_power',
+        'e': 'electrolyser_power',
+        'h': 'h2_energy',
+    }
+    
+    # Parse potentially multiple adjustments separated by underscore
+    adjustments = learning_rate_str.split('_')
+    
+    global_method = None
+    global_value = None
+    tech_specific = {}
+    
+    for adj in adjustments:
+        # Parse format: tech.method-value
+        # E.g., "s.m1.2" -> tech="s", method="m", value="1.2"
+        if '.' not in adj:
+            logger.warning(f"Invalid learning rate format: {adj}, skipping")
+            continue
+        
+        parts = adj.split('.')
+        if len(parts) < 2:
+            logger.warning(f"Invalid learning rate format: {adj}, skipping")
+            continue
+        
+        tech_code = parts[0]
+        method_value = '.'.join(parts[1:])  # Rejoin in case value has decimal point
+        
+        # Parse method and value (e.g., "m1.2" or "o-0.1")
+        if method_value.startswith('m'):
+            method = 'multiplier'
+            value_str = method_value[1:]
+        elif method_value.startswith('o'):
+            method = 'offset'
+            value_str = method_value[1:]
+        else:
+            logger.warning(f"Invalid method in {adj}, expected 'm' or 'o'")
+            continue
+        
+        try:
+            value = float(value_str)
+        except ValueError:
+            logger.warning(f"Invalid numeric value in {adj}: {value_str}")
+            continue
+        
+        # Apply to appropriate tech
+        if tech_code == 'all':
+            global_method = method
+            global_value = value
+        elif tech_code in tech_map:
+            tech_name = tech_map[tech_code]
+            tech_specific[tech_name] = value
+        else:
+            logger.warning(f"Unknown tech code: {tech_code}")
+    
+    # Build config dict
+    if global_method:
+        config = {
+            "enabled": True,
+            "method": global_method,
+            "multiplier": global_value if global_method == "multiplier" else 1.0,
+            "offset": global_value if global_method == "offset" else 0.0,
+            "tech_specific": tech_specific,
+        }
+    else:
+        # Only tech-specific adjustments, default to multiplier method
+        config = {
+            "enabled": True,
+            "method": "multiplier",
+            "multiplier": 1.0,
+            "offset": 0.0,
+            "tech_specific": tech_specific,
+        }
+    
+    logger.info(f"Parsed learning_rate wildcard '{learning_rate_str}':")
+    logger.info(f"  Enabled: {config['enabled']}")
+    logger.info(f"  Method: {config['method']}")
+    if global_method:
+        logger.info(f"  Global {config['method']}: {global_value}")
+    if tech_specific:
+        logger.info(f"  Tech-specific: {tech_specific}")
+    
+    return config
 
 
 def calculate_annuity(lifetime, discount_rate):
@@ -258,6 +409,9 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
     params_adjusted = params.copy()
     params_adjusted["beta_base"] = params_adjusted["beta"]  # Store original beta
     
+    # Dictionary to store learning rates for metadata
+    learning_rates = {}
+    
     for tech in params_adjusted.index:
         A_base = params_adjusted.loc[tech, "A_over_unit"]
         beta_base = params_adjusted.loc[tech, "beta"]
@@ -286,6 +440,22 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
             if multiplier != 1.0 or offset != 0.0:
                 logger.info(f"  {tech}: β_base={beta_base:.4f} → β_scenario={beta_scenario:.4f}")
         
+        # Calculate learning rates: LR = 1 - 2^(-β)
+        lr_base = 1 - 2**(-beta_base)
+        lr_scenario = 1 - 2**(-beta_scenario)
+        
+        # Print learning rates
+        if beta_base != beta_scenario:
+            logger.info(f"  {tech}: LR = {lr_scenario:.1%} (base: {lr_base:.1%})")
+        
+        # Store learning rates for metadata
+        learning_rates[tech] = {
+            "beta_base": float(beta_base),
+            "beta_scenario": float(beta_scenario),
+            "lr_base": float(lr_base),
+            "lr_scenario": float(lr_scenario)
+        }
+        
         # Recalibrate A to maintain anchor point
         A_scenario = recalibrate_A_for_beta_scenario(
             A_base, beta_base, beta_scenario, L_anchor, tech
@@ -294,6 +464,9 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
         # Update parameters
         params_adjusted.loc[tech, "beta"] = beta_scenario
         params_adjusted.loc[tech, "A_over_unit"] = A_scenario
+    
+    # Store learning rates in the params_adjusted for passing to main
+    params_adjusted.attrs["learning_rates"] = learning_rates
     
     return params_adjusted
 
@@ -479,7 +652,7 @@ def load_realized_capacity_history(state_file_path, tech, current_year, planning
     return df
 
 
-def calculate_predicted_costs(params, state, learning_cfg, current_year, planning_horizons, state_file_path, costs_file):
+def calculate_predicted_costs(params, state, learning_cfg, current_year, planning_horizons, state_file_path, costs_file, wacc_dict=None):
     """
     Calculate predicted costs for all technologies at current horizon.
     
@@ -494,6 +667,7 @@ def calculate_predicted_costs(params, state, learning_cfg, current_year, plannin
         planning_horizons: List of all planning horizons
         state_file_path: Path to state file (for pattern matching)
         costs_file: Path to cost CSV file for this year
+        wacc_dict: Optional dict of regional WACCs {tech: {country: wacc}}
     
     Returns:
         Dict of {tech: {capital_cost, L_pred, dK_pred, ...}}
@@ -587,6 +761,8 @@ def calculate_predicted_costs(params, state, learning_cfg, current_year, plannin
         c_overnight_pred = A * (L_pred ** (-beta))
         
         # Convert to capital_cost (EUR/MW-yr or EUR/MWh-yr)
+        # NOTE: For renewable technologies, we calculate a global average capital cost here
+        # The actual regional WACCs will be applied in update_network_costs() on a per-bus basis
         capital_cost = convert_to_capital_cost(
             c_overnight_pred, tech, unit, learning_cfg, costs_file
         )
@@ -606,6 +782,7 @@ def calculate_predicted_costs(params, state, learning_cfg, current_year, plannin
             "beta_adjusted": beta != beta_base,
             "unit": unit,
             "c_overnight_pred": c_overnight_pred,
+            "wacc_dict": wacc_dict,  # Store for per-bus calculation
         }
         
         # Determine capital cost unit for logging
@@ -620,7 +797,7 @@ def calculate_predicted_costs(params, state, learning_cfg, current_year, plannin
     return predictions
 
 
-def convert_to_capital_cost(c_overnight, tech, unit, learning_cfg, costs_file):
+def convert_to_capital_cost(c_overnight, tech, unit, learning_cfg, costs_file, wacc_override=None):
     """
     Convert overnight CAPEX to PyPSA capital_cost.
     
@@ -633,14 +810,18 @@ def convert_to_capital_cost(c_overnight, tech, unit, learning_cfg, costs_file):
         unit: 'kW' or 'kWh'
         learning_cfg: Learning configuration
         costs_file: Path to cost CSV file for this year
+        wacc_override: Optional WACC to use instead of config value (for regional WACCs)
     
     Returns:
         capital_cost in EUR/MW-yr or EUR/MWh-yr
     """
     finance = learning_cfg["finance"]
     
-    # Get financial parameters
-    wacc = finance["wacc"].get(tech, finance["wacc"]["default"])
+    # Get financial parameters - use override if provided (for regional WACCs)
+    if wacc_override is not None:
+        wacc = wacc_override
+    else:
+        wacc = finance["wacc"].get(tech, finance["wacc"]["default"])
     lifetime = finance["lifetime"][tech]
     
     # Load FOM from cost file
@@ -670,7 +851,7 @@ def convert_to_capital_cost(c_overnight, tech, unit, learning_cfg, costs_file):
     return capital_cost
 
 
-def update_network_costs(network_path, predictions, tech_mapping, output_path):
+def update_network_costs(network_path, predictions, tech_mapping, output_path, learning_cfg, costs_file, learning_rates=None):
     """
     Update network component costs in-memory and save.
     
@@ -680,11 +861,18 @@ def update_network_costs(network_path, predictions, tech_mapping, output_path):
     IMPORTANT: Checks unit dimension to prevent applying energy costs (EUR/MWh-yr) 
     to power components (generators/links) or vice versa.
     
+    For renewable technologies (solar, onwind, offwind), applies regional WACCs on a per-bus basis
+    by recalculating capital costs using the overnight cost from learning curve predictions
+    and the region-specific WACC.
+    
     Args:
         network_path: Path to input brownfield network
         predictions: Dict of predicted costs per technology
         tech_mapping: Dict mapping carriers to technologies
         output_path: Path to save updated network
+        learning_cfg: Learning configuration dict
+        costs_file: Path to cost CSV file
+        learning_rates: Optional dict of learning rates to store in metadata
     
     Returns:
         Tuple of (network, updates_log)
@@ -694,6 +882,13 @@ def update_network_costs(network_path, predictions, tech_mapping, output_path):
     
     # Reverse mapping: carrier -> tech
     carrier_to_tech = {carrier: tech for carrier, tech in tech_mapping.items()}
+    
+    # Map learning tech names to carrier names for regional WACC lookup
+    LEARNING_TO_WACC_TECH = {
+        'solar_power': 'solar',
+        'onwind_power': 'onwind',
+        'offwind_power': 'offwind',  # Will match both offwind-ac and offwind-dc
+    }
     
     updates_log = []
     updates_count = 0
@@ -725,18 +920,71 @@ def update_network_costs(network_path, predictions, tech_mapping, output_path):
                 logger.warning(f"No generators found for carrier '{carrier}' - skipping")
                 continue
             
-            new_cost = predictions[tech]["capital_cost"]
-            old_cost = n.generators.loc[mask, "capital_cost"].iloc[0] if mask.any() else np.nan
+            # Check if this is a renewable technology requiring regional WACC treatment
+            wacc_dict = predictions[tech].get("wacc_dict")
+            is_renewable = tech in LEARNING_TO_WACC_TECH and wacc_dict is not None
             
-            n.generators.loc[mask, "capital_cost"] = new_cost
-            updates_log.append({
-                "component": "generators",
-                "carrier": carrier,
-                "tech": tech,
-                "old_cost": old_cost,
-                "new_cost": new_cost,
-            })
-            logger.info(f"  Updated generators[{carrier}]: {old_cost:.2f} → {new_cost:.2f} EUR/MW-yr")
+            if is_renewable:
+                # Apply regional WACCs on a per-bus basis
+                wacc_tech = LEARNING_TO_WACC_TECH[tech]
+                c_overnight = predictions[tech]["c_overnight_pred"]
+                unit = predictions[tech]["unit"]
+                
+                # Get FOM and lifetime from config
+                finance = learning_cfg["finance"]
+                lifetime = finance["lifetime"][tech]
+                fom = load_fom_from_costs(costs_file, tech)
+                
+                # Calculate capital cost for each generator based on its bus location
+                # Get old cost BEFORE updating
+                old_cost = n.generators.loc[mask, "capital_cost"].iloc[0] if mask.any() else np.nan
+                
+                new_costs = []
+                for idx in n.generators.index[mask]:
+                    bus = n.generators.loc[idx, "bus"]
+                    # Extract country code from bus name (e.g., "NG 0" -> "NG")
+                    country = bus.split()[0] if ' ' in bus else bus
+                    
+                    # Get regional WACC
+                    regional_wacc = wacc_dict[wacc_tech].get(country)
+                    if regional_wacc is None:
+                        logger.warning(f"    No regional WACC for {country}, using global default")
+                        regional_wacc = finance["wacc"].get(tech, finance["wacc"]["default"])
+                    
+                    # Calculate capital cost with regional WACC
+                    annuity = calculate_annuity(lifetime, regional_wacc)
+                    investment_mw = c_overnight * 1e3  # kW → MW
+                    capital_cost = (annuity + fom) * investment_mw
+                    new_costs.append(capital_cost)
+                
+                # Apply all costs
+                n.generators.loc[mask, "capital_cost"] = new_costs
+                new_cost_avg = np.mean(new_costs)
+                
+                updates_log.append({
+                    "component": "generators",
+                    "carrier": carrier,
+                    "tech": tech,
+                    "old_cost": old_cost,
+                    "new_cost": new_cost_avg,
+                    "regional_wacc": True,
+                })
+                logger.info(f"  Updated generators[{carrier}] with REGIONAL WACCs: avg={new_cost_avg:.2f} EUR/MW-yr (range: {min(new_costs):.2f}-{max(new_costs):.2f})")
+            else:
+                # Use global capital cost for non-renewable technologies
+                new_cost = predictions[tech]["capital_cost"]
+                old_cost = n.generators.loc[mask, "capital_cost"].iloc[0] if mask.any() else np.nan
+                
+                n.generators.loc[mask, "capital_cost"] = new_cost
+                updates_log.append({
+                    "component": "generators",
+                    "carrier": carrier,
+                    "tech": tech,
+                    "old_cost": old_cost,
+                    "new_cost": new_cost,
+                })
+                logger.info(f"  Updated generators[{carrier}]: {old_cost:.2f} → {new_cost:.2f} EUR/MW-yr")
+            
             updates_count += 1
     
     # Update storage_units (POWER components - require kW-based technologies)
@@ -876,6 +1124,11 @@ def update_network_costs(network_path, predictions, tech_mapping, output_path):
     n.meta["learning_predictions"] = convert_to_native(predictions)
     n.meta["learning_updates_log"] = convert_to_native(updates_log)
     
+    # Store learning rates in metadata if provided
+    if learning_rates is not None:
+        n.meta["learning_rates"] = convert_to_native(learning_rates)
+        logger.info("Stored learning rates in network metadata")
+    
     logger.info(f"Saving updated network to {output_path}")
     logger.info(f"  Updated {updates_count} carrier types across components")
     n.export_to_netcdf(output_path)
@@ -960,6 +1213,18 @@ def main(snakemake):
     logger.info("=" * 70)
     
     learning_cfg = load_config_learning(snakemake.input.learning_config)
+    
+    # Parse learning_rate wildcard and override beta_adjustment config
+    if hasattr(snakemake.wildcards, 'learning_rate'):
+        learning_rate_str = snakemake.wildcards.learning_rate
+        logger.info(f"Learning rate wildcard detected: '{learning_rate_str}'")
+        
+        # Parse wildcard into beta adjustment config
+        wildcard_beta_cfg = parse_learning_rate_wildcard(learning_rate_str)
+        
+        # Override the beta_adjustment section in learning_cfg
+        learning_cfg["beta_adjustment"] = wildcard_beta_cfg
+        logger.info("Beta adjustment config overridden by learning_rate wildcard")
     
     # Check if learning is enabled
     if not learning_cfg.get("enabled", False):
@@ -1056,17 +1321,34 @@ def main(snakemake):
     costs_file = snakemake.input.costs
     logger.info(f"Using costs file: {costs_file}")
     
+    # Load regional WACCs if available
+    wacc_dict = None
+    if hasattr(snakemake.input, 'waccs') and snakemake.input.waccs:
+        logger.info(f"Loading regional WACCs from {snakemake.input.waccs}")
+        wacc_dict = load_country_waccs(snakemake.input.waccs)
+        logger.info(f"  Loaded WACCs for {len(wacc_dict)} renewable technologies")
+    else:
+        logger.info("No regional WACC file provided - using global WACCs from config")
+    
     predictions = calculate_predicted_costs(
-        params, state, learning_cfg, year, planning_horizons, state_file_path, costs_file
+        params, state, learning_cfg, year, planning_horizons, state_file_path, costs_file, wacc_dict
     )
     
-    # Update network
+    # Extract learning rates from params if beta adjustment was applied
+    learning_rates = None
+    if hasattr(params, 'attrs') and 'learning_rates' in params.attrs:
+        learning_rates = params.attrs["learning_rates"]
+    
+    # Update network (single export with all metadata)
     tech_mapping = learning_cfg["tech_mapping"]
     n, updates_log = update_network_costs(
         snakemake.input.network,
         predictions,
         tech_mapping,
-        snakemake.output.network
+        snakemake.output.network,
+        learning_cfg,
+        costs_file,
+        learning_rates=learning_rates
     )
     
     # Save logs
@@ -1100,7 +1382,8 @@ if __name__ == "__main__":
             configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate="0.071",
             demand="AB",
-            h2export="10"
+            h2export="10",
+            learning_rate="base"
         )
 
         logger.warning("Running apply_learning_costs.py outside Snakemake!")

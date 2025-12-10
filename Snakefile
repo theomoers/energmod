@@ -148,6 +148,7 @@ wildcard_constraints:
     discountrate="[-+a-zA-Z0-9\.\s]*",
     demand="[-+a-zA-Z0-9\.\s]*",
     h2export="[0-9]+(\.[0-9]+)?",
+    learning_rate="[a-zA-Z0-9\.\_\-]*",
     planning_horizons="20[2-9][0-9]|2100",
 
 
@@ -1391,6 +1392,9 @@ rule prepare_sector_network:
             + "gas_networks/gas_network_elec_s{simpl}_{clusters}.csv"
         ),
         geothermal_capacity="data/installed-geothermal-capacity.csv",
+        fuelprices="data/fuels/all_fuels_prices_by_country.csv",
+        waccs="data/waccs/wacc_by_country.csv",
+        battery_capacities="data/energy_storage/battery_storage_capa_bycountry.csv",
     output:
         RESDIR
         + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}.nc",
@@ -1653,7 +1657,7 @@ rule prepare_energy_totals:
     input:
         unsd_paths="resources/" + SECDIR + "energy_totals_base.csv",
         efficiency_gains_cagr="data/demand/efficiency_gains_cagr.csv",
-        growth_factors_cagr="data/demand/growth_factors_cagr.csv",
+        growth_factors_cagr="data/demand/scenarios/{demand}/growth_factors_cagr_FROM_VAR.csv",
         district_heating="data/demand/district_heating.csv",
         fuel_shares="data/demand/fuel_shares.csv",
     output:
@@ -2359,7 +2363,7 @@ rule build_base_industry_totals:  #default data
         "scripts/build_base_industry_totals.py"
 
 
-rule build_industry_demand:  #default data
+rule build_industry_demand:
     params:
         countries=config["countries"],
         industry_demand=config["custom_data"]["industry_demand"],
@@ -2378,7 +2382,7 @@ rule build_industry_demand:  #default data
         + "demand/base_industry_totals_{planning_horizons}_{demand}.csv",
         industrial_database="data/industrial_database.csv",
         costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
-        industry_growth_cagr="data/demand/industry_growth_cagr.csv",
+        industry_growth_cagr="data/demand/scenarios/{demand}/industry_growth_cagr_FROM_VAR.csv",
     output:
         industrial_energy_demand_per_node="resources/"
         + SECDIR
@@ -2453,6 +2457,7 @@ if config["foresight"] == "myopic":
             + SECDIR
             + "population_shares/pop_layout_elec_s{simpl}_{clusters}_{planning_horizons}.csv",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
+            waccs="data/waccs/wacc_by_country.csv",
             cop_soil_total="resources/"
             + SECDIR
             + "cops/cop_soil_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
@@ -2465,7 +2470,7 @@ if config["foresight"] == "myopic":
             n_pre_cluster="networks/" + RDIR + "elec_s{simpl}.nc",
         output:
             RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
         wildcard_constraints:
             # TODO: The first planning_horizon needs to be aligned across scenarios
             # snakemake does not support passing functions to wildcard_constraints
@@ -2476,10 +2481,10 @@ if config["foresight"] == "myopic":
             mem_mb=2000,
         log:
             RESDIR
-            + "logs/add_existing_baseyear_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.log",
+            + "logs/add_existing_baseyear_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
         benchmark:
             RESDIR
-            +"benchmarks/add_existing_baseyear/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+            +"benchmarks/add_existing_baseyear/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
         script:
             "scripts/add_existing_baseyear.py"
 
@@ -2505,7 +2510,7 @@ if config["foresight"] == "myopic":
             RESDIR
             + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_"
             + planning_horizon_p
-            + "_{discountrate}_{demand}_{h2export}export.nc"
+            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc"
         )
 
 
@@ -2535,19 +2540,20 @@ if config["foresight"] == "myopic":
             cop_air_total="resources/"
             + SECDIR
             + "cops/cop_air_total_elec_s{simpl}_{clusters}_{planning_horizons}.nc",
+            battery_capacities="data/energy_storage/battery_storage_capa_bycountry.csv",
         output:
             RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
         threads: 4
         resources:
             mem_mb=10000,
         log:
             RESDIR
-            + "logs/add_brownfield_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.log",
+            + "logs/add_brownfield_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
         benchmark:
             (
                 RESDIR
-                + "benchmarks/add_brownfield/elec_s{simpl}_ec_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+                + "benchmarks/add_brownfield/elec_s{simpl}_ec_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
             )
         script:
             "./scripts/add_brownfield.py"
@@ -2561,36 +2567,37 @@ if config["foresight"] == "myopic":
             planning_horizons=config["scenario"]["planning_horizons"],
         input:
             network=RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
             network_p=solved_previous_horizon,  # solved network at previous time step - prevents execution for first horizon
             params="data/learning-data/params/learning_params.csv",  # Static template
             state=lambda w: (
-                f"{SDIR}learning/state/learning_state_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{get_previous_horizon_year(config['scenario']['planning_horizons'], int(w.planning_horizons))}_{w.discountrate}_{w.demand}_{w.h2export}export.csv"
+                f"{SDIR}learning/state/learning_state_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{get_previous_horizon_year(config['scenario']['planning_horizons'], int(w.planning_horizons))}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
                 if get_previous_horizon_year(config["scenario"]["planning_horizons"], int(w.planning_horizons)) is not None
                 else "data/learning-data/state/learning_state_2020.csv"  # Initial template
             ),
             learning_config="config.learning.yaml",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             basecost="resources/" + RDIR + "costs_2020.csv",
+            waccs="data/waccs/wacc_by_country.csv",
         output:
             network=RESDIR
-            + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
             cost_log=RESDIR
-            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
             pred_state=RESDIR
-            + "learning/prediction_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            + "learning/prediction_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
             cost_params=RESDIR
-            + "learning/cost_params_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            + "learning/cost_params_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
         threads: 1
         resources:
             mem_mb=5000,
         log:
             RESDIR
-            + "logs/apply_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.log",
+            + "logs/apply_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
         benchmark:
             (
                 RESDIR
-                + "benchmarks/apply_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+                + "benchmarks/apply_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
             )
         script:
             "./scripts/apply_learning_costs.py"
@@ -2606,39 +2613,40 @@ if config["foresight"] == "myopic":
                 "co2_sequestration_potential", 200
             ),
             augmented_line_connection=config["augmented_line_connection"],
+            save_lpfile=config["global_specific"].get("save_lpfile", False),
         input:
             overrides=BASE_DIR + "/data/override_component_attrs",
             # Use learning-enabled network if learning is enabled AND not the first horizon, otherwise use brownfield network
             network=lambda w: (
-                RESDIR + f"prenetworks-learning/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export.nc"
+                RESDIR + f"prenetworks-learning/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.nc"
                 if get_learning_enabled() and get_previous_horizon_year(config["scenario"]["planning_horizons"], int(w.planning_horizons)) is not None
-                else RESDIR + f"prenetworks-brownfield/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export.nc"
+                else RESDIR + f"prenetworks-brownfield/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.nc"
             ),
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             configs=SDIR + "configs/config.yaml",  # included to trigger copy_config rule
         output:
             network=RESDIR
-            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
             lpfile=RESDIR
-            + "postnetworks/lpfiles/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.lp",
+            + "postnetworks/lpfiles/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.lp",
             # config=RESDIR
             # + "configs/config.elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.yaml",
         shadow:
             "copy-minimal" if os.name == "nt" else "shallow"
         log:
             solver=RESDIR
-            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_solver.log",
+            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_solver.log",
             python=RESDIR
-            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_python.log",
+            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_python.log",
             memory=RESDIR
-            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_memory.log",
+            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_memory.log",
         threads: 25
         resources:
             mem_mb=config["solving"]["mem"],
         benchmark:
             (
                 RESDIR
-                + "benchmarks/solve_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+                + "benchmarks/solve_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
             )
         script:
             "./scripts/solve_network.py"
@@ -2650,30 +2658,30 @@ if config["foresight"] == "myopic":
             planning_horizons=config["scenario"]["planning_horizons"],
         input:
             network=RESDIR
-            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
             network_p=solved_previous_horizon,  # solved network at previous time step - prevents execution for first horizon
             prev_state=lambda w: (
-                f"{SDIR}learning/state/learning_state_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{get_previous_horizon_year(config['scenario']['planning_horizons'], int(w.planning_horizons))}_{w.discountrate}_{w.demand}_{w.h2export}export.csv"
+                f"{SDIR}learning/state/learning_state_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{get_previous_horizon_year(config['scenario']['planning_horizons'], int(w.planning_horizons))}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
                 if get_previous_horizon_year(config["scenario"]["planning_horizons"], int(w.planning_horizons)) is not None
                 else "data/learning-data/state/learning_state_2020.csv"  # Initial template
             ),
             pred_state=RESDIR
-            + "learning/prediction_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            + "learning/prediction_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
             learning_config="config.learning.yaml",
         output:
-            state=SDIR + "learning/state/learning_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            state=SDIR + "learning/state/learning_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
             comparison=RESDIR
-            + "learning/forecast_comparison_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.csv",
+            + "learning/forecast_comparison_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
         threads: 1
         resources:
             mem_mb=3000,
         log:
             RESDIR
-            + "logs/capture_learning_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.log",
+            + "logs/capture_learning_state_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
         benchmark:
             (
                 RESDIR
-                + "benchmarks/capture_learning_state/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export"
+                + "benchmarks/capture_learning_state/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
             )
         script:
             "./scripts/capture_learning_state.py"
@@ -2684,28 +2692,28 @@ if config["foresight"] == "myopic":
         input:
             cost_logs=expand(
                 RESDIR
-                + "learning/cost_log_elec_s{{simpl}}_{{clusters}}_l{{ll}}_{{opts}}_{{sopts}}_{planning_horizons}_{{discountrate}}_{{demand}}_{{h2export}}export.csv",
+                + "learning/cost_log_elec_s{{simpl}}_{{clusters}}_l{{ll}}_{{opts}}_{{sopts}}_{planning_horizons}_{{discountrate}}_{{demand}}_{{h2export}}export_{{learning_rate}}.csv",
                 planning_horizons=config["scenario"]["planning_horizons"],
             ),
             forecast_comparisons=expand(
                 RESDIR
-                + "learning/forecast_comparison_elec_s{{simpl}}_{{clusters}}_l{{ll}}_{{opts}}_{{sopts}}_{planning_horizons}_{{discountrate}}_{{demand}}_{{h2export}}export.csv",
+                + "learning/forecast_comparison_elec_s{{simpl}}_{{clusters}}_l{{ll}}_{{opts}}_{{sopts}}_{planning_horizons}_{{discountrate}}_{{demand}}_{{h2export}}export_{{learning_rate}}.csv",
                 planning_horizons=config["scenario"]["planning_horizons"],
             ),
             basecost="resources/" + RDIR + "costs_2020.csv",
         output:
             cost_trajectories=RESDIR
-            + "learning/plots/cost_trajectories_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+            + "learning/plots/cost_trajectories_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.png",
             forecast_comparison=RESDIR
-            + "learning/plots/forecast_comparison_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+            + "learning/plots/forecast_comparison_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.png",
             cumulative_deployment=RESDIR
-            + "learning/plots/cumulative_deployment_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+            + "learning/plots/cumulative_deployment_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.png",
         threads: 1
         resources:
             mem_mb=4000,
         log:
             RESDIR
-            + "logs/plot_learning_results_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.log",
+            + "logs/plot_learning_results_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
         script:
             "./scripts/plot_learning_results.py"
 
@@ -2713,14 +2721,14 @@ if config["foresight"] == "myopic":
         input:
             networks=expand(
                 RESDIR
-                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
+                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
                 **config["scenario"],
                 **config["costs"],
                 **config["export"],
             ),
             learning_plots=expand(
                 RESDIR
-                + "learning/plots/cost_trajectories_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export.png",
+                + "learning/plots/cost_trajectories_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.png",
                 **config["scenario"],
                 **config["costs"],
                 **config["export"],

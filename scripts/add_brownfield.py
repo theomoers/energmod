@@ -28,27 +28,35 @@ def add_brownfield(n, n_p, year):
     dc_i = n.links[n.links.carrier == "DC"].index
     n.links.loc[dc_i, "p_nom_min"] = n_p.links.loc[dc_i, "p_nom_opt"]
 
-    # Update p_nom_min for extendable generators and links with build_year=0 (e.g., CCGT)
+    # Update p_nom_min/e_nom_min for extendable generators, links, and stores with build_year=0 (e.g., CCGT, batteries)
     # to prevent capacity from shrinking relative to previous horizon
-    for c_name in ["Generator", "Link"]:
+    for c_name in ["Generator", "Link", "Store"]:
         if c_name == "Generator":
             component_n = n.generators
             component_n_p = n_p.generators
-        else:
+            attr = "p"
+        elif c_name == "Link":
             component_n = n.links
             component_n_p = n_p.links
+            attr = "p"
+        else:  # Store
+            component_n = n.stores
+            component_n_p = n_p.stores
+            attr = "e"
         
         # Find extendable assets with build_year=0 that exist in both networks
+        # Exclude tracking assets (infinite lifetime)
         extendable_zero_build = component_n.index[
             (component_n.build_year == 0) & 
-            (component_n.p_nom_extendable == True)
+            (component_n[f"{attr}_nom_extendable"] == True) &
+            (component_n.lifetime != np.inf)
         ]
         common_assets = extendable_zero_build.intersection(component_n_p.index)
         
         if not common_assets.empty:
-            # Set p_nom_min to the optimized capacity from previous horizon
-            component_n.loc[common_assets, "p_nom_min"] = component_n_p.loc[common_assets, "p_nom_opt"].values
-            logger.info(f"Updated p_nom_min for {len(common_assets)} extendable {c_name}s with build_year=0 from previous horizon")
+            # Set p_nom_min/e_nom_min to the optimized capacity from previous horizon
+            component_n.loc[common_assets, f"{attr}_nom_min"] = component_n_p.loc[common_assets, f"{attr}_nom_opt"].values
+            logger.info(f"Updated {attr}_nom_min for {len(common_assets)} extendable {c_name}s with build_year=0 from previous horizon")
 
     for c in n_p.iterate_components(["Link", "Generator", "Store"]):
         attr = "e" if c.name == "Store" else "p"
@@ -67,6 +75,9 @@ def add_brownfield(n, n_p, year):
             & c.df.index.str.contains("CHP")
             & c.df.index.str.contains("heat")
         ]
+        
+        # Identify battery-related assets to exclude from threshold removal
+        battery_assets = c.df.index[c.df.carrier.str.contains("battery", case=False, na=False)]
 
         threshold = snakemake.params.threshold_capacity
 
@@ -82,10 +93,11 @@ def add_brownfield(n, n_p, year):
                 chp_heat[c.df.loc[chp_heat, f"{attr}_nom_opt"] < threshold_chp_heat],
             )
 
-        n_p.mremove( # remove assets below threshold
+        # Remove assets below threshold, but exclude CHP heat and battery assets
+        n_p.mremove(
             c.name,
             c.df.index[
-                (c.df[f"{attr}_nom_extendable"] & ~c.df.index.isin(chp_heat))
+                (c.df[f"{attr}_nom_extendable"] & ~c.df.index.isin(chp_heat) & ~c.df.index.isin(battery_assets))
                 & (c.df[f"{attr}_nom_opt"] < threshold)
             ],
         )
@@ -195,6 +207,111 @@ def disable_grid_expansion_if_limit_hit(n):
                 n.global_constraints.drop(name, inplace=True)
 
 
+def adjust_battery_capacity_2025(n, year):
+    """
+    Adjust battery capacity for assets with build_year=2025 based on CSV data.
+    
+    Uses capa_2025 for Store energy capacity and power_2025_MW for Link power capacity.
+    Follows the same distribution logic as in prepare_sector_network.py.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to adjust
+    year : int
+        Current planning horizon year
+    """
+    battery_csv_path = snakemake.input.get("battery_capacities", None)
+    
+    if battery_csv_path is None:
+        logger.warning("No battery capacity CSV path provided in snakemake.input")
+        return
+    
+    try:
+        battery_df = pd.read_csv(battery_csv_path, index_col=0)
+    except FileNotFoundError:
+        logger.warning(f"Battery capacity file not found at {battery_csv_path}")
+    
+    # Check if 2025 columns exist
+    if 'capa_2025' not in battery_df.columns or 'power_2025_MW' not in battery_df.columns:
+        logger.warning("Battery CSV missing capa_2025 or power_2025_MW columns")
+        return
+    
+    # Get battery stores and links with build_year=2025
+    battery_stores = n.stores[
+        (n.stores.carrier == "battery") & (n.stores.build_year == year)
+    ]
+    battery_chargers = n.links[
+        (n.links.carrier == "battery charger") & (n.links.build_year == year)
+    ]
+    battery_dischargers = n.links[
+        (n.links.carrier == "battery discharger") & (n.links.build_year == year)
+    ]
+    
+    if battery_stores.empty:
+        logger.info(f"No battery stores with build_year={year} found")
+        return
+    
+    # Validate that chargers and dischargers exist
+    if battery_chargers.empty or battery_dischargers.empty:
+        logger.warning(f"Found {len(battery_stores)} battery stores but missing chargers or dischargers for year {year}")
+        return
+    
+    # Extract nodes from battery store names 
+    # Format can be "XX 0 battery" or "XX 0-2025 battery" -> extract "XX 0"
+    nodes = battery_stores.index.str.replace(r"-\d{4} battery$", "", regex=True).str.replace(" battery", "")
+    
+    # Extract country codes from node names (format: "XX 0" -> "XX")
+    node_countries = pd.Series({node: node.split()[0][:2] for node in nodes})
+    
+    # Count nodes per country
+    nodes_per_country = node_countries.value_counts()
+    
+    # Distribute 2025 battery capacity equally among nodes in each country
+    total_e_adjusted = 0.0
+    total_p_adjusted = 0.0
+    
+    for country_code, node_count in nodes_per_country.items():
+        if country_code in battery_df.index:
+            # Get 2025 capacity for this country and divide equally among its nodes
+            country_e_nom = battery_df.loc[country_code, 'capa_2025'] / node_count  
+            country_p_nom = battery_df.loc[country_code, 'power_2025_MW'] / node_count 
+            
+            # Get nodes for this country
+            country_nodes = node_countries[node_countries == country_code].index
+            
+            # Build actual store/link names from the battery_stores/links indices
+            # Get the actual names that exist in the network
+            country_store_names = battery_stores.index[nodes.isin(country_nodes)]
+            country_charger_names = battery_chargers.index[
+                battery_chargers.index.str.replace(r"-\d{4} battery charger$", "", regex=True).str.replace(" battery charger", "").isin(country_nodes)
+            ]
+            country_discharger_names = battery_dischargers.index[
+                battery_dischargers.index.str.replace(r"-\d{4} battery discharger$", "", regex=True).str.replace(" battery discharger", "").isin(country_nodes)
+            ]
+            
+            # Update Store energy capacity (e_nom and e_nom_min)
+            n.stores.loc[country_store_names, 'e_nom'] = country_e_nom
+            n.stores.loc[country_store_names, 'e_nom_min'] = country_e_nom
+            
+            # Update Link power capacity for chargers (p_nom and p_nom_min)
+            n.links.loc[country_charger_names, 'p_nom'] = country_p_nom
+            n.links.loc[country_charger_names, 'p_nom_min'] = country_p_nom
+            
+            # Update Link power capacity for dischargers (p_nom and p_nom_min)
+            n.links.loc[country_discharger_names, 'p_nom'] = country_p_nom
+            n.links.loc[country_discharger_names, 'p_nom_min'] = country_p_nom
+            
+            total_e_adjusted += battery_df.loc[country_code, 'capa_2025']
+            total_p_adjusted += battery_df.loc[country_code, 'power_2025_MW']
+            
+            logger.info(f"Adjusted {country_code}: {battery_df.loc[country_code, 'capa_2025']:.1f} MWh (store) / {battery_df.loc[country_code, 'power_2025_MW']:.1f} MW (power) for {node_count} nodes")
+        else:
+            logger.debug(f"No 2025 battery data for country {country_code}")
+    
+    logger.info(f"Total battery capacity adjusted for {year}: {total_e_adjusted:.1f} MWh energy, {total_p_adjusted:.1f} MW power")
+
+
 # def adjust_renewable_profiles(n, input_profiles, params, year):
 #     """
 #     Adjusts renewable profiles according to the renewable technology specified,
@@ -257,12 +374,12 @@ if __name__ == "__main__":
             clusters="110",
             ll="copt",
             opts="1h",
-            planning_horizons="2030",
+            planning_horizons="2025",
             sopts="1h",
             configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate=0.071,
             demand="AB",
-            h2export="10"
+            h2export="0.0"
         )
 
     logger.info(f"Preparing brownfield from the file {snakemake.input.network_p}")
@@ -291,14 +408,26 @@ if __name__ == "__main__":
             # Identify biomass/biogas assets
             biomass_biogas_mask = c.df.carrier.str.contains("biomass|biogas", case=False, na=False)
             biomass_biogas_current = current_year_assets[biomass_biogas_mask[current_year_assets]]
-            other_current = current_year_assets[~biomass_biogas_mask[current_year_assets]]
+            
+            # Identify battery assets (Stores with carrier "battery" or Links with "battery charger"/"battery discharger")
+            battery_mask = c.df.carrier.str.contains("battery", case=False, na=False)
+            battery_current = current_year_assets[battery_mask[current_year_assets]]
+            
+            # Other assets (excluding biomass/biogas and batteries)
+            other_current = current_year_assets[~biomass_biogas_mask[current_year_assets] & ~battery_mask[current_year_assets]]
             
             # Reset biomass/biogas to 0 but keep non-extendable
             if not biomass_biogas_current.empty:
                 c.df.loc[biomass_biogas_current, f"{attr}_nom"] = 0
                 c.df.loc[biomass_biogas_current, f"{attr}_nom_min"] = 0
-                #c.df.loc[biomass_biogas_current, f"{attr}_nom_extendable"] = False
-                logger.info(f"Reset {len(biomass_biogas_current)} {c.name} biomass/biogas assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0, {attr}_nom_extendable=False")
+                logger.info(f"Reset {len(biomass_biogas_current)} {c.name} biomass/biogas assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0")
+            
+            # Reset battery stores to 0 and make extendable
+            if not battery_current.empty:
+                c.df.loc[battery_current, f"{attr}_nom"] = 0
+                c.df.loc[battery_current, f"{attr}_nom_min"] = 0
+                c.df.loc[battery_current, f"{attr}_nom_extendable"] = True
+                logger.info(f"Reset {len(battery_current)} {c.name} battery assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0, {attr}_nom_extendable=True")
             
             # Reset other assets to 0 and make extendable
             if not other_current.empty:
@@ -306,6 +435,8 @@ if __name__ == "__main__":
                 c.df.loc[other_current, f"{attr}_nom_min"] = 0
                 c.df.loc[other_current, f"{attr}_nom_extendable"] = True
                 logger.info(f"Reset {len(other_current)} {c.name} assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0, {attr}_nom_extendable=True")
+
+    
 
     # Make geothermal and nuclear generators extendable to allow capacity expansion in future years
     #geothermal_gens = n.generators.index[n.generators.carrier == "geothermal"]
@@ -317,6 +448,17 @@ if __name__ == "__main__":
     #if not nuclear_gens.empty:
     #    n.generators.loc[nuclear_gens, "p_nom_extendable"] = True
     #    logger.info(f"Set {len(nuclear_gens)} nuclear generators to p_nom_extendable=True")
+
+    for carrier in ['coal', 'gas', 'oil']:
+        fuel_gens = n.generators.index[n.generators.carrier == carrier]
+        
+        if not fuel_gens.empty:
+            n.generators.loc[fuel_gens, "p_nom"] = n.generators.loc[fuel_gens, "p_nom_min"]
+            logger.info(f"Set {len(fuel_gens)} {carrier} generators' p_nom to p_nom_min")
+
+    # adjust battery capacity with build year 2025 based on csv
+    if year == 2025:
+        adjust_battery_capacity_2025(n, year)
 
     disable_grid_expansion_if_limit_hit(n)
 

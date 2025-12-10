@@ -93,7 +93,6 @@ def add_export(n, hydrogen_buses_ports, export_profile):
     )
 
     export_links = n.links[n.links.index.str.contains("export")]
-    logger.info(export_links)
 
     # add store depending on config settings
 

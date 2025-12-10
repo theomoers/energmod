@@ -27,11 +27,108 @@ import xarray as xr
 # )
 # from add_electricity import sanitize_carriers
 from prepare_sector_network import define_spatial, prepare_costs  # , cluster_heat_buses
+from _helpers import annuity
 
 logger = logging.getLogger(__name__)
 cc = coco.CountryConverter()
 idx = pd.IndexSlice
 spatial = SimpleNamespace()
+
+
+def load_country_waccs(wacc_path):
+    """
+    Load country-specific WACCs for renewable technologies.
+    
+    Parameters
+    ----------
+    wacc_path : str
+        Path to the WACC CSV file
+    
+    Returns
+    -------
+    dict
+        Nested dictionary: {technology: {country_code: wacc_decimal}}
+    """
+    try:
+        wacc_df = pd.read_csv(wacc_path)
+    except FileNotFoundError:
+        logger.warning(f"WACC file not found at {wacc_path}. Using default discount rates.")
+        return {}
+    
+    wacc_dict = {}
+    for tech in ['solar', 'onwind', 'offwind']:
+        if tech not in wacc_df.columns:
+            continue
+        wacc_dict[tech] = dict(zip(
+            wacc_df['country'],
+            wacc_df[tech] / 100.0  # Convert percentage to decimal
+        ))
+    
+    return wacc_dict
+
+
+def get_regional_capital_cost(bus, carrier, costs, wacc_dict, Nyears):
+    """
+    Calculate capital cost with regional WACC for renewable technologies.
+    
+    Parameters
+    ----------
+    bus : str
+        Bus name (contains country code)
+    carrier : str
+        Technology carrier (solar, onwind, offwind-ac, offwind-dc)
+    costs : pd.DataFrame
+        Cost assumptions
+    wacc_dict : dict
+        Country-specific WACCs
+    Nyears : float
+        Number of years for annualization
+    
+    Returns
+    -------
+    float
+        Capital cost in EUR/MW/year
+    """
+    # Map carriers to WACC technology names
+    carrier_to_wacc_tech = {
+        'solar': 'solar',
+        'onwind': 'onwind',
+        'offwind-ac': 'offwind',
+        'offwind-dc': 'offwind',
+    }
+    
+    # Check if this carrier uses regional WACC
+    if carrier not in carrier_to_wacc_tech or not wacc_dict:
+        # Use default fixed cost
+        cost_key = carrier if carrier in costs.index else carrier.replace('-ac', '').replace('-dc', '')
+        return costs.at[cost_key, "fixed"]
+    
+    wacc_tech = carrier_to_wacc_tech[carrier]
+    if wacc_tech not in wacc_dict:
+        cost_key = carrier if carrier in costs.index else carrier.replace('-ac', '').replace('-dc', '')
+        return costs.at[cost_key, "fixed"]
+    
+    # Extract country code from bus name
+    country_code = str(bus).split(" ")[0][:2]
+    
+    # Get country-specific WACC or use default
+    country_waccs = wacc_dict[wacc_tech]
+    if country_code in country_waccs:
+        wacc = country_waccs[country_code]
+        
+        # Get cost parameters
+        cost_key = carrier if carrier in costs.index else carrier.replace('-ac', '').replace('-dc', '')
+        investment = costs.at[cost_key, 'investment']
+        lifetime = costs.at[cost_key, 'lifetime']
+        fom = costs.at[cost_key, 'FOM']
+        
+        # Recalculate capital cost with regional WACC
+        annuity_factor = annuity(lifetime, wacc) + fom / 100.0
+        return annuity_factor * investment * Nyears
+    else:
+        # Fallback to default
+        cost_key = carrier if carrier in costs.index else carrier.replace('-ac', '').replace('-dc', '')
+        return costs.at[cost_key, "fixed"]
 
 
 def add_build_year_to_new_assets(n, baseyear):
@@ -60,7 +157,7 @@ def add_build_year_to_new_assets(n, baseyear):
             c.pnl[attr] = c.pnl[attr].rename(columns=rename)
 
 
-def add_existing_renewables(df_agg, n, costs):
+def add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears):
     """
     Append existing renewables to the df_agg pd.DataFrame with the conventional
     power plants.
@@ -308,7 +405,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
     df_agg["cluster_bus"] = df_agg.bus.map(clustermaps)
 
     # include renewables in df_agg
-    add_existing_renewables(df_agg, n, costs)
+    add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears)
 
     df_agg = df_agg[df_agg["DateIn"] <= baseyear]
 
@@ -416,7 +513,6 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 logger.info(f"No existing {generator} generators found for year {grouping_year}, will add {len(new_capacity)} new generators")
             
             cost_key = get_cost_key(carrier_label)
-            capital_cost = costs.at[cost_key, "fixed"]
             marginal_cost = costs.at[cost_key, "VOM"]
 
             # Only add new generators if there's new capacity to add
@@ -436,6 +532,12 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                         bus_list = [ind] * len(names)
                         p_nom_each = new_capacity[ind] / max(1, len(inv_ind))
                         p_nom_list = [p_nom_each] * len(names)
+                        
+                        # Calculate capital costs with regional WACC for each bus
+                        capital_cost_list = [
+                            get_regional_capital_cost(bus, carrier_label, costs, wacc_dict, Nyears)
+                            for bus in bus_list
+                        ]
 
                         n.madd(
                             "Generator",
@@ -444,7 +546,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                             carrier=carrier_label,
                             p_nom=p_nom_list,
                             marginal_cost=marginal_cost,
-                            capital_cost=capital_cost,
+                            capital_cost=capital_cost_list,
                             efficiency=costs.at[get_cost_key(carrier_label), "efficiency"],
                             p_max_pu=p_max_pu,
                             build_year=grouping_year,
@@ -497,15 +599,22 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                                     p_max_pu[bus + f" {generator}{suffix}-{grouping_year}"] = 1.0
                     
                     names = [bus + name_suffix for bus in new_capacity.index]
+                    bus_list = list(new_capacity.index)
+                    
+                    # Calculate regional capital costs for renewable technologies
+                    capital_cost_list = [
+                        get_regional_capital_cost(bus, carrier_label, costs, wacc_dict, Nyears)
+                        for bus in bus_list
+                    ]
 
                     n.madd(
                         "Generator",
                         names,
-                        bus=list(new_capacity.index),
+                        bus=bus_list,
                         carrier=carrier_label,
                         p_nom=list(new_capacity.values),
                         marginal_cost=marginal_cost,
-                        capital_cost=capital_cost,
+                        capital_cost=capital_cost_list,
                         efficiency=costs.at[get_cost_key(carrier_label), "efficiency"],
                         p_max_pu=p_max_pu,
                         build_year=grouping_year,
@@ -928,6 +1037,9 @@ if __name__ == "__main__":
         snakemake.params.costs["future_exchange_rate_strategy"],
         snakemake.params.costs["custom_future_exchange_rate"],
     )
+    
+    # Load regional WACCs for renewable capital cost calculations
+    wacc_dict = load_country_waccs(snakemake.input.waccs)
 
     # Ensure all carriers used in this script are defined
     required_carriers = ["solar", "onwind", "offwind-ac", "gas", "coal", "oil", "lignite", "uranium", "biomass", "AC"]

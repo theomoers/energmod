@@ -1,0 +1,14 @@
+central - AB
+- baseline scearnio with moderate electrification
+
+fast electrification - AP
+- moderate high electrification
+
+green shift - NZ
+- very aggressive electrification
+
+slow transition - BU
+- low electrification, minimal transition
+
+crisis - DF (Delayed Future)
+- reduced electrifciation, constrained by instability
