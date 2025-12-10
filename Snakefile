@@ -76,6 +76,7 @@ copy_default_files()
 configfile: "config.default.yaml"
 configfile: "configs/bundle_config.yaml"
 configfile: "configs/powerplantmatching_config.yaml"
+configfile: "config.sectorelectrification.yaml"
 configfile: "config.yaml"
 
 shell.executable("/bin/bash")

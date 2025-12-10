@@ -49,6 +49,211 @@ def country_to_nodal(industrial_production, keys):
     return nodal_production
 
 
+def apply_industry_electrification(industry_base_totals, config, demand_scenario, planning_horizon):
+    """
+    Apply carrier-specific electrification shares to industry demand.
+    
+    Shifts energy from fossil carriers (coal, gas) to electricity and hydrogen
+    based on scenario-specific shares defined in config.sectorelectrification.yaml.
+    
+    Parameters
+    ----------
+    industry_base_totals : pd.DataFrame
+        MultiIndex DataFrame with (country, carrier) as index and subsectors as columns
+    config : dict
+        Configuration dictionary containing industry_electrification parameters
+    demand_scenario : str
+        Demand scenario identifier (e.g., 'AB', 'NZ', 'AP', 'BU', 'DF')
+    planning_horizon : str
+        Planning year (e.g., '2020', '2030', '2050')
+    
+    Returns
+    -------
+    pd.DataFrame
+        Modified industry_base_totals with adjusted carrier shares
+    """
+    
+    # Check if industry electrification config exists
+    if 'sector' not in config:
+        _logger.warning("No 'sector' key in config. Using base carrier mix.")
+        return industry_base_totals
+    
+    if 'industry_electrification' not in config['sector']:
+        _logger.warning("No 'industry_electrification' in config['sector']. Using base carrier mix.")
+        return industry_base_totals
+    
+    elec_config = config['sector']['industry_electrification']
+    
+    # Check if this scenario is the default scenario - if so, skip electrification
+    default_scenario = elec_config.get('default_scenario', None)
+    if default_scenario and demand_scenario == default_scenario:
+        _logger.info(f"Scenario {demand_scenario} is the default scenario. Skipping industry electrification.")
+        return industry_base_totals
+    
+    result = industry_base_totals.copy()
+    
+    _logger.info(f"Applying industry electrification for {demand_scenario}_{planning_horizon}")
+    
+    # Define subsector mappings to config parameters
+    subsector_mapping = {
+        'iron and steel': ('steel_electric_share', 'steel_hydrogen_share'),
+        'non-metallic minerals': ('cement_electric_share', 'cement_hydrogen_share'),
+        'chemical and petrochemical': ('chemicals_electric_share', 'chemicals_hydrogen_share'),
+    }
+    
+    # List of other industries that use generic shares
+    other_industries = [
+        'non-ferrous metals', 'transport equipment', 'machinery',
+        'mining and quarrying', 'food and tobacco', 'paper pulp and print',
+        'wood and wood products', 'textile and leather', 'construction', 'other'
+    ]
+    
+    # Energy efficiency factors relative to conventional (coal/gas) processes
+    # Values < 1.0 mean more efficient (less energy per unit output)
+    efficiency_factors = {
+        'electricity': {
+            'iron and steel': 0.65 / 0.55,  # EAF vs blast furnace
+            'non-metallic minerals': 0.85 / 0.75,  # Electric kilns vs coal kilns
+            'chemical and petrochemical': 0.80 / 0.70,  # Electric crackers vs steam
+            'other': 0.90 / 0.85,  # General electrification
+        },
+        'hydrogen': {
+            'iron and steel': 0.70 / 0.55,  # H2-DRI vs blast furnace
+            'non-metallic minerals': 0.75 / 0.75,  # H2 kilns vs coal
+            'chemical and petrochemical': 0.85 / 0.70,  # H2 feedstock
+            'other': 0.80 / 0.85,  # Limited H2 use
+        }
+    }
+    
+    scenario_key = f"{demand_scenario}_{planning_horizon}"
+    
+    countries = result.index.get_level_values(0).unique()
+    
+    for country in countries:
+        # Process explicitly mapped subsectors (steel, cement, chemicals)
+        for subsector, (elec_param, h2_param) in subsector_mapping.items():
+            if subsector not in result.columns:
+                continue
+                
+            # Get electrification shares from config
+            elec_share = elec_config.get(elec_param, {}).get(scenario_key, 0.0)
+            h2_share = elec_config.get(h2_param, {}).get(scenario_key, 0.0)
+            conventional_share = 1.0 - elec_share - h2_share
+            
+            if conventional_share < 0:
+                _logger.warning(
+                    f"Electrification shares for {subsector} in {scenario_key} sum to > 1.0. "
+                    f"Normalizing: elec={elec_share}, h2={h2_share}"
+                )
+                total = elec_share + h2_share
+                elec_share /= total
+                h2_share /= total
+                conventional_share = 0.0
+            
+            # Get current fossil fuel consumption for this subsector
+            if (country, 'coal') in result.index:
+                coal_energy = result.loc[(country, 'coal'), subsector]
+            else:
+                coal_energy = 0.0
+                
+            if (country, 'gas') in result.index:
+                gas_energy = result.loc[(country, 'gas'), subsector]
+            else:
+                gas_energy = 0.0
+            
+            total_fossil = coal_energy + gas_energy
+            
+            if total_fossil == 0:
+                continue
+            
+            # Calculate new energy demands with efficiency adjustments
+            subsector_group = 'other' if subsector not in efficiency_factors['electricity'] else subsector
+            
+            new_elec_energy = (
+                total_fossil * elec_share * efficiency_factors['electricity'].get(subsector_group, 1.0)
+            )
+            new_h2_energy = (
+                total_fossil * h2_share * efficiency_factors['hydrogen'].get(subsector_group, 1.0)
+            )
+            
+            # Update carriers
+            if (country, 'electricity') in result.index:
+                result.loc[(country, 'electricity'), subsector] += new_elec_energy
+            else:
+                # Ensure electricity carrier exists
+                result.loc[(country, 'electricity'), subsector] = new_elec_energy
+            
+            if (country, 'hydrogen') in result.index:
+                result.loc[(country, 'hydrogen'), subsector] += new_h2_energy
+            else:
+                result.loc[(country, 'hydrogen'), subsector] = new_h2_energy
+            
+            # Reduce fossil fuels proportionally
+            if (country, 'coal') in result.index:
+                result.loc[(country, 'coal'), subsector] = coal_energy * conventional_share
+            if (country, 'gas') in result.index:
+                result.loc[(country, 'gas'), subsector] = gas_energy * conventional_share
+        
+        # Process other industries with generic shares
+        elec_share_other = elec_config.get('other_industries_electric_share', {}).get(scenario_key, 0.0)
+        h2_share_other = elec_config.get('other_industries_hydrogen_share', {}).get(scenario_key, 0.0)
+        conventional_share_other = 1.0 - elec_share_other - h2_share_other
+        
+        if conventional_share_other < 0:
+            _logger.warning(
+                f"Other industries electrification shares in {scenario_key} sum to > 1.0. Normalizing."
+            )
+            total = elec_share_other + h2_share_other
+            elec_share_other /= total
+            h2_share_other /= total
+            conventional_share_other = 0.0
+        
+        for subsector in other_industries:
+            if subsector not in result.columns:
+                continue
+            
+            # Get current fossil fuel consumption
+            coal_energy = result.loc[(country, 'coal'), subsector] if (country, 'coal') in result.index else 0.0
+            gas_energy = result.loc[(country, 'gas'), subsector] if (country, 'gas') in result.index else 0.0
+            total_fossil = coal_energy + gas_energy
+            
+            if total_fossil == 0:
+                continue
+            
+            # Apply generic efficiency factors
+            new_elec_energy = (
+                total_fossil * elec_share_other * efficiency_factors['electricity']['other']
+            )
+            new_h2_energy = (
+                total_fossil * h2_share_other * efficiency_factors['hydrogen']['other']
+            )
+            
+            # Update carriers
+            if (country, 'electricity') in result.index:
+                result.loc[(country, 'electricity'), subsector] += new_elec_energy
+            else:
+                result.loc[(country, 'electricity'), subsector] = new_elec_energy
+            
+            if (country, 'hydrogen') in result.index:
+                result.loc[(country, 'hydrogen'), subsector] += new_h2_energy
+            else:
+                result.loc[(country, 'hydrogen'), subsector] = new_h2_energy
+            
+            # Reduce fossil fuels
+            if (country, 'coal') in result.index:
+                result.loc[(country, 'coal'), subsector] = coal_energy * conventional_share_other
+            if (country, 'gas') in result.index:
+                result.loc[(country, 'gas'), subsector] = gas_energy * conventional_share_other
+    
+    _logger.info(
+        f"Applied industry electrification for scenario {scenario_key}: "
+        f"Steel elec={elec_config.get('steel_electric_share', {}).get(scenario_key, 0.0):.2%}, "
+        f"Steel H2={elec_config.get('steel_hydrogen_share', {}).get(scenario_key, 0.0):.2%}"
+    )
+    
+    return result
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
         
@@ -97,6 +302,14 @@ if __name__ == "__main__":
             1, columns=industry_demand.columns, index=countries
         )
         nodal_keys = country_to_nodal(production_base, dist_keys)
+
+        # Apply industry electrification shares to custom demand data
+        industry_demand = apply_industry_electrification(
+            industry_demand,
+            snakemake.config,
+            snakemake.wildcards['demand'],
+            snakemake.wildcards['planning_horizons']
+        )
 
         nodal_df = pd.DataFrame()
 
@@ -324,6 +537,14 @@ if __name__ == "__main__":
                 axis=1
             )
             industry_base_totals.drop(columns=other_cols, inplace=True)
+
+        # Apply industry electrification shares
+        industry_base_totals = apply_industry_electrification(
+            industry_base_totals,
+            snakemake.config,
+            snakemake.wildcards['demand'],
+            snakemake.wildcards['planning_horizons']
+        )
 
         nodal_df = pd.DataFrame()
 

@@ -1346,6 +1346,96 @@ def add_year2025_capacity_targets(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
 
 
+def add_year2025_link_capacity_targets(n, planning_year, config):
+    """
+    Add 2025 capacity targets for link-based technologies (e.g., coal, gas).
+    Constrains installed capacity by carrier to match 2025 targets +/- tolerance.
+    
+    Important: For links with efficiency < 1, p_nom represents thermal/fuel input capacity,
+    not electrical output. The target should be specified in electrical output (MW_el),
+    and this function will convert to thermal capacity using efficiency.
+    
+    Example: 100 MW coal plant with 33% efficiency -> p_nom = 100/0.33 = 303 MW_th
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+
+    target_year = str(cfg.get("year", 2025))
+    if str(planning_year) != target_year:
+        logger.info(f"Skipping 2025 link capacity constraints for {planning_year} (configured for {target_year})")
+        return
+
+    logger.info(f"Adding 2025 link capacity constraints for {planning_year}")
+
+    tol   = float(cfg.get("tolerance", 0.15))
+    units = str(cfg.get("units", "GW")).lower()
+    unit_scale = {"mw":1.0, "gw":1e3, "tw":1e6}.get(units, 1e3)
+
+    targets = cfg.get("targets", {})
+
+    # Get extendable links by carrier
+    ext_links = n.links.query("p_nom_extendable")
+    
+    if ext_links.empty:
+        logger.info("No extendable links found for capacity constraints")
+        return
+
+    # Get the capacity variable
+    p_nom = n.model["Link-p_nom"]
+    
+    for carrier, target in targets.items():
+        if isinstance(target, str) and target.upper().startswith("X"):
+            logger.info(f"Skipping {carrier} (placeholder target '{target}')")
+            continue
+
+        # Find links matching this carrier
+        carrier_links = ext_links[ext_links.carrier == carrier].index
+        
+        if len(carrier_links) == 0:
+            # Not a warning - this carrier might be a generator, not a link
+            continue
+
+        # Get average efficiency for this carrier
+        avg_efficiency = n.links.loc[carrier_links, 'efficiency'].mean()
+        
+        if avg_efficiency <= 0 or not np.isfinite(avg_efficiency):
+            logger.warning(f"Invalid efficiency {avg_efficiency} for carrier '{carrier}', skipping")
+            continue
+        
+        # Sum of p_nom for this carrier (in thermal/fuel capacity)
+        lhs = p_nom.loc[carrier_links].sum()
+        
+        # Add existing non-extendable capacity (also in thermal capacity)
+        existing_links = n.links.query("carrier == @carrier and not p_nom_extendable")
+        existing_capacity_thermal = existing_links.p_nom.sum()
+        
+        # Convert electrical target to thermal capacity using efficiency
+        # target is in MW_el, divide by efficiency to get MW_th
+        target_thermal = float(target) / avg_efficiency
+        
+        # Calculate bounds in thermal capacity
+        lower = target_thermal * (1.0 - tol) * unit_scale - existing_capacity_thermal
+        upper = target_thermal * (1.0 + tol) * unit_scale - existing_capacity_thermal
+        
+        # For logging, convert back to electrical capacity for clarity
+        existing_capacity_elec = existing_capacity_thermal * avg_efficiency
+        total_lower_elec = (lower + existing_capacity_thermal) * avg_efficiency
+        total_upper_elec = (upper + existing_capacity_thermal) * avg_efficiency
+
+        logger.info(
+            f"{carrier}: {total_lower_elec/unit_scale:.2f} ≤ total electrical capacity ≤ "
+            f"{total_upper_elec/unit_scale:.2f} {units.upper()} "
+            f"(existing: {existing_capacity_elec/unit_scale:.2f} {units.upper()}, "
+            f"avg efficiency: {avg_efficiency:.2%}, "
+            f"thermal p_nom range: {(lower + existing_capacity_thermal)/unit_scale:.2f}-{(upper + existing_capacity_thermal)/unit_scale:.2f} {units.upper()})"
+        )
+        
+        n.model.add_constraints(lhs >= lower, name=f"year2025_link_capacity_min__{carrier}")
+        n.model.add_constraints(lhs <= upper, name=f"year2025_link_capacity_max__{carrier}")
+
+
 def extra_functionality(n, snapshots):
     """
     Collects supplementary constraints which will be passed to
@@ -1463,15 +1553,19 @@ def extra_functionality(n, snapshots):
 
     add_co2_sequestration_limit(n, snapshots)
 
-    # Add 2025 capacity targets
+    # Add 2025 capacity targets for generators
     add_year2025_capacity_targets(
         n,
         planning_year=snakemake.wildcards.planning_horizons,
         config=n.config if hasattr(n, "config") else snakemake.config,
     )
-
-    logger.info('Model after adding extra functionality:')
-    logger.info(n.model)
+    
+    # Add 2025 capacity targets for links (e.g., coal, gas)
+    #add_year2025_link_capacity_targets(
+    #    n,
+    #    planning_year=snakemake.wildcards.planning_horizons,
+    #    config=n.config if hasattr(n, "config") else snakemake.config,
+    #)
 
 
 def solve_network(n, config, solving, **kwargs):
@@ -1891,33 +1985,6 @@ if __name__ == "__main__":
     n = prepare_network(n, solve_opts)
     # ensure monthly constraints can access reference network if present
     n.n_ref = n_ref
-
-    # ---- TSAM: aggregate to typical periods (ONLY if enabled) ----
-    skip = True
-    if skip:
-        logger.info("Temporal clustering in prepare_sector_network")
-    else:
-        temporal_cfg = snakemake.config.get("temporal_clustering", {})
-        if temporal_cfg.get("activate", False):
-            # Guard against accidentally using both nhours and TSAM
-            if solve_opts.get("nhours"):
-                logger.warning("Both 'nhours' and TSAM requested. Proceeding with TSAM; ignoring nhours downsampling semantics.")
-            
-            logger.info("Applying temporal clustering (TSAM) after network preparation...")
-            logger.info(f"TSAM parameters: n_periods={temporal_cfg.get('n_periods', 10)}, hours={temporal_cfg.get('hours', 24)}, method={temporal_cfg.get('clusterMethod', 'hierarchical')}")
-            
-            aggregate_snapshots(
-                n,
-                n_periods=temporal_cfg.get("n_periods", 10),
-                hours=temporal_cfg.get("hours", 24),
-                normed=temporal_cfg.get("normed", True),
-                solver=temporal_cfg.get("solver", "glpk"),
-                extremePeriodMethod=temporal_cfg.get("extremePeriodMethod", "None"),
-                clusterMethod=temporal_cfg.get("clusterMethod", "hierarchical"),
-                predefClusterOrder=None,
-                overwrite_time_dfs=temporal_cfg.get("overwrite_time_dfs", False),
-            )
-            logger.info(f"TSAM aggregation complete. Network now has {len(n.snapshots)} snapshots; period_id persisted.")
 
     n = solve_network(
         n,

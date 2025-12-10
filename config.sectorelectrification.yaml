@@ -1,0 +1,424 @@
+# SPDX-FileCopyrightText: CKI
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+sector:
+  dynamic_transport:
+    enable: false # If "True", then the BEV and FCEV shares are obtained depending on the "Co2L"-wildcard (e.g. "Co2L0.70: 0.10"). If "False", then the shares are obtained depending on the "demand" wildcard and "planning_horizons" wildcard as listed below (e.g. "DF_2050: 0.08")
+    land_transport_electric_share:
+      Co2L2.0: 0.00
+      Co2L1.0: 0.01
+      Co2L0.90: 0.03
+      Co2L0.80: 0.06
+      Co2L0.70: 0.10
+      Co2L0.60: 0.17
+      Co2L0.50: 0.27
+      Co2L0.40: 0.40
+      Co2L0.30: 0.55
+      Co2L0.20: 0.69
+      Co2L0.10: 0.80
+      Co2L0.00: 0.88
+
+    land_transport_fuel_cell_share: # shares of fuel cell vehicles in land transport
+      Co2L2.0: 0.01
+      Co2L1.0: 0.01
+      Co2L0.90: 0.01
+      Co2L0.80: 0.01
+      Co2L0.70: 0.01
+      Co2L0.60: 0.01
+      Co2L0.50: 0.01
+      Co2L0.40: 0.01
+      Co2L0.30: 0.01
+      Co2L0.20: 0.01
+      Co2L0.10: 0.01
+      Co2L0.00: 0.01
+
+  land_transport_fuel_cell_share:
+    BU_2020: 0.00
+    BU_2025: 0.00
+    BU_2030: 0.00
+    BU_2035: 0.00
+    BU_2040: 0.00
+    BU_2045: 0.00
+    BU_2050: 0.00
+
+    AP_2020: 0.00
+    AP_2025: 0.0035
+    AP_2030: 0.006
+    AP_2035: 0.013
+    AP_2040: 0.020
+    AP_2045: 0.030
+    AP_2050: 0.040
+
+    NZ_2020: 0.000
+    NZ_2025: 0.020
+    NZ_2030: 0.030
+    NZ_2035: 0.045
+    NZ_2040: 0.060
+    NZ_2045: 0.080
+    NZ_2050: 0.100
+
+    DF_2020: 0.00
+    DF_2025: 0.00
+    DF_2030: 0.00
+    DF_2035: 0.00
+    DF_2040: 0.00
+    DF_2045: 0.00
+    DF_2050: 0.00
+
+    AB_2020: 0.000
+    AB_2025: 0.0025
+    AB_2030: 0.004
+    AB_2035: 0.0095
+    AB_2040: 0.015
+    AB_2045: 0.0325
+    AB_2050: 0.050
+
+  land_transport_electric_share: # shares of electric vehicles in land transport
+    BU_2020: 0.00
+    BU_2025: 0.00
+    BU_2030: 0.00
+    BU_2035: 0.01
+    BU_2040: 0.02
+    BU_2045: 0.035
+    BU_2050: 0.05
+
+    AP_2020: 0.00
+    AP_2025: 0.01
+    AP_2030: 0.10
+    AP_2035: 0.225
+    AP_2040: 0.35
+    AP_2045: 0.45
+    AP_2050: 0.55
+
+    NZ_2020: 0.00
+    NZ_2025: 0.01
+    NZ_2030: 0.25
+    NZ_2035: 0.45
+    NZ_2040: 0.65
+    NZ_2045: 0.775
+    NZ_2050: 0.90
+
+    DF_2020: 0.00
+    DF_2025: 0.00
+    DF_2030: 0.00
+    DF_2035: 0.00
+    DF_2040: 0.00
+    DF_2045: 0.00
+    DF_2050: 0.00
+
+    AB_2020: 0.00
+    AB_2025: 0.01
+    AB_2030: 0.02
+    AB_2035: 0.05
+    AB_2040: 0.08
+    AB_2045: 0.165
+    AB_2050: 0.25
+
+  co2_network: true
+  co2_sequestration_potential: 1000 #MtCO2/a sequestration potential for Europe
+  co2_sequestration_cost: 10 #EUR/tCO2 for sequestration of CO2
+  shipping_hydrogen_liquefaction: false
+  shipping_average_efficiency: 0.4 #For conversion of fuel oil to propulsion in 2011
+
+  shipping_hydrogen_share: #1.0
+    BU_2020: 0.00
+    BU_2025: 0.00
+    BU_2030: 0.00
+    BU_2035: 0.00
+    BU_2040: 0.00
+    BU_2045: 0.00
+    BU_2050: 0.00
+
+    AP_2020: 0.00
+    AP_2025: 0.00
+    AP_2030: 0.00
+    AP_2035: 0.06
+    AP_2040: 0.12
+    AP_2045: 0.185
+    AP_2050: 0.25
+
+    NZ_2020: 0.05
+    NZ_2025: 0.075
+    NZ_2030: 0.10
+    NZ_2035: 0.165
+    NZ_2040: 0.23
+    NZ_2045: 0.295
+    NZ_2050: 0.36
+
+    DF_2020: 0.00
+    DF_2025: 0.00    
+    DF_2030: 0.00
+    DF_2035: 0.00
+    DF_2040: 0.00
+    DF_2045: 0.00
+    DF_2050: 0.00
+  
+    AB_2020: 0.01
+    AB_2025: 0.02
+    AB_2030: 0.03
+    AB_2035: 0.065
+    AB_2040: 0.10
+    AB_2045: 0.14
+    AB_2050: 0.18
+
+  h2_cavern: true
+  marginal_cost_storage: 0
+  methanation: true
+  helmeth: true
+  dac: true
+  cc_fraction: 0.9
+  cc: true
+  space_heat_share: 0.6 # the share of space heating from all heating. Remainder goes to water heating.
+  airport_sizing_factor: 3
+
+  min_part_load_fischer_tropsch: 0.9
+
+  conventional_generation: # generator : carrier -- added as links in sector-coupled network
+    OCGT: gas
+    CCGT: gas
+    oil: oil
+    coal: coal
+    lignite: lignite
+    biomass: biomass
+  keep_existing_capacities: true
+    
+  industry_electrification:
+    default_scenario: "AB"
+    # ============ IRON AND STEEL ============
+    # Electric Arc Furnace (EAF) share - electricity-based steelmaking
+    steel_electric_share:
+
+      NZ_2020: 0.194  # Actual UNSD 2020: 19.4% EAF
+      NZ_2025: 0.40
+      NZ_2030: 0.55
+      NZ_2035: 0.70
+      NZ_2040: 0.80
+      NZ_2045: 0.90
+      NZ_2050: 0.90
+
+      AB_2020: 0.194  # Actual UNSD 2020: 19.4% EAF
+      AB_2025: 0.22   # Gradual growth with policy support
+      AB_2030: 0.26
+      AB_2035: 0.31
+      AB_2040: 0.37
+      AB_2045: 0.43
+      AB_2050: 0.50   # Realistic BAU: 50% EAF by 2050
+
+      DF_2020: 0.194  # Actual UNSD 2020: 19.4% EAF
+      DF_2025: 0.194  # Frozen at baseline
+      DF_2030: 0.194
+      DF_2035: 0.194
+      DF_2040: 0.194
+      DF_2045: 0.194
+      DF_2050: 0.194
+
+    # Hydrogen Direct Reduced Iron (H2-DRI) share
+    steel_hydrogen_share:
+      NZ_2020: 0.00  # No commercial H2-DRI in 2020
+      NZ_2025: 0.05
+      NZ_2030: 0.15
+      NZ_2035: 0.25
+      NZ_2040: 0.20  # Total with electric (0.80) = 1.0
+      NZ_2045: 0.10  # Total with electric (0.90) = 1.0
+      NZ_2050: 0.10  # Total with electric (0.90) = 1.0
+
+      AB_2020: 0.00  # No commercial H2-DRI in 2020
+      AB_2025: 0.00  # Slow pilot deployment
+      AB_2030: 0.01
+      AB_2035: 0.03
+      AB_2040: 0.05
+      AB_2045: 0.07
+      AB_2050: 0.10  # Total with electric (0.50) = 0.60
+
+      DF_2020: 0.00  # Pessimistic - no hydrogen adoption
+      DF_2025: 0.00
+      DF_2030: 0.00
+      DF_2035: 0.00
+      DF_2040: 0.00
+      DF_2045: 0.00
+      DF_2050: 0.00
+
+    # ============ CEMENT (non-metallic minerals) ============
+    # Electrification of grinding and some heating processes
+    cement_electric_share:
+
+      NZ_2020: 0.076  # Actual UNSD 2020: 7.6% (grinding)
+      NZ_2025: 0.10
+      NZ_2030: 0.20
+      NZ_2035: 0.35
+      NZ_2040: 0.50
+      NZ_2045: 0.65
+      NZ_2050: 0.75
+
+      AB_2020: 0.076  # Actual UNSD 2020: 7.6% (grinding)
+      AB_2025: 0.09   # Improved grinding efficiency
+      AB_2030: 0.12
+      AB_2035: 0.16
+      AB_2040: 0.21
+      AB_2045: 0.26
+      AB_2050: 0.32   # Realistic BAU: some kiln electrification
+
+      DF_2020: 0.076  # Actual UNSD 2020: 7.6% (grinding)
+      DF_2025: 0.076  # Frozen at baseline
+      DF_2030: 0.076
+      DF_2035: 0.076
+      DF_2040: 0.076
+      DF_2045: 0.076
+      DF_2050: 0.076
+
+    # Hydrogen for high-temperature cement kilns
+    cement_hydrogen_share:
+
+      NZ_2020: 0.00  # No commercial H2 cement in 2020
+      NZ_2025: 0.02
+      NZ_2030: 0.08
+      NZ_2035: 0.15
+      NZ_2040: 0.20
+      NZ_2045: 0.20
+      NZ_2050: 0.20  # Total with electric (0.75) = 0.95
+
+      AB_2020: 0.00  # No commercial H2 cement in 2020
+      AB_2025: 0.00  # Very slow pilot deployment
+      AB_2030: 0.01
+      AB_2035: 0.03
+      AB_2040: 0.06
+      AB_2045: 0.09
+      AB_2050: 0.13  # Total with electric (0.32) = 0.45
+
+      DF_2020: 0.00  # Pessimistic - no hydrogen adoption
+      DF_2025: 0.00
+      DF_2030: 0.00
+      DF_2035: 0.00
+      DF_2040: 0.00
+      DF_2045: 0.00
+      DF_2050: 0.00
+
+    # ============ CHEMICALS (chemical and petrochemical) ============
+    # Electric steam crackers and electrified processes
+    chemicals_electric_share:
+
+      NZ_2020: 0.233  # Actual UNSD 2020: 23.3%
+      NZ_2025: 0.30
+      NZ_2030: 0.45
+      NZ_2035: 0.60
+      NZ_2040: 0.70
+      NZ_2045: 0.78
+      NZ_2050: 0.82
+
+      AB_2020: 0.233  # Actual UNSD 2020: 23.3%
+      AB_2025: 0.27   # Heat pumps, efficient motors
+      AB_2030: 0.32
+      AB_2035: 0.38
+      AB_2040: 0.44
+      AB_2045: 0.51
+      AB_2050: 0.58   # Realistic BAU: gradual electric crackers
+
+      DF_2020: 0.233  # Actual UNSD 2020: 23.3%
+      DF_2025: 0.233  # Frozen at baseline
+      DF_2030: 0.233
+      DF_2035: 0.233
+      DF_2040: 0.233
+      DF_2045: 0.233
+      DF_2050: 0.233
+
+    # Hydrogen for chemical feedstock and processes
+    chemicals_hydrogen_share:
+
+      NZ_2020: 0.05  # Grey H2 for ammonia/methanol (estimated)
+      NZ_2025: 0.10
+      NZ_2030: 0.18
+      NZ_2035: 0.25
+      NZ_2040: 0.25  # Total with electric (0.70) = 0.95
+      NZ_2045: 0.20  # Total with electric (0.78) = 0.98
+      NZ_2050: 0.17  # Total with electric (0.82) = 0.99
+
+      AB_2020: 0.05  # Grey H2 for ammonia/methanol (estimated)
+      AB_2025: 0.06  # Slow green H2 adoption
+      AB_2030: 0.08
+      AB_2035: 0.11
+      AB_2040: 0.14
+      AB_2045: 0.18
+      AB_2050: 0.22  # Total with electric (0.58) = 0.80
+
+      DF_2020: 0.05  # Grey H2 stays (counted as fossil)
+      DF_2025: 0.05
+      DF_2030: 0.05
+      DF_2035: 0.05
+      DF_2040: 0.05
+      DF_2045: 0.05
+      DF_2050: 0.05
+
+    # ============ OTHER INDUSTRIES ============
+    # Generic electrification for remaining industrial subsectors
+    # Includes: paper, food, textiles, machinery, etc.
+    other_industries_electric_share:
+
+      NZ_2020: 0.352  # Actual UNSD 2020: 35.2%
+      NZ_2025: 0.45
+      NZ_2030: 0.60
+      NZ_2035: 0.72
+      NZ_2040: 0.80
+      NZ_2045: 0.87
+      NZ_2050: 0.90
+
+      AB_2020: 0.352  # Actual UNSD 2020: 35.2%
+      AB_2025: 0.40   # Heat pumps, efficient motors
+      AB_2030: 0.47
+      AB_2035: 0.54
+      AB_2040: 0.61
+      AB_2045: 0.67
+      AB_2050: 0.73   # Realistic BAU: steady improvement
+
+      DF_2020: 0.352  # Actual UNSD 2020: 35.2%
+      DF_2025: 0.352  # Frozen at baseline
+      DF_2030: 0.352
+      DF_2035: 0.352
+      DF_2040: 0.352
+      DF_2045: 0.352
+      DF_2050: 0.352
+
+    # Hydrogen for other industries (limited adoption)
+    other_industries_hydrogen_share:
+
+      NZ_2020: 0.00  # Negligible in 2020
+      NZ_2025: 0.02
+      NZ_2030: 0.07
+      NZ_2035: 0.12
+      NZ_2040: 0.15
+      NZ_2045: 0.11  # Total with electric (0.87) = 0.98
+      NZ_2050: 0.10  # Total with electric (0.90) = 1.0
+
+      AB_2020: 0.00  # Negligible in 2020
+      AB_2025: 0.00  # Very limited adoption
+      AB_2030: 0.01
+      AB_2035: 0.03
+      AB_2040: 0.05
+      AB_2045: 0.07
+      AB_2050: 0.09  # Total with electric (0.73) = 0.82
+
+      DF_2020: 0.00  # Pessimistic - no hydrogen adoption
+      DF_2025: 0.00
+      DF_2030: 0.00
+      DF_2035: 0.00
+      DF_2040: 0.00
+      DF_2045: 0.00
+      DF_2050: 0.00
+
+    # ============ CONFIGURATION NOTES ============
+    # 
+    # Subsector mapping:
+    # - "iron and steel" -> steel_*
+    # - "non-metallic minerals" -> cement_*
+    # - "chemical and petrochemical" -> chemicals_*
+    # - All others (paper, food, textiles, machinery, etc.) -> other_industries_*
+    #
+    # Energy efficiency assumptions:
+    # - EAF efficiency: 0.65 MWh_steel/MWh_elec (vs BF: 0.55)
+    # - H2-DRI efficiency: 0.70 MWh_steel/MWh_H2 (vs BF: 0.55)
+    # - These are applied in build_industry_demand.py
+    #
+    # Scenarios:
+    # - AB (Central): Moderate transition with some policies
+    # - AP (Ambitious Policy): Fast electrification, strong policy support
+    # - NZ (Net Zero): Maximum electrification aligned with climate goals
