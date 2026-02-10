@@ -18,8 +18,83 @@ from _helpers import BASE_DIR, mock_snakemake, read_csv_nafix
 _logger = logging.getLogger(__name__)
 
 
-def calculate_end_values(df, no_years):
-    return (1 + df) ** no_years
+def calculate_end_values(df, base_year, planning_horizon, countries=None):
+    """
+    Calculate end values from CAGRs.
+
+    If the dataframe has no explicit ``year`` column, assume a single
+    CAGR applying over the full period from ``base_year`` to
+    ``planning_horizon`` and compute::
+
+        (1 + cagr) ** no_years
+
+    If a ``year`` column is present (new specification), interpret the
+    rows as year‑specific CAGRs and compute cumulative growth by
+    multiplying the growth factors for each period:
+
+    - 2025: use 2025 CAGR for 2020‑2025  -> (1 + cagr_2025) ** 5
+    - 2030: use 2025 and 2030 CAGRs     -> (1 + cagr_2025) ** 5 * (1 + cagr_2030) ** 5
+    - 2050: use all CAGRs up to 2050    -> product over all 5‑year periods
+    """
+    base_year = int(base_year)
+    planning_horizon = int(planning_horizon)
+
+    # Old behaviour: no year column, single CAGR over the whole period
+    if "year" not in df.columns:
+        no_years = planning_horizon - base_year
+        return (1 + df) ** no_years
+
+    # New behaviour: year-specific CAGRs
+    if countries is None:
+        countries = sorted(df["country"].unique())
+
+    sector_cols = [c for c in df.columns if c not in ["country", "year"]]
+
+    # Separate out DEFAULT rows (used as fallback for missing countries/years)
+    has_default = (df["country"] == "DEFAULT").any()
+    if has_default:
+        default_rows = df[df["country"] == "DEFAULT"].set_index("year")
+    else:
+        default_rows = pd.DataFrame(columns=sector_cols)
+
+    # All CAGR years available in the table
+    all_cagr_years = sorted(df["year"].unique())
+
+    results = {}
+
+    for country in countries:
+        country_rows = df[df["country"] == country].set_index("year")
+
+        # Determine which CAGR years are relevant up to the planning horizon
+        years_needed = [y for y in all_cagr_years if base_year < y <= planning_horizon]
+
+        total = pd.Series(1.0, index=sector_cols, dtype=float)
+        prev_year = base_year
+
+        for y in years_needed:
+            period_years = y - prev_year
+            if period_years <= 0:
+                continue
+
+            if y in country_rows.index:
+                row = country_rows.loc[y, sector_cols]
+            elif has_default and y in default_rows.index:
+                row = default_rows.loc[y, sector_cols]
+            else:
+                raise KeyError(
+                    f"No CAGR data for country '{country}' and year {y}, "
+                    "and no matching DEFAULT row."
+                )
+
+            period_growth = (1 + row) ** period_years
+            total *= period_growth
+            prev_year = y
+
+        results[country] = total
+
+    result_df = pd.DataFrame.from_dict(results, orient="index")
+    result_df.index.name = "country"
+    return result_df
 
 
 def country_to_nodal(industrial_production, keys):
@@ -86,13 +161,13 @@ def apply_industry_electrification(industry_base_totals, config, demand_scenario
     
     # Check if this scenario is the default scenario - if so, skip electrification
     default_scenario = elec_config.get('default_scenario', None)
-    if default_scenario and demand_scenario == default_scenario:
+    if default_scenario is not None and demand_scenario == default_scenario:
         _logger.info(f"Scenario {demand_scenario} is the default scenario. Skipping industry electrification.")
         return industry_base_totals
     
     result = industry_base_totals.copy()
     
-    _logger.info(f"Applying industry electrification for {demand_scenario}_{planning_horizon}")
+    _logger.warning(f"Applying industry electrification for {demand_scenario}_{planning_horizon}")
     
     # Define subsector mappings to config parameters
     subsector_mapping = {
@@ -108,22 +183,13 @@ def apply_industry_electrification(industry_base_totals, config, demand_scenario
         'wood and wood products', 'textile and leather', 'construction', 'other'
     ]
     
-    # Energy efficiency factors relative to conventional (coal/gas) processes
-    # Values < 1.0 mean more efficient (less energy per unit output)
-    efficiency_factors = {
-        'electricity': {
-            'iron and steel': 0.65 / 0.55,  # EAF vs blast furnace
-            'non-metallic minerals': 0.85 / 0.75,  # Electric kilns vs coal kilns
-            'chemical and petrochemical': 0.80 / 0.70,  # Electric crackers vs steam
-            'other': 0.90 / 0.85,  # General electrification
-        },
-        'hydrogen': {
-            'iron and steel': 0.70 / 0.55,  # H2-DRI vs blast furnace
-            'non-metallic minerals': 0.75 / 0.75,  # H2 kilns vs coal
-            'chemical and petrochemical': 0.85 / 0.70,  # H2 feedstock
-            'other': 0.80 / 0.85,  # Limited H2 use
-        }
-    }
+    # Get energy efficiency factors from config
+    # Ratios of energy required for new technology vs conventional (coal/gas) processes
+    # Values < 1.0 mean new process is more efficient (requires less energy)
+    if 'efficiency_factors' in elec_config:
+        efficiency_factors = elec_config['efficiency_factors']
+    else:
+        raise KeyError("Missing 'efficiency_factors' in sectorelectrification config.")
     
     scenario_key = f"{demand_scenario}_{planning_horizon}"
     
@@ -323,33 +389,26 @@ if __name__ == "__main__":
             nodal_df = pd.concat([nodal_df, nodal_df_co])
 
     else:
-        no_years = int(snakemake.wildcards.planning_horizons) - int(
-            snakemake.params.base_year
+        base_year = int(snakemake.params.base_year)
+        planning_horizon = int(snakemake.wildcards.planning_horizons)
+
+        cagr = read_csv_nafix(
+            snakemake.input.industry_growth_cagr,
+            index_col=None,
         )
 
-        cagr = read_csv_nafix(snakemake.input.industry_growth_cagr, index_col=0)
-
-        # Building nodal industry production growth
-        for country in countries:
-            if country not in cagr.index:
-                cagr.loc[country] = cagr.loc["DEFAULT"]
-                _logger.warning(
-                    "No industry growth data for "
-                    + country
-                    + " using default data instead."
-                )
-            else:
-                cagr.loc[country] = cagr.loc[country].fillna(cagr.loc["DEFAULT"])
-
-        cagr = cagr[cagr.index.isin(countries)]
-
-        growth_factors = calculate_end_values(cagr, no_years)
+        growth_factors = calculate_end_values(
+            cagr, base_year, planning_horizon, countries=countries
+        )
 
         industry_base_totals = read_csv_nafix(
             snakemake.input["base_industry_totals"], index_col=[0, 1]
         )
 
-        production_base = cagr.map(lambda x: 1)
+        # Construct a base production dataframe (all ones) with the same
+        # shape as the growth_factors, then scale by the growth factors.
+        production_base = growth_factors.copy()
+        production_base.loc[:, :] = 1.0
         production_tom = production_base * growth_factors
 
         # non-used line; commented out

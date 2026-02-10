@@ -3704,7 +3704,6 @@ if __name__ == "__main__":
             configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate=0.071,
             demand="AB",
-            h2export="10"
         )
 
     # Load population layout
@@ -3923,18 +3922,90 @@ if __name__ == "__main__":
             logger.info("Applying temporal clustering (TSAM) during prepare_sector_network...")
             logger.info(f"TSAM parameters: n_periods={temporal_cfg.get('n_periods', 10)}, hours={temporal_cfg.get('hours', 24)}, method={temporal_cfg.get('clusterMethod', 'hierarchical')}")
             
+            # Check if this is baseyear or if we should load existing clustering
+            baseyear = snakemake.params.planning_horizons_baseyear
+            current_year = investment_year
+            tsam_input_path = snakemake.input.get("tsam_clustering", [])
+            predef_cluster_order = None
+            predef_cluster_centers = None
+            
+            if current_year != baseyear and tsam_input_path:
+                import pickle
+                try:
+                    with open(tsam_input_path[0], "rb") as f:
+                        tsam_data = pickle.load(f)
+                    predef_cluster_order = tsam_data.get("predefClusterOrder", None)
+                    predef_cluster_centers = tsam_data.get("predefClusterCenterIndices", None)
+                    logger.info(f"Loaded TSAM clustering from baseyear ({baseyear}): {len(predef_cluster_order) if predef_cluster_order is not None else 0} days predefined, {len(predef_cluster_centers) if predef_cluster_centers is not None else 0} cluster centers")
+                except Exception as e:
+                    logger.warning(f"Failed to load TSAM clustering from {tsam_input_path[0]}: {e}")
+                    logger.warning("Proceeding with independent clustering (may cause snapshot mismatch!)")
+            
+            # When using predefClusterOrder, disable extremePeriodMethod 
+            # (TSAM's implementation doesn't properly support combining these features)
+            extreme_period_method = temporal_cfg.get("extremePeriodMethod", "None")
+            if predef_cluster_order is not None and extreme_period_method != "None":
+                logger.warning(f"Disabling extremePeriodMethod ({extreme_period_method}) when using predefClusterOrder from baseyear")
+                logger.warning("This ensures consistent snapshots across all planning horizons")
+                extreme_period_method = "None"
+            
+            # Pass predefClusterCenterIndices to TSAM via temporal_cfg temporarily
+            # (aggregate_snapshots doesn't have this parameter, but TSAM TimeSeriesAggregation does)
+            if predef_cluster_centers is not None:
+                temporal_cfg_with_centers = temporal_cfg.copy()
+                temporal_cfg_with_centers["predefClusterCenterIndices"] = predef_cluster_centers
+            else:
+                temporal_cfg_with_centers = temporal_cfg
+            
             aggregate_snapshots(
                 n,
                 n_periods=temporal_cfg.get("n_periods", 10),
                 hours=temporal_cfg.get("hours", 24),
                 normed=temporal_cfg.get("normed", True),
                 solver=temporal_cfg.get("solver", "glpk"),
-                extremePeriodMethod=temporal_cfg.get("extremePeriodMethod", "None"),
+                extremePeriodMethod=extreme_period_method,
                 clusterMethod=temporal_cfg.get("clusterMethod", "hierarchical"),
-                predefClusterOrder=None,
+                predefClusterOrder=predef_cluster_order,
+                predefClusterCenterIndices=predef_cluster_centers,
                 overwrite_time_dfs=temporal_cfg.get("overwrite_time_dfs", False),
             )
             logger.info(f"TSAM aggregation complete. Network now has {len(n.snapshots)} snapshots; period_id persisted.")
+            
+            # Save clustering output file (required by Snakemake)
+            import pickle
+            import os
+            tsam_output_path = snakemake.output.tsam_clustering
+            os.makedirs(os.path.dirname(tsam_output_path), exist_ok=True)
+            
+            if current_year == baseyear and hasattr(n, "cluster_order"):
+                # Baseyear: save full clustering data with clusterOrder and clusterCenterIndices
+                predef_order = list(n.cluster_order)
+                predef_centers = list(n.cluster_centers) if hasattr(n, "cluster_centers") and n.cluster_centers is not None else None
+                
+                tsam_data = {
+                    "predefClusterOrder": predef_order,
+                    "predefClusterCenterIndices": predef_centers,
+                    "n_periods": temporal_cfg.get("n_periods", 10),
+                    "hours": temporal_cfg.get("hours", 24),
+                    "snapshots": n.snapshots.tolist(),
+                    "snapshot_weightings": n.snapshot_weightings.to_dict(),
+                }
+                
+                with open(tsam_output_path, "wb") as f:
+                    pickle.dump(tsam_data, f)
+                logger.info(f"Saved TSAM clustering to {tsam_output_path} with clusterOrder and clusterCenterIndices for reuse in future horizons")
+            elif current_year == baseyear:
+                logger.warning("Could not save TSAM clustering - n.cluster_order not found")
+            else:
+                # Non-baseyear: create placeholder file (clustering was loaded from baseyear)
+                tsam_data = {
+                    "note": f"Clustering loaded from baseyear {baseyear}",
+                    "snapshots": n.snapshots.tolist(),
+                    "snapshot_weightings": n.snapshot_weightings.to_dict(),
+                }
+                with open(tsam_output_path, "wb") as f:
+                    pickle.dump(tsam_data, f)
+                logger.info(f"Created placeholder TSAM clustering file at {tsam_output_path} (used baseyear clustering)")
 
     # TODO add co2 limit here, if necessary
     # co2_limit_pu = eval(sopts[0][5:])
@@ -3984,5 +4055,5 @@ if __name__ == "__main__":
     logger.info("Applying regional WACCs to all renewable generators...")
     apply_regional_waccs(n, costs, wacc_dict, Nyears)
 
-    n.export_to_netcdf(snakemake.output[0])
+    n.export_to_netcdf(snakemake.output.network)
 

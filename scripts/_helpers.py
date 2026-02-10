@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1604,7 +1605,9 @@ def locate_bus(
             crs="EPSG:4326",
         )
 
-        gdf_merged = gpd.sjoin_nearest(gdf, gdf_shape, how="inner", rsuffix="right") 
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*Geometry is in a geographic CRS.*", category=UserWarning)
+            gdf_merged = gpd.sjoin_nearest(gdf, gdf_shape, how="inner", rsuffix="right") 
 
         df.loc[gdf_merged.index, col_out] = gdf_merged[col]
 
@@ -1848,6 +1851,118 @@ def lossy_bidirectional_links(n, carrier):
     n.links = pd.concat([n.links, rev_links], sort=False)
     n.links["reversed"] = n.links["reversed"].fillna(False).infer_objects(copy=False)
     n.links["length_original"] = n.links["length_original"].fillna(n.links.length)
+
+
+def get_rolling_window_years(planning_horizons, current_year, window_size):
+    """
+    Get list of years in the current rolling window.
+    
+    Parameters
+    ----------
+    planning_horizons : list
+        List of all planning horizon years
+    current_year : int
+        Current planning horizon year
+    window_size : int
+        Number of periods to solve together
+    
+    Returns
+    -------
+    list
+        List of years in the current rolling window
+    """
+    if current_year not in planning_horizons:
+        raise ValueError(f"Current year {current_year} not in planning horizons {planning_horizons}")
+    
+    idx = planning_horizons.index(current_year)
+    end_idx = min(idx + window_size, len(planning_horizons))
+    return planning_horizons[idx:end_idx]
+
+
+def is_final_rolling_window(planning_horizons, current_year, window_size):
+    """
+    Check if current window is the final one (where there aren't enough 
+    future periods to fill the window).
+    
+    Parameters
+    ----------
+    planning_horizons : list
+        List of all planning horizon years
+    current_year : int
+        Current planning horizon year
+    window_size : int
+        Number of periods to solve together
+    
+    Returns
+    -------
+    bool
+        True if this is the final rolling window
+    """
+    if current_year not in planning_horizons:
+        raise ValueError(f"Current year {current_year} not in planning horizons {planning_horizons}")
+    
+    idx = planning_horizons.index(current_year)
+    # Final window when we can't fill the full window size
+    return idx + window_size > len(planning_horizons)
+
+
+def get_social_discount(t, r=0.01):
+    """
+    Calculate social discount factor for a given time and rate.
+    
+    Parameters
+    ----------
+    t : int
+        Time period in years from present
+    r : float, default 0.01
+        Social discount rate per unit
+    
+    Returns
+    -------
+    float
+        Social discount factor
+    """
+    return 1 / (1 + r) ** t
+
+
+def get_investment_weighting(time_weighting, r=0.01):
+    """
+    Define cost weighting for investment periods based on social discount rate.
+    
+    Parameters
+    ----------
+    time_weighting : pd.Series
+        Time weightings for each period (typically years between periods)
+    r : float, default 0.01
+        Social discount rate per unit
+    
+    Returns
+    -------
+    pd.Series
+        Cost weightings for each investment period
+    """
+    import pandas as pd
+    
+    # Handle NaNs in time_weighting, which can occur e.g. in rolling horizon
+    # when there is only a single investment period in the window.
+    # In that case, the original construction of time_weighting can yield all-NaN.
+    if time_weighting.isna().all():
+        # Fallback: assume a single-unit duration for the lone period
+        time_weighting = pd.Series(1.0, index=time_weighting.index)
+    else:
+        # For partial NaNs (shouldn't normally occur), forward-fill from last
+        # valid value to keep a consistent duration definition
+        last_valid = time_weighting.dropna().iloc[-1]
+        time_weighting = time_weighting.fillna(last_valid)
+
+    end = time_weighting.cumsum()
+    start = time_weighting.cumsum().shift().fillna(0)
+    return pd.concat([start, end], axis=1).apply(
+        lambda x: sum(
+            get_social_discount(t, r) for t in range(int(x.iloc[0]), int(x.iloc[1]))
+        ),
+        axis=1,
+    )
 
 
 def set_length_based_efficiency(n, carrier, bus_suffix, transmission_efficiency):

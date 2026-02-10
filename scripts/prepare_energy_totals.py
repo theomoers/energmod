@@ -32,8 +32,83 @@ def get(item, investment_year=None):
         return item
 
 
-def calculate_end_values(df):
-    return (1 + df) ** no_years
+def calculate_end_values(df, base_year, planning_horizon, countries=None):
+    """
+    Calculate end values from CAGRs.
+
+    If the dataframe has no explicit ``year`` column, assume a single
+    CAGR applying over the full period from ``base_year`` to
+    ``planning_horizon`` and compute::
+
+        (1 + cagr) ** no_years
+
+    If a ``year`` column is present (new specification), interpret the
+    rows as year‑specific CAGRs and compute cumulative growth by
+    multiplying the growth factors for each period:
+
+    - 2025: use 2025 CAGR for 2020‑2025  -> (1 + cagr_2025) ** 5
+    - 2030: use 2025 and 2030 CAGRs     -> (1 + cagr_2025) ** 5 * (1 + cagr_2030) ** 5
+    - 2050: use all CAGRs up to 2050    -> product over all 5‑year periods
+    """
+    base_year = int(base_year)
+    planning_horizon = int(planning_horizon)
+
+    # Old behaviour: no year column, single CAGR over the whole period
+    if "year" not in df.columns:
+        no_years = planning_horizon - base_year
+        return (1 + df) ** no_years
+
+    # New behaviour: year-specific CAGRs
+    if countries is None:
+        countries = sorted(df["country"].unique())
+
+    sector_cols = [c for c in df.columns if c not in ["country", "year"]]
+
+    # Separate out DEFAULT rows (used as fallback for missing countries/years)
+    has_default = (df["country"] == "DEFAULT").any()
+    if has_default:
+        default_rows = df[df["country"] == "DEFAULT"].set_index("year")
+    else:
+        default_rows = pd.DataFrame(columns=sector_cols)
+
+    # All CAGR years available in the table
+    all_cagr_years = sorted(df["year"].unique())
+
+    results = {}
+
+    for country in countries:
+        country_rows = df[df["country"] == country].set_index("year")
+
+        # Determine which CAGR years are relevant up to the planning horizon
+        years_needed = [y for y in all_cagr_years if base_year < y <= planning_horizon]
+
+        total = pd.Series(1.0, index=sector_cols, dtype=float)
+        prev_year = base_year
+
+        for y in years_needed:
+            period_years = y - prev_year
+            if period_years <= 0:
+                continue
+
+            if y in country_rows.index:
+                row = country_rows.loc[y, sector_cols]
+            elif has_default and y in default_rows.index:
+                row = default_rows.loc[y, sector_cols]
+            else:
+                raise KeyError(
+                    f"No CAGR data for country '{country}' and year {y}, "
+                    "and no matching DEFAULT row."
+                )
+
+            period_growth = (1 + row) ** period_years
+            total *= period_growth
+            prev_year = y
+
+        results[country] = total
+
+    result_df = pd.DataFrame.from_dict(results, orient="index")
+    result_df.index.name = "country"
+    return result_df
 
 
 def fill_country_data(df, country, default_key="DEFAULT", label="", logger=_logger):
@@ -63,7 +138,7 @@ if __name__ == "__main__":
 
     base_energy_totals = read_csv_nafix(snakemake.input.unsd_paths, index_col=0)
     growth_factors_cagr = read_csv_nafix(
-        snakemake.input.growth_factors_cagr, index_col=0
+        snakemake.input.growth_factors_cagr, index_col=None
     )
     efficiency_gains_cagr = read_csv_nafix(
         snakemake.input.efficiency_gains_cagr, index_col=0
@@ -77,12 +152,17 @@ if __name__ == "__main__":
 
     for country in countries:
         fill_country_data(efficiency_gains_cagr, country, label="efficiency gains CAGR")
-        fill_country_data(growth_factors_cagr, country, label="growth factors CAGR")
         fill_country_data(fuel_shares, country, label="fuel share")
         fill_country_data(district_heating, country, label="heating")
 
-    growth_factors = calculate_end_values(growth_factors_cagr)
-    efficiency_gains = calculate_end_values(efficiency_gains_cagr)
+    base_year = int(snakemake.params.base_year)
+
+    growth_factors = calculate_end_values(
+        growth_factors_cagr, base_year, investment_year, countries=countries
+    )
+    efficiency_gains = calculate_end_values(
+        efficiency_gains_cagr, base_year, investment_year, countries=countries
+    )
 
     efficiency_gains = efficiency_gains[efficiency_gains.index.isin(countries)]
     fuel_shares = fuel_shares[fuel_shares.index.isin(countries)]

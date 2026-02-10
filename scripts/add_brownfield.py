@@ -13,6 +13,7 @@ import pandas as pd
 import pypsa
 import xarray as xr
 from add_existing_baseyear import add_build_year_to_new_assets
+from solve_network import apply_optional_sector_clustering
 
 # from pypsa.clustering.spatial import normed_or_uniform
 
@@ -112,6 +113,19 @@ def add_brownfield(n, n_p, year):
         selection = n.component_attrs[c.name].type.str.contains(
             "series"
         ) & n.component_attrs[c.name].status.str.contains("Input")
+        
+        # Check for snapshot alignment before importing time series
+        if not n.snapshots.equals(n_p.snapshots):
+            logger.warning(
+                f"Snapshot mismatch detected when importing {c.name} time series from previous horizon!\n"
+                f"  Current network has {len(n.snapshots)} snapshots: {n.snapshots[0]} to {n.snapshots[-1]}\n"
+                f"  Previous network has {len(n_p.snapshots)} snapshots: {n_p.snapshots[0]} to {n_p.snapshots[-1]}\n"
+                f"  This will cause PyPSA to fill missing values with defaults, corrupting capacity factors and other time series.\n"
+                f"  Skipping time-dependent data import for {c.name}. Check temporal_clustering configuration."
+            )
+            # Skip time series import to avoid corruption
+            continue
+        
         for tattr in n.component_attrs[c.name].index[selection]:
             n.import_series_from_dataframe(c.pnl[tattr], c.name, tattr)
 
@@ -392,6 +406,19 @@ if __name__ == "__main__":
     # adjust_renewable_profiles(n, snakemake.input, snakemake.params, year)
 
     add_build_year_to_new_assets(n, year)
+
+    # Ensure brownfield merge uses the same clustered topology as the previous solved horizon.
+    buses_before_clustering = len(n.buses)
+    n = apply_optional_sector_clustering(n, snakemake.config)
+    if len(n.buses) != buses_before_clustering:
+        logger.info(
+            "Applied additional sector clustering in add_brownfield before merge: buses %d -> %d.",
+            buses_before_clustering,
+            len(n.buses),
+        )
+    if not isinstance(getattr(n, "meta", None), dict):
+        n.meta = {}
+    n.meta.update({"brownfield_input_clustered_before_merge": True})
 
     n_p = pypsa.Network(snakemake.input.network_p)
 

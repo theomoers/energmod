@@ -388,6 +388,8 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year, re
     else:
         # Log initial state
         unique_plant_countries = plants.countries.unique()
+        # Filter out NaN values before converting to list/set to avoid type comparison errors
+        unique_plant_countries = [c for c in unique_plant_countries if pd.notna(c)]
         eia_countries = normalize_using_yearly.columns.tolist()
         plants_with_hydro = plants[plants.installed_hydro == True]
         
@@ -396,6 +398,12 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year, re
         logger.info(f"  Plants with installed hydro: {len(plants_with_hydro)}")
         logger.info(f"  Countries with plants: {len(unique_plant_countries)} - {sorted(unique_plant_countries)}")
         logger.info(f"  Countries with EIA data: {len(eia_countries)} - {sorted(eia_countries)}")
+        
+        # Skip rescaling if only Germany ('DE') has EIA data
+        if len(eia_countries) == 1 and eia_countries[0] == 'DE':
+            logger.warning("Skipping hydro rescaling: only 'DE' has EIA data, insufficient for multi-country rescaling")
+            logger.warning("Returning unscaled runoff data")
+            return runoff
         
         # Identify countries with EIA data but no plants
         countries_with_eia_no_plants = set(eia_countries) - set(unique_plant_countries)
@@ -658,7 +666,7 @@ if __name__ == "__main__":
         hydrobasins_path = os.path.join(BASE_DIR, resource["hydrobasins"])
         resource["hydrobasins"] = hydrobasins_path
         hydrobasins = gpd.read_file(hydrobasins_path)
-        ppls = load_powerplants("/shared/share_cki25/energymodels/pypsa-earth/permstorage/default_2/resources/powerplants.csv") # ppls = load_powerplants(snakemake.input.powerplants)
+        ppls = load_powerplants("/shared/share_cki25/energymodels/pypsa-earth/permstorage/110nodes_1h_7ph/resources/powerplants.csv") # ppls = load_powerplants(snakemake.input.powerplants)
 
         all_hydro_ppls = ppls[ppls.carrier == "hydro"]
 

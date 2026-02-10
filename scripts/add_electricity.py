@@ -654,8 +654,10 @@ def attach_hydro(n, costs, ppl):
         missing_countries = pd.Index(hydro["country"].unique()).difference(
             max_hours_country.dropna().index
         )
+        # Filter out NaN/float values before join
+        missing_countries = [c for c in missing_countries if pd.notna(c) and isinstance(c, str)]
         hydro_max_hours_default = c.get("hydro_max_hours_default", 6.0)
-        if not missing_countries.empty:
+        if len(missing_countries) > 0:
             logger.warning(
                 f"Assuming max_hours={hydro_max_hours_default} for hydro reservoirs in the countries: "
                 + ", ".join(missing_countries)
@@ -875,7 +877,7 @@ if __name__ == "__main__":
             ll="copt",
             opts="3h",
             planning_horizons="2020",
-            sopts="72h",
+            sopts="48h",
             configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
             discountrate="0.071",
             demand="AB",

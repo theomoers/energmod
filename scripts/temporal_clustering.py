@@ -1,79 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Linopy-compatible temporal clustering (TSAM) + storage constraints for typical-day models.
-
-Default behaviour = **Pyomo parity**:
-- TSAM aggregation across (optional) investment periods
-- period_id persisted on the Network (n.temporal_cluster['period_id']) for cyclic SOC wrapping
-- Storage equations per Kotzur et al. (2018) **matching the original Pyomo script**:
-  (1) soc_intra recursion with **unit time-step** (no dt scaling), **no inflow/spill** terms
-  (2) soc_inter recursion across typical periods (cyclic) using **last-hour** terms scaled by `hours`
-  (3) total SOC: E = soc_intra + soc_inter(period_of_snapshot)
-  (4) SOC upper bounds identical to the original
-  (5) Removes PyPSA's default StorageUnit SOC constraints before adding the above
-
-Optional “improved” switches (off by default):
-- use_dt_in_intra=False  -> set True to multiply intra recursion by snapshot-weight dt
-- include_inflow_in_intra=False -> set True to include inflow (+) and spill (–) in intra recursion
-
-Notes:
-- The inter-period recursion follows the original approximation: uses *last hour* of the period.
-
-Original credit to bw0928. Adapted for linopy and pypsa-earth by Filip Matic and Theo Moers
+Adapted for linopy and pypsa-earth by Filip Matic and Theo Moers
 """
 
 from importlib.util import find_spec
+import json
 import logging
-logger = logging.getLogger(__name__)
+import time
+
 import numpy as np
 import pandas as pd
 import xarray as xr
 from linopy import Variable
 
+logger = logging.getLogger(__name__)
 
-def _as_xr(obj) -> xr.DataArray:
-    """
-    Return an xarray.DataArray for linopy Variables / xr objects / numpy.
-    Never return an xarray.Dataset.
-    """
-    # Already a DataArray
-    if isinstance(obj, xr.DataArray):
-        return obj
-
-    # If it's an xarray.Dataset, collapse to a single DataArray
-    if isinstance(obj, xr.Dataset):
-        if len(obj.data_vars) == 1:
-            # take the single var
-            return next(iter(obj.data_vars.values()))
-        # otherwise stack and squeeze
-        return obj.to_array().squeeze(drop=True)
-
-    # linopy Variable often has .to_xarray()
-    if hasattr(obj, "to_xarray"):
-        x = obj.to_xarray()
-        if isinstance(x, xr.DataArray):
-            return x
-        if isinstance(x, xr.Dataset):
-            if len(x.data_vars) == 1:
-                return next(iter(x.data_vars.values()))
-            return x.to_array().squeeze(drop=True)
-
-    # Numpy / scalars fallback: only wrap true scalars/ndarrays; otherwise return as-is
-    try:
-        import numpy as _np
-        if _np.isscalar(obj) or isinstance(obj, _np.ndarray):
-            return xr.DataArray(obj)
-    except Exception:
-        pass
-    return obj  # don't force-wrap linopy/xarray-like objects
-
-
-__tcl_version__ = "2025-11-03T"  # bump each edit
-logger.info("tcl version: %s", __tcl_version__)
-
-
-if find_spec("tsam") is None:
-    raise ModuleNotFoundError("Optional dependency 'tsam' not found. Install via 'pip install tsam'")
 import tsam.timeseriesaggregation as tsam  # noqa: E402
 
 def _ensure_multiindex_snapshots(df: pd.DataFrame):
@@ -115,27 +56,56 @@ def _persist_period_id(n, period_id: pd.Series) -> None:
 
 
 def _restore_period_id(n) -> pd.Series | None:
-    """Try to restore period_id from n.temporal_cluster or from n.meta."""
+    """
+    Try to restore period_id from n.temporal_cluster or from n.meta.
+    
+    Returns period_id with index matching n.snapshots exactly (same object reference).
+    This ensures xarray operations work correctly without index conflicts.
+    """
+    # First try temporal_cluster (in-memory, most reliable)
     if hasattr(n, "temporal_cluster") and isinstance(n.temporal_cluster, dict):
         if "period_id" in n.temporal_cluster:
-            return n.temporal_cluster["period_id"]
-    ser = None
+            period_id = n.temporal_cluster["period_id"]
+            # Always recreate with snapshots index to ensure exact match
+            if hasattr(n, "snapshots"):
+                return pd.Series(period_id.values, index=n.snapshots, name="period_id")
+            return period_id
+    
+    # Try to restore from meta (JSON serialized)
     if hasattr(n, "meta") and isinstance(n.meta, dict) and "temporal_cluster_period_id" in n.meta:
         try:
+            # Try standard deserialization
             ser = pd.read_json(n.meta["temporal_cluster_period_id"], orient="split", typ="series")
-        except Exception as e:
-            logger.warning(f"Failed to deserialize period_id from n.meta: {e}")
-            ser = None
-    if ser is not None:
+        except (ValueError, TypeError) as e:
+            # If that fails, manually extract values from JSON
+            try:
+                json_data = json.loads(n.meta["temporal_cluster_period_id"])
+                if "data" in json_data:
+                    ser = pd.Series(json_data["data"], name="period_id")
+                else:
+                    raise ValueError("Unexpected JSON structure")
+            except Exception as e2:
+                logger.warning(f"Failed to deserialize period_id from n.meta: {e}, fallback also failed: {e2}")
+                return None
+        
+        # Always recreate with snapshots index to ensure exact match
+        if hasattr(n, "snapshots") and len(ser) == len(n.snapshots):
+            period_id = pd.Series(ser.values, index=n.snapshots, name="period_id")
+            # Store back in temporal_cluster for future use
         if not hasattr(n, "temporal_cluster") or not isinstance(n.temporal_cluster, dict):
             n.temporal_cluster = {}
-        n.temporal_cluster["period_id"] = ser
-    return ser
+            n.temporal_cluster["period_id"] = period_id
+            return period_id
+        else:
+            logger.warning(f"period_id length ({len(ser)}) doesn't match snapshots length ({len(n.snapshots) if hasattr(n, 'snapshots') else 'N/A'})")
+            return None
+    
+    return None
 
 
 def _weight_series_for_stores(n) -> pd.Series:
     """
-    Robustly get Δt for storage equations.
+    Robustly get delta t for storage equations.
     Priority: snapshot_weightings.stores -> 'objective' -> 'weightings' -> 1.0
     """
     sw = n.snapshot_weightings
@@ -167,6 +137,7 @@ def aggregate_snapshots(
     extremePeriodMethod="None",
     clusterMethod="k_means",
     predefClusterOrder=None,
+    predefClusterCenterIndices=None,
     overwrite_time_dfs=False,
 ):
     """
@@ -186,6 +157,8 @@ def aggregate_snapshots(
         map_snapshots_to_periods,
         new_snapshots,
         timeseries_clustered,
+        cluster_order,
+        cluster_centers,
     ) = aggregate_timeseries(
         timeseries_df,
         n_periods,
@@ -195,6 +168,7 @@ def aggregate_snapshots(
         clusterMethod,
         solver,
         predefClusterOrder,
+        predefClusterCenterIndices,
     )
 
     # If we fabricated a MultiIndex, drop back to single level to match original behavior
@@ -205,6 +179,12 @@ def aggregate_snapshots(
 
     # Save mapping original -> typical periods (for backwards compatibility)
     n.cluster = map_snapshots_to_periods
+    
+    # Store clusterOrder and clusterCenterIndices as network attributes for later saving
+    if cluster_order is not None:
+        n.cluster_order = cluster_order
+    if cluster_centers is not None:
+        n.cluster_centers = cluster_centers
 
     # Re-set snapshots and weightings (preserve column totals exactly)
     old_w = n.snapshot_weightings.copy()
@@ -302,6 +282,7 @@ def aggregate_timeseries(
     clusterMethod,
     solver,
     predefClusterOrder,
+    predefClusterCenterIndices,
 ):
     """Call TSAM to compute typical periods; return mapping and clustered data."""
     def concat_df(df, df_final, year):
@@ -315,6 +296,8 @@ def aggregate_timeseries(
     map_snapshots_to_periods_all = pd.DataFrame()
     new_snapshots_all = pd.DataFrame()
     clustered_all = pd.DataFrame()
+    cluster_order_saved = None  # Will store clusterOrder from first year
+    cluster_centers_saved = None  # Will store clusterCenterIndices from first year
 
     # Handle each investment period (first level of MultiIndex)
     for year in timeseries_df.index.levels[0]:
@@ -327,9 +310,9 @@ def aggregate_timeseries(
             hoursPerPeriod=hours,
             clusterMethod=_method,
             predefClusterOrder=predefClusterOrder,
+            predefClusterCenterIndices=predefClusterCenterIndices,
             numericalTolerance=1e-8,
         )
-
 
         clustered = aggregation.createTypicalPeriods()
         if normed:
@@ -338,15 +321,19 @@ def aggregate_timeseries(
         mapping = aggregation.indexMatching()
         mapping["day_of_year"] = (mapping.index - mapping.index[0]).days + 1
         weights = aggregation.clusterPeriodNoOccur
+        
+        # Capture clusterOrder and clusterCenterIndices for first year (for saving to pickle)
+        if cluster_order_saved is None:
+            if hasattr(aggregation, 'clusterOrder'):
+                cluster_order_saved = aggregation.clusterOrder
+            if hasattr(aggregation, 'clusterCenterIndices'):
+                cluster_centers_saved = aggregation.clusterCenterIndices
         # Period column name used by TSAM mapping
         period_col = "PeriodNum" if "PeriodNum" in mapping.columns else (
             "PeriodID" if "PeriodID" in mapping.columns else None
         )
         if period_col is None:
             raise KeyError(f"TSAM mapping missing PeriodNum/PeriodID; have: {list(mapping.columns)}")
-
-
-
 
         # k-means has no center day indices -> centers=None
         centers = getattr(aggregation, "clusterCenterIndices", None)
@@ -454,7 +441,7 @@ def aggregate_timeseries(
     # Sort new_snapshots_all by index to ensure monotonic increasing timestamps
     new_snapshots_all = new_snapshots_all.sort_index()
     
-    return map_snapshots_to_periods_all, new_snapshots_all, clustered_all
+    return map_snapshots_to_periods_all, new_snapshots_all, clustered_all, cluster_order_saved, cluster_centers_saved
 
 
 def overwrite_time_dependent(n, df_t):
@@ -465,529 +452,616 @@ def overwrite_time_dependent(n, df_t):
             if not pnl[key].empty:
                 pnl[key] = df_t.reindex(columns=pnl[key].columns)
 
+def _as_da(obj):
+    """
+    Return suitable object for linopy constraint building.
+    Linopy Variables are returned as-is (they work directly in constraints).
+    xarray DataArrays/Datasets are passed through or converted.
+    """
+    # Import here to avoid circular imports
+    from linopy import Variable
+    
+    # Linopy Variables work directly in constraints - don't convert
+    if isinstance(obj, Variable):
+        return obj
+    
+    if isinstance(obj, xr.DataArray):
+        return obj
+    if isinstance(obj, xr.Dataset):
+        if len(obj.data_vars) == 1:
+            return next(iter(obj.data_vars.values()))
+        return obj.to_array().squeeze(drop=True)
+    if hasattr(obj, "to_xarray"):
+        x = obj.to_xarray()
+        if isinstance(x, xr.DataArray):
+            return x
+        if isinstance(x, xr.Dataset):
+            if len(x.data_vars) == 1:
+                return next(iter(x.data_vars.values()))
+            return x.to_array().squeeze(drop=True)
+    
+    # Last resort: return as-is and let linopy handle it
+    return obj
 
-def temporal_aggregation_storage_constraints(
+
+def _get_period_id(n, snapshots, hours=24):
+    """
+    Get period_id aligned to `snapshots`.
+    Expects n.temporal_cluster['period_id'] from your TSAM aggregation,
+    otherwise derives as repeating 0..P-1 blocks of `hours`.
+    """
+    period_id = None
+    if hasattr(n, "temporal_cluster") and isinstance(n.temporal_cluster, dict):
+        period_id = n.temporal_cluster.get("period_id", None)
+
+    if period_id is None:
+        # fallback: assume snapshots already typical periods in blocks of `hours`
+        if len(snapshots) % hours != 0:
+            raise ValueError("Cannot derive period_id: len(snapshots) not multiple of hours.")
+        P = len(snapshots) // hours
+        period_id = pd.Series(np.repeat(np.arange(P), hours), index=snapshots, name="period_id")
+        logger.warning("period_id missing; derived as repeating blocks. (Assumes snapshots ordered by period.)")
+    else:
+        # ensure exact alignment
+        period_id = pd.Series(np.asarray(period_id), index=n.snapshots, name="period_id").reindex(snapshots)
+        if period_id.isna().any():
+            raise ValueError("period_id does not align with provided snapshots.")
+        period_id = pd.Series(period_id.values, index=snapshots, name="period_id")
+
+    # check uniform period sizes
+    counts = period_id.value_counts().sort_index()
+    if counts.nunique() != 1:
+        raise ValueError(f"Non-uniform typical period length: {counts.to_dict()}")
+    inferred_hours = int(counts.iloc[0])
+    return period_id, inferred_hours
+
+
+def _first_last_positions(period_id):
+    """
+    Return:
+      - is_first[pos] boolean array for snapshots
+      - idx_last array (length n_periods): position of last snapshot of each period (in snapshot order)
+      - idx_last_prev array: last snapshot of previous period (cyclic)
+      - per_of_snap_pos array: per snapshot -> period position 0..P-1
+      - periods: Index of unique period labels in appearance order
+    Uses positional indexing so it works with MultiIndex snapshots.
+    """
+    per_labels = pd.unique(period_id.values)  # preserves appearance order
+    periods = pd.Index(per_labels, name="period")
+
+    # Build table of (pos, period_label)
+    df = pd.DataFrame({"pos": np.arange(len(period_id)), "per": period_id.values})
+    g = df.groupby("per", sort=False)["pos"]
+    first_pos = g.first()
+    last_pos = g.last()
+
+    first_positions = set(first_pos.values.tolist())
+    is_first = np.array([i in first_positions for i in range(len(period_id))], dtype=bool)
+
+    idx_last = last_pos.reindex(periods).values.astype(int)        # length P
+    idx_last_prev = np.roll(idx_last, 1)                           # cyclic previous
+    per_of_snap_pos = periods.get_indexer(period_id.values)        # length T
+
+    return is_first, idx_last, idx_last_prev, per_of_snap_pos, periods
+
+
+def _remap_snapshot_to_period(obj, periods):
+    """
+    Helper to remap indexed object from snapshot dimension to period dimension.
+    Works for both linopy Variables and xarray DataArrays.
+    
+    Input: obj with 'snapshot' dimension of length P (one per period)
+    Output: same obj but with 'period' dimension instead
+    """
+    return obj.rename({"snapshot": "period"}).assign_coords(period=periods)
+
+
+def _remove_constraints_for_subset(m, prefix, names_to_remove):
+    """
+    Remove constraints whose name is in names_to_remove if present.
+    We keep this conservative: remove by exact name only.
+    """
+    for nm in names_to_remove:
+        if nm in m.constraints:
+            m.remove_constraints(nm)
+            logger.info("Removed constraint: %s", nm)
+
+
+# ---------------------------
+# Main entry
+# ---------------------------
+
+def add_kotzur_storage_constraints(
     n,
     snapshots=None,
     *,
-    use_dt_in_intra: bool = False,
-    include_inflow_in_intra: bool = False,
+    hours_per_period=24,
+    su_carriers=("phs", "hydro"),
+    store_carriers=("battery", "battery storage", "h2", "h2 store tank"),
 ):
     """
-    Add Linopy storage constraints consistent with typical-period aggregation.
-    
-    Only applies to:
-    - PHS (StorageUnit with carrier='PHS')
-    - Battery stores (Store with carrier in ['battery', 'battery storage'])
-    - Hydrogen stores (Store with carrier in ['H2', 'H2 Store Tank'])
-    
-    Hydro reservoirs (StorageUnit with carrier='hydro') and fuel/commodity stores
-    (gas, oil, coal, biomass, water tanks, etc.) keep default constraints.
+    Enforce Kotzur-style storage constraints on:
+      - StorageUnits with carrier in su_carriers
+      - Stores with carrier in store_carriers
+    Keep default energy_balance for all other Stores (accounting stores).
 
-    Defaults match the original Pyomo script exactly:
-      - intra recursion uses unit step (no dt scaling)
-      - intra recursion does NOT include inflow/spill
-
-    Set use_dt_in_intra=True and/or include_inflow_in_intra=True to enable the
-    “improved” variant if desired.
+    Assumes:
+      - n.model already built (linopy)
+      - snapshots correspond to typical-day reduced horizon (e.g. P*hours)
+      - dt for recursion = 1 per snapshot (do NOT use occurrence weights as dt)
     """
     if snapshots is None:
         snapshots = n.snapshots
-
     if not hasattr(n, "model") or n.model is None:
-        raise AttributeError("Build the Linopy model before adding constraints.")
+        raise AttributeError("n.model is missing. Build the linopy model before adding constraints.")
 
-    # Ensure period_id exists or restore it
-    period_id = None
-    if hasattr(n, "temporal_cluster") and "period_id" in getattr(n, "temporal_cluster", {}):
-        period_id = n.temporal_cluster["period_id"]
-    if period_id is None:
-        period_id = _restore_period_id(n)
+    m = n.model
 
-    # Fallback: derive from old Pyomo-style n.cluster structure
-    if period_id is None and hasattr(n, "cluster") and isinstance(n.cluster, pd.DataFrame):
-        if "TimeStep" in n.cluster.columns:
-            try:
-                hours = int(n.cluster["TimeStep"].nunique())
-                num_periods = len(n.snapshots) // hours
-                if num_periods * hours == len(n.snapshots):
-                    period_id = pd.Index(
-                        np.repeat(np.arange(num_periods), hours), name="period_id"
-                    ).to_series(index=n.snapshots)
-                    _persist_period_id(n, period_id)
-                    logger.info("Derived period_id from n.cluster (Pyomo fallback).")
-            except Exception as e:
-                logger.warning(f"Could not derive period_id from n.cluster: {e}")
+    # period structure
+    period_id, hours = _get_period_id(n, snapshots, hours=hours_per_period)
+    is_first, idx_last, idx_last_prev, per_of_snap_pos, periods = _first_last_positions(period_id)
 
-    if period_id is None:
-        raise ValueError("Missing period_id mapping; run aggregate_snapshots() from this module.")
+    # coords
+    snap_coord = snapshots
+    per_coord = periods
+    one_snap = xr.DataArray(1.0, dims=["snapshot"], coords={"snapshot": snap_coord})
 
-    period_id = period_id.reindex(n.snapshots)
-
-    sus = n.storage_units
+    # ------------------------------------------------------------
+    # StorageUnits: apply to PHS + hydro only, keep default for others
+    # ------------------------------------------------------------
+    sus = n.storage_units.copy()
     if not sus.empty and "carrier" in sus.columns:
-        phs_mask = sus["carrier"].str.lower() == "phs"
-        sus = sus[phs_mask].copy()
-        if not phs_mask.any():
-            logger.info("No PHS StorageUnits found; skipping StorageUnit block.")
-    
-    has_sus = not sus.empty
-    if not has_sus:
-        logger.info("No PHS StorageUnits; skipping StorageUnit block but will add Store constraints.")
-
-    m = n.model
-
-    if "StorageUnit-soc_intra" in m.variables:
-        logger.info("Temporal storage constraints already present; skipping.")
-        return
-
-    # unique periods in order of appearance (robust)
-    periods = pd.Index(pd.unique(period_id), name="period")
-
-    # constant period length guard
-    size_per_period = period_id.value_counts().sort_index()
-    if not (size_per_period.nunique() == 1):
-        raise ValueError("Typical periods have non-uniform length; expected constant hours.")
-    hours = int(size_per_period.iloc[0])
-
-    if len(snapshots) % hours != 0:
-        raise ValueError("Snapshot count is not a multiple of hours per typical period.")
-
-    # first/last snapshots of each period (INDEXED BY PERIOD IDS)
-    _df = pd.DataFrame({"snapshot": pd.to_datetime(snapshots.values),
-                        "period": period_id.values})
-    g = _df.groupby("period", sort=False)["snapshot"]
-    first_of = g.first()   # index: period ids, values: timestamps
-    last_of  = g.last()    # index: period ids, values: timestamps
-
-    # map snapshot -> period (as xr)
-    per_of_snap = xr.DataArray(period_id.values, dims=["snapshot"], coords={"snapshot": snapshots})
-
-    snap_idx = pd.Index(pd.to_datetime(snapshots.values))
-    per_idx  = pd.Index(periods)
-
-    # last snapshot of each period as positions; then shift to "previous period" positions (cyclic)
-    idx_last         = snap_idx.get_indexer(pd.to_datetime(last_of.values))  # length P
-    idx_last_prev    = np.roll(idx_last, 1)                                  # shift cyclically
-
-    # map snapshot -> period positions
-    idx_per_of_snap  = per_idx.get_indexer(per_of_snap.values)               # length |snapshots|
-
-    # make them xarray indexers with explicit dims
-    idx_last_prev_da   = xr.DataArray(idx_last_prev,   dims=["period"])
-    idx_per_of_snap_da = xr.DataArray(idx_per_of_snap, dims=["snapshot"])
-
-
-
-    if has_sus:
-
-        # Existing PyPSA-Linopy vars
-        try:
-            E    = m.variables["StorageUnit-state_of_charge"].loc[snapshots, sus.index]
-            Pch  = m.variables["StorageUnit-p_store"].loc[snapshots, sus.index]
-            Pdis = m.variables["StorageUnit-p_dispatch"].loc[snapshots, sus.index]
-        except KeyError as e:
-            raise KeyError(
-                f"Missing storage model variable: {e}. Ensure storage units exist and model was built."
-            )
-
-        # Remove ONLY SOC-related constraints for PHS units; keep the power/energy-balance constraints.
-        # Build constraint name patterns for the specific PHS units we're handling
-        phs_unit_names = sus.index.tolist()
-        try:
-            to_drop = []
-            for name in list(m.constraints):
-                if not name.startswith("StorageUnit-"):
-                    continue
-                if "energy_balance" in name:
-                    continue
-                if not ("state_of_charge" in name or "soc" in name.lower()):
-                    continue
-                # Only drop if it affects our PHS units
-                # Check constraint coordinates to see if it includes our PHS units
-                try:
-                    constr = m.constraints[name]
-                    if hasattr(constr, "indexes") and "StorageUnit" in constr.indexes:
-                        su_idx = constr.indexes["StorageUnit"]
-                        if any(unit in su_idx for unit in phs_unit_names):
-                            to_drop.append(name)
-                except Exception:
-                    raise RuntimeError(f"Could not inspect constraint '{name}' for StorageUnit indexing.")
-            
-            for name in to_drop:
-                m.remove_constraints(name)
-            if to_drop:
-                logger.info("Removed default storage SOC constraints for PHS: %s", to_drop)
-        except Exception as e:
-            logger.warning(f"Could not remove default storage SOC constraints: {e}; continuing.")
-
-
-        # Δt for storage equations (robust)
-        dt_ser = _weight_series_for_stores(n).reindex(snapshots).fillna(1.0)
-        dt = xr.DataArray(
-            dt_ser.astype(float),
-            dims=["snapshot"],
-            coords={"snapshot": snapshots},
-        )
-        one = xr.DataArray(1.0, dims=["snapshot"], coords={"snapshot": snapshots})
-
-        # Parameters (fill defaults)
-        eta_ch = xr.DataArray(
-            sus.efficiency_store.fillna(1.0),
-            dims=["StorageUnit"],
-            coords={"StorageUnit": sus.index},
-        )
-        eta_dis = xr.DataArray(
-            sus.efficiency_dispatch.fillna(1.0),
-            dims=["StorageUnit"],
-            coords={"StorageUnit": sus.index},
-        )
-        standing_loss = xr.DataArray(
-            sus.standing_loss.fillna(0.0),
-            dims=["StorageUnit"],
-            coords={"StorageUnit": sus.index},
-        )
-
-        # Standing-loss factor per step:
-        # PARITY TWEAK: for parity (default), exponent = 1 per snapshot (unit step).
-        # If use_dt_in_intra=True, exponent = dt (improved variant).
-        _base = (1.0 - standing_loss).clip(min=1e-12)      # dims: ["StorageUnit"]
-        _exp = dt if use_dt_in_intra else one              # dims: ["snapshot"]
-
-        # Broadcast across named dims instead of NumPy indexing
-        alpha = (_base.expand_dims(snapshot=snapshots)
-                    .transpose("snapshot", "StorageUnit")) ** (
-                _exp.expand_dims(StorageUnit=sus.index)
-        )
-
-
-        # Optional inflow/spill (only used if include_inflow_in_intra=True)
-        Inflow = 0.0
-        if include_inflow_in_intra and hasattr(n, "storage_units_t") and "inflow" in n.storage_units_t:
-            inf = n.storage_units_t.inflow.reindex(index=snapshots, columns=sus.index).fillna(0.0)
-            Inflow = xr.DataArray(
-                inf.values,
-                dims=["snapshot", "StorageUnit"],
-                coords={"snapshot": snapshots, "StorageUnit": sus.index},
-            )
-        Spill = 0.0
-        if include_inflow_in_intra and "StorageUnit-spill" in m:
-            Spill = m.variables["StorageUnit-spill"].loc[snapshots, sus.index]
-
-
-        # (1) soc_intra variables + recursion (eq. 18)
-        soc_intra = m.add_variables(0.0, np.inf, coords=[snapshots, sus.index], name="StorageUnit-soc_intra")
-
-        # Intra recursion for interior snapshots (not first-of-period)
-        mask_first = xr.DataArray(np.isin(snapshots, first_of.values),
-                                dims=["snapshot"], coords={"snapshot": snapshots})
-        interior_mask = (~mask_first)
-
-        # Expand to 2-D so mask dims match constraint dims ('snapshot','StorageUnit')
-        mask_first_2d   = mask_first.expand_dims(StorageUnit=sus.index).transpose("snapshot", "StorageUnit")
-        interior_mask_2d = interior_mask.expand_dims(StorageUnit=sus.index).transpose("snapshot", "StorageUnit")
-
-        # Previous snapshot via xarray shift (avoids NaT + reindex headaches).
-        # First row becomes NaN, but we mask first-of-period rows anyway.
-        soc_intra_prev = soc_intra.shift(snapshot=1)
-
-        # Choose unit step (Pyomo parity) or dt-scaled variant
-        tstep = dt if use_dt_in_intra else one
-
-        # Prepare broadcast-safe views (xarray-style, no [:, None]/[None, :])
-        tstep_2d  = tstep.expand_dims(StorageUnit=sus.index).transpose("snapshot", "StorageUnit")
-        eta_ch_2d = eta_ch.expand_dims(snapshot=snapshots).transpose("snapshot", "StorageUnit")
-        eta_dis_2d= eta_dis.expand_dims(snapshot=snapshots).transpose("snapshot", "StorageUnit")
-
-        # soc_intra(t) = ...
-        rhs_intra = (alpha * soc_intra_prev) + (eta_ch_2d * tstep_2d * Pch) - ((tstep_2d / eta_dis_2d) * Pdis)
-
-        if include_inflow_in_intra and isinstance(Inflow, xr.DataArray):
-            rhs_intra = rhs_intra + tstep_2d * Inflow
-        if include_inflow_in_intra and isinstance(Spill, xr.DataArray):
-            rhs_intra = rhs_intra - tstep_2d * Spill
-        m.add_constraints((soc_intra - rhs_intra) == 0,
-                        name="StorageUnit-soc_intra-recur",
-                        mask=interior_mask_2d)
-
-        m.add_constraints(soc_intra == 0,
-                        name="StorageUnit-soc_intra-zero",
-                        mask=mask_first_2d)
-
-
-        # (2) soc_inter variables + recursion (eq. 19)
-        soc_inter = m.add_variables(
-            0.0, np.inf, coords=[periods, sus.index], name="StorageUnit-soc_inter"
-        )
-
-        # efficiencies for inter/intra parts
-        eff_inter = (1.0 - standing_loss) ** hours
-        eff_intra = (1.0 - standing_loss)
-
-        # Build 2-D broadcast-safe views for ('period','StorageUnit')
-        eff_inter_2d = eff_inter.expand_dims(period=periods).transpose("period", "StorageUnit")
-        eff_intra_2d = eff_intra.expand_dims(period=periods).transpose("period", "StorageUnit")
-        eta_ch_2d_p  = eta_ch.expand_dims(period=periods).transpose("period", "StorageUnit")
-        eta_dis_2d_p = eta_dis.expand_dims(period=periods).transpose("period", "StorageUnit")
-
-        # previous period (cyclic)
-        soc_inter_prev = soc_inter.roll(period=1)  # period k gets value from k-1, wraps at start
-
-        # soc_inter(k) = ...
-        Pch_lhp       = _as_xr(Pch).isel(snapshot=idx_last_prev_da)
-        Pdis_lhp      = _as_xr(Pdis).isel(snapshot=idx_last_prev_da)
-        soc_intra_lhp = _as_xr(soc_intra).isel(snapshot=idx_last_prev_da)
-
-        rhs_inter = (
-            eff_inter_2d * soc_inter_prev
-            + eff_intra_2d * soc_intra_lhp
-            + eta_ch_2d_p * hours * Pch_lhp
-            - (hours / eta_dis_2d_p) * Pdis_lhp
-        )
-        m.add_constraints((soc_inter - rhs_inter) == 0, name="StorageUnit-soc_inter-recur")
-
-        # (3) total SOC link (eq. 20): E = soc_intra + soc_inter(period_of_snapshot)
-        soc_inter_on_snap = _as_xr(soc_inter).isel(period=idx_per_of_snap_da) \
-            .rename(period="snapshot").assign_coords(snapshot=snapshots)
-
-        m.add_constraints(E - (soc_intra + soc_inter_on_snap) == 0, name="StorageUnit-SOC-sum")
-
-        try:
-            E.set_lower_bounds(0.0)
-            Pch.set_lower_bounds(0.0)
-            Pdis.set_lower_bounds(0.0)
-        except Exception:
-            m.add_constraints(E >= 0.0, name="StorageUnit-SOC-lb")
-            m.add_constraints(Pch >= 0.0, name="StorageUnit-p_store-lb")
-            m.add_constraints(Pdis >= 0.0, name="StorageUnit-p_dispatch-lb")
-
-        e_nom_col_exists = "e_nom" in sus.columns and sus["e_nom"].notna().any()
-        if e_nom_col_exists:
-            e_nom = xr.DataArray(
-                sus.e_nom.fillna(np.inf),
-                dims=["StorageUnit"],
-                coords={"StorageUnit": sus.index},
-            )
-            try:
-                E.set_upper_bounds(e_nom)
-            except Exception:
-                e_nom_2d = e_nom.expand_dims(snapshot=snapshots).transpose("snapshot", "StorageUnit")
-                m.add_constraints(E <= e_nom_2d, name="StorageUnit-SOC-ub-e_nom")
-
-        else:
-            extendable = sus.get("p_nom_extendable", pd.Series(False, index=sus.index)).astype(bool)
-            max_hours = sus.get("max_hours", pd.Series(np.inf, index=sus.index)).fillna(np.inf)
-
-            # Fixed portion
-            p_nom_fixed = sus.get("p_nom", pd.Series(0.0, index=sus.index)).where(~extendable, other=np.nan)
-            e_nom_fixed = (p_nom_fixed * max_hours).fillna(np.inf)
-            e_nom_fixed_da = xr.DataArray(e_nom_fixed, dims=["StorageUnit"], coords={"StorageUnit": sus.index})
-            e_nom_fixed_2d = e_nom_fixed_da.expand_dims(snapshot=snapshots).transpose("snapshot", "StorageUnit")
-            m.add_constraints(E <= e_nom_fixed_2d, name="StorageUnit-SOC-ub-fixed")
-
-
-            if extendable.any() and "StorageUnit-p_nom" in m:
-                idx_var = m.variables["StorageUnit-p_nom"].indexes.get("StorageUnit-ext", pd.Index([], name="StorageUnit-ext"))
-                if len(idx_var) > 0:
-                    p_nom_var = m.variables["StorageUnit-p_nom"].loc[idx_var].rename({"StorageUnit-ext": "StorageUnit"})
-
-                    common = sus.index.intersection(p_nom_var.indexes["StorageUnit"])
-                    if len(common) > 0:
-                        ext_mask = xr.DataArray(
-                            extendable.astype(float).loc[common],
-                            dims=["StorageUnit"],
-                            coords={"StorageUnit": common},
-                        )
-                        mh_da = xr.DataArray(
-                            max_hours.astype(float).loc[common],
-                            dims=["StorageUnit"],
-                            coords={"StorageUnit": common},
-                        )
-                        # Broadcast without explicit transpose - xarray handles alignment
-                        mh_da_bcast = mh_da.loc[common]
-                        ext_mask_bcast = ext_mask.loc[common]
-                        p_nom_var_bcast = p_nom_var.loc[common]
-
-                        lhs = E.loc[:, common] - (
-                            mh_da_bcast * ext_mask_bcast * p_nom_var_bcast
-                        )
-
-                        m.add_constraints(lhs <= 0, name="StorageUnit-SOC-ub-extendable")
-
-    logger.info("Added temporal storage constraints for StorageUnits (Kotzur: intra + inter + sum)")
-    # Apply identical TSAM-aware SOC to Stores
-    _add_store_ts_constraints(n, snapshots, periods, period_id, hours,
-        use_dt_in_intra=use_dt_in_intra,
-        include_inflow_in_intra=include_inflow_in_intra,
-    )
-
-
-    logger.info("Added temporal storage constraints for StorageUnits and Stores (Kotzur: intra + inter + sum)")
-
-def _add_store_ts_constraints(n, snapshots, periods, period_id, hours, *,
-                              use_dt_in_intra=False, include_inflow_in_intra=False):
-    m = n.model
-    stores = n.stores
-    if stores.empty:
-        return
-
-    # Filter stores: only battery and hydrogen carriers
-    if "carrier" in stores.columns:
-        battery_h2_mask = stores["carrier"].isin(['battery', 'battery storage', 'H2 Store Tank'])
-        stores = stores[battery_h2_mask].copy()
-        if not battery_h2_mask.any():
-            logger.info("No battery or hydrogen stores found; skipping Store constraints.")
-            return
+        mask_su = sus["carrier"].astype(str).str.lower().isin([c.lower() for c in su_carriers])
+        sus_k = sus.loc[mask_su]
+        sus_other = sus.loc[~mask_su]
     else:
-        logger.warning("No 'carrier' column in stores; skipping Store constraints.")
+        sus_k = sus.iloc[0:0]
+        sus_other = sus
+
+    if len(sus_k) > 0:
+        # remove global StorageUnit energy balance and restore for non-targets
+        # (PyPSA creates a single StorageUnit-energy_balance over all units)
+        _remove_constraints_for_subset(m, "StorageUnit-", ["StorageUnit-energy_balance"])
+
+        if len(sus_other) > 0:
+            _readd_default_storageunit_energy_balance(n, snapshots, sus_other.index)
+            logger.info("Readding storage constraints for Storage Units")
+
+        # now add Kotzur for target units
+        _add_kotzur_storageunit_block(n, snapshots, sus_k.index, is_first, idx_last_prev, per_of_snap_pos, periods, hours, one_snap, period_id)
+
+        logger.info("Kotzur constraints added for StorageUnits: %d", len(sus_k))
+    else:
+        logger.info("No StorageUnits matched carriers %s; skipping StorageUnit Kotzur block.", su_carriers)
+
+    # ------------------------------------------------------------
+    # Stores: apply to battery + H2 only, keep default for accounting stores
+    # ------------------------------------------------------------
+    stores = n.stores.copy()
+    if stores.empty or "carrier" not in stores.columns:
+        logger.info("No Stores or missing carrier column; skipping Store Kotzur block.")
         return
 
-    if stores.empty:
+    mask_st = stores["carrier"].astype(str).str.lower().isin([c.lower() for c in store_carriers])
+    stores_k = stores.loc[mask_st]
+    stores_other = stores.loc[~mask_st]
+
+    if len(stores_k) == 0:
+        logger.info("No Stores matched carriers %s; leaving default Store constraints.", store_carriers)
         return
 
-    # remove default Store SOC constraints (keep energy_balance)
-    to_drop = [name for name in list(m.constraints)
-               if name.startswith("Store-")
-               and ("state_of_charge" in name or "soc" in name.lower())
-               and ("energy_balance" not in name)]
-    for name in to_drop:
-        m.remove_constraints(name)
+    # remove global Store energy balance and restore for non-targets
+    _remove_constraints_for_subset(m, "Store-", ["Store-energy_balance"])
+    if len(stores_other) > 0:
+        _readd_default_store_energy_balance(n, snapshots, stores_other.index)
+        logger.info("Readding store energy balance")
 
-    # variables (only for our filtered Battery/H2 stores)
-    E    = m.variables["Store-e"].loc[snapshots, stores.index]
-    Pnet = m.variables["Store-p"].loc[snapshots, stores.index]
-    Ppos = m.add_variables(0.0, np.inf, coords=[snapshots, stores.index], name="Store-p_pos")
-    Pneg = m.add_variables(0.0, np.inf, coords=[snapshots, stores.index], name="Store-p_neg")
-    m.add_constraints(Pnet - (Ppos - Pneg) == 0, name="Store-p-split")
+    # add Kotzur for target stores
+    _add_kotzur_store_block(n, snapshots, stores_k.index, is_first, idx_last_prev, per_of_snap_pos, periods, hours, one_snap)
 
-    # timestep
-    dt_ser = _weight_series_for_stores(n).reindex(snapshots).fillna(1.0).astype(float)
-    dt     = xr.DataArray(dt_ser, dims=["snapshot"], coords={"snapshot": snapshots})
-    one    = xr.DataArray(1.0,   dims=["snapshot"], coords={"snapshot": snapshots})
-    tstep  = dt if use_dt_in_intra else one
+    logger.info("Kotzur constraints added for Stores: %d; default energy_balance restored for accounting stores: %d",
+                len(stores_k), len(stores_other))
 
-    # standing loss factor
-    standing_loss = xr.DataArray(stores.standing_loss.fillna(0.0),
-                                 dims=["Store"], coords={"Store": stores.index})
-    base  = (1.0 - standing_loss).clip(min=1e-12)
-    alpha = (base.expand_dims(snapshot=snapshots).transpose("snapshot", "Store")
-            ) ** (tstep.expand_dims(Store=stores.index))
 
-    # optional inflow/spill
-    Inflow = 0.0
-    if include_inflow_in_intra and hasattr(n, "stores_t") and "inflow" in n.stores_t:
-        inf = n.stores_t.inflow.reindex(index=snapshots, columns=stores.index).fillna(0.0)
-        Inflow = xr.DataArray(inf.values, dims=["snapshot","Store"],
-                              coords={"snapshot": snapshots, "Store": stores.index})
-    Spill = 0.0
-    if include_inflow_in_intra and "Store-spill" in m:
-        Spill = m.variables["Store-spill"].loc[snapshots, stores.index]
+# ---------------------------
+# Default energy balances (restore for non-targets)
+# ---------------------------
 
-    # per-period first/last
-    _df = pd.DataFrame({"snapshot": pd.to_datetime(snapshots.values),
-                        "period":   period_id.values})
-    first_of = _df.groupby("period", sort=False)["snapshot"].first()
-    last_of  = _df.groupby("period", sort=False)["snapshot"].last()
+def _readd_default_storageunit_energy_balance(n, snapshots, su_index):
+    """
+    Re-add PyPSA-like StorageUnit SOC energy balance for a subset of storage units.
+    Uses dt=1 hour per snapshot (typical-day reduced horizon).
+    """
+    m = n.model
+    E = m.variables["StorageUnit-state_of_charge"].loc[snapshots, su_index]
+    Pch = m.variables["StorageUnit-p_store"].loc[snapshots, su_index]
+    Pdis = m.variables["StorageUnit-p_dispatch"].loc[snapshots, su_index]
 
-    mask_first = xr.DataArray(np.isin(snapshots, first_of.values),
-                              dims=["snapshot"], coords={"snapshot": snapshots})
-    interior_mask_2d = (~mask_first).expand_dims(Store=stores.index).transpose("snapshot","Store")
-    mask_first_2d    = mask_first.expand_dims(Store=stores.index).transpose("snapshot","Store")
+    Spill = None
+    if "StorageUnit-spill" in m.variables:
+        Spill = m.variables["StorageUnit-spill"].loc[snapshots, su_index]
 
-    # (1) soc_intra on snapshots
-    soc_intra = m.add_variables(0.0, np.inf, coords=[snapshots, stores.index], name="Store-soc_intra")
-    soc_intra_prev = soc_intra.shift(snapshot=1)
-    t2d = tstep.expand_dims(Store=stores.index).transpose("snapshot","Store")
-    rhs_intra = (alpha * soc_intra_prev) + t2d * (Pneg - Ppos)
-    if isinstance(Inflow, xr.DataArray): rhs_intra = rhs_intra + t2d * Inflow
-    if isinstance(Spill,  xr.DataArray): rhs_intra = rhs_intra - t2d * Spill
-    m.add_constraints(soc_intra - rhs_intra == 0, name="Store-soc_intra-recur", mask=interior_mask_2d)
-    m.add_constraints(soc_intra == 0,            name="Store-soc_intra-zero",  mask=mask_first_2d)
+    sus = n.storage_units.loc[su_index]
 
-    # (2) soc_inter on periods (cyclic, last-hour approx)
-    per_idx = pd.Index(pd.unique(period_id), name="period")
-    soc_inter = m.add_variables(0.0, np.inf, coords=[per_idx, stores.index], name="Store-soc_inter")
-
-    eff_inter = (1.0 - standing_loss) ** hours
-    eff_intra = (1.0 - standing_loss)
-    eff_inter_2d = eff_inter.expand_dims(period=per_idx).transpose("period","Store")
-    eff_intra_2d = eff_intra.expand_dims(period=per_idx).transpose("period","Store")
-
-    snap_idx = pd.Index(pd.to_datetime(snapshots.values))
-    idx_last = snap_idx.get_indexer(pd.to_datetime(last_of.values))
-    idx_last_prev = np.roll(idx_last, 1)
-    idx_last_prev_da = xr.DataArray(idx_last_prev, dims=["period"])
-    
-    
-    Ppos_lhp_temp      = _as_xr(Ppos).isel(snapshot=idx_last_prev_da)
-    Pneg_lhp_temp      = _as_xr(Pneg).isel(snapshot=idx_last_prev_da)
-    soc_intra_lhp_temp = _as_xr(soc_intra).isel(snapshot=idx_last_prev_da)
-    
-    # Fix coordinates: reset 'snapshot' and add proper 'period' coordinate to avoid dimension conflicts
-    ppos_data = Ppos_lhp_temp._data.reset_coords('snapshot', drop=True).assign_coords(period=np.arange(len(per_idx)))
-    pneg_data = Pneg_lhp_temp._data.reset_coords('snapshot', drop=True).assign_coords(period=np.arange(len(per_idx)))
-    soc_intra_data = soc_intra_lhp_temp._data.reset_coords('snapshot', drop=True).assign_coords(period=np.arange(len(per_idx)))
-    
-    Ppos_lhp = Variable(ppos_data, Ppos_lhp_temp.model, Ppos_lhp_temp.name)
-    Pneg_lhp = Variable(pneg_data, Pneg_lhp_temp.model, Pneg_lhp_temp.name)
-    soc_intra_lhp = Variable(soc_intra_data, soc_intra_lhp_temp.model, soc_intra_lhp_temp.name)
-
-    soc_inter_prev = soc_inter.roll(period=1)
-
-    # Match StorageUnit pattern: multiply each term separately to avoid bare subtraction
-    rhs_inter = (
-        eff_inter_2d * soc_inter_prev
-        + eff_intra_2d * soc_intra_lhp
-        + float(hours) * Pneg_lhp
-        - float(hours) * Ppos_lhp
+    # elapsed hours per snapshot
+    eh = xr.DataArray(
+        n.snapshot_weightings.stores.reindex(snapshots).fillna(1.0).astype(float).values,
+        dims=["snapshot"],
+        coords={"snapshot": snapshots},
     )
-    m.add_constraints(soc_inter - rhs_inter == 0, name="Store-soc_inter-recur")
+    eh_2d = eh.expand_dims(StorageUnit=su_index).transpose("snapshot", "StorageUnit")
 
-    # (3) total SOC on snapshots
-    idx_per_of_snap_da = xr.DataArray(per_idx.get_indexer(period_id.values), dims=["snapshot"])
-    soc_inter_on_snap = _as_xr(soc_inter).isel(period=idx_per_of_snap_da) \
-        .rename(period="snapshot").assign_coords(snapshot=snapshots)
-    m.add_constraints(E - (soc_intra + soc_inter_on_snap) == 0, name="Store-SOC-sum")
+    eta_ch = xr.DataArray(
+        sus.efficiency_store.fillna(1.0).values,
+        dims=["StorageUnit"],
+        coords={"StorageUnit": su_index},
+    )
+    eta_dis = xr.DataArray(
+        sus.efficiency_dispatch.fillna(1.0).values,
+        dims=["StorageUnit"],
+        coords={"StorageUnit": su_index},
+    )
+    loss = xr.DataArray(
+        sus.standing_loss.fillna(0.0).values,
+        dims=["StorageUnit"],
+        coords={"StorageUnit": su_index},
+    )
+    eff_stand = (1.0 - loss).clip(min=1e-12) ** eh_2d
 
-    # bounds
-    try:
-        E.set_lower_bounds(0.0); Ppos.set_lower_bounds(0.0); Pneg.set_lower_bounds(0.0)
-    except Exception:
-        m.add_constraints(E   >= 0.0, name="Store-SOC-lb")
-        m.add_constraints(Ppos>= 0.0, name="Store-p_pos-lb")
-        m.add_constraints(Pneg>= 0.0, name="Store-p_neg-lb")
+    inflow_df = n.storage_units_t.inflow.reindex(index=snapshots, columns=su_index).fillna(0.0)
+    inflow = xr.DataArray(
+        inflow_df.values,
+        dims=["snapshot", "StorageUnit"],
+        coords={"snapshot": snapshots, "StorageUnit": su_index},
+    )
 
-    # Upper bounds: use e_nom variable for extendable, parameter for fixed
-    extendable = stores.get("e_nom_extendable", pd.Series(False, index=stores.index)).astype(bool)
+    E_da = _as_da(E)
+    Pch_da = _as_da(Pch)
+    Pdis_da = _as_da(Pdis)
+    Spill_da = _as_da(Spill) if Spill is not None else 0.0
+
+    cyclic = sus.cyclic_state_of_charge.fillna(False).astype(bool)
+    cyc_idx = cyclic[cyclic].index
+    non_idx = cyclic[~cyclic].index
+
+    not_first = xr.DataArray(np.arange(len(snapshots)) > 0, dims=["snapshot"], coords={"snapshot": snapshots})
+    first = ~not_first
+
+    # cyclic assets: include previous soc via roll for all snapshots
+    if len(cyc_idx) > 0:
+        E_c = E_da.loc[:, cyc_idx]
+        Pch_c = Pch_da.loc[:, cyc_idx]
+        Pdis_c = Pdis_da.loc[:, cyc_idx]
+        eh_c = eh_2d.sel(StorageUnit=cyc_idx)
+        eta_ch_c = eta_ch.loc[cyc_idx]
+        eta_dis_c = eta_dis.loc[cyc_idx]
+        eff_stand_c = eff_stand.sel(StorageUnit=cyc_idx)
+        inflow_c = inflow.loc[:, cyc_idx]
+        spill_c = Spill_da.loc[:, cyc_idx] if Spill is not None else 0.0
+
+        lhs_c = (
+            -E_c
+            - (eh_c / eta_dis_c) * Pdis_c
+            + (eh_c * eta_ch_c) * Pch_c
+            + eff_stand_c * E_c.roll(snapshot=1)
+            - eh_c * spill_c
+        )
+        rhs_c = -(eh_c * inflow_c)
+        m.add_constraints(lhs_c == rhs_c, name="StorageUnit-energy_balance-other-cyclic")
+
+    # non-cyclic assets: interior snapshots include previous, first snapshot uses initial soc
+    if len(non_idx) > 0:
+        E_n = E_da.loc[:, non_idx]
+        Pch_n = Pch_da.loc[:, non_idx]
+        Pdis_n = Pdis_da.loc[:, non_idx]
+        eh_n = eh_2d.sel(StorageUnit=non_idx)
+        eta_ch_n = eta_ch.loc[non_idx]
+        eta_dis_n = eta_dis.loc[non_idx]
+        eff_stand_n = eff_stand.sel(StorageUnit=non_idx)
+        inflow_n = inflow.loc[:, non_idx]
+        spill_n = Spill_da.loc[:, non_idx] if Spill is not None else 0.0
+
+        lhs_n = (
+            -E_n
+            - (eh_n / eta_dis_n) * Pdis_n
+            + (eh_n * eta_ch_n) * Pch_n
+            + eff_stand_n * E_n.shift(snapshot=1)
+            - eh_n * spill_n
+        )
+        rhs_n = -(eh_n * inflow_n)
+        mask_n = not_first.expand_dims(StorageUnit=non_idx).transpose("snapshot", "StorageUnit")
+        m.add_constraints(lhs_n == rhs_n, name="StorageUnit-energy_balance-other-noncyclic", mask=mask_n)
+
+        soc_init_n = xr.DataArray(
+            sus.loc[non_idx, "state_of_charge_initial"].fillna(0.0).values,
+            dims=["StorageUnit"],
+            coords={"StorageUnit": non_idx},
+        )
+        lhs_n_first = (
+            -E_n
+            - (eh_n / eta_dis_n) * Pdis_n
+            + (eh_n * eta_ch_n) * Pch_n
+            - eh_n * spill_n
+        )
+        rhs_n_first = -(eh_n * inflow_n) - soc_init_n
+        mask_f = first.expand_dims(StorageUnit=non_idx).transpose("snapshot", "StorageUnit")
+        m.add_constraints(lhs_n_first == rhs_n_first, name="StorageUnit-energy_balance-other-initial", mask=mask_f)
+
+
+def _readd_default_store_energy_balance(n, snapshots, store_index):
+    """
+    Re-add PyPSA-like Store energy balance for a subset of stores.
+    Uses dt=1 hour per snapshot (typical-day reduced horizon).
+    Sign convention: e[t] = decay*e[t-1] - p[t]
+    (Store-p positive means discharge to bus, decreases stored energy.)
+    """
+    m = n.model
+    E = m.variables["Store-e"].loc[snapshots, store_index]
+    P = m.variables["Store-p"].loc[snapshots, store_index]
+
+    st = n.stores.loc[store_index]
+
+    eh = xr.DataArray(
+        n.snapshot_weightings.stores.reindex(snapshots).fillna(1.0).astype(float).values,
+        dims=["snapshot"],
+        coords={"snapshot": snapshots},
+    )
+    eh_2d = eh.expand_dims(Store=store_index).transpose("snapshot", "Store")
+
+    loss = xr.DataArray(
+        st.standing_loss.fillna(0.0).values,
+        dims=["Store"],
+        coords={"Store": store_index},
+    )
+    eff_stand = (1.0 - loss).clip(min=1e-12) ** eh_2d
+
+    E_da = _as_da(E)
+    P_da = _as_da(P)
+
+    cyclic = st.e_cyclic.fillna(False).astype(bool)
+    cyc_idx = cyclic[cyclic].index
+    non_idx = cyclic[~cyclic].index
+
+    not_first = xr.DataArray(np.arange(len(snapshots)) > 0, dims=["snapshot"], coords={"snapshot": snapshots})
+    first = ~not_first
+
+    if len(cyc_idx) > 0:
+        E_c = E_da.loc[:, cyc_idx]
+        P_c = P_da.loc[:, cyc_idx]
+        eh_c = eh_2d.sel(Store=cyc_idx)
+        eff_c = eff_stand.sel(Store=cyc_idx)
+        lhs_c = -E_c - eh_c * P_c + eff_c * E_c.roll(snapshot=1)
+        m.add_constraints(lhs_c == 0.0, name="Store-energy_balance-other-cyclic")
+
+    if len(non_idx) > 0:
+        E_n = E_da.loc[:, non_idx]
+        P_n = P_da.loc[:, non_idx]
+        eh_n = eh_2d.sel(Store=non_idx)
+        eff_n = eff_stand.sel(Store=non_idx)
+        lhs_n = -E_n - eh_n * P_n + eff_n * E_n.shift(snapshot=1)
+        mask_n = not_first.expand_dims(Store=non_idx).transpose("snapshot", "Store")
+        m.add_constraints(lhs_n == 0.0, name="Store-energy_balance-other-noncyclic", mask=mask_n)
+
+        e_init_n = xr.DataArray(
+            st.loc[non_idx, "e_initial"].fillna(0.0).values,
+            dims=["Store"],
+            coords={"Store": non_idx},
+        )
+        lhs_n_first = -E_n - eh_n * P_n
+        mask_f = first.expand_dims(Store=non_idx).transpose("snapshot", "Store")
+        m.add_constraints(lhs_n_first == -e_init_n, name="Store-energy_balance-other-initial", mask=mask_f)
+
+
+# ---------------------------
+# Kotzur blocks
+# ---------------------------
+
+def _add_kotzur_storageunit_block(n, snapshots, su_index, is_first, idx_last_prev, per_of_snap_pos, periods, hours, one_snap, period_id):
+    """
+    Kotzur-like:
+      soc_intra recursion inside each typical period (start offset at 0 each period)
+      soc_inter recursion across periods (cyclic), using last-hour approximation
+      E = soc_intra + soc_inter(period(snapshot))
+    dt = 1 per snapshot.
     
-    # For extendable stores, use the e_nom optimization variable
+    Includes inflow and spill in intra-period energy balance when present.
+    Inter-period recursion is linked via last-hour approximation only.
+    """
+    m = n.model
+    sus = n.storage_units.loc[su_index]
+
+    E    = m.variables["StorageUnit-state_of_charge"].loc[snapshots, su_index]
+    Pch  = m.variables["StorageUnit-p_store"].loc[snapshots, su_index]
+    Pdis = m.variables["StorageUnit-p_dispatch"].loc[snapshots, su_index]
+    
+    # Get Spill variable if it exists
+    Spill = None
+    if "StorageUnit-spill" in m.variables:
+        Spill = m.variables["StorageUnit-spill"].loc[snapshots, su_index]
+    
+    # Get Inflow data (time series from n.storage_units_t.inflow)
+    Inflow = None
+    if hasattr(n, 'storage_units_t') and hasattr(n.storage_units_t, 'inflow'):
+        inflow_df = n.storage_units_t.inflow
+        if isinstance(inflow_df, pd.DataFrame) and not inflow_df.empty:
+            # Get inflow for the subset of storage units we're working with
+            available_cols = inflow_df.columns.intersection(su_index)
+            if len(available_cols) > 0:
+                inflow_subset = inflow_df.loc[snapshots, available_cols]
+                Inflow = xr.DataArray(
+                    inflow_subset.values,
+                    dims=["snapshot", "StorageUnit"],
+                    coords={"snapshot": snapshots, "StorageUnit": available_cols}
+                )
+
+    eta_ch = xr.DataArray(sus.efficiency_store.fillna(1.0).values, dims=["StorageUnit"], coords={"StorageUnit": su_index})
+    eta_dis = xr.DataArray(sus.efficiency_dispatch.fillna(1.0).values, dims=["StorageUnit"], coords={"StorageUnit": su_index})
+    loss = xr.DataArray(sus.standing_loss.fillna(0.0).values, dims=["StorageUnit"], coords={"StorageUnit": su_index})
+
+    decay_step = (1.0 - loss).clip(min=1e-12)                      # per hour
+    decay_inter = decay_step ** float(hours)                       # over a full day
+
+    # variables
+    snap_idx = pd.Index(snapshots, name="snapshot")
+    su_idx = pd.Index(su_index, name="StorageUnit")
+    per_idx = pd.Index(periods, name="period")
+
+    soc_intra = m.add_variables(0.0, np.inf, coords=[snap_idx, su_idx], name="StorageUnit_soc_intra")
+    soc_inter = m.add_variables(0.0, np.inf, coords=[per_idx, su_idx], name="StorageUnit_soc_inter")
+
+    E_da = _as_da(E)
+    Pch_da = _as_da(Pch)
+    Pdis_da = _as_da(Pdis)
+    soc_intra_da = _as_da(soc_intra)
+    soc_inter_da = _as_da(soc_inter)
+    
+    # Handle optional Spill and Inflow
+    Spill_da = _as_da(Spill) if Spill is not None else 0.0
+    Inflow_da = Inflow if Inflow is not None else 0.0
+
+    # masks
+    first_mask = xr.DataArray(is_first, dims=["snapshot"], coords={"snapshot": snapshots})
+    interior = (~first_mask).expand_dims(StorageUnit=su_idx).transpose("snapshot", "StorageUnit")
+    first2d  = first_mask.expand_dims(StorageUnit=su_idx).transpose("snapshot", "StorageUnit")
+
+    # (1) soc_intra
+    # Energy balance: E[t] = decay*E[t-1] + eta_ch*Pch - Pdis/eta_dis + Inflow - Spill
+    prev = soc_intra_da.shift(snapshot=1)
+
+    rhs = (decay_step * prev) + (eta_ch * Pch_da) - (Pdis_da / eta_dis) + Inflow_da - Spill_da
+    m.add_constraints(soc_intra_da - rhs == 0, name="StorageUnit_soc_intra_recur", mask=interior)
+
+    rhs_first = (eta_ch * Pch_da) - (Pdis_da / eta_dis) + Inflow_da - Spill_da
+    m.add_constraints(soc_intra_da - rhs_first == 0, name="StorageUnit_soc_intra_init", mask=first2d)
+
+    # (2) soc_inter (cyclic over typical periods)
+    soc_inter_prev = soc_inter_da.roll(period=1)
+
+    # last-hour terms from previous period (cyclic)
+    Pch_l = Pch_da.isel(snapshot=idx_last_prev)
+    Pdis_l = Pdis_da.isel(snapshot=idx_last_prev)
+    intra_l = soc_intra_da.isel(snapshot=idx_last_prev)
+
+    # Remap from snapshot to period dimension
+    Pch_l = _remap_snapshot_to_period(Pch_l, periods)
+    Pdis_l = _remap_snapshot_to_period(Pdis_l, periods)
+    intra_l = _remap_snapshot_to_period(intra_l, periods)
+
+    # Note: Inflow and Spill are already fully accounted for in soc_intra dynamics.
+    # The inter-period recursion just links periods via the last-hour approximation.
+    # We do NOT add extra inflow/spill terms here.
+    rhs_inter = (
+        (decay_inter * soc_inter_prev)
+        + (decay_step * intra_l)
+        + (eta_ch * float(hours) * Pch_l)
+        - ((float(hours) / eta_dis) * Pdis_l)
+    )
+    m.add_constraints(soc_inter_da - rhs_inter == 0, name="StorageUnit_soc_inter_recur")
+
+    # (3) E = soc_intra + soc_inter(period(snapshot))
+    soc_inter_on_snap = soc_inter_da.isel(
+        period=xr.DataArray(per_of_snap_pos, dims=["snapshot"], coords={"snapshot": snapshots})
+    ).assign_coords(snapshot=snapshots)
+
+    m.add_constraints(E_da - (soc_intra_da + soc_inter_on_snap) == 0, name="StorageUnit_soc_sum")
+
+    # (4) SOC upper bound: prefer e_nom if present; else p_nom*max_hours (+ extendable handled by existing model)
+    if "e_nom" in sus.columns and sus["e_nom"].notna().any():
+        e_nom = xr.DataArray(sus.e_nom.fillna(np.inf).values, dims=["StorageUnit"], coords={"StorageUnit": su_index})
+        ub = e_nom.expand_dims(snapshot=snapshots).transpose("snapshot", "StorageUnit")
+        m.add_constraints(E_da <= ub, name="StorageUnit_soc_ub_e_nom")
+    else:
+        extendable = sus.get("p_nom_extendable", pd.Series(False, index=su_index)).astype(bool)
+        max_hours = sus.get("max_hours", pd.Series(np.inf, index=su_index)).fillna(np.inf)
+
+        p_nom_fixed = sus.get("p_nom", pd.Series(0.0, index=su_index)).where(~extendable, other=np.nan)
+        e_nom_fixed = (p_nom_fixed * max_hours).fillna(np.inf)
+        e_nom_fixed_da = xr.DataArray(e_nom_fixed.values, dims=["StorageUnit"], coords={"StorageUnit": su_index})
+        ub = e_nom_fixed_da.expand_dims(snapshot=snapshots).transpose("snapshot", "StorageUnit")
+        m.add_constraints(E_da <= ub, name="StorageUnit_soc_ub_fixed")
+
+
+def _add_kotzur_store_block(n, snapshots, store_index, is_first, idx_last_prev, per_of_snap_pos, periods, hours, one_snap):
+    """
+    Kotzur-like Store constraints (battery/H2):
+      soc_intra recursion inside each typical period (start offset at 0 each period)
+      soc_inter recursion across periods (cyclic), last-hour approximation
+      E = soc_intra + soc_inter(period(snapshot))
+
+    Uses Store-p directly (no split).
+    PyPSA sign convention:
+      e[t] = decay*e[t-1] - p[t]   (p>0 discharges, reduces e)
+    """
+    m = n.model
+    st = n.stores.loc[store_index]
+
+    E = m.variables["Store-e"].loc[snapshots, store_index]
+    P = m.variables["Store-p"].loc[snapshots, store_index]
+
+    loss = xr.DataArray(st.standing_loss.fillna(0.0).values, dims=["Store"], coords={"Store": store_index})
+    decay_step = (1.0 - loss).clip(min=1e-12)
+    decay_inter = decay_step ** float(hours)
+
+    # variables
+    snap_idx = pd.Index(snapshots, name="snapshot")
+    store_idx = pd.Index(store_index, name="Store")
+    per_idx = pd.Index(periods, name="period")
+
+    soc_intra = m.add_variables(0.0, np.inf, coords=[snap_idx, store_idx], name="Store_soc_intra")
+    soc_inter = m.add_variables(0.0, np.inf, coords=[per_idx, store_idx], name="Store_soc_inter")
+
+    E_da = _as_da(E)
+    P_da = _as_da(P)
+    soc_intra_da = _as_da(soc_intra)
+    soc_inter_da = _as_da(soc_inter)
+
+    first_mask = xr.DataArray(is_first, dims=["snapshot"], coords={"snapshot": snapshots})
+    interior = (~first_mask).expand_dims(Store=store_idx).transpose("snapshot", "Store")
+    first2d  = first_mask.expand_dims(Store=store_idx).transpose("snapshot", "Store")
+
+    # (1) soc_intra
+    prev = soc_intra_da.shift(snapshot=1)
+    rhs = (decay_step * prev) - P_da
+    m.add_constraints(soc_intra_da - rhs == 0, name="Store_soc_intra_recur", mask=interior)
+
+    rhs_first = -P_da
+    m.add_constraints(soc_intra_da - rhs_first == 0, name="Store_soc_intra_init", mask=first2d)
+
+    # (2) soc_inter
+    soc_inter_prev = soc_inter_da.roll(period=1)
+
+    P_l = P_da.isel(snapshot=idx_last_prev)
+    intra_l = soc_intra_da.isel(snapshot=idx_last_prev)
+
+    # Remap from snapshot to period dimension
+    P_l = _remap_snapshot_to_period(P_l, periods)
+    intra_l = _remap_snapshot_to_period(intra_l, periods)
+
+    rhs_inter = (decay_inter * soc_inter_prev) + (decay_step * intra_l) - (float(hours) * P_l)
+    m.add_constraints(soc_inter_da - rhs_inter == 0, name="Store_soc_inter_recur")
+
+    # (3) E sum
+    soc_inter_on_snap = soc_inter_da.isel(
+        period=xr.DataArray(per_of_snap_pos, dims=["snapshot"], coords={"snapshot": snapshots})
+    ).assign_coords(snapshot=snapshots)
+
+    m.add_constraints(E_da - (soc_intra_da + soc_inter_on_snap) == 0, name="Store_soc_sum")
+
+    # (4) SOC upper bounds: fixed e_nom or extendable Store-e_nom if exists
+    extendable = st.get("e_nom_extendable", pd.Series(False, index=store_index)).astype(bool)
+    non_ext = ~extendable
+
+    if non_ext.any():
+        fixed = st.index[non_ext]
+        e_nom = st.loc[fixed, "e_nom"].fillna(np.inf) if "e_nom" in st.columns else pd.Series(np.inf, index=fixed)
+        ub = xr.DataArray(e_nom.values, dims=["Store"], coords={"Store": fixed}).expand_dims(snapshot=snapshots).transpose("snapshot", "Store")
+        m.add_constraints(E_da.loc[:, fixed] <= ub, name="Store_soc_ub_fixed")
+
+    # If Store-e_nom variable exists and is already bounded/costed, keep it; otherwise user must bound it elsewhere
     if extendable.any() and "Store-e_nom" in m.variables:
-        idx_var = m.variables["Store-e_nom"].indexes.get("Store-ext", pd.Index([], name="Store-ext"))
-        if len(idx_var) > 0:
-            e_nom_var = m.variables["Store-e_nom"].loc[idx_var].rename({"Store-ext":"Store"})
-            common_ext = stores.index.intersection(e_nom_var.indexes["Store"])
-            if len(common_ext) > 0:
-                # Broadcast without explicit transpose - xarray handles alignment
-                m.add_constraints(E.loc[:, common_ext] <= e_nom_var.loc[common_ext],
-                                  name="Store-SOC-ub-extendable")
-    
-    # For non-extendable stores, use the e_nom parameter
-    non_extendable = ~extendable
-    if non_extendable.any():
-        fixed_stores = stores.index[non_extendable]
-        if "e_nom" in stores.columns:
-            e_nom_fixed = stores.loc[fixed_stores, "e_nom"].fillna(np.inf)
-        else:
-            # Fallback: calculate from p_nom * max_hours
-            p_nom = stores.get("p_nom", pd.Series(0.0, index=stores.index)).loc[fixed_stores]
-            max_hours = stores.get("max_hours", pd.Series(np.inf, index=stores.index)).loc[fixed_stores].fillna(np.inf)
-            e_nom_fixed = (p_nom * max_hours).fillna(np.inf)
-        
-        e_nom_fixed_da = xr.DataArray(e_nom_fixed, dims=["Store"], coords={"Store": fixed_stores})
-        # Broadcast without explicit transpose - xarray handles alignment
-        m.add_constraints(E.loc[:, fixed_stores] <= e_nom_fixed_da,
-                          name="Store-SOC-ub-fixed")
-    
-    logger.info("Added temporal storage constraints for Stores (Kotzur: intra + inter + sum)")
-
-logger.info("Linopy temporal clustering module ready (Pyomo-parity defaults).")
+        idx_var = m.variables["Store-e_nom"].indexes.get("Store-ext", None)
+        if idx_var is not None and len(idx_var) > 0:
+            e_nom_var = m.variables["Store-e_nom"].loc[idx_var].rename({"Store-ext": "Store"})
+            common = store_index.intersection(e_nom_var.indexes["Store"])
+            if len(common) > 0:
+                m.add_constraints(E_da.loc[:, common] <= _as_da(e_nom_var).loc[common], name="Store_soc_ub_extendable")

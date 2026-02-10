@@ -230,6 +230,7 @@ def add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears):
         # Drop countries not in mapping before grouping, and exclude cluster_country column from sum
         df_to_cluster = df[df['cluster_country'].notna()].copy()
         df_clustered = df_to_cluster.drop(columns=['cluster_country']).groupby(df_to_cluster['cluster_country']).sum()
+        df_clustered = df_clustered.fillna(0.0)
 
         # distribute capacities among nodes according to capacity factor
         # weighting with nodal_fraction
@@ -284,6 +285,8 @@ def add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears):
             # Distribute cluster country capacity among country buses weighted by normalized nodal_fraction
             for bus in country_buses:
                 nodal_df.loc[bus] = df_clustered.loc[cluster_country] * country_nodal_fraction.loc[bus]
+
+        nodal_df = nodal_df.fillna(0.0)
         
         # Verify all cluster countries were distributed
         undistributed_clusters = set(df_clustered.index) - distributed_clusters
@@ -344,7 +347,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
         "Oil": "oil",
         "OCGT": "OCGT",
         "CCGT": "CCGT",
-        "Bioenergy": "urban central solid biomass CHP",
+        "Bioenergy": "biomass",
     }
 
     # Replace Fueltype "Natural Gas" with the respective technology (OCGT or CCGT)
@@ -372,7 +375,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
     # Intermediate fix for DateIn & DateOut
     # Fill missing DateIn
     # TODO: revise CHP
-    biomass_i = df_agg.loc[df_agg.Fueltype == "urban central solid biomass CHP"].index
+    biomass_i = df_agg.loc[df_agg.Fueltype == "biomass"].index
     if biomass_i.empty:
         mean = 0
     else:
@@ -449,7 +452,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
         "oil": "oil",
         "lignite": "lignite",
         "nuclear": "uranium",
-        "urban central solid biomass CHP": "biomass",
+        "biomass": "biomass",
     }
 
     for grouping_year, generator in df.index:
@@ -623,7 +626,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                     )
 
         else:
-            if generator not in vars(spatial).keys():
+            if carrier[generator] not in vars(spatial).keys():
                 logger.debug(f"Carrier type {generator} not in spatial data, skipping")
                 continue
 
@@ -707,101 +710,25 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
             if not new_build.empty:
                 new_capacity = capacity.loc[new_build.str.replace(name_suffix, "")]
 
-                if generator != "urban central solid biomass CHP":
-                    # Handle missing lifetime data by using available lifetime values or default from costs
-                    available_lifetime_idx = new_capacity.index.intersection(lifetime_assets.index)
-                    missing_lifetime_idx = new_capacity.index.difference(lifetime_assets.index)
-                    
-                    # For buses with available lifetime data
-                    if not available_lifetime_idx.empty:
-                        n.madd(
-                            "Link",
-                            available_lifetime_idx,
-                            suffix=name_suffix,
-                            bus0=[fuel_bus(loc, carrier[generator]) for loc in available_lifetime_idx],
-                            bus1=available_lifetime_idx,
-                            bus2="co2 atmosphere",
-                            carrier=generator,
-                            marginal_cost=costs.at[generator, "efficiency"]
-                            * costs.at[generator, "VOM"],  # NB: VOM is per MWel
-                            capital_cost=costs.at[generator, "efficiency"]
-                            * costs.at[generator, "fixed"],  # NB: fixed cost is per MWel
-                            p_nom=new_capacity.loc[available_lifetime_idx] / costs.at[generator, "efficiency"],
-                            efficiency=costs.at[generator, "efficiency"],
-                            efficiency2=costs.at[carrier[generator], "CO2 intensity"],
-                            build_year=grouping_year,
-                            lifetime=lifetime_assets.loc[available_lifetime_idx],
-                            p_nom_extendable=baseyear_extendable,
-                        )
-                    
-                    # For buses with missing lifetime data, use default lifetime from costs
-                    if not missing_lifetime_idx.empty:
-                        n.madd(
-                            "Link",
-                            missing_lifetime_idx,
-                            suffix=name_suffix,
-                            bus0=[fuel_bus(loc, carrier[generator]) for loc in missing_lifetime_idx],
-                            bus1=missing_lifetime_idx,
-                            bus2="co2 atmosphere",
-                            carrier=generator,
-                            marginal_cost=costs.at[generator, "efficiency"]
-                            * costs.at[generator, "VOM"],  # NB: VOM is per MWel
-                            capital_cost=costs.at[generator, "efficiency"]
-                            * costs.at[generator, "fixed"],  # NB: fixed cost is per MWel
-                            p_nom=new_capacity.loc[missing_lifetime_idx] / costs.at[generator, "efficiency"],
-                            efficiency=costs.at[generator, "efficiency"],
-                            efficiency2=costs.at[carrier[generator], "CO2 intensity"],
-                            build_year=grouping_year,
-                            lifetime=costs.at[generator, "lifetime"],
-                            p_nom_extendable=baseyear_extendable,
-                        )
-                else:
-                    key = "central solid biomass CHP"
-                    # Handle missing lifetime data for biomass CHP
-                    available_lifetime_idx = new_capacity.index.intersection(lifetime_assets.index)
-                    missing_lifetime_idx = new_capacity.index.difference(lifetime_assets.index)
-                    
-                    # For buses with available lifetime data
-                    if not available_lifetime_idx.empty:
-                        n.madd(
-                            "Link",
-                            available_lifetime_idx,
-                            suffix=name_suffix,
-                            bus0=spatial.biomass.df.loc[available_lifetime_idx]["nodes"].values,
-                            bus1=available_lifetime_idx,
-                            bus2=available_lifetime_idx + " urban central heat",
-                            carrier=generator,
-                            p_nom=new_capacity.loc[available_lifetime_idx] / costs.at[key, "efficiency"],
-                            capital_cost=costs.at[key, "fixed"]
-                            * costs.at[key, "efficiency"],
-                            marginal_cost=costs.at[key, "VOM"],
-                            efficiency=costs.at[key, "efficiency"],
-                            build_year=grouping_year,
-                            efficiency2=costs.at[key, "efficiency-heat"],
-                            lifetime=lifetime_assets.loc[available_lifetime_idx],
-                            p_nom_extendable=baseyear_extendable,
-                        )
-                    
-                    # For buses with missing lifetime data, use default lifetime from costs
-                    if not missing_lifetime_idx.empty:
-                        n.madd(
-                            "Link",
-                            missing_lifetime_idx,
-                            suffix=name_suffix,
-                            bus0=spatial.biomass.df.loc[missing_lifetime_idx]["nodes"].values,
-                            bus1=missing_lifetime_idx,
-                            bus2=missing_lifetime_idx + " urban central heat",
-                            carrier=generator,
-                            p_nom=new_capacity.loc[missing_lifetime_idx] / costs.at[key, "efficiency"],
-                            capital_cost=costs.at[key, "fixed"]
-                            * costs.at[key, "efficiency"],
-                            marginal_cost=costs.at[key, "VOM"],
-                            efficiency=costs.at[key, "efficiency"],
-                            build_year=grouping_year,
-                            efficiency2=costs.at[key, "efficiency-heat"],
-                            lifetime=costs.at[key, "lifetime"],
-                            p_nom_extendable=baseyear_extendable,
-                        )
+                n.madd( # changed from https://github.com/pypsa-meets-earth/pypsa-earth/pull/1678/changes
+                    "Link",
+                    new_capacity.index,
+                    suffix=name_suffix,
+                    bus0=bus0,
+                    bus1=new_capacity.index,
+                    bus2="co2 atmosphere",
+                    carrier=generator,
+                    marginal_cost=costs.at[generator, "efficiency"]
+                    * costs.at[generator, "VOM"],  # NB: VOM is per MWel
+                    capital_cost=costs.at[generator, "efficiency"]
+                    * costs.at[generator, "fixed"],  # NB: fixed cost is per MWel
+                    p_nom=new_capacity / costs.at[generator, "efficiency"],
+                    efficiency=costs.at[generator, "efficiency"],
+                    efficiency2=costs.at[carrier[generator], "CO2 intensity"],
+                    build_year=grouping_year,
+                    lifetime=lifetime_assets.loc[new_capacity.index],
+                )
+
         # check if existing capacities are larger than technical potential
         existing_large = n.generators[
             n.generators["p_nom_min"] > n.generators["p_nom_max"]
@@ -1099,6 +1026,60 @@ if __name__ == "__main__":
 
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_extendable/e_nom_extendable = False")
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_min = p_nom (and e_nom_min = e_nom for storage) to prevent capacity reduction")
+
+    # Final cleanup: ensure generator capacities are not NaN
+    if hasattr(n, "generators") and not n.generators.empty:
+        gens = n.generators
+        if "p_nom" in gens.columns:
+            nan_p_nom = gens.p_nom.isna()
+            if nan_p_nom.any():
+                logger.warning(f"Found {nan_p_nom.sum()} generators with NaN p_nom; filling with 0 or p_nom_min")
+                fallback = gens.loc[nan_p_nom, "p_nom_min"] if "p_nom_min" in gens.columns else pd.Series(0.0, index=gens.index)
+                fallback = fallback.fillna(0.0)
+                gens.loc[nan_p_nom, "p_nom"] = fallback.loc[nan_p_nom]
+
+        if "p_nom_min" in gens.columns:
+            nan_p_nom_min = gens.p_nom_min.isna()
+            if nan_p_nom_min.any():
+                if "p_nom_extendable" in gens.columns:
+                    extendable = gens.p_nom_extendable.fillna(False)
+                    gens.loc[nan_p_nom_min & extendable, "p_nom_min"] = 0.0
+                    gens.loc[nan_p_nom_min & ~extendable, "p_nom_min"] = gens.loc[nan_p_nom_min & ~extendable, "p_nom"].fillna(0.0)
+                else:
+                    gens.loc[nan_p_nom_min, "p_nom_min"] = gens.loc[nan_p_nom_min, "p_nom"].fillna(0.0)
+
+    # Final cleanup: ensure link capacities are not NaN
+    if hasattr(n, "links") and not n.links.empty:
+        links = n.links
+        if "p_nom" in links.columns:
+            nan_p_nom = links.p_nom.isna()
+            if nan_p_nom.any():
+                logger.warning(f"Found {nan_p_nom.sum()} links with NaN p_nom; filling with 0")
+                links.loc[nan_p_nom, "p_nom"] = 0.0
+
+        if "p_nom_min" in links.columns:
+            nan_p_nom_min = links.p_nom_min.isna()
+            if nan_p_nom_min.any():
+                if "p_nom_extendable" in links.columns:
+                    extendable = links.p_nom_extendable.fillna(False)
+                    links.loc[nan_p_nom_min & extendable, "p_nom_min"] = 0.0
+                    links.loc[nan_p_nom_min & ~extendable, "p_nom_min"] = links.loc[nan_p_nom_min & ~extendable, "p_nom"].fillna(0.0)
+                else:
+                    links.loc[nan_p_nom_min, "p_nom_min"] = links.loc[nan_p_nom_min, "p_nom"].fillna(0.0)
+
+        if "p_nom_max" in links.columns:
+            nan_p_nom_max = links.p_nom_max.isna()
+            if nan_p_nom_max.any():
+                logger.warning(f"Found {nan_p_nom_max.sum()} links with NaN p_nom_max; setting to inf")
+                links.loc[nan_p_nom_max, "p_nom_max"] = np.inf
+
+    # Fill missing time-varying link efficiency from static values
+    if hasattr(n, "links_t") and hasattr(n.links_t, "efficiency"):
+        eff_t = n.links_t.efficiency
+        if not eff_t.empty:
+            static_eff = n.links.efficiency.reindex(eff_t.columns)
+            eff_t = eff_t.fillna(static_eff)
+            n.links_t.efficiency = eff_t
 
     # TODO: not implemented in -sec yet
     # if options["heating"]:

@@ -86,9 +86,11 @@ def download_GGIT_gas_network():
     https://globalenergymonitor.org/projects/global-gas-infrastructure-tracker/
     The dataset contains 3144 pipelines.
     """
-    url = "https://globalenergymonitor.org/wp-content/uploads/2022/12/GEM-GGIT-Gas-Pipelines-December-2022.xlsx"
+    url = "https://globalenergymonitor.org/wp-content/uploads/2022/12/GEM-GGIT-Gas-Pipelines-December-2022.xlsx" # bc of issues w download link
+    local_path = "/shared/share_cki25/energymodels/pypsa-earth/data/GEM-GGIT-Gas-Pipelines-December-2022.xlsx"
+
     GGIT_gas_pipeline = pd.read_excel(
-        content_retrieve(url),
+        local_path,
         index_col=0,
         sheet_name="Gas Pipelines 2022-12-16",
         header=0,
