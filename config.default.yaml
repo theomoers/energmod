@@ -14,6 +14,25 @@ summary_dir: results/
 
 foresight: overnight
 
+additional_sector_clustering:
+  enable: true # enable clustering in solve_network
+  mode: manual # manual: use global.cluster.yaml, kmeans: use clustering algorithm 
+  # for manual:
+  manual_mapping_file: configs/global.cluster.yaml
+  manual_missing_policy: singleton
+  validate_aggregation: true
+  # for kmeans:
+  n_clusters: 90 # final number of clusters (may be lower than numbers of countries)
+  random_state: 42
+  pca_components: 5         # how many principal components of each country’s hourly demand you keep
+  enforce_contiguity: true   # post-process to split geographically disconnected clusters
+  validate_aggregation: true # run the static/time-series conservation checks after clustering
+
+# Rolling horizon settings (only used with foresight: myopic)
+rolling_horizon:
+  enable: false  # Set to true to enable rolling horizon (solves t and t+1 together, commits t)
+  window_size: 2  # Number of investment periods to solve together (e.g., 2 means solve t and t+1)
+  social_discountrate: 0.01  # Social discount rate for weighting future periods in the window
 
 countries: ["NG", "BJ"]
 # Can be replaced by country ["NG", "BJ"], continent ["Africa"] or user-specific region, see more at https://pypsa-earth.readthedocs.io/en/latest/configuration.html#top-level-configuration
@@ -396,7 +415,9 @@ renewable:
     normalization:
       method: eia # 'hydro_capacities' to rescale country hydro production by using hydro_capacities, 'eia' to rescale by eia data, false for no rescaling
       year: 2013 # (optional) year of statistics used to rescale the runoff time series. When not provided, the cutout weather year is used
-    multiplier: 1.0 # multiplier applied after the normalization of the hydro production; default 1.0
+      quantile_ror: 0.9 # quantile of the inflow distribution beyond which inflow values are clipped for run-of-river plants
+      quantile_reservoir: 1. # quantile of the inflow distribution beyond which inflow values are clipped for reservoir plants
+      multiplier: 1. # multiplier applied after the normalization of the hydro production; default 1.0
   csp:
     cutout: cutout-2013-era5
     resource:
