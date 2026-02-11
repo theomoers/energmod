@@ -85,12 +85,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pypsa
+import pypsa.clustering.spatial as pypsa_spatial
 import xarray as xr
+import yaml
 from _helpers import configure_logging, create_logger, override_component_attrs
 from linopy import merge
-from temporal_clustering import aggregate_snapshots, temporal_aggregation_storage_constraints
+from pypsa.clustering.spatial import (
+    DEFAULT_ONE_PORT_STRATEGIES,
+    get_clustering_from_busmap,
+)
+from temporal_clustering import aggregate_snapshots
+from t_storage_constraints import add_kotzur_storage_constraints
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
+#from apply_build_constraints import add_build_rate_constraints
 #from pypsa.optimization.optimize import optimize
 
 logger = create_logger(__name__)
@@ -119,6 +127,2045 @@ def _safe_solver_log(smk):
             lf = lf[0]
 
     return str(lf) if lf else None
+
+
+def _repo_path(path_like):
+    p = Path(path_like)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parents[1] / p
+    return p.resolve()
+
+
+def _zscore_columns(df):
+    out = df.copy()
+    for col in out.columns:
+        s = out[col].astype(float)
+        std = float(s.std(ddof=0))
+        if std > 0:
+            out[col] = (s - float(s.mean())) / std
+        else:
+            out[col] = 0.0
+    return out.fillna(0.0)
+
+
+def _get_bus_country_for_clustering(n):
+    country = n.buses.country.fillna("").astype(str).str.strip().str.upper()
+    location = n.buses.location.fillna("").astype(str).str.strip().str.upper()
+    bus_name = n.buses.index.to_series(index=n.buses.index).astype(str).str.strip().str.upper()
+
+    def _extract_cc(series):
+        return series.str.extract(r"^([A-Z]{2})(?:\b|\s|[-_])", expand=False).fillna("")
+
+    inferred = _extract_cc(location)
+    country = country.where(country != "", inferred)
+
+    inferred_name = _extract_cc(bus_name)
+    country = country.where(country != "", inferred_name)
+
+    return country.fillna("")
+
+
+def _country_electric_load_profiles(n, countries):
+    valid_loads = n.loads.index[n.loads.bus.isin(n.buses.index)]
+    if len(valid_loads) == 0:
+        return pd.DataFrame(0.0, index=n.snapshots, columns=countries)
+
+    load_bus = n.loads.loc[valid_loads, "bus"]
+    bus_country = _get_bus_country_for_clustering(n)
+    load_country = load_bus.map(bus_country)
+    load_bus_carrier = load_bus.map(n.buses.carrier)
+    ac_loads = load_bus_carrier[load_bus_carrier == "AC"].index
+
+    if len(ac_loads) == 0 or "p_set" not in n.loads_t:
+        return pd.DataFrame(0.0, index=n.snapshots, columns=countries)
+
+    load_ts = n.loads_t.p_set.reindex(columns=ac_loads).fillna(0.0)
+    country_profiles = load_ts.T.groupby(load_country.loc[ac_loads]).sum().T
+    return country_profiles.reindex(columns=countries, fill_value=0.0)
+
+
+def _ac_bus_load_profiles(n, ac_buses):
+    ac_buses = pd.Index(ac_buses)
+    valid_loads = n.loads.index[n.loads.bus.isin(ac_buses)]
+    if len(valid_loads) == 0 or "p_set" not in n.loads_t:
+        return pd.DataFrame(0.0, index=n.snapshots, columns=ac_buses)
+
+    load_ts = n.loads_t.p_set.reindex(columns=valid_loads).fillna(0.0)
+    load_bus = n.loads.loc[valid_loads, "bus"]
+    bus_profiles = load_ts.T.groupby(load_bus).sum().T
+    return bus_profiles.reindex(columns=ac_buses, fill_value=0.0)
+
+
+def _parse_manual_country_clusters(mapping_file):
+    with open(mapping_file, "r") as f:
+        raw = yaml.safe_load(f)
+
+    if raw is None:
+        raise ValueError(f"Manual clustering file is empty: {mapping_file}")
+
+    if isinstance(raw, dict):
+        items = raw.items()
+    elif isinstance(raw, list):
+        items = enumerate(raw, start=1)
+    else:
+        raise TypeError(
+            f"Manual clustering must be dict/list in {mapping_file}; got {type(raw)}"
+        )
+
+    country_to_cluster = {}
+    for cluster_id, countries in items:
+        if countries is None:
+            continue
+        if isinstance(countries, str):
+            countries = [countries]
+        if not isinstance(countries, (list, tuple, set)):
+            raise TypeError(
+                f"Cluster entry {cluster_id} must be list/tuple/set/string, got {type(countries)}"
+            )
+
+        for country in countries:
+            cc = str(country).strip().upper()
+            if cc in {"", "NONE", "NAN"}:
+                continue
+            if cc in country_to_cluster and country_to_cluster[cc] != str(cluster_id):
+                raise ValueError(
+                    f"Country '{cc}' appears in multiple clusters "
+                    f"({country_to_cluster[cc]} and {cluster_id}) in {mapping_file}"
+                )
+            country_to_cluster[cc] = str(cluster_id)
+
+    if not country_to_cluster:
+        raise ValueError(f"No valid country assignments found in {mapping_file}")
+
+    return pd.Series(country_to_cluster, name="cluster")
+
+
+def _build_ac_bus_feature_frame(n, ac_buses, pca_components, random_state):
+    ac_buses = pd.Index(ac_buses)
+    profiles = _ac_bus_load_profiles(n, ac_buses)
+    annual_demand = profiles.sum(axis=0).reindex(ac_buses).fillna(0.0).clip(lower=0.0)
+
+    geo = n.buses.reindex(ac_buses)[["x", "y"]].rename(columns={"x": "geo_x", "y": "geo_y"})
+
+    gen_bus = n.generators.bus
+    gen_carrier = n.generators.carrier.astype(str).str.lower()
+    p_nom_max = n.generators.p_nom_max.where(
+        np.isfinite(n.generators.p_nom_max), np.nan
+    )
+    gen_cap = p_nom_max.fillna(n.generators.p_nom).fillna(0.0).clip(lower=0.0)
+    on_ac = gen_bus.isin(ac_buses)
+    gen_bus = gen_bus[on_ac]
+    gen_carrier = gen_carrier[on_ac]
+    gen_cap = gen_cap[on_ac]
+
+    wind = gen_cap[gen_carrier.str.contains("wind", na=False)].groupby(gen_bus).sum()
+    solar = gen_cap[gen_carrier.str.contains("solar", na=False)].groupby(gen_bus).sum()
+    hydro_gen = gen_cap[gen_carrier.isin(["hydro", "ror"])].groupby(gen_bus).sum()
+    fossil = gen_cap[
+        gen_carrier.str.contains("coal|lignite|oil|gas|ocgt|ccgt", regex=True, na=False)
+    ].groupby(gen_bus).sum()
+
+    su_bus = n.storage_units.bus
+    su_carrier = n.storage_units.carrier.astype(str).str.lower()
+    su_cap = n.storage_units.p_nom.fillna(0.0).clip(lower=0.0)
+    su_on_ac = su_bus.isin(ac_buses)
+    su_bus = su_bus[su_on_ac]
+    su_carrier = su_carrier[su_on_ac]
+    su_cap = su_cap[su_on_ac]
+    hydro_su = su_cap[su_carrier.isin(["hydro", "phs"])].groupby(su_bus).sum()
+    hydro = hydro_gen.add(hydro_su, fill_value=0.0)
+
+    installed = gen_cap.groupby(gen_bus).sum()
+    renewable = gen_cap[
+        gen_carrier.str.contains("wind|solar|hydro|ror", regex=True, na=False)
+    ].groupby(gen_bus).sum()
+    capmix_renew = renewable / installed.replace(0.0, np.nan)
+    capmix_fossil = fossil / installed.replace(0.0, np.nan)
+
+    pcs = pd.DataFrame(index=ac_buses)
+    if len(profiles.columns) > 0 and len(profiles.index) > 0 and pca_components > 0:
+        shape = profiles.divide(
+            profiles.mean(axis=0).replace(0.0, np.nan), axis=1
+        ).fillna(0.0)
+        X = shape.T.reindex(index=ac_buses).fillna(0.0).to_numpy(dtype=float)
+        X_std = X.std(axis=0)
+        X = (X - X.mean(axis=0)) / np.where(X_std > 0, X_std, 1.0)
+        max_components = min(pca_components, X.shape[0], X.shape[1])
+        if max_components > 0:
+            from sklearn.decomposition import PCA
+
+            pca = PCA(n_components=max_components, random_state=random_state)
+            scores = pca.fit_transform(X)
+            pcs = pd.DataFrame(
+                scores,
+                index=ac_buses,
+                columns=[f"load_pc{i+1}" for i in range(max_components)],
+            )
+
+    feat = pd.DataFrame(index=ac_buses)
+    feat = feat.join(geo)
+    feat["res_wind"] = wind.reindex(ac_buses).fillna(0.0)
+    feat["res_solar"] = solar.reindex(ac_buses).fillna(0.0)
+    feat["res_hydro"] = hydro.reindex(ac_buses).fillna(0.0)
+    feat["fossil_proxy"] = fossil.reindex(ac_buses).fillna(0.0)
+    feat["capmix_renew_share"] = capmix_renew.reindex(ac_buses).fillna(0.0)
+    feat["capmix_fossil_share"] = capmix_fossil.reindex(ac_buses).fillna(0.0)
+    if not pcs.empty:
+        feat = feat.join(pcs)
+
+    feat = _zscore_columns(feat.fillna(0.0))
+    return feat, annual_demand
+
+
+def _build_ac_bus_cf_pca_features(
+    n,
+    ac_buses,
+    random_state,
+    n_components=3,
+    by_tech=True,
+    tech_groups=None,
+):
+    ac_buses = pd.Index(ac_buses)
+    n_components = int(n_components)
+    if n_components <= 0:
+        return pd.DataFrame(index=ac_buses)
+    if "p_max_pu" not in n.generators_t:
+        return pd.DataFrame(index=ac_buses)
+
+    gens = n.generators[n.generators.bus.isin(ac_buses)].copy()
+    if gens.empty:
+        return pd.DataFrame(index=ac_buses)
+
+    p_nom_max = gens.p_nom_max.where(np.isfinite(gens.p_nom_max), np.nan)
+    weights = p_nom_max.fillna(gens.p_nom).fillna(0.0).clip(lower=0.0)
+    if float(weights.sum()) <= 0:
+        weights[:] = 1.0
+
+    cf_dense = get_as_dense(n, "Generator", "p_max_pu", inds=gens.index).fillna(0.0)
+    carrier = gens.carrier.astype(str).str.lower()
+
+    if tech_groups is None:
+        tech_groups = {
+            "solar": ["solar"],
+            "onwind": ["onwind"],
+            "offwind": ["offwind"],
+            "hydro": ["hydro", "ror"],
+        }
+
+    if by_tech:
+        groups = []
+        for name, tokens in tech_groups.items():
+            if isinstance(tokens, str):
+                tokens = [tokens]
+            if not tokens:
+                continue
+            mask = pd.Series(False, index=carrier.index)
+            for token in tokens:
+                t = str(token).strip().lower()
+                if t == "":
+                    continue
+                mask = mask | carrier.str.contains(t, na=False)
+            idx = carrier.index[mask]
+            if len(idx) > 0:
+                groups.append((str(name), idx))
+    else:
+        groups = [("all", carrier.index)]
+
+    if not groups:
+        return pd.DataFrame(index=ac_buses)
+
+    all_features = pd.DataFrame(index=ac_buses)
+    for group_name, gen_idx in groups:
+        g_weights = weights.reindex(gen_idx).fillna(0.0)
+        if float(g_weights.sum()) <= 0:
+            continue
+
+        g_cf = cf_dense.reindex(columns=gen_idx).fillna(0.0)
+        g_bus = gens.loc[gen_idx, "bus"]
+
+        weighted = g_cf.mul(g_weights, axis=1)
+        bus_weighted_sum = weighted.T.groupby(g_bus).sum().T
+        bus_weight_sum = g_weights.groupby(g_bus).sum()
+        bus_cf = bus_weighted_sum.div(bus_weight_sum.replace(0.0, np.nan), axis=1).fillna(0.0)
+        bus_cf = bus_cf.reindex(columns=ac_buses, fill_value=0.0)
+
+        X = bus_cf.T.to_numpy(dtype=float)
+        if X.shape[0] == 0 or X.shape[1] == 0:
+            continue
+        X_std = X.std(axis=0)
+        X = (X - X.mean(axis=0)) / np.where(X_std > 0, X_std, 1.0)
+        max_components = min(n_components, X.shape[0], X.shape[1])
+        if max_components <= 0:
+            continue
+
+        from sklearn.decomposition import PCA
+
+        pca = PCA(n_components=max_components, random_state=random_state)
+        scores = pca.fit_transform(X)
+        cols = [f"cfpc_{group_name}_{i+1}" for i in range(max_components)]
+        group_features = pd.DataFrame(scores, index=ac_buses, columns=cols)
+        all_features = all_features.join(group_features, how="left")
+
+    return _zscore_columns(all_features.fillna(0.0)) if not all_features.empty else all_features
+
+
+def _build_country_feature_frame(n, countries, pca_components, random_state):
+    profiles = _country_electric_load_profiles(n, countries)
+    annual_demand = profiles.sum(axis=0).reindex(countries).fillna(0.0).clip(lower=0.0)
+
+    bus_country = _get_bus_country_for_clustering(n)
+    ac_buses = n.buses[n.buses.carrier == "AC"]
+    if ac_buses.empty:
+        ac_buses = n.buses.copy()
+    geo = ac_buses.assign(_country=bus_country.loc[ac_buses.index]).groupby("_country")[["x", "y"]].mean().reindex(countries)
+    geo.columns = ["geo_x", "geo_y"]
+
+    gen_country = n.generators.bus.map(bus_country)
+    gen_carrier = n.generators.carrier.astype(str).str.lower()
+    p_nom_max = n.generators.p_nom_max.where(
+        np.isfinite(n.generators.p_nom_max), np.nan
+    )
+    gen_cap = p_nom_max.fillna(n.generators.p_nom).fillna(0.0).clip(lower=0.0)
+
+    wind = gen_cap[gen_carrier.str.contains("wind", na=False)].groupby(gen_country).sum()
+    solar = gen_cap[gen_carrier.str.contains("solar", na=False)].groupby(gen_country).sum()
+    hydro_gen = gen_cap[gen_carrier.isin(["hydro", "ror"])].groupby(gen_country).sum()
+    fossil = gen_cap[
+        gen_carrier.str.contains("coal|lignite|oil|gas|ocgt|ccgt", regex=True, na=False)
+    ].groupby(gen_country).sum()
+
+    su_country = n.storage_units.bus.map(bus_country)
+    su_carrier = n.storage_units.carrier.astype(str).str.lower()
+    su_cap = n.storage_units.p_nom.fillna(0.0).clip(lower=0.0)
+    hydro_su = su_cap[su_carrier.isin(["hydro", "phs"])].groupby(su_country).sum()
+
+    hydro = hydro_gen.add(hydro_su, fill_value=0.0)
+
+    installed = n.generators.p_nom.fillna(0.0).clip(lower=0.0).groupby(gen_country).sum()
+    renewable = gen_cap[
+        gen_carrier.str.contains("wind|solar|hydro|ror", regex=True, na=False)
+    ].groupby(gen_country).sum()
+
+    capmix_renew = renewable / installed.replace(0.0, np.nan)
+    capmix_fossil = fossil / installed.replace(0.0, np.nan)
+
+    pcs = pd.DataFrame(index=countries)
+    if len(profiles.columns) > 0 and len(profiles.index) > 0 and pca_components > 0:
+        shape = profiles.divide(
+            profiles.mean(axis=0).replace(0.0, np.nan), axis=1
+        ).fillna(0.0)
+        X = shape.T.reindex(index=countries).fillna(0.0).to_numpy(dtype=float)
+        X_std = X.std(axis=0)
+        X = (X - X.mean(axis=0)) / np.where(X_std > 0, X_std, 1.0)
+        max_components = min(pca_components, X.shape[0], X.shape[1])
+        if max_components > 0:
+            from sklearn.decomposition import PCA
+
+            pca = PCA(n_components=max_components, random_state=random_state)
+            scores = pca.fit_transform(X)
+            pcs = pd.DataFrame(
+                scores,
+                index=countries,
+                columns=[f"load_pc{i+1}" for i in range(max_components)],
+            )
+
+    feat = pd.DataFrame(index=countries)
+    feat = feat.join(geo)
+    feat["res_wind"] = wind.reindex(countries).fillna(0.0)
+    feat["res_solar"] = solar.reindex(countries).fillna(0.0)
+    feat["res_hydro"] = hydro.reindex(countries).fillna(0.0)
+    feat["fossil_proxy"] = fossil.reindex(countries).fillna(0.0)
+    feat["capmix_renew_share"] = capmix_renew.reindex(countries).fillna(0.0)
+    feat["capmix_fossil_share"] = capmix_fossil.reindex(countries).fillna(0.0)
+    if not pcs.empty:
+        feat = feat.join(pcs)
+
+    feat = _zscore_columns(feat.fillna(0.0))
+    return feat, annual_demand
+
+
+def _build_ac_bus_adjacency(n, ac_buses):
+    ac_buses = pd.Index(ac_buses)
+    ac_set = set(ac_buses)
+    adj = {b: set() for b in ac_buses}
+
+    def _add_edges(df):
+        for b0, b1 in df.itertuples(index=False, name=None):
+            if b0 not in ac_set or b1 not in ac_set or b0 == b1:
+                continue
+            adj[b0].add(b1)
+            adj[b1].add(b0)
+
+    _add_edges(n.lines[["bus0", "bus1"]])
+    _add_edges(n.links[["bus0", "bus1"]])
+    return adj
+
+
+def _build_country_adjacency(n, countries):
+    countries = pd.Index(countries)
+    bus_country = _get_bus_country_for_clustering(n)
+    adj = {c: set() for c in countries}
+    ac_buses = set(n.buses.index[n.buses.carrier == "AC"])
+
+    def _add_edges(df):
+        for b0, b1 in df.itertuples(index=False, name=None):
+            if b0 not in ac_buses or b1 not in ac_buses:
+                continue
+            c0 = bus_country.get(b0)
+            c1 = bus_country.get(b1)
+            if pd.isna(c0) or pd.isna(c1) or c0 == c1:
+                continue
+            if c0 in adj and c1 in adj:
+                adj[c0].add(c1)
+                adj[c1].add(c0)
+
+    _add_edges(n.lines[["bus0", "bus1"]])
+    _add_edges(n.links[["bus0", "bus1"]])
+    return adj
+
+
+def _connected_components(nodes, adjacency):
+    nodes_set = set(nodes)
+    seen = set()
+    components = []
+    for start in sorted(nodes_set):
+        if start in seen:
+            continue
+        stack = [start]
+        comp = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            comp.add(cur)
+            for nxt in sorted(adjacency.get(cur, set()), reverse=True):
+                if nxt in nodes_set and nxt not in seen:
+                    stack.append(nxt)
+        components.append(comp)
+    return components
+
+
+def _enforce_node_cluster_contiguity(labels, features, nodes, adjacency, max_iter=10):
+    node_labels = pd.Series(labels, index=nodes)
+    for _ in range(max_iter):
+        changed = False
+        unique_labels = sorted(pd.unique(node_labels.values))
+        centroids = features.groupby(node_labels).mean()
+
+        for label in unique_labels:
+            members = sorted(node_labels[node_labels == label].index.tolist())
+            if len(members) <= 1:
+                continue
+            comps = _connected_components(members, adjacency)
+            if len(comps) <= 1:
+                continue
+
+            comps_sorted = sorted(
+                (sorted(comp) for comp in comps),
+                key=lambda comp: (-len(comp), comp[0]),
+            )
+            for comp in comps_sorted[1:]:
+                neighbor_labels = set()
+                for node in comp:
+                    neighbors = sorted(adjacency.get(node, set()))
+                    if neighbors:
+                        neighbor_labels.update(node_labels.loc[neighbors].tolist())
+                neighbor_labels.discard(label)
+                if not neighbor_labels:
+                    neighbor_labels = set(unique_labels) - {label}
+                if not neighbor_labels:
+                    continue
+
+                comp_center = features.loc[comp].mean().to_numpy(dtype=float)
+                best_label = min(
+                    sorted(neighbor_labels),
+                    key=lambda l: np.linalg.norm(
+                        comp_center - centroids.loc[l].to_numpy(dtype=float)
+                    ),
+                )
+                node_labels.loc[comp] = best_label
+                changed = True
+
+        if not changed:
+            break
+
+    return node_labels.reindex(nodes).to_numpy()
+
+
+def _enforce_country_cluster_contiguity(labels, features, countries, adjacency, max_iter=10):
+    country_labels = pd.Series(labels, index=countries)
+    for _ in range(max_iter):
+        changed = False
+        unique_labels = sorted(pd.unique(country_labels.values))
+        centroids = features.groupby(country_labels).mean()
+
+        for label in unique_labels:
+            members = sorted(country_labels[country_labels == label].index.tolist())
+            if len(members) <= 1:
+                continue
+            comps = _connected_components(members, adjacency)
+            if len(comps) <= 1:
+                continue
+
+            comps_sorted = sorted(
+                (sorted(comp) for comp in comps),
+                key=lambda comp: (-len(comp), comp[0]),
+            )
+            largest = comps_sorted[0]
+            for comp in comps_sorted[1:]:
+                if comp == largest:
+                    continue
+                neighbor_labels = set()
+                for c in comp:
+                    neighbors = sorted(adjacency.get(c, set()))
+                    if neighbors:
+                        neighbor_labels.update(country_labels.loc[neighbors].tolist())
+                neighbor_labels.discard(label)
+                if not neighbor_labels:
+                    neighbor_labels = set(unique_labels) - {label}
+                if not neighbor_labels:
+                    continue
+
+                comp_center = features.loc[comp].mean().to_numpy(dtype=float)
+                best_label = min(
+                    sorted(neighbor_labels),
+                    key=lambda l: np.linalg.norm(
+                        comp_center - centroids.loc[l].to_numpy(dtype=float)
+                    ),
+                )
+                country_labels.loc[comp] = best_label
+                changed = True
+
+        if not changed:
+            break
+
+    return country_labels.reindex(countries).to_numpy()
+
+
+def _extract_ac_anchor_bus(bus_name):
+    if not isinstance(bus_name, str):
+        return None
+    m = re.match(r"^([A-Z]{2}\s+\d+)\b", bus_name.strip().upper())
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _vintage_token_numeric(value, integer=False):
+    if pd.isna(value):
+        return "nan", np.nan
+    try:
+        v = float(value)
+    except Exception:
+        return "nan", np.nan
+    if np.isinf(v):
+        return "inf", np.inf
+    if integer:
+        vint = int(round(v))
+        return str(vint), float(vint)
+    return f"{v:.12g}", v
+
+
+def _decoded_vintage_label(base, build_year, lifetime, include_lifetime=False):
+    base = str(base)
+    suffix = ""
+    if np.isfinite(build_year) and float(build_year) > 0:
+        suffix = f"-{int(round(float(build_year)))}"
+    label = f"{base}{suffix}"
+    if include_lifetime and np.isfinite(lifetime) and float(lifetime) > 0:
+        label = f"{label}_l{int(round(float(lifetime)))}"
+    return label
+
+
+def _replace_encoded_token(name, token_to_meta, include_lifetime=False):
+    text = str(name)
+    for token, (base, build_year, lifetime) in token_to_meta.items():
+        if token in text:
+            repl = _decoded_vintage_label(
+                base, build_year, lifetime, include_lifetime=include_lifetime
+            )
+            return text.replace(token, repl), (base, build_year, lifetime)
+    return text, None
+
+
+def _sanitize_vintage_encoded_component_names(n, token_to_meta, components):
+    if not token_to_meta:
+        return
+
+    processed = set()
+    for component in components:
+        if component in processed or component not in n.components:
+            continue
+        processed.add(component)
+        list_name = n.components[component]["list_name"]
+        df = getattr(n, list_name, None)
+        if df is None or df.empty:
+            continue
+
+        rename_map = {}
+        meta_by_old = {}
+        for old in df.index.astype(str):
+            if "__vintage_y" not in old:
+                continue
+            new, meta = _replace_encoded_token(old, token_to_meta, include_lifetime=False)
+            if new != old:
+                rename_map[old] = new
+                meta_by_old[old] = meta
+
+        if not rename_map:
+            continue
+
+        # Resolve collisions deterministically by adding lifetime token first.
+        inverse = {}
+        for old, new in rename_map.items():
+            inverse.setdefault(new, []).append(old)
+
+        for new, olds in inverse.items():
+            if len(olds) <= 1:
+                continue
+            for i, old in enumerate(sorted(olds)):
+                alt, meta = _replace_encoded_token(old, token_to_meta, include_lifetime=True)
+                if alt in rename_map.values() and rename_map.get(old) != alt:
+                    alt = f"{alt}__v{i}"
+                rename_map[old] = alt
+                meta_by_old[old] = meta
+
+        # Rename static index
+        df.rename(index=rename_map, inplace=True)
+
+        # Rename associated time series columns
+        pnl = getattr(n, f"{list_name}_t")
+        for attr, data in pnl.items():
+            if data.empty or not hasattr(data, "columns"):
+                continue
+            cols_map = {c: rename_map[c] for c in data.columns if c in rename_map}
+            if cols_map:
+                pnl[attr] = data.rename(columns=cols_map)
+
+
+def _encode_vintage_carriers_for_clustering(n, components):
+    """
+    Temporarily encode build_year/lifetime into carrier names before clustering.
+
+    PyPSA default aggregation strategies can reset build_year/lifetime for one-port
+    components. Encoding vintages into the grouping key preserves vintage classes.
+    """
+    carrier_backups = {}
+    token_to_meta = {}
+    processed = set()
+
+    for component in components:
+        if component in processed or component not in n.components:
+            continue
+        processed.add(component)
+        list_name = n.components[component]["list_name"]
+        df = getattr(n, list_name, None)
+        if df is None or df.empty or "carrier" not in df.columns:
+            continue
+        if "build_year" not in df.columns and "lifetime" not in df.columns:
+            continue
+
+        carrier_backups[list_name] = df["carrier"].copy()
+        carriers = df["carrier"].fillna("").astype(str)
+        build_year = (
+            pd.to_numeric(df["build_year"], errors="coerce")
+            if "build_year" in df.columns
+            else pd.Series(np.nan, index=df.index)
+        )
+        lifetime = (
+            pd.to_numeric(df["lifetime"], errors="coerce")
+            if "lifetime" in df.columns
+            else pd.Series(np.nan, index=df.index)
+        )
+
+        encoded = carriers.copy()
+        for idx in df.index:
+            base = carriers.at[idx]
+            y_token, y_value = _vintage_token_numeric(build_year.at[idx], integer=True)
+            l_token, l_value = _vintage_token_numeric(lifetime.at[idx], integer=False)
+            token = f"{base}__vintage_y{y_token}_l{l_token}"
+            encoded.at[idx] = token
+            token_to_meta[token] = (base, y_value, l_value)
+
+        df.loc[:, "carrier"] = encoded.values
+
+    return carrier_backups, token_to_meta
+
+
+def _restore_encoded_carriers(n, carrier_backups):
+    for list_name, original in carrier_backups.items():
+        df = getattr(n, list_name, None)
+        if df is None or df.empty or "carrier" not in df.columns:
+            continue
+        keep = original.index.intersection(df.index)
+        if len(keep):
+            df.loc[keep, "carrier"] = original.loc[keep].values
+
+
+def _decode_vintage_carriers_after_clustering(n, token_to_meta, components):
+    if not token_to_meta:
+        return
+
+    processed = set()
+    for component in components:
+        if component in processed or component not in n.components:
+            continue
+        processed.add(component)
+        list_name = n.components[component]["list_name"]
+        df = getattr(n, list_name, None)
+        if df is None or df.empty or "carrier" not in df.columns:
+            continue
+
+        carriers = df["carrier"].fillna("").astype(str)
+        mask = carriers.isin(token_to_meta)
+        if not mask.any():
+            continue
+
+        meta = carriers.loc[mask].map(token_to_meta)
+        decoded_carrier = [m[0] for m in meta.values]
+        decoded_build_year = [m[1] for m in meta.values]
+        decoded_lifetime = [m[2] for m in meta.values]
+
+        df.loc[mask, "carrier"] = decoded_carrier
+        if "build_year" in df.columns:
+            df.loc[:, "build_year"] = pd.to_numeric(df["build_year"], errors="coerce")
+            df.loc[mask, "build_year"] = np.asarray(decoded_build_year, dtype=float)
+        if "lifetime" in df.columns:
+            df.loc[:, "lifetime"] = pd.to_numeric(df["lifetime"], errors="coerce")
+            df.loc[mask, "lifetime"] = np.asarray(decoded_lifetime, dtype=float)
+
+
+def _cluster_tokens_by_dominant_country(ac_cluster_ids, bus_country, ac_weights=None):
+    ac_cluster_ids = ac_cluster_ids.astype(str)
+    ac_buses = pd.Index(ac_cluster_ids.index)
+
+    if ac_weights is None:
+        w = pd.Series(1.0, index=ac_buses)
+    else:
+        w = ac_weights.reindex(ac_buses).fillna(0.0).clip(lower=0.0)
+        if float(w.sum()) <= 0:
+            w[:] = 1.0
+
+    df = pd.DataFrame(
+        {
+            "cluster": ac_cluster_ids.reindex(ac_buses).values,
+            "country": bus_country.reindex(ac_buses).fillna("").astype(str).values,
+            "weight": w.values,
+        },
+        index=ac_buses,
+    )
+
+    cluster_totals = df.groupby("cluster")["weight"].sum()
+    cluster_country_weights = (
+        df.query("country != ''").groupby(["cluster", "country"])["weight"].sum()
+    )
+
+    dominant_country = {}
+    for cluster in sorted(pd.unique(df["cluster"])):
+        if (
+            isinstance(cluster_country_weights.index, pd.MultiIndex)
+            and cluster in cluster_country_weights.index.get_level_values(0)
+        ):
+            cw = cluster_country_weights.xs(cluster, level=0)
+            max_w = float(cw.max())
+            top = sorted(cw[cw == max_w].index.astype(str).tolist())[0]
+            dominant_country[cluster] = top
+        else:
+            dominant_country[cluster] = "ZZ"
+
+    dominant_series = pd.Series(dominant_country)
+    cluster_tokens = {}
+    for country in sorted(dominant_series.unique()):
+        clusters = dominant_series[dominant_series == country].index.tolist()
+        clusters = sorted(
+            clusters,
+            key=lambda c: (
+                -float(cluster_totals.get(c, 0.0)),
+                str(c),
+            ),
+        )
+        for i, c in enumerate(clusters):
+            cluster_tokens[c] = f"{country} {i}"
+
+    return pd.Series(cluster_tokens, name="cluster_token")
+
+
+def _ac_cluster_to_busmap(n, ac_cluster_ids, ac_weights=None):
+    ac_cluster_ids = ac_cluster_ids.astype(str)
+    ac_buses = pd.Index(ac_cluster_ids.index)
+    buses = n.buses.index.astype(str)
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip()
+    carriers = n.buses.carrier.fillna("unknown").astype(str)
+
+    keep_identity = bus_country == ""
+    keep_count = int(keep_identity.sum())
+    if keep_count > 0:
+        logger.info(
+            "Preserving %d global buses without country code as identity buses (not clustered).",
+            keep_count,
+        )
+
+    if ac_weights is None:
+        ac_weights = pd.Series(1.0, index=ac_buses)
+    else:
+        ac_weights = ac_weights.reindex(ac_buses).fillna(0.0)
+        if float(ac_weights.sum()) <= 0:
+            ac_weights[:] = 1.0
+
+    cluster_tokens = _cluster_tokens_by_dominant_country(
+        ac_cluster_ids=ac_cluster_ids,
+        bus_country=bus_country,
+        ac_weights=ac_weights,
+    )
+    ac_bus_tokens = ac_cluster_ids.reindex(ac_buses).map(cluster_tokens)
+    country_default_token = _country_default_tokens(n, ac_bus_tokens)
+
+    mapped = pd.Series(index=n.buses.index, dtype=object, name="busmap")
+    mapped.loc[ac_buses] = (
+        ac_bus_tokens.astype(str) + " " + carriers.reindex(ac_buses)
+    )
+
+    for b in n.buses.index:
+        if b in ac_buses:
+            continue
+        if keep_identity.get(b, False):
+            mapped.at[b] = b
+            continue
+
+        anchor = _extract_ac_anchor_bus(str(b))
+        cluster_id = None
+        if anchor in ac_cluster_ids.index:
+            cluster_id = ac_cluster_ids.at[anchor]
+        else:
+            loc = str(n.buses.at[b, "location"]).strip()
+            if loc in ac_cluster_ids.index:
+                cluster_id = ac_cluster_ids.at[loc]
+        token = None
+        if cluster_id is not None:
+            token = cluster_tokens.get(str(cluster_id))
+        if token is None and bus_country.get(b, "") in country_default_token:
+            token = country_default_token[bus_country.at[b]]
+
+        if token is None or str(token).strip() == "":
+            mapped.at[b] = b
+        else:
+            mapped.at[b] = f"{token} {carriers.at[b]}"
+
+    return mapped
+
+
+def _ac_bus_kmeans_mapping(n, cfg):
+    ac_buses = pd.Index(n.buses.index[n.buses.carrier == "AC"])
+    if len(ac_buses) == 0:
+        raise ValueError("No AC buses available for kmeans clustering.")
+
+    n_clusters = int(cfg.get("n_clusters", 90))
+    random_state = int(cfg.get("random_state", 42))
+    pca_components = int(cfg.get("pca_components", 5))
+    if n_clusters <= 0:
+        raise ValueError(f"n_clusters must be positive, got {n_clusters}")
+    if n_clusters > len(ac_buses):
+        raise ValueError(
+            f"Requested {n_clusters} clusters for {len(ac_buses)} AC buses."
+        )
+
+    features, annual_demand = _build_ac_bus_feature_frame(
+        n, ac_buses, pca_components, random_state
+    )
+    include_cf_features = bool(cfg.get("include_p_max_pu_features", False))
+    if include_cf_features:
+        cf_features = _build_ac_bus_cf_pca_features(
+            n=n,
+            ac_buses=ac_buses,
+            random_state=random_state,
+            n_components=int(cfg.get("p_max_pu_components", 3)),
+            by_tech=bool(cfg.get("p_max_pu_by_tech", True)),
+            tech_groups=cfg.get("p_max_pu_tech_groups"),
+        )
+        if not cf_features.empty:
+            features = features.join(cf_features, how="left")
+            logger.info(
+                "Added %d p_max_pu-based PCA feature columns for AC-bus clustering.",
+                len(cf_features.columns),
+            )
+        else:
+            logger.warning(
+                "include_p_max_pu_features=true but no p_max_pu PCA features were produced."
+            )
+    features = _zscore_columns(features.fillna(0.0))
+
+    feature_weights = {
+        "geography": 1.0,
+        "load_pca": 2.0,
+        "resource": 1.0,
+        "fossil": 1.0,
+        "capmix": 0.5,
+        "cf_timeseries": 1.0,
+    }
+    feature_weights.update(cfg.get("feature_weights", {}))
+
+    weighted_features = features.copy()
+    load_pc_cols = [c for c in weighted_features.columns if c.startswith("load_pc")]
+    grouped_cols = {
+        "geography": [c for c in ["geo_x", "geo_y"] if c in weighted_features.columns],
+        "load_pca": load_pc_cols,
+        "resource": [
+            c
+            for c in ["res_wind", "res_solar", "res_hydro"]
+            if c in weighted_features.columns
+        ],
+        "fossil": [c for c in ["fossil_proxy"] if c in weighted_features.columns],
+        "capmix": [
+            c
+            for c in ["capmix_renew_share", "capmix_fossil_share"]
+            if c in weighted_features.columns
+        ],
+        "cf_timeseries": [
+            c for c in weighted_features.columns if c.startswith("cfpc_")
+        ],
+    }
+    for group, cols in grouped_cols.items():
+        if not cols:
+            continue
+        weighted_features.loc[:, cols] = (
+            weighted_features.loc[:, cols] * float(feature_weights[group])
+        )
+
+    sample_weight = annual_demand.reindex(ac_buses).fillna(0.0).clip(lower=0.0)
+    if float(sample_weight.sum()) <= 0:
+        sample_weight[:] = 1.0
+    else:
+        positive = sample_weight[sample_weight > 0]
+        floor = float(positive.min()) if len(positive) else 1.0
+        sample_weight = sample_weight.where(sample_weight > 0, floor)
+
+    from sklearn.cluster import KMeans
+
+    km = KMeans(
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=int(cfg.get("n_init", 50)),
+        max_iter=int(cfg.get("max_iter", 1000)),
+    )
+    labels = km.fit_predict(
+        weighted_features.to_numpy(dtype=float), sample_weight=sample_weight.values
+    )
+
+    if bool(cfg.get("enforce_contiguity", True)):
+        adjacency = _build_ac_bus_adjacency(n, ac_buses)
+        labels = _enforce_node_cluster_contiguity(
+            labels, weighted_features, ac_buses, adjacency
+        )
+
+    unique_after = len(pd.unique(labels))
+    if unique_after != n_clusters:
+        logger.warning(
+            "Contiguity post-processing changed effective AC-bus cluster count from %d to %d.",
+            n_clusters,
+            unique_after,
+        )
+
+    ac_cluster = pd.Series(labels, index=ac_buses).map(lambda x: f"{int(x) + 1:03d}")
+    return ac_cluster, features, sample_weight
+
+
+def _country_kmeans_mapping(n, countries, cfg):
+    n_clusters = int(cfg.get("n_clusters", 90))
+    random_state = int(cfg.get("random_state", 42))
+    pca_components = int(cfg.get("pca_components", 5))
+    if n_clusters <= 0:
+        raise ValueError(f"n_clusters must be positive, got {n_clusters}")
+    if n_clusters > len(countries):
+        raise ValueError(
+            f"Requested {n_clusters} clusters for {len(countries)} countries."
+        )
+
+    features, annual_demand = _build_country_feature_frame(
+        n, countries, pca_components, random_state
+    )
+
+    feature_weights = {
+        "geography": 1.0,
+        "load_pca": 2.0,
+        "resource": 1.0,
+        "fossil": 1.0,
+        "capmix": 0.5,
+    }
+    feature_weights.update(cfg.get("feature_weights", {}))
+
+    weighted_features = features.copy()
+    load_pc_cols = [c for c in weighted_features.columns if c.startswith("load_pc")]
+    grouped_cols = {
+        "geography": [c for c in ["geo_x", "geo_y"] if c in weighted_features.columns],
+        "load_pca": load_pc_cols,
+        "resource": [
+            c
+            for c in ["res_wind", "res_solar", "res_hydro"]
+            if c in weighted_features.columns
+        ],
+        "fossil": [c for c in ["fossil_proxy"] if c in weighted_features.columns],
+        "capmix": [
+            c
+            for c in ["capmix_renew_share", "capmix_fossil_share"]
+            if c in weighted_features.columns
+        ],
+    }
+    for group, cols in grouped_cols.items():
+        if not cols:
+            continue
+        weighted_features.loc[:, cols] = (
+            weighted_features.loc[:, cols] * float(feature_weights[group])
+        )
+
+    sample_weight = annual_demand.reindex(countries).fillna(0.0).clip(lower=0.0)
+    if float(sample_weight.sum()) <= 0:
+        sample_weight[:] = 1.0
+    else:
+        positive = sample_weight[sample_weight > 0]
+        floor = float(positive.min()) if len(positive) else 1.0
+        sample_weight = sample_weight.where(sample_weight > 0, floor)
+
+    from sklearn.cluster import KMeans
+
+    km = KMeans(
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=int(cfg.get("n_init", 50)),
+        max_iter=int(cfg.get("max_iter", 1000)),
+    )
+    labels = km.fit_predict(weighted_features.to_numpy(dtype=float), sample_weight=sample_weight.values)
+
+    if bool(cfg.get("enforce_contiguity", True)):
+        adjacency = _build_country_adjacency(n, countries)
+        labels = _enforce_country_cluster_contiguity(
+            labels, weighted_features, countries, adjacency
+        )
+
+    unique_after = len(pd.unique(labels))
+    if unique_after != n_clusters:
+        logger.warning(
+            "Contiguity post-processing changed effective country-cluster count from %d to %d.",
+            n_clusters,
+            unique_after,
+        )
+
+    country_to_cluster = pd.Series(labels, index=countries).map(
+        lambda x: f"{int(x) + 1:03d}"
+    )
+    return country_to_cluster, features, sample_weight
+
+
+def _country_to_busmap(n, country_to_cluster):
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip()
+    known_countries = set([c for c in bus_country.unique() if c != ""])
+    missing = sorted(known_countries - set(country_to_cluster.index))
+    if missing:
+        raise ValueError(
+            "Country-cluster mapping missing countries: "
+            + ", ".join(missing[:20])
+            + ("..." if len(missing) > 20 else "")
+        )
+
+    def _cluster_label_by_dominant_country():
+        countries = country_to_cluster.index.astype(str)
+        profiles = _country_electric_load_profiles(n, countries)
+        annual = profiles.sum(axis=0).reindex(countries).fillna(0.0)
+
+        if float(annual.sum()) <= 0:
+            # Fallback: use AC bus counts if load profiles are empty.
+            bus_counts = (
+                bus_country[bus_country != ""]
+                .value_counts()
+                .reindex(countries)
+                .fillna(0.0)
+            )
+            weights = bus_counts
+        else:
+            weights = annual
+
+        labels = {}
+        for cluster_id in country_to_cluster.unique():
+            members = country_to_cluster[country_to_cluster == cluster_id].index
+            if len(members) == 0:
+                continue
+            w = weights.reindex(members).fillna(0.0)
+            if float(w.max()) <= 0:
+                w = pd.Series(1.0, index=members)
+            top_country = w.idxmax()
+            labels[str(cluster_id)] = str(top_country)
+        return labels
+
+    # Preserve global buses (no country code, e.g. Earth buses) one-to-one.
+    # They are system-wide carriers and should not be merged by country clustering.
+    keep_identity = bus_country == ""
+    keep_count = int(keep_identity.sum())
+    if keep_count > 0:
+        logger.info(
+            "Preserving %d global buses without country code as identity buses (not clustered).",
+            keep_count,
+        )
+
+    cluster_ids = bus_country.map(country_to_cluster).astype(str)
+    cluster_labels = _cluster_label_by_dominant_country()
+    cluster_names = cluster_ids.map(lambda cid: cluster_labels.get(str(cid), str(cid)))
+    carriers = n.buses.carrier.fillna("unknown").astype(str)
+    mapped = pd.Series(index=n.buses.index, dtype=object, name="busmap")
+    mapped.loc[~keep_identity] = (
+        cluster_names.loc[~keep_identity] + " " + carriers.loc[~keep_identity]
+    )
+    mapped.loc[keep_identity] = n.buses.index[keep_identity]
+    return mapped
+
+
+def _max_abs_series_err(a, b):
+    if len(a) == 0 and len(b) == 0:
+        return 0.0, 0.0
+    x = a.reindex(a.index.union(b.index), fill_value=0.0)
+    y = b.reindex(a.index.union(b.index), fill_value=0.0)
+    err = float(np.abs(x - y).max())
+    scale = float(max(np.abs(x).max(), np.abs(y).max(), 0.0))
+    return err, scale
+
+
+def _check_component_series_index_consistency(n):
+    for comp in n.all_components:
+        if comp not in n.components:
+            continue
+        list_name = n.components[comp]["list_name"]
+        if not hasattr(n, f"{list_name}_t"):
+            continue
+        static_df = getattr(n, list_name, None)
+        pnl = getattr(n, f"{list_name}_t")
+        if static_df is None:
+            continue
+        static_index = set(static_df.index)
+        for attr, df in pnl.items():
+            if df.empty:
+                continue
+            missing = sorted(set(df.columns) - static_index)
+            if missing:
+                raise ValueError(
+                    f"{comp}_t.{attr} has columns not present in {comp}: "
+                    + ", ".join(missing[:10])
+                    + ("..." if len(missing) > 10 else "")
+                )
+
+
+def _prune_component_time_series(n):
+    """Drop time-series columns that are not present in the static component tables."""
+    for comp in n.all_components:
+        if comp not in n.components:
+            continue
+        list_name = n.components[comp]["list_name"]
+        if not hasattr(n, f"{list_name}_t"):
+            continue
+        static_df = getattr(n, list_name, None)
+        pnl = getattr(n, f"{list_name}_t")
+        if static_df is None:
+            continue
+        static_index = static_df.index
+        for attr, df in pnl.items():
+            if df.empty:
+                continue
+            missing = sorted(set(df.columns) - set(static_index))
+            if missing:
+                pnl[attr] = df.drop(columns=missing, errors="ignore")
+                logger.warning(
+                    "Dropped %d %s_t.%s columns not present in %s",
+                    len(missing),
+                    comp,
+                    attr,
+                    comp,
+                )
+
+
+def _ensure_carriers_defined(n):
+    """Ensure all carrier names referenced by components exist in n.carriers."""
+    carrier_sources = [
+        ("buses", "carrier"),
+        ("generators", "carrier"),
+        ("loads", "carrier"),
+        ("links", "carrier"),
+        ("stores", "carrier"),
+        ("storage_units", "carrier"),
+        ("lines", "carrier"),
+        ("sub_networks", "carrier"),
+    ]
+
+    carriers = set()
+    for table, col in carrier_sources:
+        if hasattr(n, table):
+            df = getattr(n, table)
+            if hasattr(df, "columns") and col in df.columns:
+                carriers.update(df[col].dropna().astype(str).unique().tolist())
+
+    carriers = {c for c in carriers if c != ""}
+    if not carriers:
+        return
+
+    if not hasattr(n, "carriers") or n.carriers is None:
+        n.carriers = pd.DataFrame(index=pd.Index([], name="Carrier"))
+
+    existing = set(n.carriers.index.astype(str))
+    missing = sorted(carriers - existing)
+    if not missing:
+        return
+
+    new_rows = pd.DataFrame(index=pd.Index(missing, name=n.carriers.index.name or "Carrier"))
+    for col in n.carriers.columns:
+        if pd.api.types.is_numeric_dtype(n.carriers[col]):
+            new_rows[col] = 0.0
+        else:
+            new_rows[col] = ""
+
+    if "nice_name" in new_rows.columns:
+        new_rows["nice_name"] = new_rows.index.astype(str)
+
+    n.carriers = pd.concat([n.carriers, new_rows], axis=0)
+    logger.info("Added %d missing carriers to n.carriers", len(missing))
+
+
+def _validate_one_port_conservation(
+    n_before,
+    n_after,
+    components,
+    validation_rtol=1e-6,
+    validation_atol=1e-6,
+):
+    for comp in components:
+        list_name = n_before.components[comp]["list_name"]
+        df_before = getattr(n_before, list_name).copy()
+        df_after = getattr(n_after, list_name).copy()
+
+        if comp != "Generator":
+            df_before = df_before[df_before.bus.isin(n_before.buses.index)]
+            df_after = df_after[df_after.bus.isin(n_after.buses.index)]
+
+        if df_before.empty and df_after.empty:
+            continue
+
+        cap_col = "p_nom" if "p_nom" in df_before.columns else ("e_nom" if "e_nom" in df_before.columns else None)
+
+        # Static columns
+        for col, strategy in DEFAULT_ONE_PORT_STRATEGIES.items():
+            if col not in df_before.columns or col not in df_after.columns:
+                continue
+            if strategy == "sum":
+                a = float(df_before[col].fillna(0.0).sum())
+                b = float(df_after[col].fillna(0.0).sum())
+                if not np.isclose(a, b, rtol=validation_rtol, atol=validation_atol):
+                    raise ValueError(
+                        f"{comp}.{col} sum mismatch after clustering: {a} vs {b}"
+                    )
+            elif strategy == "capacity_weighted_average" and cap_col is not None:
+                a = float((df_before[col].fillna(0.0) * df_before[cap_col].fillna(0.0)).sum())
+                b = float((df_after[col].fillna(0.0) * df_after[cap_col].fillna(0.0)).sum())
+                tol = validation_atol + validation_rtol * max(abs(a), abs(b), 1.0)
+                if abs(a - b) > tol:
+                    raise ValueError(
+                        f"{comp}.{col} capacity-weighted total mismatch: {a} vs {b}"
+                    )
+
+        # Time-varying columns
+        pnl_before = getattr(n_before, f"{list_name}_t")
+        pnl_after = getattr(n_after, f"{list_name}_t")
+        for attr, strategy in DEFAULT_ONE_PORT_STRATEGIES.items():
+            if attr not in pnl_before or attr not in pnl_after:
+                continue
+            df_t_before = pnl_before[attr]
+            df_t_after = pnl_after[attr]
+            if df_t_before.empty and df_t_after.empty:
+                continue
+            if strategy == "sum":
+                pre_cols = df_t_before.columns.intersection(df_before.index)
+                post_cols = df_t_after.columns.intersection(df_after.index)
+                s_before = df_t_before[pre_cols].fillna(0.0).sum(axis=1)
+                s_after = df_t_after[post_cols].fillna(0.0).sum(axis=1)
+                err, scale = _max_abs_series_err(s_before, s_after)
+                tol = validation_atol + validation_rtol * max(scale, 1.0)
+                if err > tol:
+                    raise ValueError(
+                        f"{comp}_t.{attr} sum mismatch: max abs error {err} > {tol}"
+                    )
+            elif strategy == "capacity_weighted_average" and cap_col is not None:
+                pre_cols = df_t_before.columns.intersection(df_before.index)
+                post_cols = df_t_after.columns.intersection(df_after.index)
+                s_before = df_t_before[pre_cols].fillna(0.0).mul(
+                    df_before.loc[pre_cols, cap_col].fillna(0.0), axis=1
+                ).sum(axis=1)
+                s_after = df_t_after[post_cols].fillna(0.0).mul(
+                    df_after.loc[post_cols, cap_col].fillna(0.0), axis=1
+                ).sum(axis=1)
+                err, scale = _max_abs_series_err(s_before, s_after)
+                tol = validation_atol + validation_rtol * max(scale, 1.0)
+                if err > tol:
+                    raise ValueError(
+                        f"{comp}_t.{attr} capacity-weighted mismatch: max abs error {err} > {tol}"
+                    )
+
+
+def _validate_cluster_aggregation(
+    n_before,
+    n_after,
+    aggregate_one_ports,
+    validation_rtol=1e-6,
+    validation_atol=1e-6,
+):
+    if not n_before.snapshots.equals(n_after.snapshots):
+        raise ValueError("Snapshots changed during additional sector clustering.")
+
+    # Sanity check all component time-series tables reference existing static assets.
+    _check_component_series_index_consistency(n_after)
+
+    # Validate conservation for all aggregated one-port components + generators.
+    validate_components = sorted(set(aggregate_one_ports + ["Generator"]))
+    _validate_one_port_conservation(
+        n_before=n_before,
+        n_after=n_after,
+        components=validate_components,
+        validation_rtol=validation_rtol,
+        validation_atol=validation_atol,
+    )
+
+    logger.info(
+        "Additional clustering validation passed for components: %s",
+        ", ".join(validate_components),
+    )
+
+
+def _write_cluster_outputs(output_dir, country_to_cluster, busmap, features, settings):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    country_to_cluster.rename("cluster").to_csv(output_dir / "country_to_cluster.csv")
+    busmap.rename("clustered_bus").to_csv(output_dir / "busmap.csv")
+    if features is not None:
+        features.to_csv(output_dir / "country_features.csv")
+    with open(output_dir / "settings.yaml", "w") as f:
+        yaml.safe_dump(settings, f, sort_keys=True)
+
+
+def _load_busmap_series(path):
+    df = pd.read_csv(path, index_col=0)
+    if df.empty or len(df.columns) == 0:
+        raise ValueError(f"Busmap file is empty: {path}")
+    col = "clustered_bus" if "clustered_bus" in df.columns else df.columns[0]
+    s = df[col].astype(str)
+    s.index = s.index.astype(str)
+    s.name = "busmap"
+    return s
+
+
+def _extract_cluster_token(mapped_bus_name, carrier):
+    if pd.isna(mapped_bus_name):
+        return None
+    mapped = str(mapped_bus_name)
+    carrier = str(carrier)
+    suffix = f" {carrier}"
+    if mapped.endswith(suffix):
+        token = mapped[: -len(suffix)].strip()
+        return token if token else None
+    return None
+
+
+def _country_default_tokens(n, ac_tokens):
+    ac_tokens = ac_tokens.dropna()
+    if ac_tokens.empty:
+        return {}
+    profiles = _ac_bus_load_profiles(n, ac_tokens.index)
+    weights = profiles.sum(axis=0).reindex(ac_tokens.index).fillna(0.0).clip(lower=0.0)
+    if float(weights.sum()) <= 0:
+        weights[:] = 1.0
+    bus_country = _get_bus_country_for_clustering(n).reindex(ac_tokens.index).fillna("")
+    by_country_cluster = (
+        pd.DataFrame(
+            {
+                "country": bus_country.values,
+                "token": ac_tokens.values,
+                "weight": weights.values,
+            },
+            index=ac_tokens.index,
+        )
+        .query("country != ''")
+        .groupby(["country", "token"])["weight"]
+        .sum()
+    )
+    defaults = {}
+    if len(by_country_cluster) > 0:
+        for country in by_country_cluster.index.get_level_values(0).unique():
+            w = by_country_cluster.xs(country, level=0)
+            defaults[str(country)] = str(w.idxmax())
+    return defaults
+
+
+def _nearest_token_by_distance(n, source_bus, candidate_buses, ac_tokens):
+    candidate_buses = pd.Index(candidate_buses).intersection(ac_tokens.index)
+    candidate_buses = candidate_buses[ac_tokens.reindex(candidate_buses).notna()]
+    if len(candidate_buses) == 0:
+        return None
+
+    src_xy = n.buses.loc[source_bus, ["x", "y"]]
+    try:
+        src_x = float(src_xy["x"])
+        src_y = float(src_xy["y"])
+    except Exception:
+        return str(ac_tokens.reindex(candidate_buses).iloc[0])
+    if not np.isfinite(src_x) or not np.isfinite(src_y):
+        return str(ac_tokens.reindex(candidate_buses).iloc[0])
+
+    cand_xy = n.buses.loc[candidate_buses, ["x", "y"]].astype(float)
+    finite = np.isfinite(cand_xy["x"].values) & np.isfinite(cand_xy["y"].values)
+    if not finite.any():
+        return str(ac_tokens.reindex(candidate_buses).iloc[0])
+    cand_xy = cand_xy.iloc[np.where(finite)[0]]
+    dist2 = (cand_xy["x"] - src_x) ** 2 + (cand_xy["y"] - src_y) ** 2
+    nearest = dist2.idxmin()
+    token = ac_tokens.get(nearest)
+    return str(token) if pd.notna(token) else None
+
+
+def _extend_universal_busmap(n, busmap):
+    busmap = busmap.copy()
+    busmap.index = busmap.index.astype(str)
+    all_buses = n.buses.index.astype(str)
+    missing = all_buses.difference(busmap.index)
+    if len(missing) == 0:
+        return busmap, 0
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip()
+    carriers = n.buses.carrier.fillna("unknown").astype(str)
+    keep_identity = bus_country == ""
+
+    ac_buses = pd.Index(n.buses.index[n.buses.carrier == "AC"]).astype(str)
+    covered_ac = ac_buses.intersection(busmap.index)
+    ac_tokens = covered_ac.to_series(index=covered_ac).map(
+        lambda b: _extract_cluster_token(busmap.at[b], "AC")
+    )
+    ac_tokens = ac_tokens.dropna()
+    country_default_token = _country_default_tokens(n, ac_tokens)
+
+    # First map missing AC buses, then non-AC buses can anchor to them.
+    missing_ac = [b for b in missing if carriers.get(b, "") == "AC"]
+    missing_non_ac = [b for b in missing if carriers.get(b, "") != "AC"]
+
+    def _pick_token_for_bus(b):
+        anchor = _extract_ac_anchor_bus(str(b))
+        if anchor in busmap.index:
+            token = _extract_cluster_token(busmap.at[anchor], "AC")
+            if token:
+                return token
+        loc = str(n.buses.at[b, "location"]).strip()
+        if loc in busmap.index:
+            token = _extract_cluster_token(busmap.at[loc], "AC")
+            if token:
+                return token
+
+        country = bus_country.get(b, "")
+        if country in country_default_token:
+            same_country_ac = ac_tokens.index[bus_country.reindex(ac_tokens.index) == country]
+            if len(same_country_ac) > 0:
+                token = _nearest_token_by_distance(n, b, same_country_ac, ac_tokens)
+                if token:
+                    return token
+            return country_default_token[country]
+
+        token = _nearest_token_by_distance(n, b, ac_tokens.index, ac_tokens)
+        return token
+
+    added = 0
+    for b in missing_ac:
+        if keep_identity.get(b, False):
+            busmap.at[b] = b
+            added += 1
+            continue
+        token = _pick_token_for_bus(b)
+        if token is None:
+            busmap.at[b] = b
+        else:
+            busmap.at[b] = f"{token} AC"
+            ac_tokens.loc[b] = token
+            country = bus_country.get(b, "")
+            if country and country not in country_default_token:
+                country_default_token[country] = token
+        added += 1
+
+    for b in missing_non_ac:
+        if keep_identity.get(b, False):
+            busmap.at[b] = b
+            added += 1
+            continue
+        token = _pick_token_for_bus(b)
+        if token is None:
+            busmap.at[b] = b
+        else:
+            busmap.at[b] = f"{token} {carriers.at[b]}"
+        added += 1
+
+    busmap = busmap.reindex(all_buses)
+    busmap.name = "busmap"
+    return busmap, added
+
+
+def _ensure_pypsa_aggregateoneport_compat():
+    """
+    Patch PyPSA's aggregateoneport for pandas versions where Series.groupby(axis=...)
+    is not supported anymore.
+    """
+    if getattr(pypsa_spatial, "_cki_aggregateoneport_compat", False):
+        return
+
+    def _aggregateoneport_compat(
+        n,
+        busmap,
+        component,
+        carriers=None,
+        buses=None,
+        with_time=True,
+        custom_strategies=None,
+    ):
+        if custom_strategies is None:
+            custom_strategies = {}
+
+        c = component
+        df = n.df(c)
+        attrs = n.components[c]["attrs"]
+
+        if "carrier" in df.columns:
+            if carriers is None:
+                carriers = df.carrier.unique()
+            to_aggregate = df.carrier.isin(carriers)
+        else:
+            to_aggregate = pd.Series(True, index=df.index)
+
+        if buses is not None:
+            to_aggregate |= df.bus.isin(buses)
+
+        df = df[to_aggregate]
+        df = df.assign(bus=df.bus.map(busmap))
+
+        output_columns = attrs.index[attrs.static & attrs.status.str.startswith("Output")]
+        columns = [col for col in df.columns if col not in output_columns]
+
+        strategies = {**pypsa_spatial.DEFAULT_ONE_PORT_STRATEGIES, **custom_strategies}
+        static_strategies = pypsa_spatial.align_strategies(strategies, columns, c)
+
+        grouper = [df.bus, df.carrier] if "carrier" in df.columns else df.bus
+
+        uniform_weights = pd.Series(1.0, index=df.index).groupby(grouper).transform(
+            pypsa_spatial.normed_or_uniform
+        )
+        capacity = df.columns.intersection({"p_nom", "e_nom"})
+        capacity_weights = uniform_weights
+        if len(capacity):
+            capacity_weights = df[capacity[0]].groupby(grouper).transform(
+                pypsa_spatial.normed_or_uniform
+            )
+
+        weights = uniform_weights
+        if "weight" in df.columns:
+            weights = df.weight.groupby(grouper).transform(pypsa_spatial.normed_or_uniform)
+
+        for col, strategy in static_strategies.items():
+            if strategy == "weighted_average":
+                df[col] = df[col] * weights
+                static_strategies[col] = "sum"
+            elif strategy == "capacity_weighted_average":
+                df[col] = df[col] * capacity_weights
+                static_strategies[col] = "sum"
+            elif strategy == "weighted_min":
+                df["p_nom_max"] /= weights
+                static_strategies[col] = "min"
+
+        aggregated = df.groupby(grouper).agg(static_strategies)
+        aggregated.index = pypsa_spatial.flatten_multiindex(aggregated.index).rename(c)
+
+        non_aggregated = n.df(c)[~to_aggregate]
+        non_aggregated = non_aggregated.assign(bus=non_aggregated.bus.map(busmap))
+
+        df = pd.concat([aggregated, non_aggregated], sort=False)
+        df.fillna(attrs.default, inplace=True)
+
+        pnl = {}
+        if with_time:
+            dynamic_strategies = pypsa_spatial.align_strategies(strategies, n.pnl(c), c)
+            for attr, data in n.pnl(c).items():
+                if data.empty:
+                    pnl[attr] = data
+                    continue
+                strategy = dynamic_strategies[attr]
+                data = n.get_switchable_as_dense(c, attr)
+                aggregated = data.loc[:, to_aggregate]
+
+                if strategy == "weighted_average":
+                    aggregated = aggregated * weights
+                    aggregated = aggregated.T.groupby(grouper).sum().T
+                elif strategy == "capacity_weighted_average":
+                    aggregated = aggregated * capacity_weights
+                    aggregated = aggregated.T.groupby(grouper).sum().T
+                elif strategy == "weighted_min":
+                    aggregated = aggregated / weights
+                    aggregated = aggregated.T.groupby(grouper).min().T
+                else:
+                    aggregated = aggregated.T.groupby(grouper).agg(strategy).T
+                aggregated.columns = pypsa_spatial.flatten_multiindex(aggregated.columns).rename(c)
+
+                non_aggregated = data.loc[:, ~to_aggregate]
+                pnl[attr] = pd.concat([aggregated, non_aggregated], axis=1, sort=False)
+
+                # filter out static values
+                if attr in df:
+                    is_static = (pnl[attr] == df[attr]).all()
+                    pnl[attr] = pnl[attr].loc[:, ~is_static]
+
+        return df, pnl
+
+    pypsa_spatial.aggregateoneport = _aggregateoneport_compat
+    pypsa_spatial._cki_aggregateoneport_compat = True
+
+
+def _ensure_pypsa_nodal_balance_busname_compat():
+    """
+    Ensure nodal-balance helper receives a named bus index ("Bus").
+
+    Some PyPSA/Linopy combinations can pass unnamed bus subsets to
+    define_nodal_balance_constraints, which then fails on rhs.rename(Bus=...).
+    """
+    try:
+        import pypsa.optimization.constraints as pypsa_constraints
+        import pypsa.optimization.optimize as pypsa_optimize
+    except Exception:
+        return
+
+    if getattr(pypsa_constraints, "_cki_nodal_balance_busname_compat", False):
+        return
+
+    def _define_nodal_balance_constraints_compat(
+        n,
+        sns,
+        transmission_losses=0,
+        buses=None,
+        suffix="",
+    ):
+        # Same logic as upstream, but enforce a stable Bus dimension name.
+        m = n.model
+        if buses is None:
+            buses = n.buses.index
+        buses = pd.Index(buses)
+        if buses.name is None:
+            buses = buses.rename("Bus")
+
+        args = [
+            ["Generator", "p", "bus", 1],
+            ["Store", "p", "bus", 1],
+            ["StorageUnit", "p_dispatch", "bus", 1],
+            ["StorageUnit", "p_store", "bus", -1],
+            ["Line", "s", "bus0", -1],
+            ["Line", "s", "bus1", 1],
+            ["Transformer", "s", "bus0", -1],
+            ["Transformer", "s", "bus1", 1],
+            ["Link", "p", "bus0", -1],
+            ["Link", "p", "bus1", pypsa_constraints.get_as_dense(n, "Link", "efficiency", sns)],
+        ]
+
+        if not n.links.empty:
+            for i in pypsa_constraints.additional_linkports(n):
+                eff = pypsa_constraints.get_as_dense(n, "Link", f"efficiency{i}", sns)
+                args.append(["Link", "p", f"bus{i}", eff])
+
+        if transmission_losses:
+            args.extend(
+                [
+                    ["Line", "loss", "bus0", -0.5],
+                    ["Line", "loss", "bus1", -0.5],
+                    ["Transformer", "loss", "bus0", -0.5],
+                    ["Transformer", "loss", "bus1", -0.5],
+                ]
+            )
+
+        exprs = []
+        for c, attr, column, sign in args:
+            if n.df(c).empty:
+                continue
+            if "sign" in n.df(c):
+                sign = sign * n.df(c).sign
+
+            expr = pypsa_constraints.DataArray(sign) * m[f"{c}-{attr}"]
+            cbuses = n.df(c)[column][lambda ds: ds.isin(buses)].rename("Bus")
+
+            if column in ["bus" + i for i in pypsa_constraints.additional_linkports(n)]:
+                cbuses = cbuses[cbuses != ""]
+
+            expr = expr.sel({c: cbuses.index})
+            if expr.size:
+                exprs.append(expr.groupby(cbuses).sum())
+
+        lhs = pypsa_constraints.merge(exprs, join="outer").reindex(Bus=buses)
+        rhs_df = (
+            (-pypsa_constraints.get_as_dense(n, "Load", "p_set", sns) * n.loads.sign)
+            .T.groupby(n.loads.bus)
+            .sum()
+            .T.reindex(columns=buses, fill_value=0)
+        )
+        rhs_df.index.name = "snapshot"
+        rhs_df.columns.name = "Bus"
+        rhs = pypsa_constraints.DataArray(rhs_df)
+
+        empty_nodal_balance = (lhs.vars == -1).all("_term")
+        if empty_nodal_balance.any():
+            if (empty_nodal_balance & (rhs != 0)).any().item():
+                raise ValueError("Empty LHS with non-zero RHS in nodal balance constraint.")
+            mask = ~empty_nodal_balance
+        else:
+            mask = None
+
+        if suffix:
+            lhs = lhs.rename(Bus=f"Bus{suffix}")
+            rhs = rhs.rename(Bus=f"Bus{suffix}")
+            if mask is not None:
+                mask = mask.rename(Bus=f"Bus{suffix}")
+        n.model.add_constraints(lhs, "=", rhs, name=f"Bus{suffix}-nodal_balance", mask=mask)
+
+    pypsa_constraints.define_nodal_balance_constraints = _define_nodal_balance_constraints_compat
+    # create_model imports the function into optimize module namespace
+    pypsa_optimize.define_nodal_balance_constraints = _define_nodal_balance_constraints_compat
+    pypsa_constraints._cki_nodal_balance_busname_compat = True
+
+
+def _normalize_clustered_link_buses(clustered, busmap):
+    if clustered.links.empty:
+        return
+
+    mapping = busmap.to_dict()
+    bus_cols = [c for c in clustered.links.columns if re.fullmatch(r"bus\d*", str(c))]
+    if not bus_cols:
+        return
+
+    def _map_bus(value):
+        if pd.isna(value):
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        if value == "":
+            return ""
+        return mapping.get(value, value)
+
+    for col in bus_cols:
+        clustered.links[col] = clustered.links[col].map(_map_bus)
+        invalid = (~clustered.links[col].isin(clustered.buses.index)) & (clustered.links[col] != "")
+        if invalid.any():
+            clustered.links.loc[invalid, col] = ""
+
+    # Remove invalid intra-cluster links after terminal remapping.
+    invalid_primary = (
+        (clustered.links.bus0 == "")
+        | (clustered.links.bus1 == "")
+        | (clustered.links.bus0 == clustered.links.bus1)
+    )
+    if invalid_primary.any():
+        dropped = int(invalid_primary.sum())
+        clustered.mremove("Link", clustered.links.index[invalid_primary])
+        logger.warning(
+            "Dropped %d links with invalid clustered bus0/bus1 after additional clustering.",
+            dropped,
+        )
+
+
+def apply_optional_sector_clustering(n, config):
+    raw_cfg = config.get(
+        "additional_sector_clustering",
+        config.get("solving", {}).get("additional_sector_clustering", None),
+    )
+    if raw_cfg is None:
+        return n
+
+    if isinstance(raw_cfg, int):
+        cfg = {"enable": True, "mode": "kmeans", "n_clusters": int(raw_cfg)}
+    elif isinstance(raw_cfg, dict):
+        cfg = dict(raw_cfg)
+    else:
+        logger.warning(
+            "Ignoring additional_sector_clustering because config type is unsupported: %s",
+            type(raw_cfg),
+        )
+        return n
+
+    if not bool(cfg.get("enable", False)):
+        return n
+    if getattr(n, "_additional_sector_clustered", False):
+        return n
+    meta = getattr(n, "meta", {})
+    if isinstance(meta, dict) and meta.get("additional_sector_clustered", False):
+        n._additional_sector_clustered = 1
+        return n
+
+    mode = str(cfg.get("mode", "kmeans")).lower()
+    output_dir = None
+    try:
+        if "snakemake" in globals() and hasattr(snakemake, "output") and snakemake.output:
+            solved_path = Path(snakemake.output[0]).resolve()
+            output_dir = solved_path.parent.parent / "additional_sector_clustering"
+    except Exception:
+        output_dir = None
+
+    if output_dir is None:
+        output_dir = _repo_path(cfg.get("output_directory", "results/additional_sector_clustering"))
+    universal_busmap_file = cfg.get(
+        "universal_busmap_file", str(output_dir / "universal_busmap.csv")
+    )
+    universal_busmap_path = _repo_path(universal_busmap_file)
+    reuse_universal_busmap = bool(cfg.get("reuse_universal_busmap", True))
+    overwrite_universal_busmap = bool(cfg.get("overwrite_universal_busmap", False))
+    write_universal_busmap = bool(cfg.get("write_universal_busmap", True))
+
+    country_to_cluster = None
+    ac_bus_to_cluster = None
+    features = None
+    sample_weight = None
+    busmap_source = "computed"
+
+    if reuse_universal_busmap and universal_busmap_path.exists() and not overwrite_universal_busmap:
+        busmap = _load_busmap_series(universal_busmap_path)
+        missing = n.buses.index.difference(busmap.index)
+        if len(missing) > 0:
+            busmap, added = _extend_universal_busmap(n, busmap)
+            logger.warning(
+                "Universal busmap missing %d buses; deterministically extended mapping without changing existing assignments.",
+                added,
+            )
+            if write_universal_busmap:
+                universal_busmap_path.parent.mkdir(parents=True, exist_ok=True)
+                busmap.rename("clustered_bus").to_csv(universal_busmap_path)
+                logger.info(
+                    "Updated universal additional clustering busmap at %s",
+                    universal_busmap_path,
+                )
+        busmap = busmap.reindex(n.buses.index)
+        busmap_source = "universal"
+        logger.info("Using universal additional clustering busmap from %s", universal_busmap_path)
+    else:
+        logger.info("Applying additional sector clustering in solve_network.py (mode=%s)", mode)
+
+        if mode == "manual":
+            bus_country = _get_bus_country_for_clustering(n)
+            countries = pd.Index(sorted([c for c in bus_country.unique() if c != ""]))
+            if len(countries) == 0:
+                logger.warning("No countries found on buses; skipping additional sector clustering.")
+                return n
+            manual_file = _repo_path(cfg.get("manual_mapping_file", "configs/global.cluster.yaml"))
+            country_to_cluster = _parse_manual_country_clusters(manual_file).reindex(countries)
+            missing = country_to_cluster[country_to_cluster.isna()].index.tolist()
+            if missing:
+                missing_policy = str(cfg.get("manual_missing_policy", "singleton")).lower()
+                if missing_policy == "error":
+                    raise ValueError(
+                        "Manual cluster mapping does not cover all countries. Missing: "
+                        + ", ".join(missing[:20])
+                        + ("..." if len(missing) > 20 else "")
+                    )
+                if missing_policy == "singleton":
+                    for c in missing:
+                        country_to_cluster.loc[c] = f"auto_{c}"
+                    logger.warning(
+                        "Manual mapping missing %d countries (%s). "
+                        "Assigned deterministic singleton clusters via manual_missing_policy=singleton.",
+                        len(missing),
+                        ", ".join(missing[:20]) + ("..." if len(missing) > 20 else ""),
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown manual_missing_policy '{missing_policy}'. Use 'singleton' or 'error'."
+                    )
+            country_to_cluster = country_to_cluster.astype(str)
+            logger.info(
+                "Loaded manual country clusters from %s with %d target clusters.",
+                manual_file,
+                country_to_cluster.nunique(),
+            )
+        elif mode in {"kmeans", "algorithm"}:
+            ac_bus_to_cluster, features, sample_weight = _ac_bus_kmeans_mapping(
+                n, cfg
+            )
+            busmap = _ac_cluster_to_busmap(n, ac_bus_to_cluster, sample_weight)
+            logger.info(
+                "Computed weighted AC-bus k-means mapping with %d clusters (seed=%s).",
+                ac_bus_to_cluster.nunique(),
+                cfg.get("random_state", 42),
+            )
+        else:
+            raise ValueError(
+                f"Unknown additional sector clustering mode '{mode}'. Use 'manual' or 'kmeans'."
+            )
+
+        if mode == "manual":
+            busmap = _country_to_busmap(n, country_to_cluster)
+        if write_universal_busmap:
+            universal_busmap_path.parent.mkdir(parents=True, exist_ok=True)
+            busmap.rename("clustered_bus").to_csv(universal_busmap_path)
+            logger.info(
+                "Wrote universal additional clustering busmap to %s",
+                universal_busmap_path,
+            )
+
+    bus_strategies = {
+        "v_nom": "first",
+        "x": "mean",
+        "y": "mean",
+        "lon": "mean",
+        "lat": "mean",
+        "country": "first",
+        "carrier": "first",
+        "sub_network": "first",
+        "location": "first",
+        "type": "first",
+        "unit": "first",
+        "control": "first",
+        "tag_substation": "first",
+        "tag_area": "first",
+    }
+    line_strategies = {
+        # Aggregated lines can combine multiple spatial metadata entries.
+        # Keep deterministic representative values instead of requiring equality.
+        "geometry": "first",
+        "bounds": "first",
+        "carrier": "first",
+        "type": "first",
+        "sub_network": "first",
+    }
+    aggregate_one_ports = cfg.get("aggregate_one_ports")
+    if aggregate_one_ports is None:
+        aggregate_one_ports = [c for c in n.one_port_components if c != "Generator"]
+    if isinstance(aggregate_one_ports, str):
+        aggregate_one_ports = [aggregate_one_ports]
+    aggregate_one_ports = [c for c in aggregate_one_ports if c in n.one_port_components]
+
+    # Preserve vintage metadata when one-port aggregation is enabled.
+    raw_one_port_strategies = cfg.get("one_port_strategies", {})
+    if not isinstance(raw_one_port_strategies, dict):
+        raw_one_port_strategies = {}
+    one_port_strategies = {}
+    for comp in aggregate_one_ports:
+        comp_strategies = dict(raw_one_port_strategies.get(comp, {}))
+        comp_strategies.setdefault("build_year", "first")
+        comp_strategies.setdefault("lifetime", "first")
+        one_port_strategies[comp] = comp_strategies
+    raw_generator_strategies = cfg.get("generator_strategies", {})
+    if not isinstance(raw_generator_strategies, dict):
+        raw_generator_strategies = {}
+    generator_strategies = dict(raw_generator_strategies)
+    generator_strategies.setdefault("build_year", "first")
+    generator_strategies.setdefault("lifetime", "first")
+
+    vintage_components = ["Generator"] + aggregate_one_ports
+    carrier_backups, token_to_meta = _encode_vintage_carriers_for_clustering(
+        n, vintage_components
+    )
+
+    _ensure_pypsa_aggregateoneport_compat()
+    try:
+        clustering = get_clustering_from_busmap(
+            n,
+            busmap,
+            aggregate_generators_weighted=True,
+            aggregate_one_ports=aggregate_one_ports,
+            line_length_factor=float(cfg.get("line_length_factor", 1.0)),
+            scale_link_capital_costs=False,
+            bus_strategies=bus_strategies,
+            one_port_strategies=one_port_strategies,
+            generator_strategies=generator_strategies,
+            line_strategies=line_strategies,
+        )
+    finally:
+        _restore_encoded_carriers(n, carrier_backups)
+
+    clustered = clustering.network
+    _decode_vintage_carriers_after_clustering(clustered, token_to_meta, vintage_components)
+    _sanitize_vintage_encoded_component_names(clustered, token_to_meta, vintage_components)
+    _normalize_clustered_link_buses(clustered, busmap)
+    _ensure_carriers_defined(clustered)
+    _prune_component_time_series(clustered)
+
+    # Keep critical attributes used later in solve flow.
+    for attr in (
+        "n_ref",
+        "build_rate_limits",
+        "build_rate_scenario",
+        "build_rate_target_year",
+        "config",
+        "opts",
+        "temporal_cluster",
+    ):
+        if hasattr(n, attr):
+            setattr(clustered, attr, getattr(n, attr))
+
+    if bool(cfg.get("validate_aggregation", True)):
+        _validate_cluster_aggregation(
+            n,
+            clustered,
+            aggregate_one_ports=aggregate_one_ports,
+            validation_rtol=float(cfg.get("validation_rtol", 1e-6)),
+            validation_atol=float(cfg.get("validation_atol", 1e-6)),
+        )
+
+    if bool(cfg.get("write_mapping", True)):
+        settings = {
+            "mode": mode,
+            "n_clusters": int(
+                country_to_cluster.nunique()
+                if country_to_cluster is not None
+                else ac_bus_to_cluster.nunique() if ac_bus_to_cluster is not None else 0
+            ),
+            "random_state": int(cfg.get("random_state", 42)),
+            "pca_components": int(cfg.get("pca_components", 5)),
+            "include_p_max_pu_features": bool(cfg.get("include_p_max_pu_features", False)),
+            "p_max_pu_components": int(cfg.get("p_max_pu_components", 3)),
+            "p_max_pu_by_tech": bool(cfg.get("p_max_pu_by_tech", True)),
+            "p_max_pu_tech_groups": cfg.get("p_max_pu_tech_groups"),
+            "feature_weights": cfg.get("feature_weights", {}),
+            "busmap_source": busmap_source,
+            "universal_busmap_file": str(universal_busmap_path),
+        }
+        if country_to_cluster is not None:
+            _write_cluster_outputs(
+                output_dir=output_dir,
+                country_to_cluster=country_to_cluster.sort_index(),
+                busmap=busmap.sort_index(),
+                features=features.sort_index() if isinstance(features, pd.DataFrame) else None,
+                settings=settings,
+            )
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if ac_bus_to_cluster is not None:
+                ac_bus_to_cluster.sort_index().rename("cluster").to_csv(
+                    output_dir / "ac_bus_to_cluster.csv"
+                )
+            busmap.sort_index().rename("clustered_bus").to_csv(output_dir / "busmap.csv")
+            if isinstance(features, pd.DataFrame):
+                features.sort_index().to_csv(output_dir / "ac_bus_features.csv")
+            with open(output_dir / "settings.yaml", "w") as f:
+                yaml.safe_dump(settings, f, sort_keys=True)
+        logger.info("Wrote additional clustering mapping artifacts to %s", output_dir)
+
+    # Use int instead of bool to keep netCDF export happy (netCDF4 can't store bool attrs)
+    clustered._additional_sector_clustered = 1
+    if not isinstance(getattr(clustered, "meta", None), dict):
+        clustered.meta = {}
+    clustered.meta.update(
+        {
+            "additional_sector_clustered": True,
+            "additional_sector_clustering_mode": mode,
+            "additional_sector_clustering_busmap_source": busmap_source,
+            "additional_sector_clustering_busmap_file": str(universal_busmap_path),
+        }
+    )
+    logger.info(
+        "Additional sector clustering reduced buses %d -> %d, generators %d -> %d, loads %d -> %d.",
+        len(n.buses),
+        len(clustered.buses),
+        len(n.generators),
+        len(clustered.generators),
+        len(n.loads),
+        len(clustered.loads),
+    )
+    return clustered
 
 
 def prepare_network(n, solve_opts):
@@ -168,8 +2215,15 @@ def prepare_network(n, solve_opts):
         n.set_snapshots(n.snapshots[:nhours])
         n.snapshot_weightings[:] = 8760.0 / nhours
 
-    if snakemake.config["foresight"] == "myopic":
-        add_land_use_constraint(n)
+    # Only add land use constraints if snakemake is available (normal workflow)
+    # For rolling horizon/perfect foresight, land use constraints are handled separately
+    try:
+        if snakemake.config["foresight"] == "myopic":
+            add_land_use_constraint(n)
+    except (NameError, KeyError):
+        # snakemake not available (e.g., called from rolling horizon script)
+        # Land use constraints will be handled separately
+        pass
 
     return n
 
@@ -260,7 +2314,7 @@ def add_EQ_constraints(n, o, scaling=1e-1):
     to produce on average at least 70% of its consumption; EQ0.7 demands
     each node to produce on average at least 70% of its consumption.
     """
-    float_regex = "[0-9]*\.?[0-9]+"
+    float_regex = r"[0-9]*\.?[0-9]+"
     level = float(re.findall(float_regex, o)[0])
     if o[-1] == "c":
         ggrouper = n.generators.bus.map(n.buses.country)
@@ -1346,96 +3400,6 @@ def add_year2025_capacity_targets(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
 
 
-def add_year2025_link_capacity_targets(n, planning_year, config):
-    """
-    Add 2025 capacity targets for link-based technologies (e.g., coal, gas).
-    Constrains installed capacity by carrier to match 2025 targets +/- tolerance.
-    
-    Important: For links with efficiency < 1, p_nom represents thermal/fuel input capacity,
-    not electrical output. The target should be specified in electrical output (MW_el),
-    and this function will convert to thermal capacity using efficiency.
-    
-    Example: 100 MW coal plant with 33% efficiency -> p_nom = 100/0.33 = 303 MW_th
-    """
-    global_cfg = config.get("global_specific", {})
-    cfg = global_cfg.get("year2025_capacity", {})
-    if not cfg or not cfg.get("year2025_capacity_constraint", False):
-        return
-
-    target_year = str(cfg.get("year", 2025))
-    if str(planning_year) != target_year:
-        logger.info(f"Skipping 2025 link capacity constraints for {planning_year} (configured for {target_year})")
-        return
-
-    logger.info(f"Adding 2025 link capacity constraints for {planning_year}")
-
-    tol   = float(cfg.get("tolerance", 0.15))
-    units = str(cfg.get("units", "GW")).lower()
-    unit_scale = {"mw":1.0, "gw":1e3, "tw":1e6}.get(units, 1e3)
-
-    targets = cfg.get("targets", {})
-
-    # Get extendable links by carrier
-    ext_links = n.links.query("p_nom_extendable")
-    
-    if ext_links.empty:
-        logger.info("No extendable links found for capacity constraints")
-        return
-
-    # Get the capacity variable
-    p_nom = n.model["Link-p_nom"]
-    
-    for carrier, target in targets.items():
-        if isinstance(target, str) and target.upper().startswith("X"):
-            logger.info(f"Skipping {carrier} (placeholder target '{target}')")
-            continue
-
-        # Find links matching this carrier
-        carrier_links = ext_links[ext_links.carrier == carrier].index
-        
-        if len(carrier_links) == 0:
-            # Not a warning - this carrier might be a generator, not a link
-            continue
-
-        # Get average efficiency for this carrier
-        avg_efficiency = n.links.loc[carrier_links, 'efficiency'].mean()
-        
-        if avg_efficiency <= 0 or not np.isfinite(avg_efficiency):
-            logger.warning(f"Invalid efficiency {avg_efficiency} for carrier '{carrier}', skipping")
-            continue
-        
-        # Sum of p_nom for this carrier (in thermal/fuel capacity)
-        lhs = p_nom.loc[carrier_links].sum()
-        
-        # Add existing non-extendable capacity (also in thermal capacity)
-        existing_links = n.links.query("carrier == @carrier and not p_nom_extendable")
-        existing_capacity_thermal = existing_links.p_nom.sum()
-        
-        # Convert electrical target to thermal capacity using efficiency
-        # target is in MW_el, divide by efficiency to get MW_th
-        target_thermal = float(target) / avg_efficiency
-        
-        # Calculate bounds in thermal capacity
-        lower = target_thermal * (1.0 - tol) * unit_scale - existing_capacity_thermal
-        upper = target_thermal * (1.0 + tol) * unit_scale - existing_capacity_thermal
-        
-        # For logging, convert back to electrical capacity for clarity
-        existing_capacity_elec = existing_capacity_thermal * avg_efficiency
-        total_lower_elec = (lower + existing_capacity_thermal) * avg_efficiency
-        total_upper_elec = (upper + existing_capacity_thermal) * avg_efficiency
-
-        logger.info(
-            f"{carrier}: {total_lower_elec/unit_scale:.2f} ≤ total electrical capacity ≤ "
-            f"{total_upper_elec/unit_scale:.2f} {units.upper()} "
-            f"(existing: {existing_capacity_elec/unit_scale:.2f} {units.upper()}, "
-            f"avg efficiency: {avg_efficiency:.2%}, "
-            f"thermal p_nom range: {(lower + existing_capacity_thermal)/unit_scale:.2f}-{(upper + existing_capacity_thermal)/unit_scale:.2f} {units.upper()})"
-        )
-        
-        n.model.add_constraints(lhs >= lower, name=f"year2025_link_capacity_min__{carrier}")
-        n.model.add_constraints(lhs <= upper, name=f"year2025_link_capacity_max__{carrier}")
-
-
 def extra_functionality(n, snapshots):
     """
     Collects supplementary constraints which will be passed to
@@ -1457,7 +3421,7 @@ def extra_functionality(n, snapshots):
         add_operational_reserve_margin(n, snapshots, config)
     for o in opts:
         if "RES" in o:
-            res_share = float(re.findall("[0-9]*\.?[0-9]+$", o)[0])
+            res_share = float(re.findall(r"[0-9]*\.?[0-9]+$", o)[0])
             add_RES_constraints(n, res_share, config)
     for o in opts:
         if "EQ" in o:
@@ -1471,34 +3435,42 @@ def extra_functionality(n, snapshots):
     tc_config = config.get("temporal_clustering", {})
     
     if tc_config.get("activate", False):
-        logger.info("Adding temporal aggregation storage constraints (Kotzur et al. 2018)")
-        
-        # Get optional parameters from config (with defaults for Pyomo parity)
-        
-        use_dt_in_intra = tc_config.get("use_dt_in_intra", False)
-        include_inflow_in_intra = tc_config.get("include_inflow_in_intra", False)
-        
-        logger.info(f"  use_dt_in_intra: {use_dt_in_intra}")
-        logger.info(f"  include_inflow_in_intra: {include_inflow_in_intra}")
-        
-        temporal_aggregation_storage_constraints(
-            n,
-            use_dt_in_intra=use_dt_in_intra,
-            include_inflow_in_intra=include_inflow_in_intra,
-        )
+        skipping = False
+        if not skipping:
+            logger.info("Adding temporal aggregation storage constraints (Kotzur et al. 2018)")
+            
+            # Get parameters from config
+            hours_per_period = tc_config.get("hours", 24)
+            
+            # Carrier filtering (which storage types get Kotzur constraints)
+            su_carriers = ("phs", "hydro")  # StorageUnits
+            store_carriers = ("battery", "battery storage", "h2", "h2 store tank")  # Stores
+            
+            logger.info(f"  hours_per_period: {hours_per_period}")
+            logger.info(f"  StorageUnit carriers: {su_carriers}")
+            logger.info(f"  Store carriers: {store_carriers}")
+            
+            add_kotzur_storage_constraints(
+                n,
+                hours_per_period=hours_per_period,
+                su_carriers=su_carriers,
+                store_carriers=store_carriers,
+            )
+        else:
+            logger.info("Skipping storage constraints.")
     else:
         logger.info("No temporal clustering detected, skipping temporal storage constraints")
 
 
-    if snakemake.config["sector"]["chp"]:
+    if config["sector"]["chp"]:
         logger.info("setting CHP constraints")
         add_chp_constraints(n)
 
     if (
-        snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
+        config["policy_config"]["hydrogen"]["temporal_matching"]
         == "h2_yearly_matching"
     ):
-        if snakemake.config["policy_config"]["hydrogen"]["additionality"] == True:
+        if config["policy_config"]["hydrogen"]["additionality"] == True:
             logger.info(
                 "additionality is currently not supported for yearly constraints, proceeding without additionality"
             )
@@ -1506,10 +3478,10 @@ def extra_functionality(n, snapshots):
         H2_export_yearly_constraint(n)
 
     elif (
-        snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
+        config["policy_config"]["hydrogen"]["temporal_matching"]
         == "h2_monthly_matching"
     ):
-        if not snakemake.config["policy_config"]["hydrogen"]["is_reference"]:
+        if not config["policy_config"]["hydrogen"]["is_reference"]:
             logger.info("setting h2 export to monthly greenness constraint")
             n_ref_local = getattr(n, "n_ref", None)
             if n_ref_local is not None:
@@ -1519,7 +3491,7 @@ def extra_functionality(n, snapshots):
 
 
     elif (
-        snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
+        config["policy_config"]["hydrogen"]["temporal_matching"]
         == "no_res_matching"
     ):
         logger.info("no h2 export constraint set")
@@ -1529,43 +3501,54 @@ def extra_functionality(n, snapshots):
             'H2 export constraint is invalid, check config["policy_config"]'
         )
 
-    if snakemake.config["sector"]["hydrogen"]["network"]:
-        if snakemake.config["sector"]["hydrogen"]["network_limit"]:
+    if config["sector"]["hydrogen"]["network"]:
+        if config["sector"]["hydrogen"]["network_limit"]:
             add_h2_network_cap(
-                n, snakemake.config["sector"]["hydrogen"]["network_limit"]
+                n, config["sector"]["hydrogen"]["network_limit"]
             )
 
-    if snakemake.config["sector"]["hydrogen"]["set_color_shares"]:
+    if config["sector"]["hydrogen"]["set_color_shares"]:
         logger.info("setting H2 color mix")
         set_h2_colors(n)
 
-    add_baseyear_generation_band(
-        n,
-        planning_year=snakemake.wildcards.planning_horizons,
-        config=n.config if hasattr(n, "config") else snakemake.config,
-    )
+    # Get planning_year - use first investment period for multi-period networks
+    try:
+        planning_year = snakemake.wildcards.planning_horizons
+    except (NameError, AttributeError):
+        # For rolling horizon/perfect foresight, use first investment period
+        if hasattr(n, "investment_periods") and len(n.investment_periods) > 0:
+            planning_year = str(n.investment_periods[0])
+        else:
+            # Fallback: use first snapshot year if available
+            if hasattr(n.snapshots, "levels") and len(n.snapshots.levels) > 0:
+                planning_year = str(n.snapshots.levels[0][0])
+            else:
+                planning_year = None
 
-    add_year2025_generation_band(
-        n,
-        planning_year=snakemake.wildcards.planning_horizons,
-        config=n.config if hasattr(n, "config") else snakemake.config,
-    )
+    if planning_year is not None:
+        add_baseyear_generation_band(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
+
+        add_year2025_generation_band(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
+
+        # Add 2025 capacity targets
+        add_year2025_capacity_targets(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
 
     add_co2_sequestration_limit(n, snapshots)
-
-    # Add 2025 capacity targets for generators
-    add_year2025_capacity_targets(
-        n,
-        planning_year=snakemake.wildcards.planning_horizons,
-        config=n.config if hasattr(n, "config") else snakemake.config,
-    )
     
-    # Add 2025 capacity targets for links (e.g., coal, gas)
-    #add_year2025_link_capacity_targets(
-    #    n,
-    #    planning_year=snakemake.wildcards.planning_horizons,
-    #    config=n.config if hasattr(n, "config") else snakemake.config,
-    #)
+    # Add build rate constraints (if build_rate_limits attached to network)
+    #add_build_rate_constraints(n, snapshots)
 
 
 def solve_network(n, config, solving, **kwargs):
@@ -1575,13 +3558,12 @@ def solve_network(n, config, solving, **kwargs):
     kwargs["solver_options"] = (
         solving["solver_options"][set_of_options] if set_of_options else {}
     )
+    kwargs["solver_options"]["DualReductions"] = 0
+    logger.info("Added DualReductions=0 to force infeasible/unbounded determination")
     kwargs["solver_name"] = solving["solver"]["name"]
     kwargs["extra_functionality"] = extra_functionality
 
-    skip_iterations = cf_solving.get("skip_iterations", False)
-    if not n.lines.s_nom_extendable.any():
-        skip_iterations = True
-        logger.info("No expandable lines found. Skipping iterative solving.")
+    _ensure_pypsa_nodal_balance_busname_compat()
 
     # add to network for extra_functionality
     n.config = config
@@ -1590,6 +3572,13 @@ def solve_network(n, config, solving, **kwargs):
             n.opts = snakemake.wildcards.opts.split("-")
         else:
             n.opts = globals().get("opts", [])
+
+    n = apply_optional_sector_clustering(n, config)
+
+    skip_iterations = cf_solving.get("skip_iterations", False)
+    if not n.lines.s_nom_extendable.any():
+        skip_iterations = True
+        logger.info("No expandable lines found. Skipping iterative solving.")
 
 
 
@@ -1709,6 +3698,7 @@ def solve_network(n, config, solving, **kwargs):
 
     if skip_iterations:
         logger.info("Solving network without transmission expansion iterations...")
+        
         try:
             status, condition = n.optimize(**kwargs)
             logger.info(f"Initial solve result: status='{status}', condition='{condition}'")
@@ -1717,25 +3707,31 @@ def solve_network(n, config, solving, **kwargs):
             status, condition = "error", str(e)
             raise RuntimeError(f"Optimization failed with exception: {e}") from e
         
-        logger.info(f"Saving linopy model to {snakemake.output.lpfile.replace('.lp', '.nc')}")
-        try:
-            n.model.to_netcdf(snakemake.output.lpfile.replace('.lp', '.nc'))
-            logger.info("Linopy model saved successfully")
-        except Exception as e:
-            logger.warning(f"Could not save linopy model: {e}")
-        
-        logger.info(f"Saving LP file to {snakemake.output.lpfile}")
-        try:
-            n.model.to_file(snakemake.output.lpfile)
-            logger.info("LP file saved successfully")
-        except Exception as e:
-            logger.warning(f"Could not save LP file: {e}")
+        # Conditionally save LP files based on config
+        save_lpfile = solving.get("save_lpfile", False)
+        if save_lpfile and hasattr(snakemake, 'output') and hasattr(snakemake.output, 'lpfile'):
+            logger.info(f"Saving linopy model to {snakemake.output.lpfile.replace('.lp', '.nc')}")
+            try:
+                n.model.to_netcdf(snakemake.output.lpfile.replace('.lp', '.nc'))
+                logger.info("Linopy model saved successfully")
+            except Exception as e:
+                logger.warning(f"Could not save linopy model: {e}")
+            
+            logger.info(f"Saving LP file to {snakemake.output.lpfile}")
+            try:
+                n.model.to_file(snakemake.output.lpfile)
+                logger.info("LP file saved successfully")
+            except Exception as e:
+                logger.warning(f"Could not save LP file: {e}")
+        elif save_lpfile:
+            logger.warning("LP file saving is enabled but lpfile output not defined in Snakefile")
+        else:
+            logger.info("LP file saving is disabled (set solving.save_lpfile: true to enable)")
     else:
         logger.info("Solving network with transmission expansion iterations...")
         kwargs["track_iterations"] = cf_solving.get("track_iterations", False)
         kwargs["min_iterations"]   = cf_solving.get("min_iterations", 4)
         kwargs["max_iterations"]   = cf_solving.get("max_iterations", 6)
-
         try:
             kwargs_iter = dict(kwargs)
             kwargs_iter.pop("log_fn", None)
@@ -1747,18 +3743,25 @@ def solve_network(n, config, solving, **kwargs):
             status, condition = "error", str(e)
             raise RuntimeError(f"Iterative optimization failed with exception: {e}") from e
         
-        try:
-            n.model.to_netcdf(snakemake.output.lpfile.replace('.lp', '.nc'))
-            logger.info("Linopy model saved successfully")
-        except Exception as e:
-            logger.warning(f"Could not save linopy model: {e}")
-        
-        logger.info(f"Saving LP file to {snakemake.output.lpfile}")
-        try:
-            n.model.to_file(snakemake.output.lpfile)
-            logger.info("LP file saved successfully")
-        except Exception as e:
-            logger.warning(f"Could not save LP file: {e}")
+        # Conditionally save LP files based on config
+        save_lpfile = solving.get("save_lpfile", False)
+        if save_lpfile and hasattr(snakemake, 'output') and hasattr(snakemake.output, 'lpfile'):
+            try:
+                n.model.to_netcdf(snakemake.output.lpfile.replace('.lp', '.nc'))
+                logger.info("Linopy model saved successfully")
+            except Exception as e:
+                logger.warning(f"Could not save linopy model: {e}")
+            
+            logger.info(f"Saving LP file to {snakemake.output.lpfile}")
+            try:
+                n.model.to_file(snakemake.output.lpfile)
+                logger.info("LP file saved successfully")
+            except Exception as e:
+                logger.warning(f"Could not save LP file: {e}")
+        elif save_lpfile:
+            logger.warning("LP file saving is enabled but lpfile output not defined in Snakefile")
+        else:
+            logger.info("LP file saving is disabled (set solving.save_lpfile: true to enable)")
         
     if "infeasible" in condition or "unbounded" in condition or status != 'ok':
         logger.error(f"Solver status: {status}")
@@ -1934,13 +3937,13 @@ if __name__ == "__main__":
             simpl="",
             clusters="200",
             ll="copt",
-            opts="3h",
+            opts="1h",
             planning_horizons="2020",
-            sopts="72h",
-            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
+            sopts="1h",
+            configfile="config.myopic.yaml",
             discountrate="0.071",
             demand="AB",
-            h2export="10"
+            h2export="0.0"
         )
 
     configure_logging(snakemake)

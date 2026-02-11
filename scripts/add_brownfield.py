@@ -14,11 +14,51 @@ import pypsa
 import xarray as xr
 from add_existing_baseyear import add_build_year_to_new_assets
 from solve_network import apply_optional_sector_clustering
+import solve_network as solve_network_module
 
 # from pypsa.clustering.spatial import normed_or_uniform
 
 logger = logging.getLogger(__name__)
 idx = pd.IndexSlice
+
+
+def _validate_imported_capacity_transfer(n, c, attr):
+    """
+    Validate that imported brownfield assets kept nominal capacity and build_year.
+    """
+    list_name = n.components[c.name]["list_name"]
+    target_df = getattr(n, list_name)
+    imported_idx = c.df.index.intersection(target_df.index)
+
+    if len(imported_idx) != len(c.df.index):
+        missing = c.df.index.difference(imported_idx)
+        raise ValueError(
+            f"Brownfield import missing {len(missing)} {c.name} assets after merge; "
+            f"sample: {missing[:10].tolist()}"
+        )
+
+    expected_nom = float(c.df.loc[imported_idx, f"{attr}_nom"].fillna(0.0).sum())
+    actual_nom = float(target_df.loc[imported_idx, f"{attr}_nom"].fillna(0.0).sum())
+    if not np.isclose(expected_nom, actual_nom, rtol=1e-6, atol=1e-6):
+        raise ValueError(
+            f"Brownfield import capacity mismatch for {c.name}: "
+            f"expected {expected_nom}, got {actual_nom}"
+        )
+
+    if "build_year" in c.df.columns and "build_year" in target_df.columns:
+        expected_year = pd.to_numeric(c.df.loc[imported_idx, "build_year"], errors="coerce")
+        actual_year = pd.to_numeric(target_df.loc[imported_idx, "build_year"], errors="coerce")
+        mismatch = ~np.isclose(
+            expected_year.fillna(-1.0).to_numpy(),
+            actual_year.fillna(-1.0).to_numpy(),
+            rtol=0.0,
+            atol=0.0,
+        )
+        if mismatch.any():
+            bad = imported_idx[mismatch][:10].tolist()
+            raise ValueError(
+                f"Brownfield import changed build_year for {c.name}; sample assets: {bad}"
+            )
 
 
 def add_brownfield(n, n_p, year):
@@ -108,6 +148,7 @@ def add_brownfield(n, n_p, year):
         c.df[f"{attr}_nom_extendable"] = False
 
         n.import_components_from_dataframe(c.df, c.name)
+        _validate_imported_capacity_transfer(n, c, attr)
 
         # copy time-dependent
         selection = n.component_attrs[c.name].type.str.contains(
@@ -408,6 +449,10 @@ if __name__ == "__main__":
     add_build_year_to_new_assets(n, year)
 
     # Ensure brownfield merge uses the same clustered topology as the previous solved horizon.
+    # apply_optional_sector_clustering() resolves default universal busmap path via
+    # solve_network module globals; pass through this rule's snakemake context so both
+    # solve_network and add_brownfield derive the same scenario-specific path.
+    solve_network_module.snakemake = snakemake
     buses_before_clustering = len(n.buses)
     n = apply_optional_sector_clustering(n, snakemake.config)
     if len(n.buses) != buses_before_clustering:
