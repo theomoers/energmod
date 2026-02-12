@@ -1,4 +1,3 @@
-#!/apps/anaconda3/bin/python
 # -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText:  PyPSA-Earth and PyPSA-Eur Authors
 #
@@ -22,6 +21,7 @@ Relevant Settings
         country_specific_data:
         cost_scenario:
         financial_case:
+        output_currency:
         default_exchange_rate:
         future_exchange_rate_strategy:
         custom_future_exchange_rate:
@@ -102,14 +102,11 @@ from _helpers import (
     configure_logging,
     create_logger,
     read_csv_nafix,
+    sanitize_carriers,
+    sanitize_locations,
     update_p_nom_max,
 )
 from powerplantmatching.export import map_country_bus
-
-import psutil, os
-def print_memory(note=""):
-    mem = psutil.Process(os.getpid()).memory_info().rss / 1e9
-    print(f"[MEM] {note}: {mem:.2f} GB")
 
 idx = pd.IndexSlice
 
@@ -160,15 +157,15 @@ def load_costs(tech_costs, config, elec_config, Nyears=1):
     costs.unit = costs.unit.str.replace("/kW", "/MW")
     _currency_conversion_cache = build_currency_conversion_cache(
         costs,
-        config["output_currency"],
-        config["default_exchange_rate"],
-        future_exchange_rate_strategy=config.get(
-            "future_exchange_rate_strategy", "latest"
-        ),
+        output_currency=config["output_currency"],
+        default_exchange_rate=config["default_exchange_rate"],
+        future_exchange_rate_strategy=config.get("future_exchange_rate_strategy"),
         custom_future_exchange_rate=config.get("custom_future_rate", None),
     )
     costs = apply_currency_conversion(
-        costs, config["output_currency"], _currency_conversion_cache
+        costs,
+        config["output_currency"],
+        _currency_conversion_cache,
     )
 
     # apply filter on financial_case and scenario, if they are contained in the cost dataframe
@@ -526,35 +523,28 @@ def attach_hydro(n, costs, ppl):
         .rename(index=lambda s: str(s) + " hydro")
     )
 
+    supported_techs = ["Run-Of-River", "Pumped Storage", "Reservoir"]
+    invalid_techs = ppl.loc[~ppl.technology.isin(supported_techs)]
+
     # Current fix, NaN technologies set to ROR
-    if ppl.technology.isna().any():
-        n_nans = ppl.technology.isna().sum()
+    if not invalid_techs.empty:
+        n_invalid = invalid_techs.shape[0]
         logger.warning(
-            f"Identified {n_nans} hydro powerplants with unknown technology.\n"
+            f"Identified {n_invalid} hydro powerplants with unknown technology.\n"
             "Initialized to 'Run-Of-River'"
         )
-        ppl.loc[ppl.technology.isna(), "technology"] = "Run-Of-River"
+        ppl.loc[invalid_techs.index, "technology"] = "Run-Of-River"
 
-    ror = ppl.query('technology in ["Run-Of-River", "ror"]')
+    ror = ppl.query('technology == "Run-Of-River"')
     phs = ppl.query('technology == "Pumped Storage"')
     hydro = ppl.query('technology == "Reservoir"')
-    logger.info(
-        f"Identified {len(ror)} ROR, {len(phs)} PHS and {len(hydro)} reservoir hydro plants.\n"
-        f"Capacities: {ror.p_nom.sum()/1e3:.2f} GW, {phs.p_nom.sum()/1e3:.2f} GW, {hydro.p_nom.sum()/1e3:.2f} GW respectively."
-    )
-
 
     inflow_idx = ror.index.union(hydro.index)
-    logger.info(f"inflow_idx length: {len(inflow_idx)}")
-    
     if not inflow_idx.empty:
-        logger.info(f"Opening hydro profile")
         with xr.open_dataarray(snakemake.input.profile_hydro) as inflow:
             found_plants = ppl.ppl_id[ppl.ppl_id.isin(inflow.indexes["plant"])]
-            missing_plants_idxs = ppl.index.difference(found_plants.index)
+            missing_plants_idxs = inflow_idx.difference(found_plants.index)
 
-            logger.info(f"Found inflow time series for {len(found_plants)} hydro plants.")
-            logger.info(f"Missing inflow time series for {len(missing_plants_idxs)} hydro plants.")
             # if missing time series are found, notify the user and exclude missing hydro plants
             if not missing_plants_idxs.empty:
                 # original total p_nom
@@ -581,7 +571,6 @@ def attach_hydro(n, costs, ppl):
                 )
 
     if "ror" in carriers and not ror.empty:
-        logger.info(f"Adding {len(ror)} run-of-river plants")
         n.madd(
             "Generator",
             ror.index,
@@ -599,10 +588,12 @@ def attach_hydro(n, costs, ppl):
         )
 
     if "PHS" in carriers and not phs.empty:
-        logger.info(f"Adding {len(phs)} pumped hydro storage plants")
         # fill missing max hours to config value and
         # assume no natural inflow due to lack of data
-        phs = phs.replace({"max_hours": {0: c["PHS_max_hours"]}})
+        phs["max_hours"] = phs.max_hours.where(
+            ~phs.max_hours.isna() & (phs.max_hours > 0),
+            c["PHS_max_hours"],
+        )
         n.madd(
             "StorageUnit",
             phs.index,
@@ -617,7 +608,6 @@ def attach_hydro(n, costs, ppl):
         )
 
     if "hydro" in carriers and not hydro.empty:
-        logger.info(f"Adding {len(hydro)} reservoir hydro plants")
         hydro_max_hours = c.get("hydro_max_hours")
         hydro_stats = (
             pd.read_csv(
@@ -634,8 +624,6 @@ def attach_hydro(n, costs, ppl):
         e_missing = e_target - e_installed
         missing_mh_i = hydro.query("max_hours.isnull()").index
 
-        max_hours_country = pd.Series(dtype=float)
-
         if hydro_max_hours == "energy_capacity_totals_by_country":
             max_hours_country = (
                 e_missing / hydro.loc[missing_mh_i].groupby("country").p_nom.sum()
@@ -645,30 +633,23 @@ def attach_hydro(n, costs, ppl):
             max_hours_country = (
                 hydro_stats["E_store[TWh]"] * 1e3 / hydro_stats["p_nom_discharge[GW]"]
             )
-        
-        elif hydro_max_hours == "default":
-            logger.info(f"Using default hydro_max_hours from config for all hydro reservoirs")
 
         max_hours_country.clip(lower=0, inplace=True)
 
         missing_countries = pd.Index(hydro["country"].unique()).difference(
             max_hours_country.dropna().index
         )
-        # Filter out NaN/float values before join
-        missing_countries = [c for c in missing_countries if pd.notna(c) and isinstance(c, str)]
-        hydro_max_hours_default = c.get("hydro_max_hours_default", 6.0)
-        if len(missing_countries) > 0:
+        if not missing_countries.empty:
             logger.warning(
-                f"Assuming max_hours={hydro_max_hours_default} for hydro reservoirs in the countries: "
-                + ", ".join(missing_countries)
+                "Assuming max_hours=6 for hydro reservoirs in the countries: {}".format(
+                    ", ".join(missing_countries)
+                )
             )
-        
+        hydro_max_hours_default = c.get("hydro_max_hours_default", 6.0)
         hydro_max_hours = hydro.max_hours.where(
             hydro.max_hours > 0, hydro.country.map(max_hours_country)
         ).fillna(hydro_max_hours_default)
 
-        logger.info(f"Full list of hydro_max_hours: {hydro_max_hours}")
-    
         n.madd(
             "StorageUnit",
             hydro.index,
@@ -689,6 +670,42 @@ def attach_hydro(n, costs, ppl):
             cyclic_state_of_charge=True,
             inflow=inflow_t.loc[:, hydro.index],
         )
+
+
+def attach_existing_batteries(n, costs, ppl):
+    """
+    Add existing battery storage units from powerplants.csv to the network.
+    """
+    batteries = ppl.query('carrier == "battery"')
+    if batteries.empty:
+        logger.info("No existing batteries found in powerplants.csv.")
+        return
+
+    _add_missing_carriers_from_costs(n, costs, ["battery"])
+
+    # Remove duplicates and reset index like in attach_hydro
+    batteries = batteries.reset_index(drop=True).rename(index=lambda s: f"{s} battery")
+
+    max_hours = snakemake.params.electricity["max_hours"]["battery"]
+
+    n.madd(
+        "StorageUnit",
+        batteries.index,
+        bus=batteries["bus"],
+        carrier="battery",
+        p_nom=batteries["p_nom"],
+        capital_cost=costs.at["battery", "capital_cost"],
+        max_hours=max_hours,
+        efficiency_store=np.sqrt(costs.at["battery", "efficiency"]),
+        efficiency_dispatch=np.sqrt(costs.at["battery", "efficiency"]),
+        cyclic_state_of_charge=True,
+        marginal_cost=costs.at["battery", "marginal_cost"],
+    )
+
+    logger.info(
+        f"Added {len(batteries)} existing batteries with total capacity "
+        f"{batteries.p_nom.sum()/1e3:.2f} GW (max_hours={max_hours})."
+    )
 
 
 def attach_extendable_generators(n, costs, ppl):
@@ -870,19 +887,7 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake(
-            "add_electricity",
-            simpl="",
-            clusters="200",
-            ll="copt",
-            opts="3h",
-            planning_horizons="2020",
-            sopts="48h",
-            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
-            discountrate="0.071",
-            demand="AB",
-            h2export="10"
-        )
+        snakemake = mock_snakemake("add_electricity")
 
     configure_logging(snakemake)
 
@@ -900,7 +905,7 @@ if __name__ == "__main__":
     )
     ppl = load_powerplants(snakemake.input.powerplants)
     if "renewable_carriers" in snakemake.params.electricity:
-        renewable_carriers = set(snakemake.params.electricity["renewable_carriers"]) # includes hydro
+        renewable_carriers = set(snakemake.params.electricity["renewable_carriers"])
     else:
         logger.warning(
             "Missing key `renewable_carriers` under config entry `electricity`. "
@@ -909,7 +914,7 @@ if __name__ == "__main__":
         )
         renewable_carriers = set(snakemake.params.renewable)
 
-    extendable_carriers = snakemake.params.electricity["extendable_carriers"] # includes generator ror
+    extendable_carriers = snakemake.params.electricity["extendable_carriers"]
     if not (set(renewable_carriers) & set(extendable_carriers["Generator"])):
         logger.warning(
             "No renewables found in config entry `extendable_carriers`. "
@@ -917,7 +922,7 @@ if __name__ == "__main__":
             "Falling back to all renewables."
         )
 
-    conventional_carriers = snakemake.params.electricity["conventional_carriers"] # [nuclear, oil, OCGT, CCGT, coal, lignite, geothermal, biomass]
+    conventional_carriers = snakemake.params.electricity["conventional_carriers"]
     attach_load(n, demand_profiles)
     update_transmission_costs(n, costs, snakemake.params.length_factor)
     conventional_inputs = {
@@ -943,6 +948,7 @@ if __name__ == "__main__":
         snakemake.params.length_factor,
     )
     attach_hydro(n, costs, ppl)
+    attach_existing_batteries(n, costs, ppl)
 
     if snakemake.params.electricity.get("estimate_renewable_capacities"):
         estimate_renewable_capacities_irena(
@@ -960,5 +966,31 @@ if __name__ == "__main__":
         )
         n.generators["weight"] = pd.Series()
 
+    sanitize_carriers(n, snakemake.config)
+    if "location" in n.buses:
+        sanitize_locations(n)
+
     n.meta = snakemake.config
+
+    # Log total installed capacities by carrier (GW)
+    gen_caps = (
+        n.generators.groupby(n.generators.carrier.str.strip().str.lower())
+        .p_nom.sum()
+        .div(1e3)
+        .rename("Generators [GW]")
+    )
+    sto_caps = (
+        n.storage_units.groupby(n.storage_units.carrier.str.strip().str.lower())
+        .p_nom.sum()
+        .div(1e3)
+        .rename("StorageUnits [GW]")
+    )
+
+    summary = pd.concat([gen_caps, sto_caps], axis=1).fillna(0).sort_index()
+
+    if not summary.empty:
+        logger.info("\nInstalled capacities summary\n%s", summary.round(2))
+    else:
+        logger.info("No generators or storage units found.")
+
     n.export_to_netcdf(snakemake.output[0])
