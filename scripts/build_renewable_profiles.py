@@ -248,10 +248,24 @@ def get_eia_annual_hydro_generation(fn, countries):
     df = df.loc[~df.index.str.contains("Former")]
     df.drop(["World", "Germany, West", "Germany, East"], inplace=True)
 
-    df.index = cc.convert(df.index, to="iso2")
-    df.index.name = "countries"
+    iso2 = pd.Index(cc.convert(df.index, to="iso2"), name="countries")
+    df = df.assign(countries=iso2)
 
-    df = df.T[countries].astype(float) * 1e6  # in MWh/a
+    # drop rows that failed conversion, then aggregate duplicates after ISO2 mapping
+    df = df.loc[~df["countries"].isin([None, "", "not found"])].set_index("countries")
+    df = df.groupby(level=0).sum(min_count=1)
+
+    missing = sorted(set(countries) - set(df.index))
+    if missing:
+        logger.warning(
+            "Missing EIA hydro generation entries for countries: %s. "
+            "Filling with 0.0.",
+            ", ".join(missing),
+        )
+
+    df = df.T.reindex(columns=countries, fill_value=0.0)
+    df = df.mask(df == "ie")
+    df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0) * 1e6  # in MWh/a
     df.index = df.index.astype(int)
 
     return df
@@ -474,7 +488,12 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, ref_year, q_ror, q_res
             )
             scale_c = scale_c.clip(min=0.0)
 
-        runoff_final = runoff_ror + runoff_res * scale_c.sel(country=country_of_plant)
+        scale_for_plants = xr.DataArray(
+            scale_c.reindex(country=country_of_plant.values, fill_value=0.0).values,
+            dims=("plant",),
+            coords={"plant": country_of_plant.plant},
+        )
+        runoff_final = runoff_ror + runoff_res * scale_for_plants
 
         return runoff_final.drop_vars("country")
 
