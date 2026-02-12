@@ -62,10 +62,52 @@ BOS_multiplier = 246.7088 / (137 / 1.14)
 
 # Global scaling factors for technologies where model covers only a fraction of global deployment
 # Learning happens globally, so we scale modeled capacity to represent global deployment
-GLOBAL_SCALE_FACTORS = {
-    'battery_energy': 17.76,  # Model covers 66/1173 = 5.63% of global battery storage (2020)
-    # Other technologies are assumed to be fully captured by the model or scale with global trends
+# Values can be overridden in config.learning.yaml via:
+# learning.global_scale_factors.<technology>
+DEFAULT_GLOBAL_SCALE_FACTORS = {
+    "battery_energy": 17.76,  # Model covers 66/1173 = 5.63% of global battery storage (2020)
+    "battery_power": 17.76,   # Apply same global scaling to battery inverter learning
 }
+
+
+def get_global_scale_factors(learning_cfg):
+    """
+    Build effective global scale factors from defaults + config overrides.
+
+    Config options:
+    - learning.global_scale_factors: direct per-technology multipliers
+      (global deployment = modeled deployment × factor)
+    - learning.global_factor: optional legacy/endogenous-style fraction.
+      If provided and positive, derive battery multipliers as 1/global_factor
+      unless explicitly overridden in global_scale_factors.
+    """
+    factors = DEFAULT_GLOBAL_SCALE_FACTORS.copy()
+
+    cfg_scales = learning_cfg.get("global_scale_factors", {}) or {}
+    for tech, value in cfg_scales.items():
+        factor = float(value)
+        if factor <= 0:
+            raise ValueError(
+                f"Invalid global scale factor for {tech}: {factor}. Must be > 0."
+            )
+        factors[tech] = factor
+
+    # Optional compatibility bridge with endogenous learning config semantics.
+    # There, global_factor is a local/global fraction; here we need global/modeled.
+    legacy_gf = learning_cfg.get("global_factor", None)
+    if legacy_gf is not None:
+        legacy_gf = float(legacy_gf)
+        if legacy_gf <= 0:
+            raise ValueError(
+                f"Invalid learning.global_factor={legacy_gf}. Must be > 0."
+            )
+        derived_scale = 1.0 / legacy_gf
+        for tech in ("battery_energy", "battery_power"):
+            if tech not in cfg_scales:
+                factors[tech] = derived_scale
+
+    logger.info(f"Using global scale factors: {factors}")
+    return factors
 
 def validate_learning_parameters(tech, A, beta, learning_rate, L_current, L_max=None):
     """
@@ -798,7 +840,7 @@ def load_capacity_from_historical_csv(tech, year, learning_cfg):
     return capacity
 
 
-def extract_capacity_from_network(network_path, tech_mapping):
+def extract_capacity_from_network(network_path, tech_mapping, global_scale_factors):
     """
     Extract realized installed capacity from solved network.
     
@@ -844,6 +886,24 @@ def extract_capacity_from_network(network_path, tech_mapping):
             if carrier in carrier_to_tech:
                 tech = carrier_to_tech[carrier]
                 realized[tech] = realized.get(tech, 0.0) + capacity
+
+    # Fallback for sector batteries where carriers are charger/discharger (not "battery inverter")
+    # Use a single directional link capacity (max of charger/discharger) to avoid double counting.
+    if not n.links.empty and "battery_power" not in realized:
+        links_carriers = set(n.links.carrier.unique())
+        if {"battery charger", "battery discharger"} & links_carriers:
+            charger_cap = (
+                n.links.loc[n.links.carrier == "battery charger", "p_nom_opt"].sum() / 1e3
+            )
+            discharger_cap = (
+                n.links.loc[n.links.carrier == "battery discharger", "p_nom_opt"].sum() / 1e3
+            )
+            inferred_battery_power = max(charger_cap, discharger_cap)
+            realized["battery_power"] = inferred_battery_power
+            logger.info(
+                "    Inferred battery_power from battery charger/discharger links: "
+                f"max({charger_cap:.2f}, {discharger_cap:.2f}) = {inferred_battery_power:.2f} GW"
+            )
     
     # Extract from stores (e_nom_opt) - energy capacity
     if not n.stores.empty:
@@ -856,9 +916,9 @@ def extract_capacity_from_network(network_path, tech_mapping):
     
     # Apply global scaling factors for technologies that represent only a fraction of global deployment
     for tech in list(realized.keys()):
-        if tech in GLOBAL_SCALE_FACTORS:
+        if tech in global_scale_factors:
             modeled_cap = realized[tech]
-            scale_factor = GLOBAL_SCALE_FACTORS[tech]
+            scale_factor = global_scale_factors[tech]
             global_cap = modeled_cap * scale_factor
             realized[tech] = global_cap
             unit = "GWh" if tech in ['battery_energy', 'h2_energy'] else "GW"
@@ -870,7 +930,17 @@ def extract_capacity_from_network(network_path, tech_mapping):
     return realized
 
 
-def calculate_learning_costs(params, state, learning_cfg, current_year, planning_horizons, prev_network_path, costs_file, wacc_dict=None):
+def calculate_learning_costs(
+    params,
+    state,
+    learning_cfg,
+    current_year,
+    planning_horizons,
+    prev_network_path,
+    costs_file,
+    global_scale_factors,
+    wacc_dict=None,
+):
     """
     Calculate learning-based costs for all technologies at current horizon.
     
@@ -891,6 +961,7 @@ def calculate_learning_costs(params, state, learning_cfg, current_year, planning
         planning_horizons: List of all planning horizons
         prev_network_path: Path to previous solved network (for extracting capacity)
         costs_file: Path to cost CSV file for this year
+        global_scale_factors: Dict of per-technology global scaling multipliers
         wacc_dict: Optional dict of regional WACCs {tech: {country: wacc}}
     
     Returns:
@@ -989,11 +1060,11 @@ def calculate_learning_costs(params, state, learning_cfg, current_year, planning
                     f"This is required for exogenous learning with lag_periods={lag_periods}."
                 )
             
-            # Verify the previous network is from the expected lag year
-            # Extract year from network path for validation
-            # Expected pattern: .../elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{YEAR}_{discountrate}.nc
+            # Verify the previous network is from the expected lag year.
+            # Extract a 4-digit year token robustly from myopic filenames, e.g.:
+            # ..._2020_0.071_AB_0.0export_base.nc
             import re
-            year_match = re.search(r'_(\d{4})_[\d.]+\.nc$', str(prev_network_path))
+            year_match = re.search(r'_(\d{4})(?=_)', str(prev_network_path))
             if year_match:
                 network_year = int(year_match.group(1))
                 if network_year != lag_year:
@@ -1012,7 +1083,9 @@ def calculate_learning_costs(params, state, learning_cfg, current_year, planning
             
             # Extract capacity from lag_year network
             tech_mapping = learning_cfg.get("tech_mapping", {})
-            realized_capacity = extract_capacity_from_network(prev_network_path, tech_mapping)
+            realized_capacity = extract_capacity_from_network(
+                prev_network_path, tech_mapping, global_scale_factors
+            )
             
             if tech not in realized_capacity:
                 raise ValueError(
@@ -1496,6 +1569,7 @@ def main(snakemake):
         return
     
     logger.info("Learning is ENABLED")
+    global_scale_factors = get_global_scale_factors(learning_cfg)
     
     # Determine timestep
     planning_horizons = snakemake.params.planning_horizons
@@ -1549,7 +1623,15 @@ def main(snakemake):
         logger.info("No regional WACC file provided - using global WACCs from config")
     
     learning_costs = calculate_learning_costs(
-        params, state, learning_cfg, year, planning_horizons, prev_network_path, costs_file, wacc_dict
+        params,
+        state,
+        learning_cfg,
+        year,
+        planning_horizons,
+        prev_network_path,
+        costs_file,
+        global_scale_factors,
+        wacc_dict,
     )
     
     # Extract learning rates from params if beta adjustment was applied

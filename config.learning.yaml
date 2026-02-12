@@ -1,7 +1,7 @@
 # Learning Curves Configuration for PyPSA-Earth
 
 learning:
-  enabled: false 
+  enabled: true 
   
   method: predicted_end  # Pricing method: 'predicted_end' uses end-of-horizon prediction
   
@@ -30,6 +30,12 @@ learning:
     battery inverter: battery_power
     H2 Electrolysis: electrolyser_power
     H2 Store: h2_energy
+
+  # Scale modeled deployment to global deployment for learning curves.
+  # Factor = global / modeled capacity (applied when reading solved networks).
+  global_scale_factors:
+    battery_energy: 17.76
+    battery_power: 17.76
   
   # Learning rate scenario adjustment
   # Allows varying β while maintaining 2020 anchor point accuracy

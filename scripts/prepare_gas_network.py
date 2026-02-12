@@ -11,6 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import os
+import sys
 import zipfile
 from pathlib import Path
 
@@ -78,6 +79,22 @@ def download_IGGIELGN_gas_network():
     logger.info(f"Gas infrastructure data available in '{to_fn}'.")
 
 
+def get_local_IGGIELGN_path():
+    return os.path.join(
+        BASE_DIR, "data/gas_network/scigrid-gas/data/IGGIELGN_PipeSegments.geojson"
+    )
+
+
+def write_empty_clustered_gas_network(output_path):
+    logger.warning(
+        "Using empty gas network because no local GGIT/IGGIELGN dataset is available."
+    )
+    empty = pd.DataFrame(
+        {"bus0": [], "bus1": [], "capacity": [], "length": [], "GWKm": []}
+    )
+    empty.to_csv(output_path, index=False)
+
+
 def download_GGIT_gas_network():
     """
     Downloads a global dataset for gas networks as .xlsx.
@@ -86,14 +103,51 @@ def download_GGIT_gas_network():
     https://globalenergymonitor.org/projects/global-gas-infrastructure-tracker/
     The dataset contains 3144 pipelines.
     """
-    url = "https://globalenergymonitor.org/wp-content/uploads/2022/12/GEM-GGIT-Gas-Pipelines-December-2022.xlsx" # bc of issues w download link
-    local_path = "/shared/share_cki25/energymodels/pypsa-earth/data/GEM-GGIT-Gas-Pipelines-December-2022.xlsx"
+    url = "https://globalenergymonitor.org/wp-content/uploads/2022/12/GEM-GGIT-Gas-Pipelines-December-2022.xlsx"
+    local_candidates = [
+        Path(os.path.join(BASE_DIR, "data", "GEM-GGIT-Gas-Pipelines-December-2022.xlsx")),
+        Path(
+            os.path.join(
+                BASE_DIR,
+                "data",
+                "gas_network",
+                "GEM-GGIT-Gas-Pipelines-December-2022.xlsx",
+            )
+        ),
+        # Legacy shared path used in some CKI environments.
+        Path("/shared/share_cki25/energymodels/pypsa-earth/data/GEM-GGIT-Gas-Pipelines-December-2022.xlsx"),
+    ]
+
+    local_path = None
+    for candidate in local_candidates:
+        if candidate.exists():
+            local_path = candidate
+            logger.info(f"Using local GGIT gas pipeline data at '{local_path}'.")
+            break
+
+    if local_path is None:
+        local_path = local_candidates[1]
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Local GGIT gas pipeline file not found, downloading from '%s' to '%s'.",
+            url,
+            local_path,
+        )
+        file_content = content_retrieve(url).read()
+        if not file_content:
+            raise RuntimeError(
+                "Downloaded GGIT gas pipeline file is empty. "
+                "The source URL may be blocked in this environment."
+            )
+        with open(local_path, "wb") as f:
+            f.write(file_content)
 
     GGIT_gas_pipeline = pd.read_excel(
         local_path,
         index_col=0,
         sheet_name="Gas Pipelines 2022-12-16",
         header=0,
+        engine="openpyxl",
     )
 
     return GGIT_gas_pipeline
@@ -895,19 +949,31 @@ def cluster_gas_network(pipelines, bus_regions_onshore, length_factor):
 
 
 if not snakemake.params.custom_gas_network:
+    pipelines = None
+
     if snakemake.params.gas_config["network_data"] == "GGIT":
-        pipelines = download_GGIT_gas_network()
-        pipelines = prepare_GGIT_data(pipelines)
+        try:
+            pipelines = download_GGIT_gas_network()
+            pipelines = prepare_GGIT_data(pipelines)
+        except Exception as e:
+            logger.warning(
+                "Failed to load GGIT gas network (%s). Falling back to local IGGIELGN if available.",
+                e,
+            )
+            gas_network = get_local_IGGIELGN_path()
+            if os.path.exists(gas_network):
+                pipelines = load_IGGIELGN_data(gas_network)
+                pipelines = prepare_IGGIELGN_data(pipelines)
 
     elif snakemake.params.gas_config["network_data"] == "IGGIELGN":
-        download_IGGIELGN_gas_network()
+        gas_network = get_local_IGGIELGN_path()
+        if os.path.exists(gas_network):
+            pipelines = load_IGGIELGN_data(gas_network)
+            pipelines = prepare_IGGIELGN_data(pipelines)
 
-        gas_network = os.path.join(
-            BASE_DIR, "data/gas_network/scigrid-gas/data/IGGIELGN_PipeSegments.geojson"
-        )
-
-        pipelines = load_IGGIELGN_data(gas_network)
-        pipelines = prepare_IGGIELGN_data(pipelines)
+    if pipelines is None:
+        write_empty_clustered_gas_network(snakemake.output.clustered_gas_network)
+        sys.exit(0)
 
     bus_regions_onshore = load_bus_region(snakemake.input.regions_onshore, pipelines)[0]
     bus_regions_onshore.geometry = bus_regions_onshore.geometry.buffer(0)
