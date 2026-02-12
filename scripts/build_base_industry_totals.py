@@ -122,10 +122,26 @@ if __name__ == "__main__":
     # Get the files from the path provided in the OP
     all_files = list(Path(unsd_path).glob("*.txt"))
 
-    # Create a dataframe from all downloaded files
-    df = pd.concat(
-        (pd.read_csv(f, encoding="utf8", sep=";") for f in all_files), ignore_index=True
-    )
+    # Create a dataframe from all downloaded files (skip empty files)
+    dfs = []
+    for f in all_files:
+        try:
+            if f.stat().st_size == 0:
+                print(f"Skipping empty UNSD file: {f}")
+                continue
+            df_part = pd.read_csv(f, encoding="utf8", sep=";")
+        except pd.errors.EmptyDataError:
+            print(f"Skipping empty UNSD file: {f}")
+            continue
+        if df_part.empty:
+            print(f"Skipping empty UNSD file: {f}")
+            continue
+        dfs.append(df_part)
+
+    if not dfs:
+        raise ValueError(f"No valid UNSD files found in {unsd_path}")
+
+    df = pd.concat(dfs, ignore_index=True)
 
     # Split 'Commodity', 'Transaction' column to two
     df[["Commodity", "Transaction", "extra"]] = df["Commodity - Transaction"].str.split(

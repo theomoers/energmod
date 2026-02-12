@@ -53,6 +53,17 @@ def calculate_end_values(df, base_year, planning_horizon, countries=None):
     base_year = int(base_year)
     planning_horizon = int(planning_horizon)
 
+    df = df.copy()
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce")
+        sector_cols = [c for c in df.columns if c not in ["country", "year"]]
+        df[sector_cols] = df[sector_cols].apply(pd.to_numeric, errors="coerce")
+        df[sector_cols] = df[sector_cols].fillna(0.0)
+    else:
+        if "country" in df.columns:
+            df = df.set_index("country")
+        df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
     # Old behaviour: no year column, single CAGR over the whole period
     if "year" not in df.columns:
         no_years = planning_horizon - base_year

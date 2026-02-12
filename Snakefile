@@ -682,7 +682,6 @@ else:
             renewable=config["renewable"],
             countries=config["countries"],
             alternative_clustering=config["cluster_options"]["alternative_clustering"],
-            redistribute_hydro_over_countries=config["global_specific"]["redistribute_hydro_over_countries"],
             global_specific=config["global_specific"],
         input:
             natura="resources/" + RDIR + "natura.tiff",
