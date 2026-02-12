@@ -55,7 +55,7 @@ resources/
 results/
 .snakemake/
 slurm
-scripts/old
+scripts/archive
 .tmp
 doc/_build
 sample_pypsa_eur
