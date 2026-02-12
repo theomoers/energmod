@@ -1,4 +1,4 @@
-#!/apps/anaconda3/bin/python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 # SPDX-FileCopyrightText:  PyPSA-Earth and PyPSA-Eur Authors
@@ -243,7 +243,7 @@ def get_eia_annual_hydro_generation(fn, countries):
     df = pd.read_csv(fn, skiprows=1, index_col=1, na_values=[" ", "--"]).iloc[1:, 1:]
     df.index = df.index.str.strip()
 
-    df.loc["Germany"] = df.filter(like="Germany", axis=0).sum()
+    df.loc["Germany"] = df.filter(like="Germany", axis=0).astype(float).sum()
     df.loc["Serbia"] += df.loc["Kosovo"]
     df = df.loc[~df.index.str.contains("Former")]
     df.drop(["World", "Germany, West", "Germany, East"], inplace=True)
@@ -251,20 +251,7 @@ def get_eia_annual_hydro_generation(fn, countries):
     df.index = cc.convert(df.index, to="iso2")
     df.index.name = "countries"
 
-    # Filter countries to only include those that exist in the EIA data
-    available_countries = [c for c in countries if c in df.index]
-    missing_countries = [c for c in countries if c not in df.index]
-    
-    if missing_countries:
-        logger.warning(
-            f"The following countries are missing from EIA hydro data and will be skipped: {missing_countries}"
-        )
-    
-    if not available_countries:
-        logger.warning("No countries found in EIA hydro data. Returning empty dataframe.")
-        return pd.DataFrame()
-    
-    df = df.T[available_countries] * 1e6  # in MWh/a
+    df = df.T[countries].astype(float) * 1e6  # in MWh/a
     df.index = df.index.astype(int)
 
     return df
@@ -346,7 +333,7 @@ def filter_cutout_region(cutout, regions):
     return cutout
 
 
-def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year, redistribute_all_countries=False):
+def rescale_hydro(plants, runoff, normalize_using_yearly, ref_year, q_ror, q_reservoir):
     """
     Function used to rescale the inflows of the hydro capacities to match
     country statistics.
@@ -362,11 +349,12 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year, re
         Runoff at each bus
     normalize_using_yearly : DataFrame
         Dataframe that specifies for every country the total hydro production
-    normalization_year : int
+    ref_year : int
         Year used for normalization
-    redistribute_all_countries : bool, optional
-        If True, redistributes generation from countries without plants to countries with plants
-        proportionally according to their modeled runoff weights. Default is False.
+    q_ror : float
+        Quantile used to clip run-of-river inflows
+    q_reservoir : float
+        Quantile used to clip reservoir inflows
     """
 
     if plants.empty or plants.installed_hydro.any() == False:
@@ -381,44 +369,36 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year, re
 
     years_statistics = years_statistics.unique()
 
-    if normalization_year not in set(years_statistics):
+    if ref_year not in set(years_statistics):
         logger.warning(
-            f"Missing hydro statistics for year {normalization_year}; no normalization performed."
+            f"Missing hydro statistics for year {ref_year}; no normalization performed."
         )
+        return inflow
     else:
-        # Log initial state
-        unique_plant_countries = plants.countries.unique()
-        # Filter out NaN values before converting to list/set to avoid type comparison errors
-        unique_plant_countries = [c for c in unique_plant_countries if pd.notna(c)]
-        eia_countries = normalize_using_yearly.columns.tolist()
-        plants_with_hydro = plants[plants.installed_hydro == True]
-        
-        logger.info(f"Hydro rescaling for year {normalization_year}:")
-        logger.info(f"  Total plants: {len(plants)}")
-        logger.info(f"  Plants with installed hydro: {len(plants_with_hydro)}")
-        logger.info(f"  Countries with plants: {len(unique_plant_countries)} - {sorted(unique_plant_countries)}")
-        logger.info(f"  Countries with EIA data: {len(eia_countries)} - {sorted(eia_countries)}")
-        
-        # Skip rescaling if only Germany ('DE') has EIA data
-        if len(eia_countries) == 1 and eia_countries[0] == 'DE':
-            logger.warning("Skipping hydro rescaling: only 'DE' has EIA data, insufficient for multi-country rescaling")
-            logger.warning("Returning unscaled runoff data")
-            return runoff
-        
-        # Identify countries with EIA data but no plants
-        countries_with_eia_no_plants = set(eia_countries) - set(unique_plant_countries)
-        countries_with_plants_no_eia = set(unique_plant_countries) - set(eia_countries)
-        
-        if countries_with_eia_no_plants:
-            logger.warning(f"Countries with EIA data but no plants: {sorted(countries_with_eia_no_plants)}")
-            total_missing_generation = normalize_using_yearly.loc[normalization_year, list(countries_with_eia_no_plants)].sum()
-            logger.warning(f"  Total missing generation from these countries: {total_missing_generation:.2f} MWh/a")
-        
-        if countries_with_plants_no_eia:
-            logger.warning(f"Countries with plants but no EIA data: {sorted(countries_with_plants_no_eia)}")
-        # get buses that have installed hydro capacity to be used to compute
-        # the normalization
-        normalization_buses = plants[plants.installed_hydro == True].index
+        p_nom = xr.DataArray(
+            plants["p_nom"],
+            dims=("plant",),
+            coords={"plant": plants.index},
+        )
+        country_of_plant = xr.DataArray(
+            plants["countries"],
+            dims=("plant",),
+            coords={"plant": plants.index},
+        )
+
+        reservoir_buses = plants.query("technology == 'Reservoir'").index
+        ror_buses = plants.index.intersection(reservoir_buses)
+
+        mask_reservoirs = runoff["plant"].isin(reservoir_buses)
+
+        # expected energy
+        common_countries = normalize_using_yearly.columns.intersection(country_of_plant)
+
+        exp_en_by_cnt = xr.DataArray(
+            normalize_using_yearly.loc[ref_year, common_countries].values,
+            dims=("country",),
+            coords={"country": common_countries.values},
+        )
 
         # check nans
         share_nans = float(runoff.isnull().sum() / runoff.shape[0] / runoff.shape[1])
@@ -427,181 +407,83 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year, re
                 "Share of NaN values in hydro cutout: {:.2f}%".format(100 * share_nans)
             )
 
-        # average yearly runoff by plant
-        yearlyavg_runoff_by_plant = (
-            runoff.rename("runoff").mean("time", skipna=True).to_dataframe()
-        ) * 8760.0
-
-        yearlyavg_runoff_by_plant["country"] = plants.loc[
-            yearlyavg_runoff_by_plant.index, "countries"
-        ]
-
-        # group runoff by country
-        grouped_runoffs = (
-            yearlyavg_runoff_by_plant.loc[normalization_buses].groupby("country").sum()
+        # calculate runoff quantiles by category
+        runoff_quantile = xr.where(
+            mask_reservoirs,
+            runoff.quantile(q_reservoir, dim="time", skipna=True),  # reservoir plants
+            runoff.quantile(q_ror, dim="time", skipna=True),  # run-of-river plants
         )
 
-        # common country indices
-        common_countries = normalize_using_yearly.columns.intersection(
-            grouped_runoffs.index
+        # clip runoff values beyond quantile values
+        runoff_clipped = xr.where(
+            runoff > runoff_quantile,
+            runoff_quantile,
+            runoff,
         )
 
-        logger.info(f"  Common countries (with both EIA data and plants): {len(common_countries)} - {sorted(common_countries)}")
-
-        # Prepare EIA data for scaling - potentially redistributed
-        eia_data_for_scaling = normalize_using_yearly.loc[normalization_year].copy()
-        
-        if redistribute_all_countries and countries_with_eia_no_plants:
-            logger.info("Redistributing generation from countries without plants to countries with plants...")
-            logger.info("  Using modelled runoff weights for proportional redistribution")
-            
-            # Get generation from countries without plants
-            missing_generation = eia_data_for_scaling[list(countries_with_eia_no_plants)].sum()
-            
-            # Get countries with plants that also have EIA data for proportional redistribution
-            recipient_countries = list(common_countries)
-            
-            if recipient_countries:
-                # Calculate proportions based on modelled runoff weights instead of EIA generation
-                recipient_runoff = grouped_runoffs.runoff[recipient_countries]
-                total_recipient_runoff = recipient_runoff.sum()
-                
-                if total_recipient_runoff > 0:
-                    # Redistribute proportionally based on runoff weights
-                    redistribution_factors = recipient_runoff / total_recipient_runoff
-                    redistributed_amount = missing_generation * redistribution_factors
-                    
-                    logger.info(f"  Redistributing {missing_generation:.2f} MWh/a from {len(countries_with_eia_no_plants)} countries")
-                    logger.info(f"  To {len(recipient_countries)} countries based on runoff weights")
-                    
-                    # Add redistributed generation to recipient countries
-                    eia_data_for_scaling[recipient_countries] += redistributed_amount
-                    
-                    # Log redistribution details
-                    for country in recipient_countries:
-                        original = normalize_using_yearly.loc[normalization_year, country]
-                        new_value = eia_data_for_scaling[country]
-                        runoff_weight = recipient_runoff[country]
-                        redistrib_factor = redistribution_factors[country]
-                        logger.info(f"    {country}: {original:.2f} -> {new_value:.2f} MWh/a (+{new_value-original:.2f}) [runoff: {runoff_weight:.2f}, factor: {redistrib_factor:.3f}]")
-                else:
-                    logger.warning("Cannot redistribute: total runoff of recipient countries is zero")
-            else:
-                logger.warning("Cannot redistribute: no recipient countries with both plants and EIA data")
-
-        tot_common_yearly = np.nansum(eia_data_for_scaling[common_countries])
-        tot_common_runoff = np.nansum(grouped_runoffs.runoff[common_countries])
-        
-        logger.info(f"  Total EIA generation (common countries): {tot_common_yearly:.2f} MWh/a")
-        logger.info(f"  Total simulated runoff (common countries): {tot_common_runoff:.2f} MWh/a")
-
-        # define default_factor. When nan values, used the default 1.0
-        default_factor = 1.0
-        if not (
-            isnan(tot_common_yearly)
-            or isnan(tot_common_runoff)
-            or tot_common_runoff <= 0.0
-        ):
-            default_factor = tot_common_yearly / tot_common_runoff
-
-        def create_scaling_factor(
-            eia_data, grouped_runoffs, c_bus, default_value=1.0
-        ):
-            if c_bus in eia_data.index and c_bus in grouped_runoffs.index:
-                # normalization in place
-                scaling_factor = np.nansum(eia_data[c_bus]) / grouped_runoffs.runoff[c_bus]
-                logger.debug(f"    Scaling factor for {c_bus}: {scaling_factor:.4f} (EIA: {eia_data[c_bus]:.2f}, Runoff: {grouped_runoffs.runoff[c_bus]:.2f})")
-                return scaling_factor
-            elif c_bus not in eia_data.index:
-                # data not available in the normalization procedure
-                logger.debug(f"    No EIA data for {c_bus}, using default factor: {default_value}")
-                return default_value
-            elif c_bus not in grouped_runoffs.index:
-                # no hydro inflows available for the country
-                logger.debug(f"    No runoff data for {c_bus}, using default factor: {default_value}")
-                return default_value
-
-        unique_countries = plants.countries.unique()
-        missing_countries_normalization = np.setdiff1d(
-            unique_countries, eia_data_for_scaling.index
-        )
-        missing_countries_grouped_runoff = np.setdiff1d(
-            unique_countries, grouped_runoffs.index
-        )
-
-        if missing_countries_normalization.size != 0:
-            logger.warning(
-                f"Missing countries in the EIA dataframe: "
-                + ", ".join(missing_countries_normalization)
-                + ". Default value used"
+        # scale runoff to nominal capacity for run-of-river plants
+        mx = runoff_clipped.max("time", skipna=True)
+        runoff_ror = (
+            xr.where(
+                mask_reservoirs,
+                0.0,
+                runoff_clipped / mx * p_nom,
             )
-
-        if missing_countries_grouped_runoff.size != 0:
-            logger.warning(
-                f"Missing installed plants in: "
-                + ", ".join(missing_countries_grouped_runoff)
-                + ". Default value used"
+            .fillna(0.0)
+            .assign_coords(country=country_of_plant)
+        )
+        runoff_res = (
+            xr.where(
+                mask_reservoirs,
+                runoff_clipped,
+                0.0,
             )
-
-        logger.info(f"  Global scaling default factor: {default_factor:.4f}")
-        logger.info("  Creating scaling factors by country:")
-
-        # matrix used to scale the runoffs
-        scaling_matrix = xr.DataArray(
-            [
-                create_scaling_factor(
-                    eia_data_for_scaling,
-                    grouped_runoffs,
-                    c_bus,
-                    default_factor,
-                )
-                * np.ones(runoff.time.shape)
-                for c_bus in plants.countries
-            ],
-            coords=dict(
-                plant=plants.index.values,
-                time=runoff.time.values,
-            ),
+            .fillna(0.0)
+            .assign_coords(country=country_of_plant)
         )
 
-        # Check all buses to be in the final dataset
-        missing_buses = plants.index.difference(scaling_matrix.plant)
-        if len(missing_buses) > 0:
-            logger.warning(f"Missing hydro inflows for buses: {missing_buses}")
+        # ignore new plants when calculating the normalization factors
+        new_plants_id = plants[plants.installed_hydro != True].index
 
-        # Apply scaling
-        runoff *= scaling_matrix
-        
-        # Log final results
-        final_total_generation = (runoff.mean("time") * 8760.0).sum().values
-        logger.info(f"  Final scaled total generation: {final_total_generation:.2f} MWh/a")
-        
-        if redistribute_all_countries and countries_with_eia_no_plants:
-            original_eia_total = normalize_using_yearly.loc[normalization_year].sum()
-            logger.info(f"  Original total EIA generation: {original_eia_total:.2f} MWh/a")
-            logger.info(f"  Generation coverage: {(final_total_generation/original_eia_total)*100:.1f}%")
+        # totals per country over the time horizon
+        ror_tot_c = (
+            runoff_ror.sum(dim=("time"), skipna=True)
+            .drop_sel(plant=new_plants_id, errors="ignore")
+            .groupby("country")
+            .sum()
+        )
+        res_tot_c = (
+            runoff_res.sum(dim=("time"), skipna=True)
+            .drop_sel(plant=new_plants_id, errors="ignore")
+            .groupby("country")
+            .sum()
+        )
 
-    return runoff
+        # compute required reservoir scaling factor per country
+        target_res_c = exp_en_by_cnt - ror_tot_c
+        scale_c = xr.where(
+            res_tot_c > 0, target_res_c.sel(country=res_tot_c.country) / res_tot_c, 0.0
+        )
+
+        if (scale_c < 0).any():
+            negative_countries = scale_c.country.values[scale_c < 0].tolist()
+            logger.warning(
+                f"Negative scaling factor for reservoir plants in countries: "
+                f"{', '.join(negative_countries)}. "
+                f"Setting scaling factor to zero."
+            )
+            scale_c = scale_c.clip(min=0.0)
+
+        runoff_final = runoff_ror + runoff_res * scale_c.sel(country=country_of_plant)
+
+        return runoff_final.drop_vars("country")
 
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake(
-            "build_renewable_profiles",
-            technology="hydro",
-            simpl="",
-            clusters="200",
-            ll="copt",
-            opts="3h",
-            planning_horizons="2020",
-            sopts="72h",
-            configfile="/shared/share_cki25/energymodels/pypsa-earth/config.myopic.yaml",
-            discountrate="0.071",
-            demand="AB",
-            h2export="10"
-        )
+        snakemake = mock_snakemake("build_renewable_profiles", technology="hydro")
     configure_logging(snakemake)
 
     pgb.streams.wrap_stderr()
@@ -630,15 +512,6 @@ if __name__ == "__main__":
         "disable the corresponding renewable technology"
     )
 
-    # Remove faulty offshore shapes before availability matrix calculation
-    if snakemake.wildcards.technology.startswith("offwind") and snakemake.params.global_specific.get("remove_faulty_offshore_shapes", False):
-        logger.info(f"Original regions length: {len(regions)}")
-        to_remove = [545, 1343]
-        logger.info(f"Removing faulty offshore shapes with indices: {to_remove}. Not relevant for energy model (polar regions)")
-        logger.info(f"Removing regions: {regions.iloc[to_remove][['name', 'geometry']]}")
-        regions = regions.drop(to_remove).reset_index(drop=True)
-        logger.info(f"New regions length: {len(regions)}")
-
     # do not pull up, set_index does not work if geo dataframe is empty
     regions = regions.set_index("name").rename_axis("bus")
 
@@ -666,15 +539,17 @@ if __name__ == "__main__":
         hydrobasins_path = os.path.join(BASE_DIR, resource["hydrobasins"])
         resource["hydrobasins"] = hydrobasins_path
         hydrobasins = gpd.read_file(hydrobasins_path)
-        ppls = load_powerplants("/shared/share_cki25/energymodels/pypsa-earth/permstorage/110nodes_1h_7ph/resources/powerplants.csv") # ppls = load_powerplants(snakemake.input.powerplants)
+        ppls = load_powerplants(snakemake.input.powerplants)
 
-        all_hydro_ppls = ppls[ppls.carrier == "hydro"]
+        inflow_ppls = ppls.query(
+            "(carrier == 'hydro') and (technology != 'Pumped Storage')"
+        )
 
         # select hydro units within hydrobasins
         hgdf = gpd.GeoDataFrame(
-            all_hydro_ppls,
-            index=all_hydro_ppls.index,
-            geometry=gpd.points_from_xy(all_hydro_ppls.lon, all_hydro_ppls.lat),
+            inflow_ppls,
+            index=inflow_ppls.index,
+            geometry=gpd.points_from_xy(inflow_ppls.lon, inflow_ppls.lat),
             crs=PPL_CRS,
         ).to_crs(hydrobasins.crs)
         temp_gdf = gpd.sjoin(hgdf, hydrobasins, predicate="within", how="left")
@@ -684,17 +559,14 @@ if __name__ == "__main__":
         )
 
         bus_notin_hydrobasins = list(
-            set(all_hydro_ppls.index).difference(set(hydro_ppls.index))
+            set(inflow_ppls.index).difference(set(hydro_ppls.index))
         )
 
         resource["plants"] = hydro_ppls.rename(columns={"country": "countries"})[
-            ["lon", "lat", "countries"]
+            ["lon", "lat", "countries", "technology", "p_nom"]
         ]
 
-        # TODO: possibly revise to account for non-existent hydro powerplants
-        resource["plants"]["installed_hydro"] = [
-            True for bus_id in resource["plants"].index
-        ]
+        resource["plants"]["installed_hydro"] = resource["plants"].p_nom > 0
 
         # get normalization before executing runoff
         normalization = None
@@ -717,7 +589,10 @@ if __name__ == "__main__":
             # check if normalization field belongs to the settings and it is not false
             if normalization:
                 method = normalization["method"]
-                norm_year = normalization.get("year", int(inflow.time[0].dt.year))
+                norm_year = normalization["year"]
+                q_ror = normalization["quantile_ror"]
+                q_reservoir = normalization["quantile_reservoir"]
+                multiplier = normalization["multiplier"]
                 if method == "hydro_capacities":
                     path_hydro_capacities = snakemake.input.hydro_capacities
                     normalize_using_yearly = (
@@ -732,11 +607,13 @@ if __name__ == "__main__":
                         path_eia_stats, countries
                     )
 
-                redistribute_hydro = snakemake.params.get("redistribute_hydro_over_countries", False)
-                
                 inflow = rescale_hydro(
-                    resource["plants"], inflow, normalize_using_yearly, norm_year, 
-                    redistribute_hydro
+                    resource["plants"],
+                    inflow,
+                    normalize_using_yearly * multiplier,
+                    norm_year,
+                    q_ror,
+                    q_reservoir,
                 )
                 logger.info(
                     f"Hydro normalization method '{method}' on year-statistics {norm_year}"
@@ -744,11 +621,9 @@ if __name__ == "__main__":
             else:
                 logger.info("No hydro normalization")
 
-            inflow *= config.get("multiplier", 1.0)
-
             # add zero values for out of hydrobasins elements
             if len(bus_notin_hydrobasins) > 0:
-                regions_notin = all_hydro_ppls.loc[
+                regions_notin = inflow_ppls.loc[
                     bus_notin_hydrobasins, ["lon", "lat", "country"]
                 ]
                 logger.warning(

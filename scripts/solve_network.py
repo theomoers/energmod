@@ -94,8 +94,7 @@ from pypsa.clustering.spatial import (
     DEFAULT_ONE_PORT_STRATEGIES,
     get_clustering_from_busmap,
 )
-from temporal_clustering import aggregate_snapshots
-from t_storage_constraints import add_kotzur_storage_constraints
+from temporal_clustering import add_kotzur_storage_constraints
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
 #from apply_build_constraints import add_build_rate_constraints
