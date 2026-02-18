@@ -1391,83 +1391,45 @@ def define_spatial(nodes, options):
     return spatial
 
 
-def biomass_p_nom_caps(n, costs, spatial, total_TWh_per_a):
-    """
-    Convert annual biomass potential (TWh/a) into capacity caps (MW) per node.
-    """
-    # total annual energy [MWh/a]
-    E_total = float(total_TWh_per_a) * 1e6
-
-    # split across biomass nodes -- replace iwth weights if we have them
-    nodes = pd.Index(spatial.biomass.nodes)
-    weights = pd.Series(1.0, index=nodes)
-    weights /= weights.sum()
-    E_node = E_total * weights  # MWh/a per node
-
-    hours = float(n.snapshot_weightings.generators.sum())  # not 8760 if sampled
-    eta_el = float(costs.at["biomass EOP", "efficiency"]) if "biomass EOP" in costs.index else 0.4
-
-    p_nom_max = (E_node / max(hours, 1e-9)) / max(eta_el, 1e-9)
-    return p_nom_max  # index = spatial.biomass.nodes
-
-
-def biogas_p_nom_caps(n, costs, spatial, total_TWh_per_a):
-    """
-    Convert annual biogas potential (TWh/a) into capacity caps (MW) per node.
-    """
-    E_total = float(total_TWh_per_a) * 1e6
-
-    nodes = pd.Index(spatial.gas.biogas)
-    weights = pd.Series(1.0, index=nodes)
-    weights /= weights.sum()
-    E_node = E_total * weights  # MWh/a per node
-
-    hours = float(n.snapshot_weightings.generators.sum())  # not 8760 if sampled
-
-    eta_el = float(costs.at["biogas upgrading", "efficiency"]) if "biogas upgrading" in costs.index else 1.0
-
-    p_nom_max = (E_node / max(hours, 1e-9)) / max(eta_el, 1e-9)
-    return p_nom_max  # index = spatial.gas.biogas
-
-
 def add_biomass(n, costs):
     logger.info("adding biomass")
 
     # TODO get biomass potentials dataset and enable spatially resolved potentials
 
-    # Get biomass and biogas potentials from config (in TWh/a)
-    biomass_pot_TWh_per_a = snakemake.params.sector_options["solid_biomass_potential"]  # TWh/a
-    biogas_pot_TWh_per_a = snakemake.params.sector_options["biogas_potential"]  # TWh/a
+    # Get biomass and biogas potentials from config and convert from TWh to MWh
+    biomass_pot = (
+        snakemake.params.sector_options["solid_biomass_potential"] * 1e6
+    )  # MWh
+    biogas_pot = snakemake.params.sector_options["biogas_potential"] * 1e6  # MWh
     logger.info("Biomass and Biogas potential fetched from config")
 
-    # capacity caps in MW per node
-    biomass_p_nom_max = biomass_p_nom_caps(n, costs, spatial, biomass_pot_TWh_per_a)
-    biogas_p_nom_max = biogas_p_nom_caps(n, costs, spatial, biogas_pot_TWh_per_a)
-    logger.info("Biomass and biogas capacity caps calculated from annual potential")
-
-    hours = float(n.snapshot_weightings.generators.sum())
-    
-    biomass_eff = float(costs.at["biomass EOP", "efficiency"]) if "biomass EOP" in costs.index else 0.4
-    biogas_eff = float(costs.at["biogas upgrading", "efficiency"]) if "biogas upgrading" in costs.index else 1.0
-    
-    biomass_pot_spatial = biomass_p_nom_max * biomass_eff * hours  # MWh per node
-    biogas_pot_spatial = biogas_p_nom_max * biogas_eff * hours  # MWh per node
-    
-    logger.info("Biomass store energy limits aligned with link capacity constraints")
+    # Convert from total to nodal potentials,
+    biomass_pot_spatial = biomass_pot / len(spatial.biomass.nodes)
+    biogas_pot_spatial = biogas_pot / len(spatial.gas.biogas)
+    logger.info("Biomass potentials spatially resolved equally across all nodes")
 
     n.add("Carrier", "biogas")
     n.add("Carrier", "solid biomass")
 
-    n.madd(
-        "Bus", spatial.gas.biogas, location=spatial.biomass.locations, carrier="biogas"
-    )
+    biogas_buses = pd.Index(spatial.gas.biogas)
+    biogas_buses_new = biogas_buses.difference(n.buses.index)
+    if len(biogas_buses_new):
+        n.madd(
+            "Bus",
+            biogas_buses_new,
+            location=biogas_buses_new.to_series().map(dict(zip(spatial.gas.biogas, spatial.biomass.locations))),
+            carrier="biogas",
+        )
 
-    n.madd(
-        "Bus",
-        spatial.biomass.nodes,
-        location=spatial.biomass.locations,
-        carrier="solid biomass",
-    )
+    biomass_buses = pd.Index(spatial.biomass.nodes)
+    biomass_buses_new = biomass_buses.difference(n.buses.index)
+    if len(biomass_buses_new):
+        n.madd(
+            "Bus",
+            biomass_buses_new,
+            location=biomass_buses_new.to_series().map(dict(zip(spatial.biomass.nodes, spatial.biomass.locations))),
+            carrier="solid biomass",
+        )
 
     n.madd(
         "Store",
@@ -1489,7 +1451,6 @@ def add_biomass(n, costs):
         e_initial=biomass_pot_spatial,
     )
 
-    # Add capacity constraints to biomass EOP link
     biomass_gen = "biomass EOP"
     n.madd(
         "Link",
@@ -1497,17 +1458,18 @@ def add_biomass(n, costs):
         bus0=spatial.biomass.nodes,
         bus1=spatial.nodes,
         # bus2="co2 atmosphere",
-        marginal_cost=costs.at[biomass_gen, "efficiency"] * costs.at[biomass_gen, "VOM"],
-        capital_cost=costs.at[biomass_gen, "efficiency"] * costs.at[biomass_gen, "fixed"],
+        marginal_cost=costs.at[biomass_gen, "efficiency"]
+        * costs.at[biomass_gen, "VOM"],  # NB: VOM is per MWel
+        # NB: fixed cost is per MWel
+        capital_cost=costs.at[biomass_gen, "efficiency"]
+        * costs.at[biomass_gen, "fixed"],
         p_nom_extendable=True,
-        p_nom_max=biomass_p_nom_max.reindex(spatial.biomass.nodes).fillna(0.0),  # NEW
         carrier=biomass_gen,
         efficiency=costs.at[biomass_gen, "efficiency"],
         # efficiency2=costs.at["solid biomass", "CO2 intensity"],
         lifetime=costs.at[biomass_gen, "lifetime"],
     )
-    
-    # Add capacity constraints to biogas upgrading link
+
     n.madd(
         "Link",
         spatial.gas.biogas_to_gas,
@@ -1519,7 +1481,6 @@ def add_biomass(n, costs):
         marginal_cost=costs.loc["biogas upgrading", "VOM"],
         efficiency2=-costs.at["gas", "CO2 intensity"],
         p_nom_extendable=True,
-        p_nom_max=biogas_p_nom_max.reindex(spatial.gas.biogas).fillna(0.0),  # NEW
     )
 
     if options["biomass_transport"]:
@@ -2189,13 +2150,19 @@ def add_industry(n, costs):
         efficiency=1.0,
     )
     if snakemake.params.sector_options["cc"]:
+        biomass_locations = pd.Index(spatial.biomass.locations)
+        if biomass_locations.isin(spatial.co2.df.index).all():
+            biomass_cc_bus3 = spatial.co2.df.loc[biomass_locations, "nodes"].values
+        else:
+            biomass_cc_bus3 = np.repeat(spatial.co2.nodes[0], len(spatial.biomass.industry_cc))
+
         n.madd(
             "Link",
             spatial.biomass.industry_cc,
             bus0=spatial.biomass.nodes,
             bus1=spatial.biomass.industry,
             bus2="co2 atmosphere",
-            bus3=spatial.co2.nodes,
+            bus3=biomass_cc_bus3,
             carrier="solid biomass for industry CC",
             p_nom_extendable=True,
             capital_cost=costs.at["cement capture", "fixed"]
@@ -4039,21 +4006,20 @@ if __name__ == "__main__":
     ) # based on owid data
     
 
-    s_factor = ((4348 - 708.68) / 2056.70) * 0.939688716
-    n.storage_units.loc[n.storage_units.carrier == "hydro", "max_hours"] *= s_factor
-    n.storage_units_t.inflow *= s_factor
-    logger.info(f"Scaling inflow data to match IEA historical hydro data. Scaling by {s_factor}")
+    #s_factor = ((4348 - 708.68) / 2056.70) * 0.939688716
+    #n.storage_units.loc[n.storage_units.carrier == "hydro", "max_hours"] *= s_factor
+    #n.storage_units_t.inflow *= s_factor
+    #logger.info(f"Scaling inflow data to match IEA historical hydro data. Scaling by {s_factor}")
 
-    onwind_factor = (1484 / 1295)
-    onwind_idx = n.generators[n.generators.carrier == 'onwind'].index
-    onwind_time_idx = n.generators_t.p_max_pu.columns
-    onwind_idx = onwind_idx.intersection(onwind_time_idx)
-    n.generators_t.p_max_pu[onwind_idx] *= onwind_factor
-    logger.info(f"Scaling onwind p_max_pu to match IRENA data by factor {onwind_factor}")
+    #onwind_factor = (1484 / 1295)
+    #onwind_idx = n.generators[n.generators.carrier == 'onwind'].index
+    #onwind_time_idx = n.generators_t.p_max_pu.columns
+    #onwind_idx = onwind_idx.intersection(onwind_time_idx)
+    #n.generators_t.p_max_pu[onwind_idx] *= onwind_factor
+    #logger.info(f"Scaling onwind p_max_pu to match IRENA data by factor {onwind_factor}")
 
     # Apply country-specific WACCs to ALL renewable generators (must be last to catch all generators)
     logger.info("Applying regional WACCs to all renewable generators...")
     apply_regional_waccs(n, costs, wacc_dict, Nyears)
 
     n.export_to_netcdf(snakemake.output.network)
-
