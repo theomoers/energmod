@@ -639,6 +639,8 @@ def attach_hydro(n, costs, ppl):
         missing_countries = pd.Index(hydro["country"].unique()).difference(
             max_hours_country.dropna().index
         )
+        # Country values can include NaN/floats; cast to string for robust logging.
+        missing_countries = missing_countries.dropna().map(str)
         if not missing_countries.empty:
             logger.warning(
                 "Assuming max_hours=6 for hydro reservoirs in the countries: {}".format(
@@ -867,11 +869,16 @@ def estimate_renewable_capacities_irena(
 
 
 def add_nice_carrier_names(n, config):
+    def _fallback_nice_name(carrier):
+        s = str(carrier)
+        # Preserve acronym-like carrier names (e.g. AC, DC, H2, AC-AC).
+        return s if s == s.upper() else s.title()
+
     carrier_i = n.carriers.index
     nice_names = (
         pd.Series(config["plotting"]["nice_names"])
         .reindex(carrier_i)
-        .fillna(carrier_i.to_series().str.title())
+        .fillna(carrier_i.to_series().map(_fallback_nice_name))
     )
     n.carriers["nice_name"] = nice_names
     colors = pd.Series(config["plotting"]["tech_colors"]).reindex(carrier_i)
