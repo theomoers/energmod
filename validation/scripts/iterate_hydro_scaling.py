@@ -20,6 +20,12 @@ import numpy as np
 import pandas as pd
 import pypsa
 
+from tuner_guardrails import (
+    raise_if_simulated_failure,
+    restore_from_last_good,
+    sync_last_good_from_mutable,
+)
+
 LOG = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -261,6 +267,11 @@ def parse_args():
         ],
     )
     p.add_argument("--unlock-first", action="store_true")
+    p.add_argument(
+        "--simulate-post-write-failure",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -310,7 +321,11 @@ def main():
         except Exception as exc:
             LOG.warning("Could not load existing overrides from %s: %s", override_csv, exc)
     # Seed rollback file from current known-good scales (the solved network we start from).
-    _write_scales_csv(last_good_override_csv, scales)
+    if not sync_last_good_from_mutable(override_csv, last_good_override_csv):
+        _write_scales_csv(last_good_override_csv, scales)
+        LOG.info("Seeded last-good hydro overrides: %s", last_good_override_csv)
+    else:
+        LOG.info("Seeded last-good hydro overrides from current mutable file: %s", last_good_override_csv)
 
     targets = pd.DataFrame({"target_hydro_twh": ref_hydro_twh.clip(lower=0.0)})
 
@@ -404,20 +419,21 @@ def main():
         )
 
         try:
+            raise_if_simulated_failure(args.simulate_post_write_failure, "hydro tuner")
             _run_snakemake(args)
         except Exception as exc:
-            _write_scales_csv(override_csv, current_good_scales)
-            _write_scales_csv(last_good_override_csv, current_good_scales)
+            restored = restore_from_last_good(override_csv, last_good_override_csv)
             LOG.error(
-                "Hydro solve failed after writing new overrides. Rolled back to last good hydro overrides at %s and %s. Error: %s",
+                "Hydro solve/update failed after writing new overrides. Rolled back to last good hydro overrides at %s (restored=%s, snapshot=%s). Error: %s",
                 override_csv,
+                restored,
                 last_good_override_csv,
                 exc,
             )
             raise
 
         # Solve succeeded; persist this as the new rollback point.
-        _write_scales_csv(last_good_override_csv, scales)
+        sync_last_good_from_mutable(override_csv, last_good_override_csv)
 
     history = pd.DataFrame(history_rows)
     history.to_csv(history_csv, index=False, float_format="%.4f")

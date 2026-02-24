@@ -18,6 +18,12 @@ import numpy as np
 import pandas as pd
 import pypsa
 
+from tuner_guardrails import (
+    raise_if_simulated_failure,
+    restore_from_last_good,
+    sync_last_good_from_mutable,
+)
+
 LOG = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -213,6 +219,11 @@ def parse_args():
         "--country-detail-csv",
         default="validation/results_compare/nuclear_iteration_country_detail.csv",
     )
+    p.add_argument(
+        "--last-good-override-csv",
+        default="validation/data/nuclear_iteration_scaling_overrides_last_good.csv",
+        help="Rollback snapshot of the last known-good nuclear override CSV.",
+    )
     p.add_argument("--country-min-ref-twh", type=float, default=1.0)
     p.add_argument("--target-country-ape-pct", type=float, default=10.0)
     p.add_argument("--target-country-success-share-pct", type=float, default=85.0)
@@ -236,6 +247,11 @@ def parse_args():
         ],
     )
     p.add_argument("--unlock-first", action="store_true")
+    p.add_argument(
+        "--simulate-post-write-failure",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -247,6 +263,7 @@ def main():
     network_target = _repo_path(args.network_target)
     owid_csv = _repo_path(args.owid_csv)
     override_csv = _repo_path(args.override_csv)
+    last_good_override_csv = _repo_path(args.last_good_override_csv)
     history_csv = _repo_path(args.history_csv)
     country_detail_csv = _repo_path(args.country_detail_csv)
 
@@ -258,6 +275,7 @@ def main():
         raise RuntimeError(f"No OWID nuclear reference found for year {args.year} in {owid_csv}")
 
     override_csv.parent.mkdir(parents=True, exist_ok=True)
+    last_good_override_csv.parent.mkdir(parents=True, exist_ok=True)
     history_csv.parent.mkdir(parents=True, exist_ok=True)
     country_detail_csv.parent.mkdir(parents=True, exist_ok=True)
 
@@ -282,6 +300,16 @@ def main():
             LOG.info("Loaded existing override scales from %s", override_csv)
         except Exception as exc:
             LOG.warning("Could not load existing overrides from %s: %s", override_csv, exc)
+
+    if not sync_last_good_from_mutable(override_csv, last_good_override_csv):
+        seed_out = scales.reset_index().rename(columns={"index": "country"}).sort_values("country")
+        seed_out.to_csv(last_good_override_csv, index=False, float_format="%.6f")
+        LOG.info("Seeded last-good nuclear overrides: %s", last_good_override_csv)
+    else:
+        LOG.info(
+            "Seeded last-good nuclear overrides from current mutable file: %s",
+            last_good_override_csv,
+        )
 
     targets = pd.DataFrame({"target_nuclear_twh": ref_nuclear_twh.clip(lower=0.0)})
 
@@ -356,8 +384,20 @@ def main():
         scales_out = scales.reset_index().rename(columns={"index": "country"}).sort_values("country")
         scales_out.to_csv(override_csv, index=False, float_format="%.6f")
         LOG.info("Wrote overrides: %s", override_csv)
-
-        _run_snakemake(args)
+        try:
+            raise_if_simulated_failure(args.simulate_post_write_failure, "nuclear tuner")
+            _run_snakemake(args)
+        except Exception as exc:
+            restored = restore_from_last_good(override_csv, last_good_override_csv)
+            LOG.error(
+                "Nuclear solve/update failed after writing overrides. Rolled back to last good overrides at %s (restored=%s, snapshot=%s). Error: %s",
+                override_csv,
+                restored,
+                last_good_override_csv,
+                exc,
+            )
+            raise
+        sync_last_good_from_mutable(override_csv, last_good_override_csv)
 
     history = pd.DataFrame(history_rows)
     history.to_csv(history_csv, index=False, float_format="%.4f")
