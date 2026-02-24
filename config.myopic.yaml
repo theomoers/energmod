@@ -1,6 +1,6 @@
 run:
-  name: "Earth_myopic_90cluster" # use this to keep track of runs with different settings
-  sector_name: "Global_sect_90cluster" # use this to keep track of sector scenario runs
+  name: "Earth_200" # use this to keep track of runs with different settings
+  sector_name: "Global_200" # use this to keep track of sector scenario runs
   shared_cutouts: true # set to true to share the default cutout(s) across runs
   allow_scenario_failure: true # If True, the workflow will continue even if a scenario in run_scenario fails
 
@@ -8,7 +8,7 @@ countries: ["Global"]
 
 scenario:
   simpl: [""]
-  ll: ["copt"]
+  ll: ["copt"] # c1.0c
   clusters: [200] 
   opts: [1h]
   planning_horizons:
@@ -37,7 +37,7 @@ scenario:
 foresight: myopic
 
 additional_sector_clustering:
-  enable: true # enable clustering in solve_network
+  enable: false # enable clustering in solve_network
   mode: kmeans # manual: use global.cluster.yaml, kmeans: use clustering algorithm 
   validate_aggregation: true # run the static/time-series conservation checks after clustering
   overwrite_universal_busmap: true
@@ -74,9 +74,7 @@ temporal_clustering:
   extremePeriodMethod: 'new_cluster_center'  # how to handle extreme periods
   normed: true # normalize timeseries before clustering
   overwrite_time_dfs: false  # whether to overwrite time-dependent data with clustered values
-  use_dt_in_intra: false   # Set to true for dt-scaled intra recursion
-  include_inflow_in_intra: false  # Set to true to include inflow/spill in intra # LAST TO SET TO FALSE
-
+  
 enable:
   retrieve_databundle: false 
   retrieve_databundle_sector: false
@@ -91,7 +89,6 @@ enable:
 
 global_specific:
   save_lpfile: false
-  redistribute_hydro_over_countries: true # If true, hydro generation of missing countries in the powerplants dataset is redistributed to countries with plants according to EIA data
   remove_faulty_offshore_shapes: true # for offwind profiles, remove faulty shapes that cause crashes
   global_clustering: true # must be true to apply minimum clustering per country
   minimum_clustering_per_countries:
@@ -103,37 +100,71 @@ global_specific:
   
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_generation:
-    baseyear_generation_constraint: false # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
-    tolerance: 0.03 # +- x% tolerance for baseyear generation constraint
+    baseyear_generation_constraint: true # 2020 country-level electricity generation constrained to OWID historical values
+    year: 2020
+    owid_csv: validation/data/owid-energy-data.csv
+    tolerance: 0.10
+    absolute_tolerance_twh: 0.25
+    min_reference_twh: 1.0
+    min_country_electric_load_twh: 0.5
+    slack_penalty_eur_per_mwh: 1000.0
     units: TWh
     link_bus_carrier: AC
     gen_bus_carrier: AC
-    targets:
-      solar: 855.23
-      onshore_wind: 1484
-      offshore_wind: 104
-      hydro: 4348.0
-      nuclear: 2648.0
-      coal_lignite_power: 9437.0
-      gas_power: 6386.34
-      oil_power: 775.3
-      biomass: 615.21
-      geothermal: 86.12
-    carriers_map:
-      solar: ["solar"]
-      onshore_wind: ["onwind"]
-      offshore_wind: ["offwind-ac","offwind-dc"]
-      hydro: ["ror", "hydro"]
-      nuclear: ["nuclear"]
-      coal_lignite_power: ["coal", "lignite"]
-      gas_power: ["CCGT","OCGT"]
-      oil_power: ["oil"]
-      biomass: 
-        - "urban central solid biomass CHP CC"
-        - "urban central solid biomass CHP"
-        - "biomass"
-        - "biomass EOP"
-      geothermal: ["geothermal"]
+    metrics:
+      - coal_electricity
+      - gas_electricity
+      - oil_electricity
+      - biofuel_electricity
+      - hydro_electricity
+      - nuclear_electricity
+      - solar_electricity
+      - wind_electricity
+      - other_renewable_electricity
+      - electricity_generation
+
+    hydro_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
+    hydro_inflow_alignment: true
+    hydro_inflow_min_reference_twh: 1.0
+    hydro_inflow_min_model_twh: 0.1
+    hydro_inflow_scale_min: 0.25
+    hydro_inflow_scale_max: 20.0
+    hydro_inflow_alignment_alpha: 1.0
+    hydro_iteration_scaling_enabled: false
+    hydro_iteration_override_csv: validation/data/hydro_iteration_scaling_overrides.csv
+    hydro_iteration_scale_min: 0.05
+    hydro_iteration_scale_max: 20.0
+    hydro_ror_p_max_pu_cap: 1.0
+
+    onwind_profile_alignment: true
+    onwind_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
+    onwind_min_reference_twh: 1.0
+    onwind_min_model_twh: 0.1
+    onwind_scale_min: 0.25
+    onwind_scale_max: 4.0
+    onwind_alignment_alpha: 1.0
+    onwind_p_max_pu_cap: 1.0
+
+    wind_iteration_scaling_enabled: true
+    wind_iteration_override_csv: validation/data/wind_iteration_scaling_overrides_global200_2020_validated.csv
+    wind_iteration_scale_min: 0.05
+    wind_iteration_scale_max: 20.0
+    offwind_p_max_pu_cap: 1.0
+
+    solar_iteration_scaling_enabled: false
+    solar_iteration_override_csv: validation/data/solar_iteration_scaling_overrides.csv
+    solar_iteration_scale_min: 0.05
+    solar_iteration_scale_max: 20.0
+    solar_p_max_pu_cap: 1.0
+
+    nuclear_iteration_scaling_enabled: false
+    nuclear_iteration_override_csv: validation/data/nuclear_iteration_scaling_overrides.csv
+    nuclear_iteration_scale_min: 0.05
+    nuclear_iteration_scale_max: 20.0
+    nuclear_p_max_pu_cap: 1.0
+
+    fossil_price_tuning_enabled: false
+    fossil_price_override_csv: validation/data/fossil_price_tuning_overrides.csv
 
   year2025_generation: 
     year2025_generation_constraint: false
@@ -170,7 +201,7 @@ global_specific:
       geothermal: ["geothermal"]
 
   year2025_capacity:
-    year2025_capacity_constraint: true
+    year2025_capacity_constraint: false
     year: 2025
     tolerance: 0.1
     units: GW
@@ -180,27 +211,27 @@ global_specific:
 
 permstore:
   enable: true
-  path: /shared/share_cki25/energymodels/pypsa-earth/permstorage
-  scenario: "110nodes_1h_7ph"
+  path: /Users/tlm2160/Library/Mobile Documents/com~apple~CloudDocs/Documents/Research 2/CKI/energmod/permstorage
+  scenario: "Global_200"
   use:
-    shapes: false
-    base_network: false
-    bus_regions: false # should be false if base_network is false !
-    demand_profiles: false # elec only
-    powerplants: false 
-    pop_layouts: false
-    pop_layouts_clustered: false
-    temperatures: false
-    heat_demand: false
-    transport_data: false
-    gas_network: false
+    shapes: true
+    base_network: true
+    bus_regions: true # should be false if base_network is false !
+    demand_profiles: true # elec only
+    powerplants: true 
+    pop_layouts: true
+    pop_layouts_clustered: true
+    temperatures: true
+    heat_demand: true
+    transport_data: true
+    gas_network: true
     industry_distribution: false # adjusted for gadm clustering
     elec_prepared: false
     renewable_profiles: true
-    solar_thermal_profile: false
+    solar_thermal_profile: true
     costs: true
     raw_osm: true
-    clean_osm: false
+    clean_osm: true
     base_energy_totals: true # use permstorage for energy_totals_base instead of downloading from UN database 
 
 electricity:
@@ -283,7 +314,7 @@ sector:
   lignite:
     spatial_lignite: true
 
-  international_bunkers: false # Whether or not to count the emissions of international aviation and navigation
+  international_bunkers: true # Whether or not to count the emissions of international aviation and navigation
 
   oil:
     spatial_oil: true
@@ -508,7 +539,7 @@ solving:
       parallel: "on"
       random_seed: 123
     gurobi-default:
-      threads: 64
+      threads: 10
       method: 2 # barrier
       crossover: 0
       BarConvTol: 1.e-5 # 1.e-6

@@ -1,0 +1,2240 @@
+# -*- coding: utf-8 -*-
+"""Validation/tuning helper hooks used by core workflow scripts.
+
+This module centralizes validation/tuning extensions so `prepare_sector_network.py`,
+`add_existing_baseyear.py`, and `solve_network.py` only need thin imports/aliases.
+"""
+
+import logging
+import os
+import re
+
+import numpy as np
+import pandas as pd
+import pypsa
+import xarray as xr
+
+from _helpers import BASE_DIR, three_2_two_digits_country
+
+logger = logging.getLogger(__name__)
+
+
+def _get_bus_country_for_clustering(n):
+    country = (
+        n.buses["country"]
+        if "country" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    location = (
+        n.buses["location"]
+        if "location" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    country = country.fillna("").astype(str).str.strip().str.upper()
+    location = location.fillna("").astype(str).str.strip().str.upper()
+    bus_name = n.buses.index.to_series(index=n.buses.index).astype(str).str.strip().str.upper()
+
+    return (
+        country.where(country != "")
+        .fillna(location.str.extract(r"^([A-Z]{2})\b", expand=False))
+        .fillna(bus_name.str.extract(r"^([A-Z]{2})\b", expand=False))
+        .fillna("")
+    )
+
+
+def _profile_col_bus(col, generator, suffix, year):
+    marker = f" {generator}{suffix}-{year}"
+    if isinstance(col, str) and col.endswith(marker):
+        return col[: -len(marker)]
+    return None
+
+
+def _replace_zero_profile_columns_with_nearest(
+    n, p_max_pu, generator, suffix, source_year, target_year
+):
+    """
+    Replace all-zero p_max_pu columns by copying the nearest non-zero profile of the
+    same generator technology (typically from a neighboring country).
+    """
+    if p_max_pu.empty:
+        return p_max_pu
+
+    zero_cols = p_max_pu.columns[p_max_pu.fillna(0.0).sum(axis=0).abs() <= 1e-12]
+    if len(zero_cols) == 0:
+        return p_max_pu
+
+    pool_cols = [
+        c for c in n.generators_t.p_max_pu.columns
+        if isinstance(c, str) and f" {generator}{suffix}-" in c
+    ]
+    if not pool_cols:
+        logger.warning(
+            "No fallback p_max_pu pool found for %s zero-profile replacement (%d columns).",
+            generator,
+            len(zero_cols),
+        )
+        return p_max_pu
+
+    pool = n.generators_t.p_max_pu[pool_cols].fillna(0.0)
+    nonzero_pool_cols = pool.columns[pool.sum(axis=0).abs() > 1e-12]
+    if len(nonzero_pool_cols) == 0:
+        logger.warning(
+            "All candidate p_max_pu profiles are zero for %s; cannot replace %d zero columns.",
+            generator,
+            len(zero_cols),
+        )
+        return p_max_pu
+
+    # Build bus coordinate table for candidate source profiles.
+    src_records = []
+    for col in nonzero_pool_cols:
+        bus = _profile_col_bus(col, generator, suffix, source_year)
+        if bus is None:
+            # Accept any year in the pool as fallback.
+            m = re.search(rf"^(.*) {re.escape(generator + suffix)}-\d+$", str(col))
+            bus = m.group(1) if m else None
+        if bus is None:
+            continue
+        if bus in n.buses.index and pd.notna(n.buses.at[bus, "x"]) and pd.notna(n.buses.at[bus, "y"]):
+            src_records.append((col, bus, float(n.buses.at[bus, "x"]), float(n.buses.at[bus, "y"])))
+
+    if not src_records:
+        template = pool[nonzero_pool_cols[0]]
+        for col in zero_cols:
+            p_max_pu[col] = template.values
+        logger.warning(
+            "Replaced %d zero %s p_max_pu profiles using generic fallback template %s (no bus coordinates).",
+            len(zero_cols),
+            generator,
+            nonzero_pool_cols[0],
+        )
+        return p_max_pu
+
+    src_df = pd.DataFrame(src_records, columns=["col", "bus", "x", "y"]).drop_duplicates(subset=["col"])
+    replaced = []
+    failed = []
+    for col in zero_cols:
+        target_bus = _profile_col_bus(col, generator, suffix, target_year)
+        if target_bus is None:
+            m = re.search(rf"^(.*) {re.escape(generator + suffix)}-\d+$", str(col))
+            target_bus = m.group(1) if m else None
+        if (
+            target_bus is None
+            or target_bus not in n.buses.index
+            or pd.isna(n.buses.at[target_bus, "x"])
+            or pd.isna(n.buses.at[target_bus, "y"])
+        ):
+            failed.append((col, target_bus))
+            continue
+
+        tx = float(n.buses.at[target_bus, "x"])
+        ty = float(n.buses.at[target_bus, "y"])
+        d2 = (src_df["x"] - tx) ** 2 + (src_df["y"] - ty) ** 2
+        best = src_df.loc[d2.idxmin()]
+        p_max_pu[col] = pool[best["col"]].values
+        replaced.append((col, target_bus, best["col"], best["bus"]))
+
+    if replaced:
+        sample = ", ".join(
+            [f"{tbus}<-{sbus}" for _, tbus, _, sbus in replaced[:5]]
+        )
+        logger.warning(
+            "Replaced %d zero %s p_max_pu profiles using nearest non-zero fallback (sample: %s%s).",
+            len(replaced),
+            generator,
+            sample,
+            " ..." if len(replaced) > 5 else "",
+        )
+    if failed:
+        logger.warning(
+            "Could not replace %d zero %s p_max_pu profiles due to missing target bus coordinates.",
+            len(failed),
+            generator,
+        )
+
+    return p_max_pu
+
+
+
+
+def _safe_iso3_to_iso2(code):
+    if not isinstance(code, str) or len(code) != 3:
+        return np.nan
+    try:
+        iso2 = three_2_two_digits_country(code)
+    except Exception:
+        return np.nan
+    if isinstance(iso2, str) and len(iso2) == 2:
+        return iso2
+    return np.nan
+
+
+def _repo_path(path_like):
+    path_str = str(path_like)
+    return path_str if os.path.isabs(path_str) else os.path.join(BASE_DIR, path_str)
+
+
+def _bus_country_lookup(n):
+    country = n.buses["country"].replace("", np.nan)
+    location_iso2 = (
+        n.buses["location"].astype(str).str.extract(r"^([A-Z]{2})\b")[0]
+    )
+    index_iso2 = (
+        n.buses.index.astype(str).to_series(index=n.buses.index).str.extract(r"^([A-Z]{2})\b")[0]
+    )
+    return country.fillna(location_iso2).fillna(index_iso2).fillna("")
+
+
+def _electric_load_index_and_country(n):
+    if n.loads.empty:
+        return pd.Index([]), pd.Series(dtype=object)
+
+    load_bus = n.loads["bus"]
+    bus_carrier = load_bus.map(n.buses.carrier).fillna("")
+    elec_loads = n.loads.index[bus_carrier.isin(["AC", "low voltage"])]
+    if len(elec_loads) == 0:
+        return pd.Index([]), pd.Series(dtype=object)
+
+    bus_country = _bus_country_lookup(n)
+    load_country = load_bus.loc[elec_loads].map(bus_country).fillna("")
+    valid = load_country.ne("")
+    elec_loads = elec_loads[valid.values]
+    load_country = load_country.loc[valid]
+    return elec_loads, load_country
+
+
+def _electric_load_energy_by_load_mwh(n, load_index):
+    if len(load_index) == 0:
+        return pd.Series(dtype=float)
+
+    weights = n.snapshot_weightings["generators"]
+    weight_sum = float(weights.sum())
+    weighted = pd.Series(0.0, index=load_index, dtype=float)
+
+    time_cols = n.loads_t.p_set.columns.intersection(load_index)
+    if len(time_cols) > 0:
+        weighted.loc[time_cols] = (
+            n.loads_t.p_set.reindex(columns=time_cols)
+            .fillna(0.0)
+            .mul(weights, axis=0)
+            .sum(axis=0)
+            .astype(float)
+        )
+
+    static_cols = load_index.difference(time_cols)
+    if len(static_cols) > 0:
+        static_p = pd.to_numeric(n.loads.loc[static_cols, "p_set"], errors="coerce").fillna(0.0)
+        weighted.loc[static_cols] = static_p * weight_sum
+
+    return weighted
+
+
+def align_country_electricity_demand_to_owid(n, investment_year, config):
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping OWID electricity-demand alignment for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    owid_csv = _repo_path(base_cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
+    if not os.path.exists(owid_csv):
+        logger.warning(
+            "OWID electricity-demand alignment skipped: file not found at %s", owid_csv
+        )
+        return
+
+    usecols = {"year", "iso_code", "electricity_demand"}
+    owid = pd.read_csv(owid_csv, usecols=lambda c: c in usecols)
+    if "electricity_demand" not in owid.columns:
+        logger.warning(
+            "OWID electricity-demand alignment skipped: column 'electricity_demand' not found in %s",
+            owid_csv,
+        )
+        return
+
+    owid = owid.loc[owid["year"] == int(baseyear)].copy()
+    owid["country"] = owid["iso_code"].apply(_safe_iso3_to_iso2)
+    owid = owid.loc[owid["country"].notna()].copy()
+    owid["electricity_demand"] = pd.to_numeric(owid["electricity_demand"], errors="coerce").fillna(0.0)
+    ref_twh = owid.groupby("country")["electricity_demand"].sum(min_count=1)
+    if ref_twh.empty:
+        logger.warning(
+            "OWID electricity-demand alignment skipped: no reference values for year %s in %s",
+            baseyear,
+            owid_csv,
+        )
+        return
+
+    elec_loads, load_country = _electric_load_index_and_country(n)
+    if len(elec_loads) == 0:
+        logger.warning("OWID electricity-demand alignment skipped: no electricity loads found on AC/low voltage buses.")
+        return
+
+    energy_mwh_by_load = _electric_load_energy_by_load_mwh(n, elec_loads)
+    model_twh_before = energy_mwh_by_load.groupby(load_country).sum() / 1e6
+
+    comp_before = pd.DataFrame(
+        {
+            "model_twh": model_twh_before,
+            "reference_twh": ref_twh.reindex(model_twh_before.index),
+        }
+    ).dropna(subset=["reference_twh"])
+    eligible = comp_before["model_twh"].gt(0.0) & comp_before["reference_twh"].gt(0.0)
+    factors_by_country = (
+        comp_before.loc[eligible, "reference_twh"] / comp_before.loc[eligible, "model_twh"]
+    )
+    if factors_by_country.empty:
+        logger.warning(
+            "OWID electricity-demand alignment skipped: no countries with positive modeled and reference demand."
+        )
+        return
+
+    load_factors = load_country.map(factors_by_country).fillna(1.0)
+    time_cols = n.loads_t.p_set.columns.intersection(elec_loads)
+    if len(time_cols) > 0:
+        n.loads_t.p_set.loc[:, time_cols] = n.loads_t.p_set.loc[:, time_cols].mul(
+            load_factors.reindex(time_cols).fillna(1.0), axis=1
+        )
+
+    static_cols = elec_loads.difference(time_cols)
+    if len(static_cols) > 0:
+        n.loads.loc[static_cols, "p_set"] = (
+            pd.to_numeric(n.loads.loc[static_cols, "p_set"], errors="coerce")
+            .fillna(0.0)
+            .mul(load_factors.reindex(static_cols).fillna(1.0))
+        )
+
+    model_twh_after = (
+        _electric_load_energy_by_load_mwh(n, elec_loads).groupby(load_country).sum() / 1e6
+    )
+    comp_after = pd.DataFrame(
+        {
+            "model_twh": model_twh_after,
+            "reference_twh": ref_twh.reindex(model_twh_after.index),
+        }
+    ).dropna(subset=["reference_twh"])
+
+    before_abs_err = (comp_before["model_twh"] - comp_before["reference_twh"]).abs().sum()
+    after_abs_err = (comp_after["model_twh"] - comp_after["reference_twh"]).abs().sum()
+    ref_sum = comp_after["reference_twh"].sum()
+    before_wape = 100.0 * before_abs_err / ref_sum if ref_sum > 0 else np.nan
+    after_wape = 100.0 * after_abs_err / ref_sum if ref_sum > 0 else np.nan
+
+    logger.info(
+        "Aligned country electricity demand to OWID for %s: countries_scaled=%d, global_model_before=%.1f TWh, global_model_after=%.1f TWh, global_reference=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%",
+        baseyear,
+        len(factors_by_country),
+        comp_before["model_twh"].sum(),
+        comp_after["model_twh"].sum(),
+        comp_after["reference_twh"].sum(),
+        before_wape,
+        after_wape,
+    )
+
+
+def align_country_hydro_reservoir_inflow_to_owid(n, investment_year, config):
+    """
+    Calibrate hydro scaling from a solved baseline network and scale baseyear inputs
+    so expected country hydro generation approaches OWID hydro electricity.
+
+    Inputs scaled in the current prenetwork:
+    - StorageUnit carrier='hydro': inflow time series
+    - Generator carrier='ror': p_max_pu availability
+
+    Expected hydro generation per country is estimated as:
+    expected = k_res(country) * reservoir_inflow_twh + k_ror(country) * ror_available_twh
+    where k_res and k_ror are derived from the solved baseline network as:
+    - k_res = baseline_reservoir_generation_twh / baseline_reservoir_inflow_twh
+    - k_ror = baseline_ror_generation_twh / baseline_ror_available_twh
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("hydro_inflow_alignment", False)):
+        return
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping OWID hydro inflow alignment for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    owid_csv = _repo_path(base_cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
+    if not os.path.exists(owid_csv):
+        logger.warning(
+            "OWID hydro inflow alignment skipped: file not found at %s", owid_csv
+        )
+        return
+
+    usecols = {"year", "iso_code", "hydro_electricity"}
+    owid = pd.read_csv(owid_csv, usecols=lambda c: c in usecols)
+    if "hydro_electricity" not in owid.columns:
+        logger.warning(
+            "OWID hydro inflow alignment skipped: column 'hydro_electricity' not found in %s",
+            owid_csv,
+        )
+        return
+
+    owid = owid.loc[owid["year"] == int(baseyear)].copy()
+    owid["country"] = owid["iso_code"].apply(_safe_iso3_to_iso2)
+    owid = owid.loc[owid["country"].notna()].copy()
+    owid["hydro_electricity"] = pd.to_numeric(owid["hydro_electricity"], errors="coerce").fillna(0.0)
+    ref_twh = owid.groupby("country")["hydro_electricity"].sum(min_count=1)
+    if ref_twh.empty:
+        logger.warning(
+            "OWID hydro inflow alignment skipped: no reference values for year %s in %s",
+            baseyear,
+            owid_csv,
+        )
+        return
+
+    baseline_path_cfg = base_cfg.get(
+        "hydro_baseline_network",
+        "results/Global_200/postnetworks/baseline_snapshots/"
+        "elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc",
+    )
+    baseline_network = _repo_path(baseline_path_cfg)
+    if not os.path.exists(baseline_network):
+        logger.warning(
+            "OWID hydro alignment skipped: baseline solved network not found at %s",
+            baseline_network,
+        )
+        return
+
+    def _hydro_assets_by_country(net):
+        bus_country_lu = _bus_country_lookup(net)
+        weights_local = net.snapshot_weightings["generators"]
+        weight_sum = float(weights_local.sum())
+
+        hydro_units = (
+            net.storage_units.index[net.storage_units.carrier.astype(str).eq("hydro")]
+            if not net.storage_units.empty
+            else pd.Index([])
+        )
+        inflow_cols_local = (
+            net.storage_units_t.inflow.columns.intersection(hydro_units)
+            if not net.storage_units_t.inflow.empty
+            else pd.Index([])
+        )
+        su_country_local = (
+            net.storage_units.loc[inflow_cols_local, "bus"].map(bus_country_lu).fillna("")
+            if len(inflow_cols_local) > 0
+            else pd.Series(dtype=object)
+        )
+        if len(su_country_local) > 0:
+            su_valid_local = su_country_local.ne("")
+            inflow_cols_local = inflow_cols_local[su_valid_local.values]
+            su_country_local = su_country_local.loc[su_valid_local]
+
+        ror_units = (
+            net.generators.index[net.generators.carrier.astype(str).eq("ror")]
+            if not net.generators.empty
+            else pd.Index([])
+        )
+        ror_country_local = (
+            net.generators.loc[ror_units, "bus"].map(bus_country_lu).fillna("")
+            if len(ror_units) > 0
+            else pd.Series(dtype=object)
+        )
+        if len(ror_country_local) > 0:
+            ror_valid_local = ror_country_local.ne("")
+            ror_units = ror_units[ror_valid_local.values]
+            ror_country_local = ror_country_local.loc[ror_valid_local]
+
+        res_inflow_twh = pd.Series(dtype=float)
+        if len(inflow_cols_local) > 0:
+            res_inflow_twh = (
+                net.storage_units_t.inflow.reindex(columns=inflow_cols_local)
+                .fillna(0.0)
+                .mul(weights_local, axis=0)
+                .sum(axis=0)
+                .groupby(su_country_local)
+                .sum()
+                / 1e6
+            )
+
+        ror_available_twh = pd.Series(dtype=float)
+        ror_ts_cols_local = pd.Index([])
+        ror_static_cols_local = pd.Index([])
+        if len(ror_units) > 0:
+            if "p_nom_opt" in net.generators.columns:
+                p_nom_source = pd.to_numeric(
+                    net.generators.loc[ror_units, "p_nom_opt"], errors="coerce"
+                )
+                p_nom_nominal = pd.to_numeric(net.generators.loc[ror_units, "p_nom"], errors="coerce")
+                ror_nom = p_nom_source.fillna(p_nom_nominal).fillna(0.0)
+            else:
+                ror_nom = pd.to_numeric(net.generators.loc[ror_units, "p_nom"], errors="coerce").fillna(0.0)
+
+            ror_ts_cols_local = net.generators_t.p_max_pu.columns.intersection(ror_units)
+            ror_static_cols_local = ror_units.difference(ror_ts_cols_local)
+            availability_hours = pd.Series(0.0, index=ror_units, dtype=float)
+
+            if len(ror_ts_cols_local) > 0:
+                availability_hours.loc[ror_ts_cols_local] = (
+                    net.generators_t.p_max_pu.reindex(columns=ror_ts_cols_local)
+                    .fillna(0.0)
+                    .mul(weights_local, axis=0)
+                    .sum(axis=0)
+                    .astype(float)
+                )
+            if len(ror_static_cols_local) > 0:
+                static_pmax = (
+                    pd.to_numeric(net.generators.loc[ror_static_cols_local, "p_max_pu"], errors="coerce")
+                    .fillna(0.0)
+                    .clip(lower=0.0)
+                )
+                availability_hours.loc[ror_static_cols_local] = static_pmax * weight_sum
+
+            ror_available_twh = (
+                availability_hours.mul(ror_nom.reindex(ror_units).fillna(0.0))
+                .groupby(ror_country_local)
+                .sum()
+                / 1e6
+            )
+
+        return {
+            "res_inflow_twh": res_inflow_twh,
+            "ror_available_twh": ror_available_twh,
+            "inflow_cols": inflow_cols_local,
+            "su_country": su_country_local,
+            "ror_idx": ror_units,
+            "ror_country": ror_country_local,
+            "ror_ts_cols": ror_ts_cols_local,
+            "ror_static_cols": ror_static_cols_local,
+        }
+
+    def _hydro_generation_by_country(net):
+        eb = net.statistics.energy_balance(
+            bus_carrier="AC",
+            aggregate_time="sum",
+            aggregate_groups="sum",
+            groupby=net.statistics.groupers.get_country_and_carrier,
+            nice_names=False,
+        )
+        eb = eb.rename("energy_mwh").reset_index()
+        eb = eb.loc[(eb.country != "") & (eb.energy_mwh > 0)].copy()
+
+        res_gen_twh = (
+            eb.loc[(eb.component == "StorageUnit") & (eb.carrier == "hydro")]
+            .groupby("country")["energy_mwh"]
+            .sum()
+            / 1e6
+        )
+        ror_gen_twh = (
+            eb.loc[(eb.component == "Generator") & (eb.carrier == "ror")]
+            .groupby("country")["energy_mwh"]
+            .sum()
+            / 1e6
+        )
+        return res_gen_twh, ror_gen_twh
+
+    current = _hydro_assets_by_country(n)
+    if len(current["inflow_cols"]) == 0 and len(current["ror_idx"]) == 0:
+        logger.warning(
+            "OWID hydro alignment skipped: no hydro reservoirs with inflow and no ror generators with country mapping."
+        )
+        return
+
+    n_baseline = pypsa.Network(baseline_network)
+    baseline = _hydro_assets_by_country(n_baseline)
+    base_res_gen_twh, base_ror_gen_twh = _hydro_generation_by_country(n_baseline)
+
+    min_model_twh = float(base_cfg.get("hydro_inflow_min_model_twh", 0.1))
+    min_reference_twh = float(base_cfg.get("hydro_inflow_min_reference_twh", 1.0))
+    scale_min = float(base_cfg.get("hydro_inflow_scale_min", 0.25))
+    scale_max = float(base_cfg.get("hydro_inflow_scale_max", 4.0))
+    alpha = float(base_cfg.get("hydro_inflow_alignment_alpha", 1.0))
+
+    res_denom = baseline["res_inflow_twh"]
+    ror_denom = baseline["ror_available_twh"]
+    res_ratio = pd.Series(dtype=float)
+    ror_ratio = pd.Series(dtype=float)
+    if not res_denom.empty:
+        res_ratio = base_res_gen_twh.reindex(res_denom.index).fillna(0.0).div(
+            res_denom.where(res_denom >= min_model_twh)
+        )
+    if not ror_denom.empty:
+        ror_ratio = base_ror_gen_twh.reindex(ror_denom.index).fillna(0.0).div(
+            ror_denom.where(ror_denom >= min_model_twh)
+        )
+    res_ratio = res_ratio.replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
+    ror_ratio = ror_ratio.replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
+
+    res_ratio_default = (
+        float(base_res_gen_twh.sum() / max(res_denom.sum(), 1e-9))
+        if not res_denom.empty
+        else 0.0
+    )
+    ror_ratio_default = (
+        float(base_ror_gen_twh.sum() / max(ror_denom.sum(), 1e-9))
+        if not ror_denom.empty
+        else 0.0
+    )
+
+    all_countries = current["res_inflow_twh"].index.union(current["ror_available_twh"].index)
+    expected_before_twh = (
+        current["res_inflow_twh"].reindex(all_countries, fill_value=0.0).mul(
+            res_ratio.reindex(all_countries).fillna(res_ratio_default)
+        )
+        + current["ror_available_twh"].reindex(all_countries, fill_value=0.0).mul(
+            ror_ratio.reindex(all_countries).fillna(ror_ratio_default)
+        )
+    )
+
+    comp_before = pd.DataFrame(
+        {
+            "model_twh": expected_before_twh,
+            "reference_twh": ref_twh.reindex(expected_before_twh.index),
+        }
+    ).dropna(subset=["reference_twh"])
+
+    eligible = comp_before["reference_twh"].ge(min_reference_twh) & comp_before["model_twh"].ge(min_model_twh)
+    raw_ratio = comp_before.loc[eligible, "reference_twh"] / comp_before.loc[eligible, "model_twh"]
+    if raw_ratio.empty:
+        logger.warning(
+            "OWID hydro inflow alignment skipped: no countries met eligibility thresholds (min_reference_twh=%.3f, min_model_twh=%.3f).",
+            min_reference_twh,
+            min_model_twh,
+        )
+        return
+
+    target_ratio = raw_ratio.clip(lower=scale_min, upper=scale_max)
+    factors_by_country = 1.0 + alpha * (target_ratio - 1.0)
+    factors_by_country = factors_by_country.clip(lower=scale_min, upper=scale_max)
+
+    if len(current["inflow_cols"]) > 0:
+        inflow_factors = current["su_country"].map(factors_by_country).fillna(1.0)
+        n.storage_units_t.inflow.loc[:, current["inflow_cols"]] = n.storage_units_t.inflow.loc[
+            :, current["inflow_cols"]
+        ].mul(inflow_factors.reindex(current["inflow_cols"]).fillna(1.0), axis=1)
+
+    ror_pmax_pu_cap = float(base_cfg.get("hydro_ror_p_max_pu_cap", 1.0))
+    if len(current["ror_idx"]) > 0:
+        ror_factors = current["ror_country"].map(factors_by_country).fillna(1.0)
+        if len(current["ror_ts_cols"]) > 0:
+            scaled_ts = n.generators_t.p_max_pu.loc[
+                :, current["ror_ts_cols"]
+            ].mul(ror_factors.reindex(current["ror_ts_cols"]).fillna(1.0), axis=1)
+            if ror_pmax_pu_cap > 0.0:
+                scaled_ts = scaled_ts.clip(lower=0.0, upper=ror_pmax_pu_cap)
+            n.generators_t.p_max_pu.loc[:, current["ror_ts_cols"]] = scaled_ts
+        if len(current["ror_static_cols"]) > 0:
+            scaled_static = (
+                pd.to_numeric(n.generators.loc[current["ror_static_cols"], "p_max_pu"], errors="coerce")
+                .fillna(0.0)
+                .mul(ror_factors.reindex(current["ror_static_cols"]).fillna(1.0))
+            )
+            if ror_pmax_pu_cap > 0.0:
+                scaled_static = scaled_static.clip(lower=0.0, upper=ror_pmax_pu_cap)
+            n.generators.loc[current["ror_static_cols"], "p_max_pu"] = scaled_static
+
+    current_after = _hydro_assets_by_country(n)
+    all_countries_after = current_after["res_inflow_twh"].index.union(
+        current_after["ror_available_twh"].index
+    )
+    model_after_twh = (
+        current_after["res_inflow_twh"].reindex(all_countries_after, fill_value=0.0).mul(
+            res_ratio.reindex(all_countries_after).fillna(res_ratio_default)
+        )
+        + current_after["ror_available_twh"].reindex(all_countries_after, fill_value=0.0).mul(
+            ror_ratio.reindex(all_countries_after).fillna(ror_ratio_default)
+        )
+    )
+
+    comp_after = pd.DataFrame(
+        {
+            "model_twh": model_after_twh,
+            "reference_twh": ref_twh.reindex(model_after_twh.index),
+        }
+    ).dropna(subset=["reference_twh"])
+
+    before_abs_err = (comp_before["model_twh"] - comp_before["reference_twh"]).abs().sum()
+    after_abs_err = (comp_after["model_twh"] - comp_after["reference_twh"]).abs().sum()
+    ref_sum = comp_after["reference_twh"].sum()
+    before_wape = 100.0 * before_abs_err / ref_sum if ref_sum > 0 else np.nan
+    after_wape = 100.0 * after_abs_err / ref_sum if ref_sum > 0 else np.nan
+
+    logger.info(
+        "Aligned hydro inputs to OWID with baseline conversion ratios for %s: countries_scaled=%d, baseline_network=%s, global_expected_before=%.1f TWh, global_expected_after=%.1f TWh, global_reference=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%, k_res_default=%.3f, k_ror_default=%.3f, scale_range=[%.3f, %.3f], alpha=%.2f",
+        baseyear,
+        len(factors_by_country),
+        baseline_network,
+        comp_before["model_twh"].sum(),
+        comp_after["model_twh"].sum(),
+        comp_after["reference_twh"].sum(),
+        before_wape,
+        after_wape,
+        res_ratio_default,
+        ror_ratio_default,
+        scale_min,
+        scale_max,
+        alpha,
+    )
+
+
+def align_country_onwind_profiles_to_owid(n, investment_year, config):
+    """
+    Scale onshore-wind availability profiles by country in baseyear using
+    baseline conversion ratios and OWID wind electricity reference.
+
+    The target onwind generation is computed as:
+    target_onwind = max(OWID_wind_electricity - expected_offwind, 0)
+    where expected_offwind is estimated from baseline offwind conversion ratios.
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("onwind_profile_alignment", False)):
+        return
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping OWID onwind profile alignment for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    owid_csv = _repo_path(base_cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
+    if not os.path.exists(owid_csv):
+        logger.warning(
+            "OWID onwind profile alignment skipped: file not found at %s", owid_csv
+        )
+        return
+
+    usecols = {"year", "iso_code", "wind_electricity"}
+    owid = pd.read_csv(owid_csv, usecols=lambda c: c in usecols)
+    if "wind_electricity" not in owid.columns:
+        logger.warning(
+            "OWID onwind profile alignment skipped: column 'wind_electricity' not found in %s",
+            owid_csv,
+        )
+        return
+
+    owid = owid.loc[owid["year"] == int(baseyear)].copy()
+    owid["country"] = owid["iso_code"].apply(_safe_iso3_to_iso2)
+    owid = owid.loc[owid["country"].notna()].copy()
+    owid["wind_electricity"] = pd.to_numeric(owid["wind_electricity"], errors="coerce").fillna(0.0)
+    ref_wind_twh = owid.groupby("country")["wind_electricity"].sum(min_count=1)
+    if ref_wind_twh.empty:
+        logger.warning(
+            "OWID onwind profile alignment skipped: no wind reference values for year %s in %s",
+            baseyear,
+            owid_csv,
+        )
+        return
+
+    baseline_path_cfg = base_cfg.get(
+        "onwind_baseline_network",
+        base_cfg.get(
+            "hydro_baseline_network",
+            "results/Global_200/postnetworks/baseline_snapshots/"
+            "elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc",
+        ),
+    )
+    baseline_network = _repo_path(baseline_path_cfg)
+    if not os.path.exists(baseline_network):
+        logger.warning(
+            "OWID onwind profile alignment skipped: baseline solved network not found at %s",
+            baseline_network,
+        )
+        return
+
+    def _generator_availability_by_country(net, carriers):
+        weights_local = net.snapshot_weightings["generators"]
+        weight_sum = float(weights_local.sum())
+        bus_country_lu = _bus_country_lookup(net)
+
+        idx = (
+            net.generators.index[net.generators.carrier.astype(str).isin(carriers)]
+            if not net.generators.empty
+            else pd.Index([])
+        )
+        country = (
+            net.generators.loc[idx, "bus"].map(bus_country_lu).fillna("")
+            if len(idx) > 0
+            else pd.Series(dtype=object)
+        )
+        if len(country) > 0:
+            valid = country.ne("")
+            idx = idx[valid.values]
+            country = country.loc[valid]
+
+        ts_cols = net.generators_t.p_max_pu.columns.intersection(idx)
+        static_cols = idx.difference(ts_cols)
+        availability_hours = pd.Series(0.0, index=idx, dtype=float)
+
+        if len(ts_cols) > 0:
+            availability_hours.loc[ts_cols] = (
+                net.generators_t.p_max_pu.reindex(columns=ts_cols)
+                .fillna(0.0)
+                .mul(weights_local, axis=0)
+                .sum(axis=0)
+                .astype(float)
+            )
+        if len(static_cols) > 0:
+            static_pmax = (
+                pd.to_numeric(net.generators.loc[static_cols, "p_max_pu"], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0.0)
+            )
+            availability_hours.loc[static_cols] = static_pmax * weight_sum
+
+        if "p_nom_opt" in net.generators.columns:
+            p_nom_opt = pd.to_numeric(net.generators.loc[idx, "p_nom_opt"], errors="coerce")
+            p_nom = pd.to_numeric(net.generators.loc[idx, "p_nom"], errors="coerce")
+            p_nom_eff = p_nom_opt.fillna(p_nom).fillna(0.0)
+        else:
+            p_nom_eff = pd.to_numeric(net.generators.loc[idx, "p_nom"], errors="coerce").fillna(0.0)
+
+        availability_twh = (
+            availability_hours.mul(p_nom_eff.reindex(idx).fillna(0.0)).groupby(country).sum() / 1e6
+        )
+        return {
+            "availability_twh": availability_twh,
+            "idx": idx,
+            "country": country,
+            "ts_cols": ts_cols,
+            "static_cols": static_cols,
+        }
+
+    def _generator_generation_by_country(net, carriers):
+        eb = net.statistics.energy_balance(
+            bus_carrier="AC",
+            aggregate_time="sum",
+            aggregate_groups="sum",
+            groupby=net.statistics.groupers.get_country_and_carrier,
+            nice_names=False,
+        )
+        eb = eb.rename("energy_mwh").reset_index()
+        eb = eb.loc[(eb.country != "") & (eb.energy_mwh > 0)].copy()
+        return (
+            eb.loc[(eb.component == "Generator") & (eb.carrier.isin(carriers))]
+            .groupby("country")["energy_mwh"]
+            .sum()
+            / 1e6
+        )
+
+    onwind_carriers = {"onwind"}
+    offwind_carriers = {"offwind-ac", "offwind-dc"}
+
+    current_on = _generator_availability_by_country(n, onwind_carriers)
+    if len(current_on["idx"]) == 0:
+        logger.warning("OWID onwind profile alignment skipped: no onwind generators with country mapping.")
+        return
+    current_off = _generator_availability_by_country(n, offwind_carriers)
+
+    n_baseline = pypsa.Network(baseline_network)
+    base_on = _generator_availability_by_country(n_baseline, onwind_carriers)
+    base_off = _generator_availability_by_country(n_baseline, offwind_carriers)
+    base_on_gen = _generator_generation_by_country(n_baseline, onwind_carriers)
+    base_off_gen = _generator_generation_by_country(n_baseline, offwind_carriers)
+
+    min_model_twh = float(base_cfg.get("onwind_min_model_twh", 0.1))
+    min_reference_twh = float(base_cfg.get("onwind_min_reference_twh", 1.0))
+    scale_min = float(base_cfg.get("onwind_scale_min", 0.25))
+    scale_max = float(base_cfg.get("onwind_scale_max", 4.0))
+    alpha = float(base_cfg.get("onwind_alignment_alpha", 1.0))
+    onwind_pmax_pu_cap = float(base_cfg.get("onwind_p_max_pu_cap", 1.0))
+
+    on_ratio = pd.Series(dtype=float)
+    off_ratio = pd.Series(dtype=float)
+    if not base_on["availability_twh"].empty:
+        on_ratio = base_on_gen.reindex(base_on["availability_twh"].index).fillna(0.0).div(
+            base_on["availability_twh"].where(base_on["availability_twh"] >= min_model_twh)
+        )
+    if not base_off["availability_twh"].empty:
+        off_ratio = base_off_gen.reindex(base_off["availability_twh"].index).fillna(0.0).div(
+            base_off["availability_twh"].where(base_off["availability_twh"] >= min_model_twh)
+        )
+    on_ratio = on_ratio.replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
+    off_ratio = off_ratio.replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
+
+    on_ratio_default = (
+        float(base_on_gen.sum() / max(base_on["availability_twh"].sum(), 1e-9))
+        if not base_on["availability_twh"].empty
+        else 0.0
+    )
+    off_ratio_default = (
+        float(base_off_gen.sum() / max(base_off["availability_twh"].sum(), 1e-9))
+        if not base_off["availability_twh"].empty
+        else 0.0
+    )
+
+    on_countries = current_on["availability_twh"].index
+    expected_on_before = current_on["availability_twh"].reindex(on_countries, fill_value=0.0).mul(
+        on_ratio.reindex(on_countries).fillna(on_ratio_default)
+    )
+    expected_off = current_off["availability_twh"].reindex(on_countries, fill_value=0.0).mul(
+        off_ratio.reindex(on_countries).fillna(off_ratio_default)
+    )
+    target_on = (
+        ref_wind_twh.reindex(on_countries).fillna(0.0).sub(expected_off, fill_value=0.0).clip(lower=0.0)
+    )
+
+    comp_before = pd.DataFrame(
+        {
+            "model_twh": expected_on_before,
+            "reference_twh": target_on,
+        }
+    )
+    eligible = comp_before["reference_twh"].ge(min_reference_twh) & comp_before["model_twh"].ge(min_model_twh)
+    raw_ratio = comp_before.loc[eligible, "reference_twh"] / comp_before.loc[eligible, "model_twh"]
+    if raw_ratio.empty:
+        logger.warning(
+            "OWID onwind profile alignment skipped: no countries met eligibility thresholds (min_reference_twh=%.3f, min_model_twh=%.3f).",
+            min_reference_twh,
+            min_model_twh,
+        )
+        return
+
+    target_ratio = raw_ratio.clip(lower=scale_min, upper=scale_max)
+    factors_by_country = 1.0 + alpha * (target_ratio - 1.0)
+    factors_by_country = factors_by_country.clip(lower=scale_min, upper=scale_max)
+
+    on_factors = current_on["country"].map(factors_by_country).fillna(1.0)
+    if len(current_on["ts_cols"]) > 0:
+        scaled_ts = n.generators_t.p_max_pu.loc[:, current_on["ts_cols"]].mul(
+            on_factors.reindex(current_on["ts_cols"]).fillna(1.0),
+            axis=1,
+        )
+        if onwind_pmax_pu_cap > 0.0:
+            scaled_ts = scaled_ts.clip(lower=0.0, upper=onwind_pmax_pu_cap)
+        n.generators_t.p_max_pu.loc[:, current_on["ts_cols"]] = scaled_ts
+    if len(current_on["static_cols"]) > 0:
+        scaled_static = (
+            pd.to_numeric(n.generators.loc[current_on["static_cols"], "p_max_pu"], errors="coerce")
+            .fillna(0.0)
+            .mul(on_factors.reindex(current_on["static_cols"]).fillna(1.0))
+        )
+        if onwind_pmax_pu_cap > 0.0:
+            scaled_static = scaled_static.clip(lower=0.0, upper=onwind_pmax_pu_cap)
+        n.generators.loc[current_on["static_cols"], "p_max_pu"] = scaled_static
+
+    current_on_after = _generator_availability_by_country(n, onwind_carriers)
+    on_countries_after = current_on_after["availability_twh"].index
+    expected_on_after = current_on_after["availability_twh"].reindex(on_countries_after, fill_value=0.0).mul(
+        on_ratio.reindex(on_countries_after).fillna(on_ratio_default)
+    )
+    expected_off_after = current_off["availability_twh"].reindex(on_countries_after, fill_value=0.0).mul(
+        off_ratio.reindex(on_countries_after).fillna(off_ratio_default)
+    )
+    target_on_after = (
+        ref_wind_twh.reindex(on_countries_after)
+        .fillna(0.0)
+        .sub(expected_off_after, fill_value=0.0)
+        .clip(lower=0.0)
+    )
+    comp_after = pd.DataFrame(
+        {"model_twh": expected_on_after, "reference_twh": target_on_after}
+    )
+
+    before_abs_err = (comp_before["model_twh"] - comp_before["reference_twh"]).abs().sum()
+    after_abs_err = (comp_after["model_twh"] - comp_after["reference_twh"]).abs().sum()
+    ref_sum = comp_after["reference_twh"].sum()
+    before_wape = 100.0 * before_abs_err / ref_sum if ref_sum > 0 else np.nan
+    after_wape = 100.0 * after_abs_err / ref_sum if ref_sum > 0 else np.nan
+
+    logger.info(
+        "Aligned onwind profiles to OWID using baseline conversion ratios for %s: countries_scaled=%d, baseline_network=%s, expected_onwind_before=%.1f TWh, expected_onwind_after=%.1f TWh, onwind_target=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%, on_ratio_default=%.3f, off_ratio_default=%.3f, p_max_pu_cap=%.2f, scale_range=[%.3f, %.3f], alpha=%.2f",
+        baseyear,
+        len(factors_by_country),
+        baseline_network,
+        comp_before["model_twh"].sum(),
+        comp_after["model_twh"].sum(),
+        comp_after["reference_twh"].sum(),
+        before_wape,
+        after_wape,
+        on_ratio_default,
+        off_ratio_default,
+        onwind_pmax_pu_cap,
+        scale_min,
+        scale_max,
+        alpha,
+    )
+
+
+def apply_country_wind_iteration_scaling(n, investment_year, config):
+    """
+    Apply per-country iterative p_max_pu scaling factors for onshore and offshore wind.
+
+    This is intended for external calibration loops that update
+    `wind_iteration_override_csv` between solves.
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("wind_iteration_scaling_enabled", False)):
+        return
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping iterative wind scaling for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    override_csv_cfg = base_cfg.get("wind_iteration_override_csv", "")
+    if not override_csv_cfg:
+        logger.warning("Iterative wind scaling enabled but no wind_iteration_override_csv configured.")
+        return
+
+    override_csv = _repo_path(override_csv_cfg)
+    if not os.path.exists(override_csv):
+        logger.warning(
+            "Iterative wind scaling skipped: override file not found at %s", override_csv
+        )
+        return
+
+    override = pd.read_csv(override_csv)
+    if override.empty:
+        logger.warning(
+            "Iterative wind scaling skipped: override file is empty at %s", override_csv
+        )
+        return
+
+    cols = {c.lower().strip(): c for c in override.columns}
+    if "country" not in cols:
+        logger.warning(
+            "Iterative wind scaling skipped: column 'country' missing in %s", override_csv
+        )
+        return
+
+    rename_cols = {cols["country"]: "country"}
+    if "onwind_scale" in cols:
+        rename_cols[cols["onwind_scale"]] = "onwind_scale"
+    if "offwind_scale" in cols:
+        rename_cols[cols["offwind_scale"]] = "offwind_scale"
+    override = override.rename(columns=rename_cols)
+    if "onwind_scale" not in override.columns:
+        override["onwind_scale"] = 1.0
+    if "offwind_scale" not in override.columns:
+        override["offwind_scale"] = 1.0
+
+    override["country"] = override["country"].astype(str).str.upper().str.strip()
+    override = override.loc[override["country"].str.len().eq(2)].copy()
+    if override.empty:
+        logger.warning(
+            "Iterative wind scaling skipped: no valid ISO2 countries in %s", override_csv
+        )
+        return
+
+    min_scale = float(base_cfg.get("wind_iteration_scale_min", 0.05))
+    max_scale = float(base_cfg.get("wind_iteration_scale_max", 20.0))
+    for col in ["onwind_scale", "offwind_scale"]:
+        override[col] = (
+            pd.to_numeric(override[col], errors="coerce")
+            .fillna(1.0)
+            .clip(lower=min_scale, upper=max_scale)
+        )
+
+    scale_by_country = override.groupby("country")[["onwind_scale", "offwind_scale"]].mean()
+    bus_country_lu = _bus_country_lookup(n)
+
+    def _apply_for_carriers(carriers, scale_col, pmax_cap):
+        idx = (
+            n.generators.index[n.generators.carrier.astype(str).isin(carriers)]
+            if not n.generators.empty
+            else pd.Index([])
+        )
+        if len(idx) == 0:
+            return 0, 0
+
+        country = n.generators.loc[idx, "bus"].map(bus_country_lu).fillna("")
+        valid = country.ne("")
+        idx = idx[valid.values]
+        country = country.loc[valid]
+        if len(idx) == 0:
+            return 0, 0
+
+        factors = country.map(scale_by_country[scale_col]).fillna(1.0)
+        scaled_country_count = int((~np.isclose(factors, 1.0, atol=1e-12)).sum())
+
+        ts_cols = n.generators_t.p_max_pu.columns.intersection(idx)
+        static_cols = idx.difference(ts_cols)
+        if len(ts_cols) > 0:
+            scaled_ts = n.generators_t.p_max_pu.loc[:, ts_cols].mul(
+                factors.reindex(ts_cols).fillna(1.0), axis=1
+            )
+            if pmax_cap > 0.0:
+                scaled_ts = scaled_ts.clip(lower=0.0, upper=pmax_cap)
+            n.generators_t.p_max_pu.loc[:, ts_cols] = scaled_ts
+        if len(static_cols) > 0:
+            scaled_static = (
+                pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce")
+                .fillna(0.0)
+                .mul(factors.reindex(static_cols).fillna(1.0))
+            )
+            if pmax_cap > 0.0:
+                scaled_static = scaled_static.clip(lower=0.0, upper=pmax_cap)
+            n.generators.loc[static_cols, "p_max_pu"] = scaled_static
+
+        return len(idx), scaled_country_count
+
+    on_cap = float(base_cfg.get("onwind_p_max_pu_cap", 1.0))
+    off_cap = float(base_cfg.get("offwind_p_max_pu_cap", 1.0))
+    on_count, on_scaled_countries = _apply_for_carriers({"onwind"}, "onwind_scale", on_cap)
+    off_count, off_scaled_countries = _apply_for_carriers(
+        {"offwind-ac", "offwind-dc"}, "offwind_scale", off_cap
+    )
+
+    logger.info(
+        "Applied iterative wind scaling from %s: onwind_generators=%d (scaled_entries=%d), offwind_generators=%d (scaled_entries=%d), country_rows=%d, scale_bounds=[%.3f, %.3f], on_cap=%.2f, off_cap=%.2f",
+        override_csv,
+        on_count,
+        on_scaled_countries,
+        off_count,
+        off_scaled_countries,
+        len(scale_by_country),
+        min_scale,
+        max_scale,
+        on_cap,
+        off_cap,
+    )
+
+
+def apply_country_solar_iteration_scaling(n, investment_year, config):
+    """
+    Apply per-country iterative p_max_pu scaling factors for solar generators.
+
+    This is intended for external calibration loops that update
+    `solar_iteration_override_csv` between solves.
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("solar_iteration_scaling_enabled", False)):
+        return
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping iterative solar scaling for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    override_csv_cfg = base_cfg.get("solar_iteration_override_csv", "")
+    if not override_csv_cfg:
+        logger.warning("Iterative solar scaling enabled but no solar_iteration_override_csv configured.")
+        return
+
+    override_csv = _repo_path(override_csv_cfg)
+    if not os.path.exists(override_csv):
+        logger.warning(
+            "Iterative solar scaling skipped: override file not found at %s", override_csv
+        )
+        return
+
+    override = pd.read_csv(override_csv)
+    if override.empty:
+        logger.warning(
+            "Iterative solar scaling skipped: override file is empty at %s", override_csv
+        )
+        return
+
+    cols = {c.lower().strip(): c for c in override.columns}
+    if "country" not in cols:
+        logger.warning(
+            "Iterative solar scaling skipped: column 'country' missing in %s", override_csv
+        )
+        return
+    rename_cols = {cols["country"]: "country"}
+    if "solar_scale" in cols:
+        rename_cols[cols["solar_scale"]] = "solar_scale"
+    override = override.rename(columns=rename_cols)
+    if "solar_scale" not in override.columns:
+        override["solar_scale"] = 1.0
+
+    override["country"] = override["country"].astype(str).str.upper().str.strip()
+    override = override.loc[override["country"].str.len().eq(2)].copy()
+    if override.empty:
+        logger.warning(
+            "Iterative solar scaling skipped: no valid ISO2 countries in %s", override_csv
+        )
+        return
+
+    min_scale = float(base_cfg.get("solar_iteration_scale_min", 0.05))
+    max_scale = float(base_cfg.get("solar_iteration_scale_max", 20.0))
+    override["solar_scale"] = (
+        pd.to_numeric(override["solar_scale"], errors="coerce")
+        .fillna(1.0)
+        .clip(lower=min_scale, upper=max_scale)
+    )
+    scale_by_country = override.groupby("country")["solar_scale"].mean()
+
+    if n.generators.empty:
+        return
+    idx = n.generators.index[n.generators.carrier.astype(str).eq("solar")]
+    if len(idx) == 0:
+        logger.warning("Iterative solar scaling skipped: no solar generators found.")
+        return
+
+    bus_country_lu = _bus_country_lookup(n)
+    country = n.generators.loc[idx, "bus"].map(bus_country_lu).fillna("")
+    valid = country.ne("")
+    idx = idx[valid.values]
+    country = country.loc[valid]
+    if len(idx) == 0:
+        logger.warning("Iterative solar scaling skipped: no solar generators with country mapping.")
+        return
+
+    factors = country.map(scale_by_country).fillna(1.0)
+    scaled_entries = int((~np.isclose(factors, 1.0, atol=1e-12)).sum())
+    pmax_cap = float(base_cfg.get("solar_p_max_pu_cap", 1.0))
+
+    ts_cols = n.generators_t.p_max_pu.columns.intersection(idx)
+    static_cols = idx.difference(ts_cols)
+    if len(ts_cols) > 0:
+        scaled_ts = n.generators_t.p_max_pu.loc[:, ts_cols].mul(
+            factors.reindex(ts_cols).fillna(1.0), axis=1
+        )
+        if pmax_cap > 0.0:
+            scaled_ts = scaled_ts.clip(lower=0.0, upper=pmax_cap)
+        n.generators_t.p_max_pu.loc[:, ts_cols] = scaled_ts
+    if len(static_cols) > 0:
+        scaled_static = (
+            pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce")
+            .fillna(0.0)
+            .mul(factors.reindex(static_cols).fillna(1.0))
+        )
+        if pmax_cap > 0.0:
+            scaled_static = scaled_static.clip(lower=0.0, upper=pmax_cap)
+        n.generators.loc[static_cols, "p_max_pu"] = scaled_static
+
+    logger.info(
+        "Applied iterative solar scaling from %s: solar_generators=%d (scaled_entries=%d), country_rows=%d, scale_bounds=[%.3f, %.3f], p_max_pu_cap=%.2f",
+        override_csv,
+        len(idx),
+        scaled_entries,
+        len(scale_by_country),
+        min_scale,
+        max_scale,
+        pmax_cap,
+    )
+
+
+def apply_country_hydro_iteration_scaling(n, investment_year, config):
+    """
+    Apply per-country iterative hydro scaling jointly to reservoir inflow and ror profiles.
+
+    Override CSV format:
+    - country (ISO2)
+    - hydro_scale
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("hydro_iteration_scaling_enabled", False)):
+        return
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping iterative hydro scaling for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    override_csv_cfg = base_cfg.get("hydro_iteration_override_csv", "")
+    if not override_csv_cfg:
+        logger.warning("Iterative hydro scaling enabled but no hydro_iteration_override_csv configured.")
+        return
+
+    override_csv = _repo_path(override_csv_cfg)
+    if not os.path.exists(override_csv):
+        logger.warning(
+            "Iterative hydro scaling skipped: override file not found at %s", override_csv
+        )
+        return
+
+    override = pd.read_csv(override_csv)
+    if override.empty:
+        logger.warning(
+            "Iterative hydro scaling skipped: override file is empty at %s", override_csv
+        )
+        return
+
+    cols = {c.lower().strip(): c for c in override.columns}
+    if "country" not in cols:
+        logger.warning(
+            "Iterative hydro scaling skipped: column 'country' missing in %s", override_csv
+        )
+        return
+    rename_cols = {cols["country"]: "country"}
+    if "hydro_scale" in cols:
+        rename_cols[cols["hydro_scale"]] = "hydro_scale"
+    override = override.rename(columns=rename_cols)
+    if "hydro_scale" not in override.columns:
+        override["hydro_scale"] = 1.0
+
+    override["country"] = override["country"].astype(str).str.upper().str.strip()
+    override = override.loc[override["country"].str.len().eq(2)].copy()
+    if override.empty:
+        logger.warning(
+            "Iterative hydro scaling skipped: no valid ISO2 countries in %s", override_csv
+        )
+        return
+
+    min_scale = float(base_cfg.get("hydro_iteration_scale_min", 0.05))
+    max_scale = float(base_cfg.get("hydro_iteration_scale_max", 20.0))
+    override["hydro_scale"] = (
+        pd.to_numeric(override["hydro_scale"], errors="coerce")
+        .fillna(1.0)
+        .clip(lower=min_scale, upper=max_scale)
+    )
+    scale_by_country = override.groupby("country")["hydro_scale"].mean()
+    bus_country_lu = _bus_country_lookup(n)
+
+    su_idx = (
+        n.storage_units.index[n.storage_units.carrier.astype(str).eq("hydro")]
+        if not n.storage_units.empty
+        else pd.Index([])
+    )
+    inflow_cols = (
+        n.storage_units_t.inflow.columns.intersection(su_idx)
+        if not n.storage_units_t.inflow.empty
+        else pd.Index([])
+    )
+    su_country = (
+        n.storage_units.loc[inflow_cols, "bus"].map(bus_country_lu).fillna("")
+        if len(inflow_cols) > 0
+        else pd.Series(dtype=object)
+    )
+    if len(su_country) > 0:
+        valid = su_country.ne("")
+        inflow_cols = inflow_cols[valid.values]
+        su_country = su_country.loc[valid]
+    inflow_scaled = 0
+    if len(inflow_cols) > 0:
+        inflow_factors = su_country.map(scale_by_country).fillna(1.0)
+        inflow_scaled = int((~np.isclose(inflow_factors, 1.0, atol=1e-12)).sum())
+        n.storage_units_t.inflow.loc[:, inflow_cols] = n.storage_units_t.inflow.loc[
+            :, inflow_cols
+        ].mul(inflow_factors.reindex(inflow_cols).fillna(1.0), axis=1)
+
+    ror_idx = (
+        n.generators.index[n.generators.carrier.astype(str).eq("ror")]
+        if not n.generators.empty
+        else pd.Index([])
+    )
+    ror_country = (
+        n.generators.loc[ror_idx, "bus"].map(bus_country_lu).fillna("")
+        if len(ror_idx) > 0
+        else pd.Series(dtype=object)
+    )
+    if len(ror_country) > 0:
+        valid = ror_country.ne("")
+        ror_idx = ror_idx[valid.values]
+        ror_country = ror_country.loc[valid]
+
+    ror_scaled = 0
+    if len(ror_idx) > 0:
+        ror_factors = ror_country.map(scale_by_country).fillna(1.0)
+        ror_scaled = int((~np.isclose(ror_factors, 1.0, atol=1e-12)).sum())
+        ror_ts_cols = n.generators_t.p_max_pu.columns.intersection(ror_idx)
+        ror_static_cols = ror_idx.difference(ror_ts_cols)
+        ror_pmax_cap = float(base_cfg.get("hydro_ror_p_max_pu_cap", 1.0))
+        if len(ror_ts_cols) > 0:
+            scaled_ts = n.generators_t.p_max_pu.loc[:, ror_ts_cols].mul(
+                ror_factors.reindex(ror_ts_cols).fillna(1.0), axis=1
+            )
+            if ror_pmax_cap > 0.0:
+                scaled_ts = scaled_ts.clip(lower=0.0, upper=ror_pmax_cap)
+            n.generators_t.p_max_pu.loc[:, ror_ts_cols] = scaled_ts
+        if len(ror_static_cols) > 0:
+            scaled_static = (
+                pd.to_numeric(n.generators.loc[ror_static_cols, "p_max_pu"], errors="coerce")
+                .fillna(0.0)
+                .mul(ror_factors.reindex(ror_static_cols).fillna(1.0))
+            )
+            if ror_pmax_cap > 0.0:
+                scaled_static = scaled_static.clip(lower=0.0, upper=ror_pmax_cap)
+            n.generators.loc[ror_static_cols, "p_max_pu"] = scaled_static
+
+    logger.info(
+        "Applied iterative hydro scaling from %s: reservoir_inflows=%d (scaled=%d), ror_generators=%d (scaled=%d), country_rows=%d, scale_bounds=[%.3f, %.3f]",
+        override_csv,
+        len(inflow_cols),
+        inflow_scaled,
+        len(ror_idx),
+        ror_scaled,
+        len(scale_by_country),
+        min_scale,
+        max_scale,
+    )
+
+
+def apply_country_nuclear_iteration_scaling(n, investment_year, config):
+    """
+    Apply per-country iterative p_max_pu scaling for nuclear generators.
+
+    Override CSV format:
+    - country (ISO2)
+    - nuclear_scale
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("nuclear_iteration_scaling_enabled", False)):
+        return
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping iterative nuclear scaling for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return
+
+    override_csv_cfg = base_cfg.get("nuclear_iteration_override_csv", "")
+    if not override_csv_cfg:
+        logger.warning(
+            "Iterative nuclear scaling enabled but no nuclear_iteration_override_csv configured."
+        )
+        return
+
+    override_csv = _repo_path(override_csv_cfg)
+    if not os.path.exists(override_csv):
+        logger.warning(
+            "Iterative nuclear scaling skipped: override file not found at %s", override_csv
+        )
+        return
+
+    override = pd.read_csv(override_csv)
+    if override.empty:
+        logger.warning(
+            "Iterative nuclear scaling skipped: override file is empty at %s", override_csv
+        )
+        return
+
+    cols = {c.lower().strip(): c for c in override.columns}
+    if "country" not in cols:
+        logger.warning(
+            "Iterative nuclear scaling skipped: column 'country' missing in %s", override_csv
+        )
+        return
+    rename_cols = {cols["country"]: "country"}
+    if "nuclear_scale" in cols:
+        rename_cols[cols["nuclear_scale"]] = "nuclear_scale"
+    override = override.rename(columns=rename_cols)
+    if "nuclear_scale" not in override.columns:
+        override["nuclear_scale"] = 1.0
+
+    override["country"] = override["country"].astype(str).str.upper().str.strip()
+    override = override.loc[override["country"].str.len().eq(2)].copy()
+    if override.empty:
+        logger.warning(
+            "Iterative nuclear scaling skipped: no valid ISO2 countries in %s", override_csv
+        )
+        return
+
+    min_scale = float(base_cfg.get("nuclear_iteration_scale_min", 0.05))
+    max_scale = float(base_cfg.get("nuclear_iteration_scale_max", 20.0))
+    override["nuclear_scale"] = (
+        pd.to_numeric(override["nuclear_scale"], errors="coerce")
+        .fillna(1.0)
+        .clip(lower=min_scale, upper=max_scale)
+    )
+    scale_by_country = override.groupby("country")["nuclear_scale"].mean()
+
+    if n.generators.empty:
+        return
+    idx = n.generators.index[n.generators.carrier.astype(str).eq("nuclear")]
+    if len(idx) == 0:
+        logger.warning("Iterative nuclear scaling skipped: no nuclear generators found.")
+        return
+
+    bus_country_lu = _bus_country_lookup(n)
+    country = n.generators.loc[idx, "bus"].map(bus_country_lu).fillna("")
+    valid = country.ne("")
+    idx = idx[valid.values]
+    country = country.loc[valid]
+    if len(idx) == 0:
+        logger.warning(
+            "Iterative nuclear scaling skipped: no nuclear generators with country mapping."
+        )
+        return
+
+    factors = country.map(scale_by_country).fillna(1.0)
+    scaled_entries = int((~np.isclose(factors, 1.0, atol=1e-12)).sum())
+    pmax_cap = float(base_cfg.get("nuclear_p_max_pu_cap", 1.0))
+
+    ts_cols = n.generators_t.p_max_pu.columns.intersection(idx)
+    static_cols = idx.difference(ts_cols)
+    if len(ts_cols) > 0:
+        scaled_ts = n.generators_t.p_max_pu.loc[:, ts_cols].fillna(1.0).mul(
+            factors.reindex(ts_cols).fillna(1.0), axis=1
+        )
+        if pmax_cap > 0.0:
+            scaled_ts = scaled_ts.clip(lower=0.0, upper=pmax_cap)
+        n.generators_t.p_max_pu.loc[:, ts_cols] = scaled_ts
+    if len(static_cols) > 0:
+        scaled_static = (
+            pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce")
+            .fillna(1.0)
+            .mul(factors.reindex(static_cols).fillna(1.0))
+        )
+        if pmax_cap > 0.0:
+            scaled_static = scaled_static.clip(lower=0.0, upper=pmax_cap)
+        n.generators.loc[static_cols, "p_max_pu"] = scaled_static
+
+    logger.info(
+        "Applied iterative nuclear scaling from %s: nuclear_generators=%d (scaled_entries=%d), country_rows=%d, scale_bounds=[%.3f, %.3f], p_max_pu_cap=%.2f",
+        override_csv,
+        len(idx),
+        scaled_entries,
+        len(scale_by_country),
+        min_scale,
+        max_scale,
+        pmax_cap,
+    )
+
+
+
+
+
+MODEL_CARRIER_TO_OWID_METRIC = {
+    "solar": "solar_electricity",
+    "onwind": "wind_electricity",
+    "offwind-ac": "wind_electricity",
+    "offwind-dc": "wind_electricity",
+    "ror": "hydro_electricity",
+    "hydro": "hydro_electricity",
+    "geothermal": "other_renewable_electricity",
+    "nuclear": "nuclear_electricity",
+    "ocgt": "gas_electricity",
+    "ccgt": "gas_electricity",
+    "urban central gas chp": "gas_electricity",
+    "urban central gas chp cc": "gas_electricity",
+    "coal": "coal_electricity",
+    "lignite": "coal_electricity",
+    "oil": "oil_electricity",
+    "biomass": "biofuel_electricity",
+    "urban central solid biomass chp": "biofuel_electricity",
+    "urban central solid biomass chp cc": "biofuel_electricity",
+    "biomass eop": "biofuel_electricity",
+}
+
+MODEL_STORAGE_CARRIER_TO_OWID_METRIC = {
+    "hydro": "hydro_electricity",
+    "phs": "hydro_electricity",
+}
+
+OWID_BASE_METRICS = [
+    "coal_electricity",
+    "gas_electricity",
+    "oil_electricity",
+    "biofuel_electricity",
+    "hydro_electricity",
+    "nuclear_electricity",
+    "solar_electricity",
+    "wind_electricity",
+    "other_renewable_electricity",
+]
+
+OWID_AGGREGATE_METRICS = [
+    "fossil_electricity",
+    "renewables_electricity",
+    "low_carbon_electricity",
+    "electricity_generation",
+]
+
+COUNTRY_METRIC_KEY_SEP = "|::|"
+
+
+def _safe_iso3_to_iso2(code):
+    if not isinstance(code, str) or len(code) != 3:
+        return np.nan
+    try:
+        iso2 = three_2_two_digits_country(code)
+    except Exception:
+        return np.nan
+    if not isinstance(iso2, str) or len(iso2) != 2:
+        return np.nan
+    return iso2.upper()
+
+
+def _sanitize_constraint_token(value):
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(value)).strip("_")
+
+
+def _country_metric_key(country, metric):
+    return f"{country}{COUNTRY_METRIC_KEY_SEP}{metric}"
+
+
+def _decode_country_metric_key(key):
+    if COUNTRY_METRIC_KEY_SEP not in str(key):
+        return None
+    country, metric = str(key).split(COUNTRY_METRIC_KEY_SEP, 1)
+    if not country or not metric:
+        return None
+    return country, metric
+
+
+def _snapshot_weights_da(n, column="generators"):
+    if column not in n.snapshot_weightings.columns:
+        column = "generators"
+    return xr.DataArray(
+        n.snapshot_weightings[column].values,
+        coords=[n.snapshots],
+        dims=["snapshot"],
+    )
+
+
+def _add_grouped_country_metric_expressions(target, grouped):
+    if grouped is None or getattr(grouped, "size", 0) == 0:
+        return
+    keys = grouped.indexes.get("country_metric", pd.Index([]))
+    for key in keys:
+        decoded = _decode_country_metric_key(key)
+        if decoded is None:
+            continue
+        expr = grouped.sel(country_metric=key)
+        if decoded in target:
+            target[decoded] = target[decoded] + expr
+        else:
+            target[decoded] = expr
+
+
+def _model_country_metric_energy_expressions(n, gen_bus_carrier="AC", link_bus_carrier="AC"):
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    out = {}
+
+    # Generator output by (country, metric)
+    if not n.generators.empty:
+        gen_bus = n.generators.bus.map(n.buses.carrier)
+        gen_mask = gen_bus.fillna("").eq(gen_bus_carrier)
+        gen = n.generators.loc[gen_mask].copy()
+        if not gen.empty:
+            gen["country"] = gen.bus.map(bus_country).fillna("").astype(str).str.upper()
+            gen["metric"] = (
+                gen.carrier.astype(str).str.lower().map(MODEL_CARRIER_TO_OWID_METRIC)
+            )
+            gen = gen.loc[gen.country.ne("") & gen.metric.notna()].copy()
+            if not gen.empty:
+                p_g_full = n.model["Generator-p"]
+                gen_idx = p_g_full.indexes.get("Generator", pd.Index([]))
+                gen_var_mask = gen_idx.isin(gen.index)
+                if gen_var_mask.any():
+                    p_g = p_g_full.isel(Generator=gen_var_mask)
+                    filtered = gen_idx[gen_var_mask]
+                    key = (
+                        gen.loc[filtered, "country"]
+                        + COUNTRY_METRIC_KEY_SEP
+                        + gen.loc[filtered, "metric"]
+                    )
+                    key_da = xr.DataArray(
+                        key.values,
+                        coords=[filtered],
+                        dims=["Generator"],
+                        name="country_metric",
+                    )
+                    grouped = (p_g * _snapshot_weights_da(n, "generators")).sum(
+                        "snapshot"
+                    ).groupby(key_da).sum("Generator")
+                    _add_grouped_country_metric_expressions(out, grouped)
+
+    # Link AC output by (country, metric)
+    if not n.links.empty:
+        p_l_full = n.model["Link-p"]
+        link_idx = p_l_full.indexes.get("Link", pd.Index([]))
+        link_df = n.links.copy()
+        w_gen = _snapshot_weights_da(n, "generators")
+        for port in [1, 2, 3, 4]:
+            bus_col = f"bus{port}"
+            eff_col = "efficiency" if port == 1 else f"efficiency{port}"
+            if bus_col not in link_df.columns or eff_col not in link_df.columns:
+                continue
+            buses = link_df[bus_col]
+            mask = buses.notna() & buses.ne("") & buses.map(n.buses.carrier).eq(link_bus_carrier)
+            if not mask.any():
+                continue
+            sub = link_df.loc[mask, [bus_col, eff_col, "carrier"]].copy()
+            sub["country"] = buses.loc[mask].map(bus_country).fillna("").astype(str).str.upper()
+            sub["metric"] = (
+                sub["carrier"].astype(str).str.lower().map(MODEL_CARRIER_TO_OWID_METRIC)
+            )
+            sub = sub.loc[sub.country.ne("") & sub.metric.notna()].copy()
+            if sub.empty:
+                continue
+
+            var_mask = link_idx.isin(sub.index)
+            if not var_mask.any():
+                continue
+            p_l = p_l_full.isel(Link=var_mask)
+            filtered = link_idx[var_mask]
+            eta = xr.DataArray(
+                pd.to_numeric(sub.loc[filtered, eff_col], errors="coerce")
+                .fillna(1.0)
+                .abs()
+                .values,
+                coords=[filtered],
+                dims=["Link"],
+            )
+            key = (
+                sub.loc[filtered, "country"]
+                + COUNTRY_METRIC_KEY_SEP
+                + sub.loc[filtered, "metric"]
+            )
+            key_da = xr.DataArray(
+                key.values,
+                coords=[filtered],
+                dims=["Link"],
+                name="country_metric",
+            )
+            grouped = (p_l * eta * w_gen).sum("snapshot").groupby(key_da).sum("Link")
+            _add_grouped_country_metric_expressions(out, grouped)
+
+    # StorageUnit dispatch by (country, metric)
+    if not n.storage_units.empty:
+        su_bus = n.storage_units.bus.map(n.buses.carrier)
+        su_mask = su_bus.fillna("").eq(gen_bus_carrier)
+        su = n.storage_units.loc[su_mask].copy()
+        if not su.empty:
+            su["country"] = su.bus.map(bus_country).fillna("").astype(str).str.upper()
+            su["metric"] = (
+                su.carrier.astype(str).str.lower().map(MODEL_STORAGE_CARRIER_TO_OWID_METRIC)
+            )
+            su = su.loc[su.country.ne("") & su.metric.notna()].copy()
+            if not su.empty:
+                p_su_full = n.model["StorageUnit-p_dispatch"]
+                su_idx = p_su_full.indexes.get("StorageUnit", pd.Index([]))
+                su_var_mask = su_idx.isin(su.index)
+                if su_var_mask.any():
+                    p_su = p_su_full.isel(StorageUnit=su_var_mask)
+                    filtered = su_idx[su_var_mask]
+                    key = (
+                        su.loc[filtered, "country"]
+                        + COUNTRY_METRIC_KEY_SEP
+                        + su.loc[filtered, "metric"]
+                    )
+                    key_da = xr.DataArray(
+                        key.values,
+                        coords=[filtered],
+                        dims=["StorageUnit"],
+                        name="country_metric",
+                    )
+                    grouped = (p_su * _snapshot_weights_da(n, "stores")).sum(
+                        "snapshot"
+                    ).groupby(key_da).sum("StorageUnit")
+                    _add_grouped_country_metric_expressions(out, grouped)
+
+    # Derived aggregate metrics by country
+    by_country = {}
+    for (country, metric), expr in out.items():
+        by_country.setdefault(country, {})[metric] = expr
+
+    for country, metric_map in by_country.items():
+        fossil_terms = [
+            metric_map[m]
+            for m in ["coal_electricity", "gas_electricity", "oil_electricity"]
+            if m in metric_map
+        ]
+        if fossil_terms:
+            fossil_expr = fossil_terms[0]
+            for t in fossil_terms[1:]:
+                fossil_expr = fossil_expr + t
+            out[(country, "fossil_electricity")] = fossil_expr
+
+        renewable_terms = [
+            metric_map[m]
+            for m in [
+                "hydro_electricity",
+                "solar_electricity",
+                "wind_electricity",
+                "biofuel_electricity",
+                "other_renewable_electricity",
+            ]
+            if m in metric_map
+        ]
+        if renewable_terms:
+            renew_expr = renewable_terms[0]
+            for t in renewable_terms[1:]:
+                renew_expr = renew_expr + t
+            out[(country, "renewables_electricity")] = renew_expr
+
+        low_carbon = None
+        if renewable_terms:
+            low_carbon = renew_expr
+        if "nuclear_electricity" in metric_map:
+            low_carbon = (
+                metric_map["nuclear_electricity"]
+                if low_carbon is None
+                else low_carbon + metric_map["nuclear_electricity"]
+            )
+
+        if low_carbon is not None:
+            out[(country, "low_carbon_electricity")] = low_carbon
+            if fossil_terms:
+                out[(country, "electricity_generation")] = fossil_expr + low_carbon
+            else:
+                out[(country, "electricity_generation")] = low_carbon
+        elif fossil_terms:
+            out[(country, "electricity_generation")] = fossil_expr
+
+    return out
+
+
+def _owid_country_metric_reference(owid_csv, year, metrics):
+    usecols = {"year", "iso_code"} | set(metrics)
+    if "other_renewable_electricity" in metrics:
+        usecols.add("other_renewable_exc_biofuel_electricity")
+        usecols.add("other_renewable_electricity")
+    owid = pd.read_csv(owid_csv, usecols=lambda c: c in usecols)
+    owid = owid.loc[owid["year"] == int(year)].copy()
+    if owid.empty:
+        return pd.DataFrame(columns=["country", "metric", "reference_twh"])
+
+    owid["country"] = owid["iso_code"].apply(_safe_iso3_to_iso2)
+    owid = owid.loc[owid["country"].notna()].copy()
+    if owid.empty:
+        return pd.DataFrame(columns=["country", "metric", "reference_twh"])
+
+    if (
+        "other_renewable_exc_biofuel_electricity" in owid.columns
+        and "other_renewable_electricity" in metrics
+    ):
+        owid["other_renewable_electricity"] = pd.to_numeric(
+            owid["other_renewable_exc_biofuel_electricity"], errors="coerce"
+        )
+
+    metric_cols = [m for m in metrics if m in owid.columns]
+    for col in metric_cols:
+        owid[col] = pd.to_numeric(owid[col], errors="coerce")
+
+    grouped = owid.groupby("country", as_index=False)[metric_cols].sum(min_count=1)
+    ref = grouped.melt(
+        id_vars="country",
+        value_vars=metric_cols,
+        var_name="metric",
+        value_name="reference_twh",
+    )
+    ref["reference_twh"] = pd.to_numeric(ref["reference_twh"], errors="coerce").fillna(0.0)
+    return ref
+
+
+def _country_ac_load_twh(n):
+    if n.loads.empty or "p_set" not in n.loads_t:
+        return pd.Series(dtype=float)
+    load_bus_carrier = n.loads.bus.map(n.buses.carrier).fillna("")
+    ac_loads = n.loads.index[load_bus_carrier.eq("AC")]
+    if len(ac_loads) == 0:
+        return pd.Series(dtype=float)
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    load_country = n.loads.loc[ac_loads, "bus"].map(bus_country).fillna("")
+    valid = load_country.ne("")
+    ac_loads = ac_loads[valid.values]
+    load_country = load_country.loc[valid]
+    if len(ac_loads) == 0:
+        return pd.Series(dtype=float)
+
+    load_ts = n.loads_t.p_set.reindex(columns=ac_loads).fillna(0.0)
+    weighted = load_ts.mul(n.snapshot_weightings["generators"], axis=0).sum(axis=0)
+    by_country_mwh = weighted.groupby(load_country).sum()
+    return by_country_mwh / 1e6
+
+
+def _generator_output_energy_by_buscarrier(n, bus_carrier="AC"):
+    """
+    Annual generator output (MWh) grouped by GENERATOR carrier, but only from
+    generators whose bus has carrier == bus_carrier (e.g. "AC").
+    """
+    # pick only generators connected to the requested bus carrier
+    ac_gen_i = n.generators.index[
+        n.generators.bus.map(n.buses.carrier).fillna("").eq(bus_carrier)
+    ]
+    if len(ac_gen_i) == 0:
+        return xr.DataArray([], dims=["carrier"])
+
+    # Use integer-based indexing for temporal clustering compatibility
+    p_g_full = n.model["Generator-p"]
+    gen_idx = p_g_full.indexes.get("Generator", pd.Index([]))
+    gen_mask = gen_idx.isin(ac_gen_i)
+    p_g = p_g_full.isel(Generator=gen_mask)                            # [snapshot, Generator]
+    
+    # Get the actual generator indices after filtering
+    filtered_gen_i = gen_idx[gen_mask]
+    
+    # snapshot_weightings.generators is a Series (column from DataFrame)
+    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
+    w = xr.DataArray(
+        n.snapshot_weightings.generators.values,
+        coords=[n.snapshots],
+        dims=["snapshot"]
+    )
+    g_car = n.generators.loc[filtered_gen_i, "carrier"].rename_axis("Generator").to_xarray()
+
+    # MWh by generator carrier
+    return (p_g * w).sum("snapshot").groupby(g_car).sum("Generator")
+
+
+def _link_output_energy_by_buscarrier(n, bus_carrier="AC"):
+    """
+    Annual link *output-side* energy (MWh) grouped by LINK carrier, restricted
+    to links whose OUTPUT bus (bus1) sits on a bus with carrier == bus_carrier.
+    Energy at the output side is p[t,link] * efficiency[link].
+    """
+    if n.links.empty:
+        return xr.DataArray([], dims=["carrier"])
+
+    out_bus_carrier = n.links.bus1.map(n.buses.carrier).fillna("")
+    link_i = n.links.index[out_bus_carrier.eq(bus_carrier)]
+    if len(link_i) == 0:
+        return xr.DataArray([], dims=["carrier"])
+
+    # Use integer-based indexing for temporal clustering compatibility
+    p_l_full = n.model["Link-p"]
+    link_idx = p_l_full.indexes.get("Link", pd.Index([]))
+    link_mask = link_idx.isin(link_i)
+    p_l = p_l_full.isel(Link=link_mask)                                # [snapshot, Link]
+    
+    # Get the actual link indices after filtering
+    filtered_link_i = link_idx[link_mask]
+    
+    eta  = xr.DataArray(n.links.loc[filtered_link_i, "efficiency"].fillna(1.0),
+                        coords=[filtered_link_i], dims=["Link"])
+    # snapshot_weightings.generators is a Series (column from DataFrame)
+    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
+    w = xr.DataArray(
+        n.snapshot_weightings.generators.values,
+        coords=[n.snapshots],
+        dims=["snapshot"]
+    )
+    lcar = n.links.loc[filtered_link_i, "carrier"].rename_axis("Link").to_xarray()
+
+    # MWh by link carrier at AC output
+    return (p_l * eta * w).sum("snapshot").groupby(lcar).sum("Link")
+
+def _storageunit_output_energy_by_buscarrier(n, bus_carrier="AC"):
+    """
+    Annual StorageUnit *output-side* energy (MWh) grouped by STORAGE UNIT carrier,
+    restricted to storage units whose bus sits on a bus with carrier == bus_carrier.
+    Output is the electric dispatch variable p_dispatch (already AC-side).
+    Weighted with snapshot_weightings.stores (consistent with PyPSA stats).
+    """
+    if n.storage_units.empty:
+        return xr.DataArray([], dims=["carrier"])
+
+    ac_su_i = n.storage_units.index[
+        n.storage_units.bus.map(n.buses.carrier).fillna("").eq(bus_carrier)
+    ]
+    if len(ac_su_i) == 0:
+        return xr.DataArray([], dims=["carrier"])
+
+    # Use integer-based indexing for temporal clustering compatibility
+    p_su_full = n.model["StorageUnit-p_dispatch"]
+    su_idx = p_su_full.indexes.get("StorageUnit", pd.Index([]))
+    su_mask = su_idx.isin(ac_su_i)
+    p_su = p_su_full.isel(StorageUnit=su_mask)                         # [snapshot, StorageUnit]
+    
+    # Get the actual storage unit indices after filtering
+    filtered_su_i = su_idx[su_mask]
+    
+    # snapshot_weightings.stores is a Series (column from DataFrame)
+    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
+    w = xr.DataArray(
+        n.snapshot_weightings.stores.values,
+        coords=[n.snapshots],
+        dims=["snapshot"]
+    )
+    su_car = n.storage_units.loc[filtered_su_i, "carrier"].rename_axis("StorageUnit").to_xarray()
+
+    # MWh by storage-unit carrier at AC output
+    return (p_su * w).sum("snapshot").groupby(su_car).sum("StorageUnit")
+
+
+def add_baseyear_generation_band(n, planning_year, config):
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("baseyear_generation", {})
+    if not cfg or not cfg.get("baseyear_generation_constraint", False):
+        return
+
+    baseyear = int(cfg.get("year", 2020))
+    try:
+        current_year = int(float(planning_year))
+    except Exception:
+        logger.warning("Could not parse planning year '%s' for baseyear constraints", planning_year)
+        return
+    if current_year != baseyear:
+        logger.info(
+            "Skipping baseyear generation constraints for %s (configured for %s)",
+            planning_year,
+            baseyear,
+        )
+        return
+
+    logger.info("Adding baseyear OWID country-level generation constraints for %s", planning_year)
+
+    tolerance = float(cfg.get("tolerance", 0.10))
+    absolute_tolerance_twh = float(cfg.get("absolute_tolerance_twh", 0.5))
+    min_reference_twh = float(cfg.get("min_reference_twh", 1.0))
+    min_country_electric_load_twh = float(cfg.get("min_country_electric_load_twh", 0.0))
+    slack_penalty_eur_per_mwh = float(cfg.get("slack_penalty_eur_per_mwh", 0.0))
+    link_bus_carrier = cfg.get("link_bus_carrier", "AC")
+    gen_bus_carrier = cfg.get("gen_bus_carrier", "AC")
+    owid_csv = _repo_path(cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
+    metrics = cfg.get("metrics", OWID_BASE_METRICS + OWID_AGGREGATE_METRICS)
+
+    model_expr = _model_country_metric_energy_expressions(
+        n,
+        gen_bus_carrier=gen_bus_carrier,
+        link_bus_carrier=link_bus_carrier,
+    )
+    if not model_expr:
+        logger.warning("No model country-metric expressions found for baseyear generation constraints")
+        return
+
+    ref = _owid_country_metric_reference(owid_csv, baseyear, metrics)
+    if ref.empty:
+        logger.warning("No OWID references found in %s for year %s", owid_csv, baseyear)
+        return
+
+    network_countries = {
+        c
+        for c in _get_bus_country_for_clustering(n).astype(str).str.upper().unique()
+        if c and re.match(r"^[A-Z]{2}$", c)
+    }
+    ref = ref.loc[ref["country"].isin(network_countries)].copy()
+
+    skipped_low_load = 0
+    if min_country_electric_load_twh > 0.0:
+        country_load_twh = _country_ac_load_twh(n)
+        keep_countries = set(
+            country_load_twh.loc[
+                country_load_twh.ge(min_country_electric_load_twh)
+            ].index.astype(str).str.upper()
+        )
+        skipped_low_load = int((~ref["country"].isin(keep_countries)).sum())
+        ref = ref.loc[ref["country"].isin(keep_countries)].copy()
+
+    added = 0
+    skipped_low = 0
+    skipped_missing = 0
+    slack_terms = []
+    for row in ref.itertuples(index=False):
+        reference_twh = float(row.reference_twh)
+        if reference_twh < min_reference_twh:
+            skipped_low += 1
+            continue
+
+        key = (str(row.country).upper(), str(row.metric))
+        lhs = model_expr.get(key)
+        if lhs is None:
+            skipped_missing += 1
+            continue
+
+        band_twh = max(absolute_tolerance_twh, tolerance * abs(reference_twh))
+        lower = max(reference_twh - band_twh, 0.0) * 1e6
+        upper = (reference_twh + band_twh) * 1e6
+
+        country_token = _sanitize_constraint_token(key[0])
+        metric_token = _sanitize_constraint_token(key[1])
+        if slack_penalty_eur_per_mwh > 0.0:
+            slack_low = n.model.add_variables(
+                lower=0.0,
+                name=f"baseyear_owid_country_metric_min_slack__{country_token}__{metric_token}",
+            )
+            slack_high = n.model.add_variables(
+                lower=0.0,
+                name=f"baseyear_owid_country_metric_max_slack__{country_token}__{metric_token}",
+            )
+            n.model.add_constraints(
+                lhs + slack_low >= lower,
+                name=f"baseyear_owid_country_metric_min__{country_token}__{metric_token}",
+            )
+            n.model.add_constraints(
+                lhs - slack_high <= upper,
+                name=f"baseyear_owid_country_metric_max__{country_token}__{metric_token}",
+            )
+            slack_terms.extend([slack_low, slack_high])
+        else:
+            n.model.add_constraints(
+                lhs >= lower,
+                name=f"baseyear_owid_country_metric_min__{country_token}__{metric_token}",
+            )
+            n.model.add_constraints(
+                lhs <= upper,
+                name=f"baseyear_owid_country_metric_max__{country_token}__{metric_token}",
+            )
+        added += 1
+
+    if slack_penalty_eur_per_mwh > 0.0 and slack_terms:
+        slack_sum = slack_terms[0]
+        for term in slack_terms[1:]:
+            slack_sum = slack_sum + term
+        n.model.objective = n.model.objective + slack_penalty_eur_per_mwh * slack_sum
+
+    logger.info(
+        "Added %d country-metric OWID constraints (skipped_low_reference=%d, skipped_missing_metric=%d, skipped_low_country_load=%d, tolerance=%s%%, absolute_tolerance=%.3f TWh, min_country_electric_load=%.3f TWh, slack_penalty=%.2f EUR/MWh)",
+        added,
+        skipped_low,
+        skipped_missing,
+        skipped_low_load,
+        100.0 * tolerance,
+        absolute_tolerance_twh,
+        min_country_electric_load_twh,
+        slack_penalty_eur_per_mwh,
+    )
+
+
+
+def apply_country_fuel_price_overrides(fuel_price_dict, investment_year, costs, config):
+    """
+    Optionally apply country-level fossil fuel price overrides from a CSV.
+
+    Expected columns:
+    - country (ISO2)
+    - fuel_type (oil/gas/coal)
+    - optional year
+    - and either `price_eur_mwh` (absolute) or `price_multiplier` (relative)
+    """
+    global_cfg = config.get("global_specific", {})
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("fossil_price_tuning_enabled", False)):
+        return fuel_price_dict
+
+    baseyear = int(base_cfg.get("year", 2020))
+    if int(investment_year) != baseyear:
+        logger.info(
+            "Skipping fossil price overrides for %s (configured baseyear is %s).",
+            investment_year,
+            baseyear,
+        )
+        return fuel_price_dict
+
+    override_csv_cfg = base_cfg.get("fossil_price_override_csv", "")
+    if not override_csv_cfg:
+        logger.warning(
+            "Fossil price tuning enabled but no fossil_price_override_csv configured."
+        )
+        return fuel_price_dict
+
+    override_csv = _repo_path(override_csv_cfg)
+    if not os.path.exists(override_csv):
+        logger.warning(
+            "Fossil price override CSV not found at %s; using original fuel prices.",
+            override_csv,
+        )
+        return fuel_price_dict
+
+    try:
+        override = pd.read_csv(override_csv)
+    except Exception as exc:
+        logger.warning(
+            "Could not read fossil price override CSV %s (%s); using original fuel prices.",
+            override_csv,
+            exc,
+        )
+        return fuel_price_dict
+
+    if override.empty:
+        logger.warning("Fossil price override CSV is empty at %s.", override_csv)
+        return fuel_price_dict
+
+    cols = {c.lower().strip(): c for c in override.columns}
+    if "country" not in cols or "fuel_type" not in cols:
+        logger.warning(
+            "Fossil price override CSV %s must contain columns 'country' and 'fuel_type'.",
+            override_csv,
+        )
+        return fuel_price_dict
+
+    has_abs = "price_eur_mwh" in cols
+    has_mult = "price_multiplier" in cols
+    if not has_abs and not has_mult:
+        logger.warning(
+            "Fossil price override CSV %s must contain 'price_eur_mwh' and/or 'price_multiplier'.",
+            override_csv,
+        )
+        return fuel_price_dict
+
+    rename_cols = {
+        cols["country"]: "country",
+        cols["fuel_type"]: "fuel_type",
+    }
+    if "year" in cols:
+        rename_cols[cols["year"]] = "year"
+    if has_abs:
+        rename_cols[cols["price_eur_mwh"]] = "price_eur_mwh"
+    if has_mult:
+        rename_cols[cols["price_multiplier"]] = "price_multiplier"
+    override = override.rename(columns=rename_cols)
+
+    if "year" in override.columns:
+        override["year"] = pd.to_numeric(override["year"], errors="coerce")
+        override = override.loc[
+            override["year"].isna() | override["year"].eq(int(investment_year))
+        ].copy()
+
+    override["country"] = override["country"].astype(str).str.upper().str.strip()
+    override["fuel_type"] = override["fuel_type"].astype(str).str.lower().str.strip()
+    override = override.loc[
+        override["country"].str.len().eq(2)
+        & override["fuel_type"].isin(["oil", "gas", "coal"])
+    ].copy()
+    if override.empty:
+        logger.warning(
+            "Fossil price override CSV %s has no valid rows for year %s.",
+            override_csv,
+            investment_year,
+        )
+        return fuel_price_dict
+
+    out = {
+        "oil": dict(fuel_price_dict.get("oil", {})),
+        "gas": dict(fuel_price_dict.get("gas", {})),
+        "coal": dict(fuel_price_dict.get("coal", {})),
+    }
+    counts = {"oil": 0, "gas": 0, "coal": 0}
+    applied = 0
+    for _, row in override.iterrows():
+        fuel = row["fuel_type"]
+        country = row["country"]
+        default_price = float(costs.at[fuel, "fuel"]) if fuel in costs.index else 0.0
+        base_price = float(out.get(fuel, {}).get(country, default_price))
+        new_price = np.nan
+
+        if has_abs and "price_eur_mwh" in row.index and pd.notna(row.get("price_eur_mwh")):
+            new_price = pd.to_numeric(pd.Series([row["price_eur_mwh"]]), errors="coerce").iloc[0]
+        elif has_mult and "price_multiplier" in row.index and pd.notna(row.get("price_multiplier")):
+            mult = pd.to_numeric(pd.Series([row["price_multiplier"]]), errors="coerce").iloc[0]
+            if pd.notna(mult):
+                new_price = base_price * float(mult)
+
+        if pd.isna(new_price):
+            continue
+        out.setdefault(fuel, {})[country] = float(max(new_price, 0.0))
+        counts[fuel] = counts.get(fuel, 0) + 1
+        applied += 1
+
+    if applied > 0:
+        logger.info(
+            "Applied fossil price overrides from %s for %s: rows=%d, oil=%d, gas=%d, coal=%d",
+            override_csv,
+            investment_year,
+            applied,
+            counts.get("oil", 0),
+            counts.get("gas", 0),
+            counts.get("coal", 0),
+        )
+        return out
+
+    logger.warning(
+        "No valid fossil price overrides were applied from %s for year %s.",
+        override_csv,
+        investment_year,
+    )
+    return fuel_price_dict
+
+

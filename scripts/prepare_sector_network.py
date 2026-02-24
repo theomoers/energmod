@@ -15,6 +15,7 @@ import pypsa
 import pytz
 import ruamel.yaml
 import xarray as xr
+import validation as _validation_hooks
 from _helpers import (
     BASE_DIR,
     create_dummy_data,
@@ -35,10 +36,21 @@ from temporal_clustering import aggregate_snapshots
 
 logger = logging.getLogger(__name__)
 
-# Historical load scaling factor to match observed generation from IEA 2020
-hist_load_scaling = 1.043582
-
 spatial = SimpleNamespace()
+
+
+# Centralized validation/tuning hooks (kept outside this core script for easier reversion).
+if hasattr(_validation_hooks, "align_country_electricity_demand_to_owid"):
+    align_country_electricity_demand_to_owid = _validation_hooks.align_country_electricity_demand_to_owid
+    align_country_hydro_reservoir_inflow_to_owid = _validation_hooks.align_country_hydro_reservoir_inflow_to_owid
+    align_country_onwind_profiles_to_owid = _validation_hooks.align_country_onwind_profiles_to_owid
+    apply_country_wind_iteration_scaling = _validation_hooks.apply_country_wind_iteration_scaling
+    apply_country_solar_iteration_scaling = _validation_hooks.apply_country_solar_iteration_scaling
+    apply_country_hydro_iteration_scaling = _validation_hooks.apply_country_hydro_iteration_scaling
+    apply_country_nuclear_iteration_scaling = _validation_hooks.apply_country_nuclear_iteration_scaling
+    logger.info("Using centralized validation/tuning hooks from scripts/validation.py")
+if hasattr(_validation_hooks, "apply_country_fuel_price_overrides"):
+    apply_country_fuel_price_overrides = _validation_hooks.apply_country_fuel_price_overrides
 
 
 def load_country_fuel_prices(fuelprices_path, investment_year, costs):
@@ -87,6 +99,11 @@ def load_country_fuel_prices(fuelprices_path, investment_year, costs):
     logger.info(f"  Coal prices: {len(fuel_price_dict.get('coal', {}))} countries")
     
     return fuel_price_dict
+
+
+# Fossil price override hook is centralized in scripts/validation.py.
+if hasattr(_validation_hooks, "apply_country_fuel_price_overrides"):
+    apply_country_fuel_price_overrides = _validation_hooks.apply_country_fuel_price_overrides
 
 
 def load_country_waccs(wacc_path, costs):
@@ -2242,6 +2259,40 @@ def add_industry(n, costs):
             lifetime=costs.at["cement capture", "lifetime"],
         )
 
+    # CARRIER = COAL
+    n.madd(
+        "Bus",
+        spatial.coal.industry,
+        location=spatial.coal.locations,
+        carrier="coal for industry",
+    )
+
+    coal_demand = industrial_demand.loc[spatial.nodes, "coal"] / W
+    if options["coal"]["spatial_coal"]:
+        spatial_coal_demand = coal_demand.rename(index=lambda x: x + " coal for industry")
+    else:
+        spatial_coal_demand = coal_demand.sum()
+
+    n.madd(
+        "Load",
+        spatial.coal.industry,
+        bus=spatial.coal.industry,
+        carrier="coal for industry",
+        p_set=spatial_coal_demand,
+    )
+
+    n.madd(
+        "Link",
+        spatial.coal.industry,
+        bus0=spatial.coal.nodes,
+        bus1=spatial.coal.industry,
+        bus2="co2 atmosphere",
+        carrier="coal for industry",
+        p_nom_extendable=True,
+        efficiency=1.0,
+        efficiency2=costs.at["coal", "CO2 intensity"],
+    )
+
     #################################################### CARRIER = HYDROGEN
 
     if not (
@@ -2288,24 +2339,9 @@ def add_industry(n, costs):
         flat=True
     )
 
-    # Get p_set for industry coal
-    p_set_industry_coal = industrial_demand["coal"] / W
-    
-    # Use helper function for proper temporal weighting
-    add_emissions_from_weighted_energy(
-        n,
-        "industry coal emissions",
-        p_set_industry_coal,
-        costs.at["coal", "CO2 intensity"],
-        "co2 atmosphere",
-        "industry coal emissions",
-        flat=True
-    )
-
     ########################################################### CARRIER = HEAT
     # TODO simplify bus expression
     p_set_ind_heat = industrial_demand.loc[spatial.nodes, "low-temperature heat"] / W
-    logger.info(f"Scaling industry heat load by {hist_load_scaling}: original sum = {p_set_ind_heat.sum():.2f} MW, scaled sum = {(p_set_ind_heat * hist_load_scaling).sum():.2f} MW")
     
     n.madd(
         "Load",
@@ -2320,7 +2356,7 @@ def add_industry(n, costs):
             for node in spatial.nodes
         ],
         carrier="low-temperature heat for industry",
-        p_set=p_set_ind_heat * hist_load_scaling,
+        p_set=p_set_ind_heat,
     )
 
     ################################################## CARRIER = ELECTRICITY
@@ -2351,7 +2387,6 @@ def add_industry(n, costs):
 
     # else:
     industrial_elec = industrial_demand["electricity"] / W # converting to TWh per hour
-    logger.info(f"Scaling industry electricity load by {hist_load_scaling}: original sum = {industrial_elec.sum():.2f} MW, scaled sum = {(industrial_elec * hist_load_scaling).sum():.2f} MW")
 
     n.madd(
         "Load",
@@ -2359,7 +2394,7 @@ def add_industry(n, costs):
         suffix=" industry electricity",
         bus=spatial.nodes,
         carrier="industry electricity",
-        p_set=industrial_elec * hist_load_scaling,
+        p_set=industrial_elec,
     )
 
     n.add("Bus", "process emissions", location="Earth", carrier="process emissions")
@@ -2487,8 +2522,7 @@ def add_land_transport(n, costs):
             )
             / 3
         )
-        logger.info(f"Scaling land transport EV load by {hist_load_scaling}: original sum = {p_set_base.sum().sum():.2f} MW, scaled sum = {(p_set_base * hist_load_scaling).sum().sum():.2f} MW")
-        p_set = p_set_base * hist_load_scaling
+        p_set = p_set_base
 
         n.madd(
             "Load",
@@ -2564,7 +2598,6 @@ def add_land_transport(n, costs):
                 / options["transport_fuel_cell_efficiency"]
                 * transport[spatial.nodes]
             )
-            logger.info(f"Scaling land transport fuel cell load by {hist_load_scaling}: original sum = {p_set_fc_base.sum().sum():.2f} MW, scaled sum = {(p_set_fc_base * hist_load_scaling).sum().sum():.2f} MW")
             
             n.madd(
                 "Load",
@@ -2572,7 +2605,7 @@ def add_land_transport(n, costs):
                 suffix=" land transport fuel cell",
                 bus=spatial.nodes + " H2",
                 carrier="land transport fuel cell",
-                p_set=p_set_fc_base * hist_load_scaling,
+                p_set=p_set_fc_base,
             )
 
     if ice_share > 0:
@@ -2722,15 +2755,13 @@ def add_heat(n, costs):
                 )
             )
 
-        logger.info(f"Scaling {name} heat load by {hist_load_scaling}: original sum = {heat_load.sum().sum():.2f} MW, scaled sum = {(heat_load * hist_load_scaling).sum().sum():.2f} MW")
-        
         n.madd(
             "Load",
             h_nodes[name],
             suffix=f" {name} heat",
             bus=h_nodes[name] + f" {name} heat",
             carrier=name + " heat",
-            p_set=heat_load * hist_load_scaling,
+            p_set=heat_load,
         )
 
         ## Add heat pumps
@@ -3004,7 +3035,6 @@ def add_services(n, costs):
     p_set_elec = p_set_from_scaling(
         "services electricity", profile_residential, energy_totals, temporal_resolution
     )
-    logger.info(f"Scaling services electricity load by {hist_load_scaling}: original sum = {p_set_elec.sum().sum():.2f} MW, scaled sum = {(p_set_elec * hist_load_scaling).sum().sum():.2f} MW")
 
     n.madd(
         "Load",
@@ -3012,7 +3042,7 @@ def add_services(n, costs):
         suffix=" services electricity",
         bus=spatial.nodes,
         carrier="services electricity",
-        p_set=p_set_elec * hist_load_scaling,
+        p_set=p_set_elec,
     )
     p_set_biomass = p_set_from_scaling(
         "services biomass", profile_residential, energy_totals, temporal_resolution
@@ -3092,7 +3122,6 @@ def add_agriculture(n, costs):
     W = n.snapshot_weightings.generators.sum()
     
     p_set_agri_elec = nodal_energy_totals.loc[spatial.nodes, "agriculture electricity"] * 1e6 / W
-    logger.info(f"Scaling agriculture electricity load by {hist_load_scaling}: original sum = {p_set_agri_elec.sum():.2f} MW, scaled sum = {(p_set_agri_elec * hist_load_scaling).sum():.2f} MW")
     
     n.madd(
         "Load",
@@ -3100,7 +3129,7 @@ def add_agriculture(n, costs):
         suffix=" agriculture electricity",
         bus=spatial.nodes,
         carrier="agriculture electricity",
-        p_set=p_set_agri_elec * hist_load_scaling,
+        p_set=p_set_agri_elec,
     )
 
     n.madd(
@@ -3201,8 +3230,7 @@ def add_residential(n, costs):
         - energy_totals["residential heat gas"],
         level=0,
     ).droplevel(level=0, axis=1).div(temporal_resolution, axis=0)
-    logger.info(f"Scaling residential heat load by {hist_load_scaling}: original sum = {res_heat_load.sum().sum():.2f} MW, scaled sum = {(res_heat_load * hist_load_scaling).sum().sum():.2f} MW")
-    n.loads_t.p_set[heat_ind] = res_heat_load * hist_load_scaling
+    n.loads_t.p_set[heat_ind] = res_heat_load
 
     heat_oil_demand = p_set_from_scaling(
         "residential heat oil", heat_shape, energy_totals, temporal_resolution
@@ -3322,8 +3350,7 @@ def add_residential(n, costs):
     res_elec_load = p_set_from_scaling(
         "electricity residential", profile_pu, energy_totals, temporal_resolution
     )
-    logger.info(f"Scaling residential electricity load by {hist_load_scaling}: original sum = {res_elec_load.sum().sum():.2f} MW, scaled sum = {(res_elec_load * hist_load_scaling).sum().sum():.2f} MW")
-    n.loads_t.p_set.loc[:, buses] = res_elec_load * hist_load_scaling
+    n.loads_t.p_set.loc[:, buses] = res_elec_load
 
 
 def add_electricity_distribution_grid(n, costs):
@@ -3538,7 +3565,6 @@ def add_rail_transport(n, costs):
     )
 
     p_set_rail_elec = p_set_elec * 1e6 / W
-    logger.info(f"Scaling rail transport electricity load by {hist_load_scaling}: original sum = {p_set_rail_elec.sum():.2f} MW, scaled sum = {(p_set_rail_elec * hist_load_scaling).sum():.2f} MW")
     
     n.madd(
         "Load",
@@ -3546,7 +3572,7 @@ def add_rail_transport(n, costs):
         suffix=" rail transport electricity",
         bus=spatial.nodes,
         carrier="rail transport electricity",
-        p_set=p_set_rail_elec * hist_load_scaling,
+        p_set=p_set_rail_elec,
     )
 
 
@@ -3646,14 +3672,13 @@ def add_direct_electric_loads(n, energy_totals, columns, temporal_resolution):
         if col not in energy_totals.columns:
             continue
         p_set = p_set_from_scaling(col, profile_residential, energy_totals, temporal_resolution)
-        logger.info(f"Scaling {col} load by {hist_load_scaling}: original sum = {p_set.sum().sum():.2f} MW, scaled sum = {(p_set * hist_load_scaling).sum().sum():.2f} MW")
         n.madd(
             "Load",
             spatial.nodes,                     # use spatial nodes 
             suffix=f" {col}",
             bus=spatial.nodes,                 # AC buses
             carrier=col,
-            p_set=p_set * hist_load_scaling,
+            p_set=p_set,
         )
 
 
@@ -3726,6 +3751,12 @@ if __name__ == "__main__":
         snakemake.input.fuelprices,
         investment_year,
         costs
+    )
+    fuel_price_dict = apply_country_fuel_price_overrides(
+        fuel_price_dict,
+        investment_year,
+        costs,
+        snakemake.config,
     )
 
     # Load country-specific WACCs for renewable technologies
@@ -3974,6 +4005,25 @@ if __name__ == "__main__":
                     pickle.dump(tsam_data, f)
                 logger.info(f"Created placeholder TSAM clustering file at {tsam_output_path} (used baseyear clustering)")
 
+    # Match exogenous electricity demand (Load components) to OWID in baseyear.
+    # Endogenous electricity consumption through Links (e.g. heat pumps/electrolysis)
+    # is intentionally not scaled here.
+    align_country_electricity_demand_to_owid(n, investment_year, snakemake.config)
+    # Scale hydro reservoir inflow (StorageUnit carrier='hydro') by country
+    # against OWID hydro electricity in baseyear.
+    align_country_hydro_reservoir_inflow_to_owid(n, investment_year, snakemake.config)
+    # Optional per-country iterative hydro overrides (reservoir+ror jointly).
+    apply_country_hydro_iteration_scaling(n, investment_year, snakemake.config)
+    # Scale onshore wind availability profiles against OWID wind electricity
+    # using baseline conversion ratios in baseyear.
+    align_country_onwind_profiles_to_owid(n, investment_year, snakemake.config)
+    # Optional per-country iterative wind overrides written by calibration wrapper.
+    apply_country_wind_iteration_scaling(n, investment_year, snakemake.config)
+    # Optional per-country iterative solar overrides written by calibration wrapper.
+    apply_country_solar_iteration_scaling(n, investment_year, snakemake.config)
+    # Optional per-country iterative nuclear availability overrides.
+    apply_country_nuclear_iteration_scaling(n, investment_year, snakemake.config)
+
     # TODO add co2 limit here, if necessary
     # co2_limit_pu = eval(sopts[0][5:])
     # co2_limit = co2_limit_pu *
@@ -4005,18 +4055,6 @@ if __name__ == "__main__":
         regions_shapefile=regions_shapefile
     ) # based on owid data
     
-
-    #s_factor = ((4348 - 708.68) / 2056.70) * 0.939688716
-    #n.storage_units.loc[n.storage_units.carrier == "hydro", "max_hours"] *= s_factor
-    #n.storage_units_t.inflow *= s_factor
-    #logger.info(f"Scaling inflow data to match IEA historical hydro data. Scaling by {s_factor}")
-
-    #onwind_factor = (1484 / 1295)
-    #onwind_idx = n.generators[n.generators.carrier == 'onwind'].index
-    #onwind_time_idx = n.generators_t.p_max_pu.columns
-    #onwind_idx = onwind_idx.intersection(onwind_time_idx)
-    #n.generators_t.p_max_pu[onwind_idx] *= onwind_factor
-    #logger.info(f"Scaling onwind p_max_pu to match IRENA data by factor {onwind_factor}")
 
     # Apply country-specific WACCs to ALL renewable generators (must be last to catch all generators)
     logger.info("Applying regional WACCs to all renewable generators...")

@@ -73,14 +73,25 @@ def _active_gem_mask(df: pd.DataFrame, year: int) -> pd.Series:
     retired_col = next((c for c in df.columns if "retired year" in str(c).lower()), None)
 
     mask = pd.Series(True, index=df.index)
+    retired = pd.Series(np.nan, index=df.index)
+    if retired_col is not None:
+        retired = pd.to_numeric(df[retired_col], errors="coerce")
     if status_col is not None:
         status = df[status_col].astype(str).str.lower()
-        mask &= status.str.contains(r"\boperating\b|\bmothballed\b", regex=True)
+        is_operating = status.str.contains(r"\boperating\b", regex=True)
+        is_mothballed = status.str.contains(r"\bmothballed\b", regex=True)
+        is_retired = status.str.contains(r"\bretired\b", regex=True)
+        # For historical snapshots (e.g. 2020), include plants now marked retired
+        # if retirement happened in or after the validation year.
+        if retired_col is not None:
+            is_retired_active = is_retired & (retired >= year)
+        else:
+            is_retired_active = pd.Series(False, index=df.index)
+        mask &= (is_operating | is_mothballed | is_retired_active)
     if start_col is not None:
         start = pd.to_numeric(df[start_col], errors="coerce")
         mask &= start.fillna(-np.inf) <= year
     if retired_col is not None:
-        retired = pd.to_numeric(df[retired_col], errors="coerce")
         mask &= retired.isna() | (retired >= year)
     return mask
 

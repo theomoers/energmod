@@ -61,6 +61,16 @@ doc/_build
 sample_pypsa_eur
 test/tmp/
 playground/
+pypsa-eur
+!validation/data/*
+!validation/data/
+!validation
+validation/results_compare/
+validation/results_dashboard/
+validation/state_snapshots/
+validation/.tmp/
+validation/.DS_Store
+validation/data/.DS_Store
 
 # Specific configuration files
 configs/scenarios/config.*.yaml

@@ -19,6 +19,7 @@ import pandas as pd
 import powerplantmatching as pm
 import pypsa
 import xarray as xr
+import validation as _validation_hooks
 
 # from _helpers import (
 #     configure_logging,
@@ -33,6 +34,13 @@ logger = logging.getLogger(__name__)
 cc = coco.CountryConverter()
 idx = pd.IndexSlice
 spatial = SimpleNamespace()
+
+
+# Centralized profile fallback hook (kept outside this core script for easier reversion).
+if hasattr(_validation_hooks, "_replace_zero_profile_columns_with_nearest"):
+    _profile_col_bus = _validation_hooks._profile_col_bus
+    _replace_zero_profile_columns_with_nearest = _validation_hooks._replace_zero_profile_columns_with_nearest
+    logger.info("Using centralized profile fallback hook from scripts/validation.py")
 
 
 def load_country_waccs(wacc_path):
@@ -600,6 +608,18 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                                 # Use 1.0
                                 for bus in missing_buses:
                                     p_max_pu[bus + f" {generator}{suffix}-{grouping_year}"] = 1.0
+
+                    # Handle profiles that exist but are all-zero (e.g. JP/TW onwind),
+                    # by borrowing the nearest non-zero profile from the same technology.
+                    if generator in {"onwind", "offwind-ac", "offwind-dc", "solar"}:
+                        p_max_pu = _replace_zero_profile_columns_with_nearest(
+                            n=n,
+                            p_max_pu=p_max_pu,
+                            generator=generator,
+                            suffix=suffix,
+                            source_year=baseyear,
+                            target_year=grouping_year,
+                        )
                     
                     names = [bus + name_suffix for bus in new_capacity.index]
                     bus_list = list(new_capacity.index)

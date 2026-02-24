@@ -88,7 +88,13 @@ import pypsa
 import pypsa.clustering.spatial as pypsa_spatial
 import xarray as xr
 import yaml
-from _helpers import configure_logging, create_logger, override_component_attrs
+import validation as _validation_hooks
+from _helpers import (
+    configure_logging,
+    create_logger,
+    override_component_attrs,
+    three_2_two_digits_country,
+)
 from linopy import merge
 from pypsa.clustering.spatial import (
     DEFAULT_ONE_PORT_STRATEGIES,
@@ -102,6 +108,10 @@ from pypsa.optimization.abstract import optimize_transmission_expansion_iterativ
 
 logger = create_logger(__name__)
 pypsa.pf.logger.setLevel(logging.WARNING)
+
+
+# Baseyear generation validation helpers moved to scripts/validation.py
+
 
 def _safe_solver_log(smk):
     """Return a usable log filename if present (named 'solver' or first log), else None."""
@@ -148,8 +158,18 @@ def _zscore_columns(df):
 
 
 def _get_bus_country_for_clustering(n):
-    country = n.buses.country.fillna("").astype(str).str.strip().str.upper()
-    location = n.buses.location.fillna("").astype(str).str.strip().str.upper()
+    country = (
+        n.buses["country"]
+        if "country" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    location = (
+        n.buses["location"]
+        if "location" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    country = country.fillna("").astype(str).str.strip().str.upper()
+    location = location.fillna("").astype(str).str.strip().str.upper()
     bus_name = n.buses.index.to_series(index=n.buses.index).astype(str).str.strip().str.upper()
 
     def _extract_cc(series):
@@ -3071,187 +3091,11 @@ def add_lossy_bidirectional_link_constraints(n: pypsa.Network) -> None:
     n.model.add_constraints(lhs == 0, name="Link-bidirectional_sync")
 
 
-def _generator_output_energy_by_buscarrier(n, bus_carrier="AC"):
-    """
-    Annual generator output (MWh) grouped by GENERATOR carrier, but only from
-    generators whose bus has carrier == bus_carrier (e.g. "AC").
-    """
-    # pick only generators connected to the requested bus carrier
-    ac_gen_i = n.generators.index[
-        n.generators.bus.map(n.buses.carrier).fillna("").eq(bus_carrier)
-    ]
-    if len(ac_gen_i) == 0:
-        return xr.DataArray([], dims=["carrier"])
+# Baseyear OWID country-generation constraint implementation moved to scripts/validation.py
 
-    # Use integer-based indexing for temporal clustering compatibility
-    p_g_full = n.model["Generator-p"]
-    gen_idx = p_g_full.indexes.get("Generator", pd.Index([]))
-    gen_mask = gen_idx.isin(ac_gen_i)
-    p_g = p_g_full.isel(Generator=gen_mask)                            # [snapshot, Generator]
-    
-    # Get the actual generator indices after filtering
-    filtered_gen_i = gen_idx[gen_mask]
-    
-    # snapshot_weightings.generators is a Series (column from DataFrame)
-    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
-    w = xr.DataArray(
-        n.snapshot_weightings.generators.values,
-        coords=[n.snapshots],
-        dims=["snapshot"]
-    )
-    g_car = n.generators.loc[filtered_gen_i, "carrier"].rename_axis("Generator").to_xarray()
-
-    # MWh by generator carrier
-    return (p_g * w).sum("snapshot").groupby(g_car).sum("Generator")
-
-
-def _link_output_energy_by_buscarrier(n, bus_carrier="AC"):
-    """
-    Annual link *output-side* energy (MWh) grouped by LINK carrier, restricted
-    to links whose OUTPUT bus (bus1) sits on a bus with carrier == bus_carrier.
-    Energy at the output side is p[t,link] * efficiency[link].
-    """
-    if n.links.empty:
-        return xr.DataArray([], dims=["carrier"])
-
-    out_bus_carrier = n.links.bus1.map(n.buses.carrier).fillna("")
-    link_i = n.links.index[out_bus_carrier.eq(bus_carrier)]
-    if len(link_i) == 0:
-        return xr.DataArray([], dims=["carrier"])
-
-    # Use integer-based indexing for temporal clustering compatibility
-    p_l_full = n.model["Link-p"]
-    link_idx = p_l_full.indexes.get("Link", pd.Index([]))
-    link_mask = link_idx.isin(link_i)
-    p_l = p_l_full.isel(Link=link_mask)                                # [snapshot, Link]
-    
-    # Get the actual link indices after filtering
-    filtered_link_i = link_idx[link_mask]
-    
-    eta  = xr.DataArray(n.links.loc[filtered_link_i, "efficiency"].fillna(1.0),
-                        coords=[filtered_link_i], dims=["Link"])
-    # snapshot_weightings.generators is a Series (column from DataFrame)
-    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
-    w = xr.DataArray(
-        n.snapshot_weightings.generators.values,
-        coords=[n.snapshots],
-        dims=["snapshot"]
-    )
-    lcar = n.links.loc[filtered_link_i, "carrier"].rename_axis("Link").to_xarray()
-
-    # MWh by link carrier at AC output
-    return (p_l * eta * w).sum("snapshot").groupby(lcar).sum("Link")
-
-def _storageunit_output_energy_by_buscarrier(n, bus_carrier="AC"):
-    """
-    Annual StorageUnit *output-side* energy (MWh) grouped by STORAGE UNIT carrier,
-    restricted to storage units whose bus sits on a bus with carrier == bus_carrier.
-    Output is the electric dispatch variable p_dispatch (already AC-side).
-    Weighted with snapshot_weightings.stores (consistent with PyPSA stats).
-    """
-    if n.storage_units.empty:
-        return xr.DataArray([], dims=["carrier"])
-
-    ac_su_i = n.storage_units.index[
-        n.storage_units.bus.map(n.buses.carrier).fillna("").eq(bus_carrier)
-    ]
-    if len(ac_su_i) == 0:
-        return xr.DataArray([], dims=["carrier"])
-
-    # Use integer-based indexing for temporal clustering compatibility
-    p_su_full = n.model["StorageUnit-p_dispatch"]
-    su_idx = p_su_full.indexes.get("StorageUnit", pd.Index([]))
-    su_mask = su_idx.isin(ac_su_i)
-    p_su = p_su_full.isel(StorageUnit=su_mask)                         # [snapshot, StorageUnit]
-    
-    # Get the actual storage unit indices after filtering
-    filtered_su_i = su_idx[su_mask]
-    
-    # snapshot_weightings.stores is a Series (column from DataFrame)
-    # Explicitly provide coordinates to avoid timestamp/int comparison warnings
-    w = xr.DataArray(
-        n.snapshot_weightings.stores.values,
-        coords=[n.snapshots],
-        dims=["snapshot"]
-    )
-    su_car = n.storage_units.loc[filtered_su_i, "carrier"].rename_axis("StorageUnit").to_xarray()
-
-    # MWh by storage-unit carrier at AC output
-    return (p_su * w).sum("snapshot").groupby(su_car).sum("StorageUnit")
-
-
-def add_baseyear_generation_band(n, planning_year, config):
-    global_cfg = config.get("global_specific", {})
-    cfg = global_cfg.get("baseyear_generation", {})
-    if not cfg or not cfg.get("baseyear_generation_constraint", False):
-        return
-
-    baseyear = str(cfg.get("year", 2020))
-    if str(planning_year) != baseyear:
-        logger.info(f"Skipping baseyear generation constraints for {planning_year} (configured for {baseyear})")
-        return
-
-    logger.info(f"Adding baseyear generation constraints for {planning_year}")
-
-    tol   = float(cfg.get("tolerance", 0.05))
-    units = str(cfg.get("units", "TWh")).lower()
-    unit_scale = {"mwh":1.0, "gwh":1e3, "twh":1e6}.get(units, 1e6)
-
-    carriers_map     = cfg.get("carriers_map", {})
-    targets          = cfg.get("targets", {})
-    link_bus_carrier = cfg.get("link_bus_carrier", "AC") # should be "AC"
-    gen_bus_carrier  = cfg.get("gen_bus_carrier",  "AC") # allows override; default "AC"
-
-    gen_E  = _generator_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
-    link_E = _link_output_energy_by_buscarrier(n, bus_carrier=link_bus_carrier) # [carrier] MWh
-    su_E = _storageunit_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
-
-    def _sum_tokens(tokens):
-        toks = tokens if isinstance(tokens, (list, tuple)) else [tokens]
-        pieces = []
-
-        gen_list  = list(gen_E.indexes.get("carrier", []))  if gen_E.size  else []
-        link_list = list(link_E.indexes.get("carrier", [])) if link_E.size else []
-        su_list   = list(su_E.indexes.get("carrier", []))   if su_E.size   else []
-
-        for t in toks:
-            if isinstance(t, str) and t.startswith("re:"):
-                pat = re.compile(t[3:])
-                g = [c for c in gen_list  if pat.search(c)]
-                l = [c for c in link_list if pat.search(c)]
-                s = [c for c in su_list   if pat.search(c)]
-                if g: pieces.append(gen_E.sel(carrier=g).sum("carrier"))
-                if l: pieces.append(link_E.sel(carrier=l).sum("carrier"))
-                if s: pieces.append(su_E.sel(carrier=s).sum("carrier"))
-            else:
-                if t in gen_list:  pieces.append(gen_E.sel(carrier=t))
-                if t in link_list: pieces.append(link_E.sel(carrier=t))
-                if t in su_list:   pieces.append(su_E.sel(carrier=t))
-
-        if not pieces:
-            return None
-        out = pieces[0]
-        for p in pieces[1:]:
-            out = out + p
-        return out
-
-    for alias, target in targets.items():
-        if isinstance(target, str) and target.upper().startswith("X"):
-            logger.info(f"Skipping {alias} (placeholder target '{target}')")
-            continue
-
-        tokens = carriers_map.get(alias, [alias])  # e.g., ["coal"] or ["coal","lignite"]
-        lhs = _sum_tokens(tokens)
-        if lhs is None:
-            logger.warning(f"No carriers matched for alias '{alias}' with tokens {tokens}")
-            continue
-
-        lower = float(target) * (1.0 - tol) * unit_scale
-        upper = float(target) * (1.0 + tol) * unit_scale
-
-        logger.info(f"{alias}: {lower/unit_scale:.2f} ≤ AC-side energy ≤ {upper/unit_scale:.2f} {units.upper()} (tokens={tokens})")
-        n.model.add_constraints(lhs >= lower, name=f"baseyear_energy_min__{alias}")
-        n.model.add_constraints(lhs <= upper, name=f"baseyear_energy_max__{alias}")
+if hasattr(_validation_hooks, "add_baseyear_generation_band"):
+    add_baseyear_generation_band = _validation_hooks.add_baseyear_generation_band
+    logger.info("Using centralized baseyear generation constraint hook from scripts/validation.py")
 
 
 def add_year2025_generation_band(n, planning_year, config):
@@ -3631,14 +3475,10 @@ def solve_network(n, config, solving, **kwargs):
         logger.info(f"Bus carriers: {bus_carriers.to_dict()}")
         
         h2_buses = n.buses[n.buses.carrier.str.contains('H2', na=False)]
-        if len(h2_buses) > 0:
-            logger.info(f"Found {len(h2_buses)} H2 buses: {h2_buses.index.tolist()}")
-            
+        if len(h2_buses) > 0:            
             h2_loads = n.loads[n.loads.carrier.str.contains('H2', na=False)] if not n.loads.empty else pd.DataFrame()
             h2_stores = n.stores[n.stores.carrier.str.contains('H2', na=False)] if not n.stores.empty else pd.DataFrame()
             h2_links = n.links[n.links.carrier.str.contains('H2', na=False)] if not n.links.empty else pd.DataFrame()
-            
-            logger.info(f"H2 components: {len(h2_loads)} loads, {len(h2_stores)} stores, {len(h2_links)} links")
     
 
     logger.info("Performing preemptive network cleanup...")
