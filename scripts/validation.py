@@ -8,6 +8,7 @@ This module centralizes validation/tuning extensions so `prepare_sector_network.
 import logging
 import os
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -175,14 +176,738 @@ def _repo_path(path_like):
 
 
 def _bus_country_lookup(n):
-    country = n.buses["country"].replace("", np.nan)
+    country = (
+        n.buses["country"].replace("", np.nan)
+        if "country" in n.buses.columns
+        else pd.Series(np.nan, index=n.buses.index)
+    )
     location_iso2 = (
         n.buses["location"].astype(str).str.extract(r"^([A-Z]{2})\b")[0]
+        if "location" in n.buses.columns
+        else pd.Series(np.nan, index=n.buses.index)
     )
     index_iso2 = (
         n.buses.index.astype(str).to_series(index=n.buses.index).str.extract(r"^([A-Z]{2})\b")[0]
     )
     return country.fillna(location_iso2).fillna(index_iso2).fillna("")
+
+
+def _effective_p_nom_mw(df):
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    p_nom = (
+        pd.to_numeric(df["p_nom"], errors="coerce")
+        if "p_nom" in df.columns
+        else pd.Series(0.0, index=df.index, dtype=float)
+    )
+    p_nom = p_nom.reindex(df.index).fillna(0.0).astype(float)
+
+    if "p_nom_opt" in df.columns:
+        p_nom_opt = pd.to_numeric(df["p_nom_opt"], errors="coerce")
+        p_nom_opt = p_nom_opt.reindex(df.index).astype(float)
+        # Prenetworks often carry `p_nom_opt=0`; prefer nominal capacity in that case.
+        p_nom_opt = p_nom_opt.where(p_nom_opt > 0.0)
+        return p_nom_opt.fillna(p_nom).fillna(0.0)
+
+    return p_nom
+
+
+def _snapshot_generator_weights(n):
+    try:
+        weights = n.snapshot_weightings["generators"]
+    except Exception:
+        weights = pd.Series(1.0, index=n.snapshots, dtype=float)
+    return pd.to_numeric(weights, errors="coerce").reindex(n.snapshots).fillna(1.0).astype(float)
+
+
+def _hydro_profile_pathology_assets(n, zero_twh_tol=1e-9):
+    """
+    Asset-level hydro profile diagnostics for prenetwork structures.
+
+    Flags missing/zero reservoir inflow time series and missing/zero run-of-river
+    (`ror`) availability profiles for non-zero capacity assets.
+    """
+    rows = []
+    bus_country = _bus_country_lookup(n)
+    weights = _snapshot_generator_weights(n)
+    weight_sum = float(weights.sum())
+
+    if not n.storage_units.empty:
+        su = n.storage_units.loc[n.storage_units["carrier"].astype(str).eq("hydro")].copy()
+        if not su.empty:
+            su["capacity_mw"] = _effective_p_nom_mw(su)
+            su = su.loc[su["capacity_mw"] > 0.0].copy()
+            if not su.empty:
+                su["bus"] = su["bus"].fillna("").astype(str)
+                su["country"] = su["bus"].map(bus_country).fillna("")
+                inflow_cols = (
+                    n.storage_units_t.inflow.columns.intersection(su.index)
+                    if not n.storage_units_t.inflow.empty
+                    else pd.Index([])
+                )
+                inflow_twh = pd.Series(0.0, index=su.index, dtype=float)
+                if len(inflow_cols) > 0:
+                    inflow_twh.loc[inflow_cols] = (
+                        n.storage_units_t.inflow.reindex(columns=inflow_cols)
+                        .fillna(0.0)
+                        .mul(weights, axis=0)
+                        .sum(axis=0)
+                        .astype(float)
+                        / 1e6
+                    )
+
+                has_col = su.index.isin(inflow_cols)
+                has_col = pd.Series(has_col, index=su.index, dtype=bool)
+                profile_all_zero = has_col & inflow_twh.le(zero_twh_tol)
+                missing_profile = ~has_col
+                needs_fallback = missing_profile | profile_all_zero
+                issue = pd.Series("", index=su.index, dtype=object)
+                issue.loc[missing_profile] = "missing_reservoir_inflow"
+                issue.loc[profile_all_zero] = "zero_reservoir_inflow"
+                issue.loc[needs_fallback & issue.eq("")] = "reservoir_profile_pathology"
+
+                su_out = su.reset_index().rename(columns={su.index.name or "index": "asset"})
+                su_out["component"] = "StorageUnit"
+                su_out["carrier"] = "hydro"
+                su_out["available_twh"] = inflow_twh.reindex(su_out["asset"]).values
+                su_out["has_profile_column"] = has_col.reindex(su_out["asset"]).values
+                su_out["profile_all_zero"] = profile_all_zero.reindex(su_out["asset"]).values
+                su_out["missing_profile"] = missing_profile.reindex(su_out["asset"]).values
+                su_out["needs_fallback"] = needs_fallback.reindex(su_out["asset"]).values
+                su_out["issue"] = issue.reindex(su_out["asset"]).values
+                rows.extend(
+                    su_out[
+                        [
+                            "component",
+                            "carrier",
+                            "asset",
+                            "bus",
+                            "country",
+                            "capacity_mw",
+                            "available_twh",
+                            "has_profile_column",
+                            "missing_profile",
+                            "profile_all_zero",
+                            "needs_fallback",
+                            "issue",
+                        ]
+                    ].to_dict("records")
+                )
+
+    if not n.generators.empty:
+        ror = n.generators.loc[n.generators["carrier"].astype(str).eq("ror")].copy()
+        if not ror.empty:
+            ror["capacity_mw"] = _effective_p_nom_mw(ror)
+            ror = ror.loc[ror["capacity_mw"] > 0.0].copy()
+            if not ror.empty:
+                ror["bus"] = ror["bus"].fillna("").astype(str)
+                ror["country"] = ror["bus"].map(bus_country).fillna("")
+
+                ts_cols = (
+                    n.generators_t.p_max_pu.columns.intersection(ror.index)
+                    if not n.generators_t.p_max_pu.empty
+                    else pd.Index([])
+                )
+                ts_cols = pd.Index(ts_cols)
+                has_ts = pd.Series(ror.index.isin(ts_cols), index=ror.index, dtype=bool)
+                availability_hours = pd.Series(0.0, index=ror.index, dtype=float)
+                if len(ts_cols) > 0:
+                    availability_hours.loc[ts_cols] = (
+                        n.generators_t.p_max_pu.reindex(columns=ts_cols)
+                        .fillna(0.0)
+                        .mul(weights, axis=0)
+                        .sum(axis=0)
+                        .astype(float)
+                    )
+                static_cols = ror.index.difference(ts_cols)
+                if len(static_cols) > 0:
+                    static_pmax = (
+                        pd.to_numeric(ror.loc[static_cols, "p_max_pu"], errors="coerce")
+                        .fillna(0.0)
+                        .clip(lower=0.0)
+                    )
+                    availability_hours.loc[static_cols] = static_pmax * weight_sum
+
+                available_twh = availability_hours.mul(ror["capacity_mw"]).div(1e6)
+                missing_profile = ~has_ts
+                # Zero-profile fallback applies to explicit time-series profiles only.
+                profile_all_zero = has_ts & available_twh.le(zero_twh_tol)
+                needs_fallback = missing_profile | profile_all_zero
+                issue = pd.Series("", index=ror.index, dtype=object)
+                issue.loc[missing_profile] = "missing_ror_profile"
+                issue.loc[profile_all_zero] = "zero_ror_profile"
+                issue.loc[needs_fallback & issue.eq("")] = "ror_profile_pathology"
+
+                ror_out = ror.reset_index().rename(columns={ror.index.name or "index": "asset"})
+                ror_out["component"] = "Generator"
+                ror_out["carrier"] = "ror"
+                ror_out["available_twh"] = available_twh.reindex(ror_out["asset"]).values
+                ror_out["has_profile_column"] = has_ts.reindex(ror_out["asset"]).values
+                ror_out["missing_profile"] = missing_profile.reindex(ror_out["asset"]).values
+                ror_out["profile_all_zero"] = profile_all_zero.reindex(ror_out["asset"]).values
+                ror_out["needs_fallback"] = needs_fallback.reindex(ror_out["asset"]).values
+                ror_out["issue"] = issue.reindex(ror_out["asset"]).values
+                rows.extend(
+                    ror_out[
+                        [
+                            "component",
+                            "carrier",
+                            "asset",
+                            "bus",
+                            "country",
+                            "capacity_mw",
+                            "available_twh",
+                            "has_profile_column",
+                            "missing_profile",
+                            "profile_all_zero",
+                            "needs_fallback",
+                            "issue",
+                        ]
+                    ].to_dict("records")
+                )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "component",
+            "carrier",
+            "asset",
+            "bus",
+            "country",
+            "capacity_mw",
+            "available_twh",
+            "has_profile_column",
+            "missing_profile",
+            "profile_all_zero",
+            "needs_fallback",
+            "issue",
+        ],
+    )
+
+
+def _hydro_profile_pathology_summary(asset_diag):
+    columns = [
+        "component",
+        "carrier",
+        "country",
+        "assets",
+        "assets_needing_fallback",
+        "missing_profile_assets",
+        "zero_profile_assets",
+        "capacity_mw",
+        "capacity_needing_fallback_mw",
+        "available_twh",
+        "available_twh_affected",
+    ]
+    if asset_diag.empty:
+        return pd.DataFrame(columns=columns)
+
+    diag = asset_diag.copy()
+    diag["country"] = diag["country"].fillna("")
+    summary = (
+        diag.groupby(["component", "carrier", "country"], as_index=False)
+        .agg(
+            assets=("asset", "count"),
+            assets_needing_fallback=("needs_fallback", "sum"),
+            missing_profile_assets=("missing_profile", "sum"),
+            zero_profile_assets=("profile_all_zero", "sum"),
+            capacity_mw=("capacity_mw", "sum"),
+            capacity_needing_fallback_mw=(
+                "capacity_mw",
+                lambda s: float(s[diag.loc[s.index, "needs_fallback"]].sum()),
+            ),
+            available_twh=("available_twh", "sum"),
+            available_twh_affected=(
+                "available_twh",
+                lambda s: float(s[diag.loc[s.index, "needs_fallback"]].sum()),
+            ),
+        )
+        .sort_values(["component", "carrier", "country"])
+        .reset_index(drop=True)
+    )
+    return summary[columns]
+
+
+def _hydro_fallback_donor_table(n, asset_diag, component, carrier):
+    if asset_diag.empty:
+        return pd.DataFrame()
+    donors = asset_diag.loc[
+        asset_diag["component"].eq(component)
+        & asset_diag["carrier"].eq(carrier)
+        & asset_diag["has_profile_column"].astype(bool)
+        & (~asset_diag["needs_fallback"].astype(bool))
+        & (pd.to_numeric(asset_diag["capacity_mw"], errors="coerce").fillna(0.0) > 0.0)
+    ].copy()
+    if donors.empty:
+        return donors
+    donors["x"] = pd.to_numeric(donors["bus"].map(n.buses.get("x", pd.Series(dtype=float))), errors="coerce")
+    donors["y"] = pd.to_numeric(donors["bus"].map(n.buses.get("y", pd.Series(dtype=float))), errors="coerce")
+    donors = donors.sort_values(["country", "asset"]).reset_index(drop=True)
+    return donors
+
+
+def _pick_hydro_fallback_donor(n, donors, target_bus, target_country):
+    if donors.empty:
+        return None
+
+    target_country = (target_country or "").strip()
+    target_x = np.nan
+    target_y = np.nan
+    if target_bus in n.buses.index:
+        target_x = pd.to_numeric(pd.Series([n.buses.at[target_bus, "x"]]), errors="coerce").iloc[0]
+        target_y = pd.to_numeric(pd.Series([n.buses.at[target_bus, "y"]]), errors="coerce").iloc[0]
+
+    same_country = donors.loc[donors["country"].fillna("").eq(target_country)].copy()
+    donors_xy = donors.loc[donors["x"].notna() & donors["y"].notna()].copy()
+    same_country_xy = same_country.loc[same_country["x"].notna() & same_country["y"].notna()].copy()
+
+    if pd.notna(target_x) and pd.notna(target_y) and not same_country_xy.empty:
+        d2 = (same_country_xy["x"] - float(target_x)) ** 2 + (same_country_xy["y"] - float(target_y)) ** 2
+        picked = same_country_xy.loc[d2.idxmin()].copy()
+        picked["distance_xy"] = float(np.sqrt(float(d2.min())))
+        picked["match_method"] = "nearest_xy_same_country"
+        return picked
+
+    if pd.notna(target_x) and pd.notna(target_y) and not donors_xy.empty:
+        d2 = (donors_xy["x"] - float(target_x)) ** 2 + (donors_xy["y"] - float(target_y)) ** 2
+        picked = donors_xy.loc[d2.idxmin()].copy()
+        picked["distance_xy"] = float(np.sqrt(float(d2.min())))
+        picked["match_method"] = "nearest_xy"
+        return picked
+
+    if not same_country.empty:
+        picked = same_country.iloc[0].copy()
+        picked["distance_xy"] = np.nan
+        picked["match_method"] = "first_same_country"
+        return picked
+
+    picked = donors.iloc[0].copy()
+    picked["distance_xy"] = np.nan
+    picked["match_method"] = "first_available"
+    return picked
+
+
+def _apply_hydro_reservoir_inflow_fallback(n, asset_diag, max_capacity_scale=None):
+    actions = []
+    rows = asset_diag.loc[
+        asset_diag["component"].eq("StorageUnit") & asset_diag["carrier"].eq("hydro")
+    ].copy()
+    if rows.empty:
+        return pd.DataFrame()
+
+    targets = rows.loc[rows["needs_fallback"].astype(bool)].copy()
+    if targets.empty:
+        return pd.DataFrame()
+
+    donors = _hydro_fallback_donor_table(n, rows, "StorageUnit", "hydro")
+    if donors.empty:
+        for _, t in targets.iterrows():
+            actions.append(
+                {
+                    "component": "StorageUnit",
+                    "carrier": "hydro",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": float(t["capacity_mw"]),
+                    "issue_before": t["issue"],
+                    "status": "unpatched",
+                    "reason": "no_nonzero_reservoir_inflow_donor",
+                }
+            )
+        return pd.DataFrame(actions)
+
+    for _, t in targets.iterrows():
+        donor = _pick_hydro_fallback_donor(n, donors, str(t["bus"]), str(t["country"]))
+        if donor is None:
+            actions.append(
+                {
+                    "component": "StorageUnit",
+                    "carrier": "hydro",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": float(t["capacity_mw"]),
+                    "issue_before": t["issue"],
+                    "status": "unpatched",
+                    "reason": "no_donor_selected",
+                }
+            )
+            continue
+
+        donor_asset = str(donor["asset"])
+        if donor_asset not in n.storage_units_t.inflow.columns:
+            actions.append(
+                {
+                    "component": "StorageUnit",
+                    "carrier": "hydro",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": float(t["capacity_mw"]),
+                    "issue_before": t["issue"],
+                    "status": "unpatched",
+                    "reason": "selected_donor_missing_inflow_column",
+                }
+            )
+            continue
+
+        donor_cap = float(pd.to_numeric(pd.Series([donor["capacity_mw"]]), errors="coerce").iloc[0] or 0.0)
+        target_cap = float(pd.to_numeric(pd.Series([t["capacity_mw"]]), errors="coerce").iloc[0] or 0.0)
+        if donor_cap <= 0.0:
+            actions.append(
+                {
+                    "component": "StorageUnit",
+                    "carrier": "hydro",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": target_cap,
+                    "issue_before": t["issue"],
+                    "donor_asset": donor_asset,
+                    "status": "unpatched",
+                    "reason": "selected_donor_nonpositive_capacity",
+                }
+            )
+            continue
+
+        scale_factor = target_cap / donor_cap if donor_cap > 0.0 else 1.0
+        if (
+            max_capacity_scale is not None
+            and max_capacity_scale > 0.0
+            and scale_factor > float(max_capacity_scale)
+        ):
+            actions.append(
+                {
+                    "component": "StorageUnit",
+                    "carrier": "hydro",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": target_cap,
+                    "issue_before": t["issue"],
+                    "donor_asset": donor_asset,
+                    "donor_bus": donor.get("bus", ""),
+                    "donor_country": donor.get("country", ""),
+                    "donor_capacity_mw": donor_cap,
+                    "donor_available_twh": float(
+                        pd.to_numeric(pd.Series([donor.get("available_twh", np.nan)]), errors="coerce").iloc[0]
+                    ),
+                    "scale_factor": float(scale_factor),
+                    "scale_factor_cap": float(max_capacity_scale),
+                    "distance_xy": float(donor.get("distance_xy")) if pd.notna(donor.get("distance_xy")) else np.nan,
+                    "match_method": donor.get("match_method", ""),
+                    "status": "unpatched",
+                    "reason": "reservoir_capacity_scale_exceeds_cap",
+                }
+            )
+            continue
+        donor_series = n.storage_units_t.inflow[donor_asset].fillna(0.0)
+        n.storage_units_t.inflow.loc[:, str(t["asset"])] = donor_series.values * scale_factor
+
+        actions.append(
+            {
+                "component": "StorageUnit",
+                "carrier": "hydro",
+                "target_asset": t["asset"],
+                "target_bus": t["bus"],
+                "target_country": t["country"],
+                "target_capacity_mw": target_cap,
+                "issue_before": t["issue"],
+                "donor_asset": donor_asset,
+                "donor_bus": donor.get("bus", ""),
+                "donor_country": donor.get("country", ""),
+                "donor_capacity_mw": donor_cap,
+                "donor_available_twh": float(pd.to_numeric(pd.Series([donor.get("available_twh", np.nan)]), errors="coerce").iloc[0]),
+                "scale_factor": float(scale_factor),
+                "scale_factor_cap": float(max_capacity_scale) if max_capacity_scale is not None else np.nan,
+                "distance_xy": float(donor.get("distance_xy")) if pd.notna(donor.get("distance_xy")) else np.nan,
+                "match_method": donor.get("match_method", ""),
+                "status": "patched",
+                "reason": "",
+            }
+        )
+
+    return pd.DataFrame(actions)
+
+
+def _apply_ror_profile_fallback(n, asset_diag):
+    actions = []
+    rows = asset_diag.loc[
+        asset_diag["component"].eq("Generator") & asset_diag["carrier"].eq("ror")
+    ].copy()
+    if rows.empty:
+        return pd.DataFrame()
+
+    targets = rows.loc[rows["needs_fallback"].astype(bool)].copy()
+    if targets.empty:
+        return pd.DataFrame()
+
+    donors = _hydro_fallback_donor_table(n, rows, "Generator", "ror")
+    if donors.empty:
+        for _, t in targets.iterrows():
+            actions.append(
+                {
+                    "component": "Generator",
+                    "carrier": "ror",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": float(t["capacity_mw"]),
+                    "issue_before": t["issue"],
+                    "status": "unpatched",
+                    "reason": "no_nonzero_ror_profile_donor",
+                }
+            )
+        return pd.DataFrame(actions)
+
+    for _, t in targets.iterrows():
+        donor = _pick_hydro_fallback_donor(n, donors, str(t["bus"]), str(t["country"]))
+        if donor is None:
+            actions.append(
+                {
+                    "component": "Generator",
+                    "carrier": "ror",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": float(t["capacity_mw"]),
+                    "issue_before": t["issue"],
+                    "status": "unpatched",
+                    "reason": "no_donor_selected",
+                }
+            )
+            continue
+
+        donor_asset = str(donor["asset"])
+        if donor_asset not in n.generators_t.p_max_pu.columns:
+            actions.append(
+                {
+                    "component": "Generator",
+                    "carrier": "ror",
+                    "target_asset": t["asset"],
+                    "target_bus": t["bus"],
+                    "target_country": t["country"],
+                    "target_capacity_mw": float(t["capacity_mw"]),
+                    "issue_before": t["issue"],
+                    "status": "unpatched",
+                    "reason": "selected_donor_missing_ror_profile",
+                }
+            )
+            continue
+
+        donor_series = n.generators_t.p_max_pu[donor_asset].fillna(0.0).clip(lower=0.0)
+        n.generators_t.p_max_pu.loc[:, str(t["asset"])] = donor_series.values
+
+        actions.append(
+            {
+                "component": "Generator",
+                "carrier": "ror",
+                "target_asset": t["asset"],
+                "target_bus": t["bus"],
+                "target_country": t["country"],
+                "target_capacity_mw": float(pd.to_numeric(pd.Series([t["capacity_mw"]]), errors="coerce").iloc[0] or 0.0),
+                "issue_before": t["issue"],
+                "donor_asset": donor_asset,
+                "donor_bus": donor.get("bus", ""),
+                "donor_country": donor.get("country", ""),
+                "donor_capacity_mw": float(pd.to_numeric(pd.Series([donor.get("capacity_mw", np.nan)]), errors="coerce").iloc[0]),
+                "donor_available_twh": float(pd.to_numeric(pd.Series([donor.get("available_twh", np.nan)]), errors="coerce").iloc[0]),
+                "scale_factor": 1.0,
+                "scale_factor_cap": np.nan,
+                "distance_xy": float(donor.get("distance_xy")) if pd.notna(donor.get("distance_xy")) else np.nan,
+                "match_method": donor.get("match_method", ""),
+                "status": "patched",
+                "reason": "",
+            }
+        )
+
+    return pd.DataFrame(actions)
+
+
+def _hydro_fallback_diagnostics_dir(config, investment_year, output_network_path=None):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    diagnostics_dir_cfg = str(base_cfg.get("hydro_profile_fallback_diagnostics_dir", "") or "").strip()
+    if diagnostics_dir_cfg:
+        return Path(_repo_path(diagnostics_dir_cfg))
+
+    if output_network_path:
+        net_path = Path(str(output_network_path))
+        return net_path.parent / "diagnostics" / f"{net_path.stem}.hydro_profile_fallback"
+
+    return Path(BASE_DIR) / "validation" / ".tmp" / "hydro_profile_fallback" / str(investment_year)
+
+
+def _write_hydro_fallback_diagnostics(
+    config,
+    investment_year,
+    asset_before,
+    asset_after,
+    actions,
+    output_network_path=None,
+):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("hydro_profile_fallback_diagnostics", True)):
+        return None
+
+    diag_dir = _hydro_fallback_diagnostics_dir(config, investment_year, output_network_path)
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_before = _hydro_profile_pathology_summary(asset_before)
+    summary_after = _hydro_profile_pathology_summary(asset_after)
+
+    asset_before.to_csv(diag_dir / "hydro_profile_pathology_assets_before.csv", index=False)
+    asset_after.to_csv(diag_dir / "hydro_profile_pathology_assets_after.csv", index=False)
+    summary_before.to_csv(diag_dir / "hydro_profile_pathology_summary_before.csv", index=False)
+    summary_after.to_csv(diag_dir / "hydro_profile_pathology_summary_after.csv", index=False)
+    actions.to_csv(diag_dir / "hydro_profile_fallback_actions.csv", index=False)
+
+    return diag_dir
+
+
+def apply_hydro_profile_fallback_and_diagnostics(
+    n,
+    investment_year,
+    config,
+    output_network_path=None,
+):
+    """
+    Patch hydro profile pathologies in prenetwork structures before hydro scaling hooks.
+
+    Fallbacks:
+    - `ror`: nearest non-zero `p_max_pu` profile
+    - reservoir (`StorageUnit carrier='hydro'`): nearest non-zero inflow profile,
+      scaled by `target_capacity / donor_capacity`
+
+    Diagnostics (CSV):
+    - asset-level pathology table before/after
+    - country summary before/after
+    - fallback action log (patched/unpatched)
+    """
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("hydro_profile_fallback_enabled", True)):
+        return {
+            "enabled": False,
+            "diagnostics_dir": None,
+            "actions": pd.DataFrame(),
+        }
+
+    zero_twh_tol = float(base_cfg.get("hydro_profile_fallback_zero_twh_tol", 1e-9))
+    reservoir_scale_cap = float(base_cfg.get("hydro_reservoir_fallback_scale_cap", 10.0))
+    asset_before = _hydro_profile_pathology_assets(n, zero_twh_tol=zero_twh_tol)
+
+    if asset_before.empty:
+        diag_dir = _write_hydro_fallback_diagnostics(
+            config,
+            investment_year,
+            asset_before,
+            asset_before.copy(),
+            pd.DataFrame(),
+            output_network_path=output_network_path,
+        )
+        logger.info("Hydro profile fallback: no hydro reservoir/ror assets found; diagnostics_dir=%s", diag_dir)
+        return {
+            "enabled": True,
+            "diagnostics_dir": str(diag_dir) if diag_dir is not None else None,
+            "actions": pd.DataFrame(),
+            "before": asset_before,
+            "after": asset_before.copy(),
+        }
+
+    reservoir_actions = _apply_hydro_reservoir_inflow_fallback(
+        n,
+        asset_before,
+        max_capacity_scale=reservoir_scale_cap,
+    )
+    ror_actions = _apply_ror_profile_fallback(n, asset_before)
+    actions = pd.concat([reservoir_actions, ror_actions], ignore_index=True, sort=False)
+    if actions.empty:
+        actions = pd.DataFrame(
+            columns=[
+                "component",
+                "carrier",
+                "target_asset",
+                "target_bus",
+                "target_country",
+                "target_capacity_mw",
+                "issue_before",
+                "donor_asset",
+                "donor_bus",
+                "donor_country",
+                "donor_capacity_mw",
+                "donor_available_twh",
+                "scale_factor",
+                "scale_factor_cap",
+                "distance_xy",
+                "match_method",
+                "status",
+                "reason",
+            ]
+        )
+
+    asset_after = _hydro_profile_pathology_assets(n, zero_twh_tol=zero_twh_tol)
+    diag_dir = _write_hydro_fallback_diagnostics(
+        config,
+        investment_year,
+        asset_before,
+        asset_after,
+        actions,
+        output_network_path=output_network_path,
+    )
+
+    before_count = int(asset_before["needs_fallback"].sum()) if not asset_before.empty else 0
+    after_count = int(asset_after["needs_fallback"].sum()) if not asset_after.empty else 0
+    patched_count = int(actions["status"].eq("patched").sum()) if not actions.empty else 0
+    unpatched_count = int(actions["status"].eq("unpatched").sum()) if not actions.empty else 0
+    cap_exceeded_count = (
+        int(actions["reason"].eq("reservoir_capacity_scale_exceeds_cap").sum())
+        if not actions.empty and "reason" in actions.columns
+        else 0
+    )
+    patched_sample = ""
+    if patched_count > 0:
+        sample_rows = actions.loc[actions["status"].eq("patched")].head(5)
+        patched_sample = ", ".join(
+            f"{row.target_asset}<-{row.donor_asset}" for row in sample_rows.itertuples()
+        )
+
+    if cap_exceeded_count > 0:
+        cap_rows = actions.loc[actions["reason"].eq("reservoir_capacity_scale_exceeds_cap")].head(5)
+        cap_sample = ", ".join(
+            f"{row.target_asset}<-{row.donor_asset} ({row.scale_factor:.2f}x>{row.scale_factor_cap:.2f}x)"
+            for row in cap_rows.itertuples()
+        )
+        logger.warning(
+            "Hydro reservoir inflow fallback skipped %d asset(s) due to capacity-scale cap %.2fx (sample: %s%s)",
+            cap_exceeded_count,
+            reservoir_scale_cap,
+            cap_sample,
+            " ..." if cap_exceeded_count > 5 else "",
+        )
+
+    logger.warning(
+        "Hydro profile fallback diagnostics: pathologies_before=%d, patched=%d, unpatched=%d, residual_after=%d, reservoir_scale_cap=%.2fx, diagnostics_dir=%s%s%s",
+        before_count,
+        patched_count,
+        unpatched_count,
+        after_count,
+        reservoir_scale_cap,
+        diag_dir,
+        ", sample=" if patched_sample else "",
+        patched_sample if patched_sample else "",
+    )
+
+    return {
+        "enabled": True,
+        "diagnostics_dir": str(diag_dir) if diag_dir is not None else None,
+        "actions": actions,
+        "before": asset_before,
+        "after": asset_after,
+    }
 
 
 def _electric_load_index_and_country(n):
@@ -2236,5 +2961,3 @@ def apply_country_fuel_price_overrides(fuel_price_dict, investment_year, costs, 
         investment_year,
     )
     return fuel_price_dict
-
-
