@@ -15,6 +15,7 @@ from functools import lru_cache
 import json
 import logging
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -22,6 +23,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 import pypsa
+import yaml
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 try:
@@ -223,6 +225,91 @@ IAEA_COUNTRY_ALIASES = {
 }
 
 
+EXTENDABLE_COMPONENT_SPECS = {
+    "Generator": {
+        "list_name": "generators",
+        "extendable_col": "p_nom_extendable",
+        "nom_col": "p_nom",
+        "nom_opt_col": "p_nom_opt",
+        "nom_min_col": "p_nom_min",
+        "bus_cols": ["bus"],
+    },
+    "Link": {
+        "list_name": "links",
+        "extendable_col": "p_nom_extendable",
+        "nom_col": "p_nom",
+        "nom_opt_col": "p_nom_opt",
+        "nom_min_col": "p_nom_min",
+        "bus_cols": ["bus0", "bus1", "bus2", "bus3", "bus4"],
+    },
+    "StorageUnit": {
+        "list_name": "storage_units",
+        "extendable_col": "p_nom_extendable",
+        "nom_col": "p_nom",
+        "nom_opt_col": "p_nom_opt",
+        "nom_min_col": "p_nom_min",
+        "bus_cols": ["bus"],
+    },
+    "Store": {
+        "list_name": "stores",
+        "extendable_col": "e_nom_extendable",
+        "nom_col": "e_nom",
+        "nom_opt_col": "e_nom_opt",
+        "nom_min_col": "e_nom_min",
+        "bus_cols": ["bus"],
+    },
+    "Line": {
+        "list_name": "lines",
+        "extendable_col": "s_nom_extendable",
+        "nom_col": "s_nom",
+        "nom_opt_col": "s_nom_opt",
+        "nom_min_col": "s_nom_min",
+        "bus_cols": ["bus0", "bus1"],
+    },
+    "Transformer": {
+        "list_name": "transformers",
+        "extendable_col": "s_nom_extendable",
+        "nom_col": "s_nom",
+        "nom_opt_col": "s_nom_opt",
+        "nom_min_col": "s_nom_min",
+        "bus_cols": ["bus0", "bus1"],
+    },
+}
+
+BASEYEAR_EXTENDABILITY_AUDIT_COLUMNS = [
+    "year",
+    "component",
+    "asset",
+    "carrier",
+    "country",
+    "country_context",
+    "extendable_attr",
+    "nominal_attr",
+    "nominal_value",
+    "nominal_opt_attr",
+    "nominal_opt_value",
+    "nominal_min_attr",
+    "nominal_min_value",
+    "build_year",
+    "lifetime",
+    "lifetime_is_inf",
+    "is_zero_capacity_placeholder",
+    "classification",
+    "gate_bucket",
+    "gate_blocking",
+    "matched_rule_id",
+    "matched_rule_rationale",
+]
+
+# Treat tiny optimized capacities as numerical noise for template placeholders.
+EXTENDABILITY_PLACEHOLDER_ABS_TOL = 1e-3
+BATTERY_BASEYEAR_CARRIERS_BY_COMPONENT = {
+    "Link": {"battery charger", "battery discharger"},
+    "Store": {"battery"},
+    "StorageUnit": {"battery"},
+}
+
+
 @lru_cache(maxsize=1)
 def _country_to_continent_lookup() -> dict[str, str]:
     """
@@ -257,14 +344,297 @@ def _bus_country_lookup(n: pypsa.Network) -> pd.Series:
     Some sectoral fuel buses do not populate `buses.country`; for these,
     infer ISO2 from `buses.location` or bus name prefix.
     """
-    country_col = n.buses["country"] if "country" in n.buses.columns else pd.Series("", index=n.buses.index)
-    country = country_col.replace("", np.nan)
-    if "location" in n.buses.columns:
-        location_iso2 = n.buses["location"].astype(str).str.extract(r"^([A-Z]{2})\b")[0]
-    else:
-        location_iso2 = pd.Series(np.nan, index=n.buses.index, dtype=object)
+    country = (
+        n.buses["country"].replace("", np.nan)
+        if "country" in n.buses.columns
+        else pd.Series("", index=n.buses.index, dtype=object)
+    )
+    location_series = (
+        n.buses["location"]
+        if "location" in n.buses.columns
+        else pd.Series("", index=n.buses.index, dtype=object)
+    )
+    location_iso2 = location_series.astype(str).str.extract(r"^([A-Z]{2})\b")[0]
     index_iso2 = n.buses.index.astype(str).to_series(index=n.buses.index).str.extract(r"^([A-Z]{2})\b")[0]
     return country.fillna(location_iso2).fillna(index_iso2).fillna("")
+
+
+def _normalize_allowlist_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
+
+
+def _load_baseyear_extendability_allowlist(path: Path) -> list[dict]:
+    if not path.exists():
+        raise FileNotFoundError(f"Baseyear extendability allowlist not found: {path}")
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    rules_raw = data.get("rules", []) if isinstance(data, dict) else data
+    if not isinstance(rules_raw, list):
+        raise ValueError(
+            f"Invalid extendability allowlist format in {path}; expected a top-level 'rules' list."
+        )
+
+    normalized: list[dict] = []
+    for i, rule in enumerate(rules_raw, start=1):
+        if not isinstance(rule, dict):
+            raise ValueError(f"Allowlist rule #{i} in {path} must be a mapping")
+        normalized.append(
+            {
+                "id": str(rule.get("id", f"rule_{i}")),
+                "classification": str(rule.get("classification", "allowed")),
+                "rationale": str(rule.get("rationale", "")),
+                "component": set(_normalize_allowlist_list(rule.get("component"))),
+                "carrier": set(_normalize_allowlist_list(rule.get("carrier"))),
+                "name": set(_normalize_allowlist_list(rule.get("name"))),
+                "component_regex": rule.get("component_regex"),
+                "carrier_regex": rule.get("carrier_regex"),
+                "name_regex": rule.get("name_regex"),
+                "extendable_attr": set(_normalize_allowlist_list(rule.get("extendable_attr"))),
+                "lifetime_is_inf": rule.get("lifetime_is_inf"),
+                "build_year_eq": rule.get("build_year_eq"),
+            }
+        )
+    return normalized
+
+
+def _allowlist_rule_matches_extendability_row(row: pd.Series, rule: dict) -> bool:
+    for field in ["component", "carrier", "name", "extendable_attr"]:
+        allowed = rule.get(field) or set()
+        row_field = "asset" if field == "name" else field
+        if allowed and str(row.get(row_field, "")) not in allowed:
+            return False
+
+    if rule.get("component_regex") and not re.search(str(rule["component_regex"]), str(row.get("component", ""))):
+        return False
+    if rule.get("carrier_regex") and not re.search(str(rule["carrier_regex"]), str(row.get("carrier", ""))):
+        return False
+    if rule.get("name_regex") and not re.search(str(rule["name_regex"]), str(row.get("asset", ""))):
+        return False
+
+    if rule.get("lifetime_is_inf") is not None:
+        if bool(row.get("lifetime_is_inf", False)) != bool(rule["lifetime_is_inf"]):
+            return False
+
+    if rule.get("build_year_eq") is not None:
+        row_year = pd.to_numeric(pd.Series([row.get("build_year")]), errors="coerce").iloc[0]
+        try:
+            rule_year = float(rule["build_year_eq"])
+        except Exception:
+            return False
+        if not pd.notna(row_year) or not np.isclose(float(row_year), rule_year, rtol=0.0, atol=0.0):
+            return False
+
+    return True
+
+
+def _first_non_empty_country_context(df: pd.DataFrame, bus_cols: list[str], bus_country: pd.Series) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
+    if df.empty:
+        out["country"] = pd.Series(dtype=object)
+        out["country_context"] = pd.Series(dtype=object)
+        return out
+
+    mapped_cols = []
+    for col in bus_cols:
+        if col in df.columns:
+            mapped = df[col].map(bus_country).fillna("").astype(str)
+            mapped_cols.append(mapped.rename(col))
+
+    if not mapped_cols:
+        out["country"] = ""
+        out["country_context"] = ""
+        return out
+
+    mapped_df = pd.concat(mapped_cols, axis=1)
+    non_empty = mapped_df.replace("", np.nan)
+    out["country"] = non_empty.bfill(axis=1).iloc[:, 0].fillna("")
+
+    def _row_country_context(row: pd.Series) -> str:
+        vals = sorted({str(v) for v in row.tolist() if isinstance(v, str) and v})
+        return "|".join(vals)
+
+    out["country_context"] = mapped_df.apply(_row_country_context, axis=1)
+    return out
+
+
+def _empty_baseyear_extendability_audit() -> pd.DataFrame:
+    return pd.DataFrame(columns=BASEYEAR_EXTENDABILITY_AUDIT_COLUMNS)
+
+
+def _classify_extendability_gate_buckets(audit_df: pd.DataFrame, year: int) -> pd.DataFrame:
+    if audit_df.empty:
+        out = audit_df.copy()
+        if "is_zero_capacity_placeholder" not in out.columns:
+            out["is_zero_capacity_placeholder"] = pd.Series(dtype=bool)
+        if "gate_bucket" not in out.columns:
+            out["gate_bucket"] = pd.Series(dtype=object)
+        if "gate_blocking" not in out.columns:
+            out["gate_blocking"] = pd.Series(dtype=bool)
+        return out
+
+    out = audit_df.copy()
+    nominal = pd.to_numeric(out["nominal_value"], errors="coerce").fillna(0.0).abs()
+    nominal_opt = pd.to_numeric(out["nominal_opt_value"], errors="coerce").fillna(0.0).abs()
+    build_year = pd.to_numeric(out["build_year"], errors="coerce")
+    build_year_is_baseyear = build_year.notna() & build_year.eq(float(year))
+    zero_placeholder = (
+        out["classification"].eq("unexpected")
+        & out["component"].isin(["Link", "Store"])
+        & build_year_is_baseyear
+        & (nominal <= EXTENDABILITY_PLACEHOLDER_ABS_TOL)
+        & (nominal_opt <= EXTENDABILITY_PLACEHOLDER_ABS_TOL)
+    )
+    carrier_norm = out["carrier"].fillna("").astype(str).str.lower()
+    battery_placeholder = pd.Series(False, index=out.index)
+    for component, carriers in BATTERY_BASEYEAR_CARRIERS_BY_COMPONENT.items():
+        battery_placeholder |= out["component"].eq(component) & carrier_norm.isin(set(carriers))
+    zero_placeholder &= ~battery_placeholder
+    out["is_zero_capacity_placeholder"] = zero_placeholder.astype(bool)
+
+    out["gate_bucket"] = "unexpected_blocking"
+    out.loc[out["classification"].eq("allowed"), "gate_bucket"] = "allowed"
+    out.loc[
+        out["classification"].eq("unexpected") & out["is_zero_capacity_placeholder"],
+        "gate_bucket",
+    ] = "unexpected_zero_placeholder_nonblocking"
+    out["gate_blocking"] = out["gate_bucket"].eq("unexpected_blocking")
+    return out
+
+
+def _baseyear_extendability_audit(
+    n: pypsa.Network,
+    year: int,
+    allowlist_rules: list[dict],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    bus_country = _bus_country_lookup(n)
+    audit_parts: list[pd.DataFrame] = []
+
+    for component_name, spec in EXTENDABLE_COMPONENT_SPECS.items():
+        if not hasattr(n, spec["list_name"]):
+            continue
+        df = getattr(n, spec["list_name"])
+        extendable_col = spec["extendable_col"]
+        if extendable_col not in df.columns:
+            continue
+        extendable_mask = df[extendable_col].fillna(False).astype(bool)
+        if not extendable_mask.any():
+            continue
+
+        sub = df.loc[extendable_mask].copy()
+        ctx = _first_non_empty_country_context(sub, spec["bus_cols"], bus_country)
+
+        carrier = (
+            sub["carrier"].astype(str)
+            if "carrier" in sub.columns
+            else pd.Series("", index=sub.index, dtype=object)
+        )
+        if component_name == "Line":
+            carrier = carrier.replace("", "AC")
+        elif component_name == "Transformer":
+            carrier = carrier.replace("", "transformer")
+
+        nominal = (
+            pd.to_numeric(sub.get(spec["nom_col"]), errors="coerce")
+            if spec["nom_col"] in sub.columns
+            else pd.Series(np.nan, index=sub.index)
+        )
+        nominal_opt = (
+            pd.to_numeric(sub.get(spec["nom_opt_col"]), errors="coerce")
+            if spec["nom_opt_col"] in sub.columns
+            else pd.Series(np.nan, index=sub.index)
+        )
+        nominal_min = (
+            pd.to_numeric(sub.get(spec["nom_min_col"]), errors="coerce")
+            if spec["nom_min_col"] in sub.columns
+            else pd.Series(np.nan, index=sub.index)
+        )
+        build_year = (
+            pd.to_numeric(sub.get("build_year"), errors="coerce")
+            if "build_year" in sub.columns
+            else pd.Series(np.nan, index=sub.index)
+        )
+        lifetime = (
+            pd.to_numeric(sub.get("lifetime"), errors="coerce")
+            if "lifetime" in sub.columns
+            else pd.Series(np.nan, index=sub.index)
+        )
+
+        audit = pd.DataFrame(index=sub.index)
+        audit["year"] = int(year)
+        audit["component"] = component_name
+        audit["asset"] = sub.index.astype(str)
+        audit["carrier"] = carrier.fillna("").astype(str)
+        audit["country"] = ctx["country"].fillna("")
+        audit["country_context"] = ctx["country_context"].fillna("")
+        audit["extendable_attr"] = extendable_col
+        audit["nominal_attr"] = spec["nom_col"]
+        audit["nominal_value"] = nominal
+        audit["nominal_opt_attr"] = spec["nom_opt_col"]
+        audit["nominal_opt_value"] = nominal_opt
+        audit["nominal_min_attr"] = spec["nom_min_col"]
+        audit["nominal_min_value"] = nominal_min
+        audit["build_year"] = build_year
+        audit["lifetime"] = lifetime
+        audit["lifetime_is_inf"] = np.isinf(lifetime.fillna(np.nan))
+        audit["classification"] = "unexpected"
+        audit["matched_rule_id"] = ""
+        audit["matched_rule_rationale"] = ""
+
+        for idx, row in audit.iterrows():
+            for rule in allowlist_rules:
+                if _allowlist_rule_matches_extendability_row(row, rule):
+                    audit.at[idx, "classification"] = str(rule.get("classification", "allowed"))
+                    audit.at[idx, "matched_rule_id"] = str(rule.get("id", ""))
+                    audit.at[idx, "matched_rule_rationale"] = str(rule.get("rationale", ""))
+                    break
+
+        audit_parts.append(audit.reset_index(drop=True))
+
+    if audit_parts:
+        audit_df = pd.concat(audit_parts, ignore_index=True)
+        audit_df = _classify_extendability_gate_buckets(audit_df, year=year)
+        audit_df = audit_df.loc[:, BASEYEAR_EXTENDABILITY_AUDIT_COLUMNS].copy()
+        audit_df = audit_df.sort_values(
+            ["gate_bucket", "classification", "component", "carrier", "country", "asset"],
+            ascending=[True, True, True, True, True, True],
+            ignore_index=True,
+        )
+    else:
+        audit_df = _empty_baseyear_extendability_audit()
+
+    summary = pd.DataFrame(
+        [
+            {
+                "year": int(year),
+                "total_extendable_assets": int(len(audit_df)),
+                "allowed_assets": int((audit_df["classification"] == "allowed").sum()),
+                "unexpected_assets": int((audit_df["classification"] == "unexpected").sum()),
+                "unexpected_blocking_assets": int(
+                    (audit_df.get("gate_blocking", pd.Series(False, index=audit_df.index))).sum()
+                ),
+                "unexpected_zero_placeholder_nonblocking_assets": int(
+                    (
+                        audit_df.get(
+                            "is_zero_capacity_placeholder",
+                            pd.Series(False, index=audit_df.index),
+                        )
+                    ).sum()
+                ),
+                "status": (
+                    "fail"
+                    if bool(
+                        audit_df.get("gate_blocking", pd.Series(False, index=audit_df.index)).any()
+                    )
+                    else "pass"
+                ),
+            }
+        ]
+    )
+    return audit_df, summary
 
 
 def _safe_iso3_to_iso2(code: str) -> str | np.nan:
@@ -3063,6 +3433,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--year", type=int, default=2020, help="Validation year")
     parser.add_argument(
+        "--baseyear-extendability-allowlist",
+        type=Path,
+        default=REPO_ROOT / "validation" / "config.baseyear_extendability_allowlist.yaml",
+        help="YAML allowlist for 2020 extendable non-physical/accounting assets.",
+    )
+    parser.add_argument(
+        "--skip-baseyear-extendability-check",
+        action="store_true",
+        help="Skip the 2020 extendability audit/hard-fail check.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=REPO_ROOT / "validation" / "results",
@@ -3146,6 +3527,67 @@ def main() -> None:
 
     LOGGER.info("Loading network: %s", args.network)
     n = pypsa.Network(args.network)
+
+    baseyear_extendability_audit = _empty_baseyear_extendability_audit()
+    baseyear_extendability_summary = pd.DataFrame(
+        [
+            {
+                "year": int(args.year),
+                "total_extendable_assets": 0,
+                "allowed_assets": 0,
+                "unexpected_assets": 0,
+                "unexpected_blocking_assets": 0,
+                "unexpected_zero_placeholder_nonblocking_assets": 0,
+                "status": (
+                    "skipped"
+                    if args.skip_baseyear_extendability_check or args.year != 2020
+                    else "not_run"
+                ),
+            }
+        ]
+    )
+    extendability_gate_failed = False
+    extendability_check_enabled = not args.skip_baseyear_extendability_check and args.year == 2020
+    if extendability_check_enabled:
+        allowlist_rules = _load_baseyear_extendability_allowlist(args.baseyear_extendability_allowlist)
+        baseyear_extendability_audit, baseyear_extendability_summary = _baseyear_extendability_audit(
+            n=n,
+            year=args.year,
+            allowlist_rules=allowlist_rules,
+        )
+        baseyear_extendability_summary["allowlist_path"] = str(
+            args.baseyear_extendability_allowlist.resolve()
+        )
+        unexpected_extendable = baseyear_extendability_audit.loc[
+            baseyear_extendability_audit["classification"] == "unexpected"
+        ].copy()
+        unexpected_blocking_extendable = baseyear_extendability_audit.loc[
+            baseyear_extendability_audit.get("gate_blocking", pd.Series(False, index=baseyear_extendability_audit.index))
+        ].copy()
+        nonblocking_zero_placeholders = baseyear_extendability_audit.loc[
+            baseyear_extendability_audit.get(
+                "is_zero_capacity_placeholder",
+                pd.Series(False, index=baseyear_extendability_audit.index),
+            )
+        ].copy()
+        extendability_gate_failed = not unexpected_blocking_extendable.empty
+        if extendability_gate_failed:
+            LOGGER.error(
+                "2020 extendability audit found %d blocking unexpected extendable assets "
+                "(plus %d non-blocking zero-cap placeholders; see baseyear_extendability_audit.csv).",
+                len(unexpected_blocking_extendable),
+                len(nonblocking_zero_placeholders),
+            )
+        else:
+            LOGGER.info(
+                "2020 extendability audit passed: blocking unexpected=0 "
+                "(non-blocking zero-cap placeholders=%d, total unexpected=%d, total extendable=%d).",
+                len(nonblocking_zero_placeholders),
+                len(unexpected_extendable),
+                len(baseyear_extendability_audit),
+            )
+    else:
+        baseyear_extendability_summary["allowlist_path"] = str(args.baseyear_extendability_allowlist)
 
     network_countries = set(n.buses.country.dropna())
     network_countries.discard("")
@@ -3319,6 +3761,12 @@ def main() -> None:
     _round_for_csv(zero_profile_summary).to_csv(
         args.output_dir / "renewable_zero_profile_country_carrier_summary.csv", index=False
     )
+    _round_for_csv(baseyear_extendability_audit).to_csv(
+        args.output_dir / "baseyear_extendability_audit.csv", index=False
+    )
+    _round_for_csv(baseyear_extendability_summary).to_csv(
+        args.output_dir / "baseyear_extendability_summary.csv", index=False
+    )
     _write_validation_gate_outputs(
         output_dir=args.output_dir,
         gate_summary=gate_summary,
@@ -3484,6 +3932,9 @@ def main() -> None:
         demand_summary,
     )
     if args.fail_on_guardrail_fail and guardrail_status["overall_status"] == "fail":
+        raise SystemExit(2)
+
+    if extendability_check_enabled and extendability_gate_failed:
         raise SystemExit(2)
 
 

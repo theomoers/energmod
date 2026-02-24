@@ -1,0 +1,48 @@
+version: 1
+description: >
+  Validator-side allowlist for 2020 extendable components that are expected to be
+  accounting/tracking/slack-like rather than physical capacity expansion assets.
+
+rules:
+  - id: tracking_infinite_lifetime
+    classification: allowed
+    component:
+      - Generator
+      - Link
+      - Store
+      - StorageUnit
+    lifetime_is_inf: true
+    rationale: "Infinite-lifetime components are typically accounting/tracking carriers."
+
+  - id: load_shedding_slack_generator
+    classification: allowed
+    component: Generator
+    carrier: Load
+    rationale: "Load shedding pseudo-generator is a slack construct, not physical capacity."
+
+  - id: co2_accounting_carriers
+    classification: allowed
+    component:
+      - Generator
+      - Link
+      - Store
+    carrier_regex: "(?i)co2"
+    rationale: "CO2 accounting chains may be extendable and are not physical electricity assets."
+
+  - id: non_transmission_non_battery_links_allowed_2020
+    classification: allowed
+    component: Link
+    carrier_regex: "(?i)^(?!(dc|battery charger|battery discharger)$).+"
+    rationale: >
+      2020 policy: sector conversion/process links may remain extendable. Transmission DC links
+      and battery charger/discharger links are excluded and remain blocking if extendable.
+
+  - id: explicit_tracking_name_pattern
+    classification: allowed
+    component:
+      - Generator
+      - Link
+      - Store
+      - StorageUnit
+    name_regex: "(?i)(tracking|dummy|slack)"
+    rationale: "Explicitly named tracking/slack placeholders are allowlisted."
