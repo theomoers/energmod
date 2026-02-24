@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 from functools import lru_cache
+import json
 import logging
 from pathlib import Path
 import sys
+from typing import Any
 
 import matplotlib
 import numpy as np
@@ -22,6 +24,10 @@ import pandas as pd
 import pypsa
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+try:
+    import yaml
+except ImportError:  # pragma: no cover - runtime environment normally provides PyYAML
+    yaml = None
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -37,6 +43,52 @@ from _helpers import (
 
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_VALIDATION_GATE_CONFIG_PATH = REPO_ROOT / "validation" / "config.validation_gate.yaml"
+
+
+DEMAND_METRIC_DEFINITIONS = {
+    "electricity_demand": "load + link (excludes storage charging and Store withdrawals)",
+    "electricity_demand_total_ac_withdrawal": "load + link + storage charging + Store withdrawals",
+    "electricity_demand_load_component": "AC Load withdrawals only",
+    "electricity_demand_link_component": "AC withdrawals attributed to Links",
+    "electricity_demand_storage_charging": "AC withdrawals used for StorageUnit charging",
+    "electricity_demand_store_component": "AC withdrawals used for Store charging",
+}
+
+VALIDATION_GATE_DOMAIN_SPECS = {
+    "capacity": {
+        "metric_col": "validation_tech",
+        "model_col": "capacity_mw",
+        "reference_col": "reference_mw",
+        "abs_error_col": "abs_error_mw",
+        "ape_col": "ape_pct",
+        "unit": "MW",
+    },
+    "electricity_balance": {
+        "metric_col": "metric",
+        "model_col": "model_twh",
+        "reference_col": "reference_twh",
+        "abs_error_col": "abs_error_twh",
+        "ape_col": "ape_pct",
+        "unit": "TWh",
+    },
+    "electricity_demand": {
+        "metric_col": "metric",
+        "model_col": "model_twh",
+        "reference_col": "reference_twh",
+        "abs_error_col": "abs_error_twh",
+        "ape_col": "ape_pct",
+        "unit": "TWh",
+    },
+    "fossil_non_electric": {
+        "metric_col": "metric",
+        "model_col": "model_twh",
+        "reference_col": "reference_twh",
+        "abs_error_col": "abs_error_twh",
+        "ape_col": "ape_pct",
+        "unit": "TWh",
+    },
+}
 
 
 # IRENA technology categories -> validation categories (non-fossil electric techs).
@@ -1312,6 +1364,863 @@ def _round_for_csv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _pct_or_nan(numerator: int | float, denominator: int | float) -> float:
+    if denominator is None or float(denominator) <= 0:
+        return np.nan
+    return float(numerator) / float(denominator) * 100.0
+
+
+def _wape_or_nan(abs_error_total: float, reference_total: float) -> float:
+    if reference_total <= 0:
+        return np.nan
+    return float(abs_error_total) / float(reference_total) * 100.0
+
+
+def _load_validation_gate_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Validation gate config not found: {path}")
+
+    text = path.read_text(encoding="utf-8")
+    if yaml is not None:
+        cfg = yaml.safe_load(text)
+    else:
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "PyYAML is not installed and validation gate config is not JSON-compatible YAML."
+            ) from exc
+
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Validation gate config must be a mapping at top level: {path}")
+
+    metric_rules = cfg.get("metric_rules", [])
+    guardrail_rules = cfg.get("guardrail_rules", [])
+    if not isinstance(metric_rules, list):
+        raise ValueError("'metric_rules' must be a list in validation gate config")
+    if not isinstance(guardrail_rules, list):
+        raise ValueError("'guardrail_rules' must be a list in validation gate config")
+
+    cfg["metric_rules"] = metric_rules
+    cfg["guardrail_rules"] = guardrail_rules
+
+    merged_defs = dict(DEMAND_METRIC_DEFINITIONS)
+    user_defs = cfg.get("demand_metric_definitions", {})
+    if isinstance(user_defs, dict):
+        merged_defs.update({str(k): str(v) for k, v in user_defs.items()})
+    cfg["demand_metric_definitions"] = merged_defs
+    return cfg
+
+
+def _demand_metric_definitions_table(definitions: dict[str, str]) -> pd.DataFrame:
+    preferred_order = [
+        "electricity_demand",
+        "electricity_demand_total_ac_withdrawal",
+        "electricity_demand_load_component",
+        "electricity_demand_link_component",
+        "electricity_demand_storage_charging",
+        "electricity_demand_store_component",
+    ]
+    seen: set[str] = set()
+    rows: list[dict[str, str]] = []
+    for metric in preferred_order:
+        if metric in definitions:
+            rows.append({"metric": metric, "definition": str(definitions[metric])})
+            seen.add(metric)
+    for metric in sorted(definitions):
+        if metric in seen:
+            continue
+        rows.append({"metric": str(metric), "definition": str(definitions[metric])})
+    return pd.DataFrame(rows, columns=["metric", "definition"])
+
+
+def _evaluate_metric_gate_rule(
+    rule: dict[str, Any],
+    *,
+    cmp_frames_by_domain: dict[str, pd.DataFrame],
+    demand_metric_definitions: dict[str, str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    gate_item = str(rule.get("metric", ""))
+    domain = str(rule.get("domain", "")).strip()
+    gate_class = str(rule.get("gate_class", "secondary")).strip().lower() or "secondary"
+    required_for_overall = _coerce_bool(
+        rule.get("required_for_overall_gate"),
+        default=(gate_class == "blocking"),
+    )
+    enabled = _coerce_bool(rule.get("enabled"), default=True)
+
+    row: dict[str, Any] = {
+        "row_type": "metric",
+        "gate_item": gate_item,
+        "domain": domain,
+        "gate_class": gate_class,
+        "required_for_overall_gate": required_for_overall,
+        "evaluation_status": "not_evaluated",
+        "status": "not_evaluated",
+        "pass": None,
+        "metric_definition": demand_metric_definitions.get(gate_item, "") if domain == "electricity_demand" else "",
+        "notes": str(rule.get("notes", "") or ""),
+        "unit": "",
+        "model_total": np.nan,
+        "reference_total": np.nan,
+        "global_wape_pct_actual": np.nan,
+        "global_wape_pct_threshold": _coerce_optional_float(rule.get("global_wape_threshold_pct")),
+        "global_wape_pass": None,
+        "country_ape_threshold_pct": _coerce_optional_float(rule.get("country_ape_threshold_pct")),
+        "country_pass_rate_pct_threshold": _coerce_optional_float(
+            rule.get("country_pass_rate_threshold_pct")
+        ),
+        "country_pass_rate_required": _coerce_bool(rule.get("country_pass_rate_required"), default=False),
+        "country_pass_rate_all_pct": np.nan,
+        "country_pass_rate_all_num": np.nan,
+        "country_pass_rate_all_den": np.nan,
+        "country_pass_rate_material_pct": np.nan,
+        "country_pass_rate_material_num": np.nan,
+        "country_pass_rate_material_den": np.nan,
+        "country_pass_rate_pass": None,
+        "materiality_threshold": _coerce_optional_float(rule.get("materiality_threshold")),
+        "materiality_unit": str(rule.get("materiality_unit", "") or ""),
+        "metric_gate_pass": None,
+        "actual_total_zero_profile_assets": np.nan,
+        "actual_total_zero_profile_capacity_mw": np.nan,
+        "warn_if_total_zero_profile_assets_gt": np.nan,
+        "fail_if_total_zero_profile_assets_gt": np.nan,
+        "warn_if_total_zero_profile_capacity_mw_gt": np.nan,
+        "fail_if_total_zero_profile_capacity_mw_gt": np.nan,
+    }
+    country_rows: list[dict[str, Any]] = []
+
+    if not enabled:
+        row["notes"] = (row["notes"] + " " if row["notes"] else "") + "Rule disabled in config."
+        return row, country_rows
+
+    if not gate_item:
+        row["notes"] = (row["notes"] + " " if row["notes"] else "") + "Missing 'metric' in config rule."
+        return row, country_rows
+
+    spec = VALIDATION_GATE_DOMAIN_SPECS.get(domain)
+    if spec is None:
+        row["notes"] = (
+            (row["notes"] + " " if row["notes"] else "")
+            + f"Unsupported domain '{domain}'."
+        )
+        return row, country_rows
+
+    cmp_df = cmp_frames_by_domain.get(domain)
+    if cmp_df is None:
+        row["notes"] = (row["notes"] + " " if row["notes"] else "") + "No comparison table available."
+        return row, country_rows
+
+    metric_col = str(spec["metric_col"])
+    model_col = str(spec["model_col"])
+    reference_col = str(spec["reference_col"])
+    abs_error_col = str(spec["abs_error_col"])
+    ape_col = str(spec["ape_col"])
+    unit = str(spec["unit"])
+    row["unit"] = unit
+    if not row["materiality_unit"]:
+        row["materiality_unit"] = unit
+
+    if metric_col not in cmp_df.columns:
+        row["notes"] = (
+            (row["notes"] + " " if row["notes"] else "")
+            + f"Comparison table for domain '{domain}' is missing '{metric_col}'."
+        )
+        return row, country_rows
+
+    subset = cmp_df.loc[cmp_df[metric_col].astype(str) == gate_item].copy()
+    if subset.empty:
+        row["notes"] = (row["notes"] + " " if row["notes"] else "") + "Metric not present in comparison output."
+        return row, country_rows
+
+    model_total = float(subset[model_col].sum())
+    reference_total = float(subset[reference_col].sum())
+    abs_error_total = float(subset[abs_error_col].sum())
+    wape_actual = _wape_or_nan(abs_error_total, reference_total)
+    row["model_total"] = model_total
+    row["reference_total"] = reference_total
+    row["global_wape_pct_actual"] = wape_actual
+
+    global_wape_threshold = row["global_wape_pct_threshold"]
+    if global_wape_threshold is not None and np.isfinite(wape_actual):
+        row["global_wape_pass"] = bool(wape_actual <= global_wape_threshold)
+
+    ape_threshold = row["country_ape_threshold_pct"]
+    materiality_threshold = row["materiality_threshold"]
+    if materiality_threshold is not None and materiality_threshold < 0:
+        materiality_threshold = 0.0
+        row["materiality_threshold"] = materiality_threshold
+
+    eligible_all = subset.loc[pd.to_numeric(subset[reference_col], errors="coerce").fillna(0.0) > 0].copy()
+    if materiality_threshold is None:
+        eligible_material = eligible_all.copy()
+    else:
+        eligible_material = eligible_all.loc[eligible_all[reference_col] >= materiality_threshold].copy()
+
+    all_den = int(len(eligible_all))
+    material_den = int(len(eligible_material))
+    row["country_pass_rate_all_den"] = all_den
+    row["country_pass_rate_material_den"] = material_den
+
+    if ape_threshold is not None and all_den > 0:
+        all_pass_mask = pd.to_numeric(eligible_all[ape_col], errors="coerce") <= float(ape_threshold)
+        all_num = int(all_pass_mask.fillna(False).sum())
+        row["country_pass_rate_all_num"] = all_num
+        row["country_pass_rate_all_pct"] = _pct_or_nan(all_num, all_den)
+    if ape_threshold is not None and material_den > 0:
+        material_pass_mask = pd.to_numeric(eligible_material[ape_col], errors="coerce") <= float(ape_threshold)
+        material_num = int(material_pass_mask.fillna(False).sum())
+        row["country_pass_rate_material_num"] = material_num
+        row["country_pass_rate_material_pct"] = _pct_or_nan(material_num, material_den)
+
+    country_pass_required = bool(row["country_pass_rate_required"])
+    country_pass_rate_threshold = row["country_pass_rate_pct_threshold"]
+    if country_pass_required:
+        if country_pass_rate_threshold is None:
+            row["notes"] = (
+                (row["notes"] + " " if row["notes"] else "")
+                + "Country pass rate is required but threshold is missing."
+            )
+        elif ape_threshold is None:
+            row["notes"] = (
+                (row["notes"] + " " if row["notes"] else "")
+                + "Country pass rate is required but country APE threshold is missing."
+            )
+        elif material_den <= 0:
+            row["notes"] = (
+                (row["notes"] + " " if row["notes"] else "")
+                + "Country pass rate is required but no material reference countries are available."
+            )
+        elif np.isfinite(float(row["country_pass_rate_material_pct"])):
+            row["country_pass_rate_pass"] = bool(
+                float(row["country_pass_rate_material_pct"]) >= float(country_pass_rate_threshold)
+            )
+
+    required_check_results: list[bool | None] = []
+    if global_wape_threshold is not None:
+        required_check_results.append(
+            bool(row["global_wape_pass"]) if row["global_wape_pass"] is not None else None
+        )
+    if country_pass_required:
+        required_check_results.append(
+            bool(row["country_pass_rate_pass"]) if row["country_pass_rate_pass"] is not None else None
+        )
+
+    if required_check_results:
+        if any(result is False for result in required_check_results):
+            row["metric_gate_pass"] = False
+        elif any(result is None for result in required_check_results):
+            row["metric_gate_pass"] = None
+        else:
+            row["metric_gate_pass"] = True
+
+    if row["metric_gate_pass"] is True:
+        row["evaluation_status"] = "evaluated"
+        row["status"] = "pass"
+        row["pass"] = True
+    elif row["metric_gate_pass"] is False:
+        row["evaluation_status"] = "evaluated"
+        row["status"] = "fail"
+        row["pass"] = False
+    elif required_check_results:
+        row["evaluation_status"] = "partial"
+        row["status"] = "partial"
+        row["pass"] = None
+    else:
+        row["evaluation_status"] = "partial"
+        row["status"] = "info"
+        row["pass"] = None
+
+    ref_values = pd.to_numeric(subset[reference_col], errors="coerce").fillna(0.0)
+    ape_values = pd.to_numeric(subset[ape_col], errors="coerce")
+    for idx, r in subset.iterrows():
+        ref_val = float(ref_values.loc[idx])
+        ape_val = ape_values.loc[idx]
+        is_reference_positive = bool(ref_val > 0.0)
+        is_material = bool(is_reference_positive and (materiality_threshold is None or ref_val >= materiality_threshold))
+        counts_all = bool(is_reference_positive and ape_threshold is not None and pd.notna(ape_val))
+        counts_material = bool(counts_all and is_material)
+        passes_ape = None
+        if counts_all:
+            passes_ape = bool(float(ape_val) <= float(ape_threshold))
+        country_rows.append(
+            {
+                "domain": domain,
+                "gate_class": gate_class,
+                "required_for_overall_gate": required_for_overall,
+                "metric": gate_item,
+                "country": str(r.get("country", "")),
+                "unit": unit,
+                "model_value": float(r.get(model_col, 0.0)),
+                "reference_value": ref_val,
+                "abs_error_value": float(r.get(abs_error_col, 0.0)),
+                "ape_pct": (float(ape_val) if pd.notna(ape_val) else np.nan),
+                "country_ape_threshold_pct": ape_threshold if ape_threshold is not None else np.nan,
+                "passes_country_ape_threshold": passes_ape,
+                "is_reference_positive": is_reference_positive,
+                "is_material_country": is_material,
+                "materiality_threshold": (
+                    materiality_threshold if materiality_threshold is not None else np.nan
+                ),
+                "materiality_unit": row["materiality_unit"],
+                "counts_toward_all_country_pass_rate": counts_all,
+                "counts_toward_material_country_pass_rate": counts_material,
+                "metric_definition": row["metric_definition"],
+            }
+        )
+
+    country_rows.sort(
+        key=lambda rec: (
+            str(rec.get("metric", "")),
+            -float(rec.get("abs_error_value", 0.0)),
+            str(rec.get("country", "")),
+        )
+    )
+    return row, country_rows
+
+
+def _evaluate_guardrail_rule(
+    rule: dict[str, Any],
+    *,
+    zero_profile_summary: pd.DataFrame,
+) -> dict[str, Any]:
+    guardrail = str(rule.get("guardrail", ""))
+    gate_class = str(rule.get("gate_class", "guardrail")).strip().lower() or "guardrail"
+    required_for_overall = _coerce_bool(rule.get("required_for_overall_gate"), default=False)
+    enabled = _coerce_bool(rule.get("enabled"), default=True)
+
+    row: dict[str, Any] = {
+        "row_type": "guardrail",
+        "gate_item": guardrail,
+        "domain": "guardrail",
+        "gate_class": gate_class,
+        "required_for_overall_gate": required_for_overall,
+        "evaluation_status": "not_evaluated",
+        "status": "not_evaluated",
+        "pass": None,
+        "metric_definition": "",
+        "notes": str(rule.get("notes", "") or ""),
+        "unit": "",
+        "model_total": np.nan,
+        "reference_total": np.nan,
+        "global_wape_pct_actual": np.nan,
+        "global_wape_pct_threshold": np.nan,
+        "global_wape_pass": None,
+        "country_ape_threshold_pct": np.nan,
+        "country_pass_rate_pct_threshold": np.nan,
+        "country_pass_rate_required": False,
+        "country_pass_rate_all_pct": np.nan,
+        "country_pass_rate_all_num": np.nan,
+        "country_pass_rate_all_den": np.nan,
+        "country_pass_rate_material_pct": np.nan,
+        "country_pass_rate_material_num": np.nan,
+        "country_pass_rate_material_den": np.nan,
+        "country_pass_rate_pass": None,
+        "materiality_threshold": np.nan,
+        "materiality_unit": "",
+        "metric_gate_pass": None,
+        "actual_total_zero_profile_assets": np.nan,
+        "actual_total_zero_profile_capacity_mw": np.nan,
+        "warn_if_total_zero_profile_assets_gt": _coerce_optional_float(
+            rule.get("warn_if_total_zero_profile_assets_gt")
+        ),
+        "fail_if_total_zero_profile_assets_gt": _coerce_optional_float(
+            rule.get("fail_if_total_zero_profile_assets_gt")
+        ),
+        "warn_if_total_zero_profile_capacity_mw_gt": _coerce_optional_float(
+            rule.get("warn_if_total_zero_profile_capacity_mw_gt")
+        ),
+        "fail_if_total_zero_profile_capacity_mw_gt": _coerce_optional_float(
+            rule.get("fail_if_total_zero_profile_capacity_mw_gt")
+        ),
+    }
+
+    if not enabled:
+        row["notes"] = (row["notes"] + " " if row["notes"] else "") + "Rule disabled in config."
+        return row
+    if guardrail != "renewable_zero_profile_assets":
+        row["notes"] = (
+            (row["notes"] + " " if row["notes"] else "")
+            + f"Unsupported guardrail '{guardrail}' (WS1 implementation)."
+        )
+        return row
+
+    total_zero_assets = 0.0
+    total_zero_cap = 0.0
+    if not zero_profile_summary.empty:
+        if "zero_profile_assets" in zero_profile_summary.columns:
+            total_zero_assets = float(
+                pd.to_numeric(zero_profile_summary["zero_profile_assets"], errors="coerce")
+                .fillna(0.0)
+                .sum()
+            )
+        if "zero_profile_capacity_mw" in zero_profile_summary.columns:
+            total_zero_cap = float(
+                pd.to_numeric(zero_profile_summary["zero_profile_capacity_mw"], errors="coerce")
+                .fillna(0.0)
+                .sum()
+            )
+
+    row["actual_total_zero_profile_assets"] = total_zero_assets
+    row["actual_total_zero_profile_capacity_mw"] = total_zero_cap
+    row["evaluation_status"] = "evaluated"
+
+    fail_hit = False
+    warn_hit = False
+    fail_assets_gt = row["fail_if_total_zero_profile_assets_gt"]
+    fail_cap_gt = row["fail_if_total_zero_profile_capacity_mw_gt"]
+    warn_assets_gt = row["warn_if_total_zero_profile_assets_gt"]
+    warn_cap_gt = row["warn_if_total_zero_profile_capacity_mw_gt"]
+
+    thresholds_defined = any(
+        threshold is not None
+        for threshold in [fail_assets_gt, fail_cap_gt, warn_assets_gt, warn_cap_gt]
+    )
+    if fail_assets_gt is not None and total_zero_assets > float(fail_assets_gt):
+        fail_hit = True
+    if fail_cap_gt is not None and total_zero_cap > float(fail_cap_gt):
+        fail_hit = True
+    if warn_assets_gt is not None and total_zero_assets > float(warn_assets_gt):
+        warn_hit = True
+    if warn_cap_gt is not None and total_zero_cap > float(warn_cap_gt):
+        warn_hit = True
+
+    if not thresholds_defined:
+        row["status"] = "info"
+        row["pass"] = None
+        row["notes"] = (row["notes"] + " " if row["notes"] else "") + "No thresholds configured."
+    elif fail_hit:
+        row["status"] = "fail"
+        row["pass"] = False
+    elif warn_hit:
+        row["status"] = "warn"
+        row["pass"] = False
+    else:
+        row["status"] = "pass"
+        row["pass"] = True
+
+    return row
+
+
+def _rollup_metric_group_status(metric_rows: pd.DataFrame) -> str:
+    if metric_rows.empty:
+        return "not_applicable"
+    if metric_rows["status"].astype(str).eq("fail").any():
+        return "fail"
+    if metric_rows["evaluation_status"].astype(str).isin(["partial", "not_evaluated"]).any():
+        return "incomplete"
+    return "pass"
+
+
+def _rollup_guardrail_status(guardrail_rows: pd.DataFrame) -> str:
+    if guardrail_rows.empty:
+        return "not_applicable"
+    if guardrail_rows["status"].astype(str).eq("fail").any():
+        return "fail"
+    if guardrail_rows["evaluation_status"].astype(str).isin(["partial", "not_evaluated"]).any():
+        return "incomplete"
+    if guardrail_rows["status"].astype(str).eq("warn").any():
+        return "warn"
+    return "pass"
+
+
+def _required_guardrails_gate_status(guardrail_rows: pd.DataFrame) -> str:
+    required = guardrail_rows.loc[guardrail_rows["required_for_overall_gate"].fillna(False)].copy()
+    if required.empty:
+        return "not_applicable"
+    if required["status"].astype(str).eq("fail").any():
+        return "fail"
+    if required["evaluation_status"].astype(str).isin(["partial", "not_evaluated"]).any():
+        return "incomplete"
+    if required["status"].astype(str).eq("warn").any():
+        return "warn"
+    return "pass"
+
+
+def _evaluate_validation_gate(
+    *,
+    gate_config: dict[str, Any],
+    cap_cmp: pd.DataFrame,
+    elec_cmp: pd.DataFrame,
+    demand_cmp: pd.DataFrame,
+    non_elec_cmp: pd.DataFrame,
+    zero_profile_summary: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    cmp_frames_by_domain = {
+        "capacity": cap_cmp,
+        "electricity_balance": elec_cmp,
+        "electricity_demand": demand_cmp,
+        "fossil_non_electric": non_elec_cmp,
+    }
+    demand_defs = dict(gate_config.get("demand_metric_definitions", DEMAND_METRIC_DEFINITIONS))
+
+    summary_rows: list[dict[str, Any]] = []
+    country_rows: list[dict[str, Any]] = []
+
+    for raw_rule in gate_config.get("metric_rules", []):
+        if not isinstance(raw_rule, dict):
+            continue
+        metric_row, metric_country_rows = _evaluate_metric_gate_rule(
+            raw_rule,
+            cmp_frames_by_domain=cmp_frames_by_domain,
+            demand_metric_definitions=demand_defs,
+        )
+        summary_rows.append(metric_row)
+        country_rows.extend(metric_country_rows)
+
+    for raw_rule in gate_config.get("guardrail_rules", []):
+        if not isinstance(raw_rule, dict):
+            continue
+        summary_rows.append(
+            _evaluate_guardrail_rule(
+                raw_rule,
+                zero_profile_summary=zero_profile_summary,
+            )
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    country_df = pd.DataFrame(country_rows)
+
+    if summary_df.empty:
+        summary_df = pd.DataFrame(
+            columns=[
+                "row_type",
+                "gate_item",
+                "domain",
+                "gate_class",
+                "required_for_overall_gate",
+                "evaluation_status",
+                "status",
+                "pass",
+            ]
+        )
+
+    if country_df.empty:
+        country_df = pd.DataFrame(
+            columns=[
+                "domain",
+                "gate_class",
+                "required_for_overall_gate",
+                "metric",
+                "country",
+                "unit",
+                "model_value",
+                "reference_value",
+                "abs_error_value",
+                "ape_pct",
+                "country_ape_threshold_pct",
+                "passes_country_ape_threshold",
+                "is_reference_positive",
+                "is_material_country",
+                "materiality_threshold",
+                "materiality_unit",
+                "counts_toward_all_country_pass_rate",
+                "counts_toward_material_country_pass_rate",
+                "metric_definition",
+            ]
+        )
+
+    metric_rows = summary_df.loc[summary_df["row_type"].astype(str) == "metric"].copy()
+    blocking_metric_rows = metric_rows.loc[metric_rows["required_for_overall_gate"].fillna(False)].copy()
+    secondary_metric_rows = metric_rows.loc[~metric_rows["required_for_overall_gate"].fillna(False)].copy()
+    guardrail_rows = summary_df.loc[summary_df["row_type"].astype(str) == "guardrail"].copy()
+
+    blocking_metrics_status = _rollup_metric_group_status(blocking_metric_rows)
+    secondary_metrics_status = _rollup_metric_group_status(secondary_metric_rows)
+    guardrail_reporting_status = _rollup_guardrail_status(guardrail_rows)
+    required_guardrails_status = _required_guardrails_gate_status(guardrail_rows)
+
+    overall_gate_status = "pass"
+    if blocking_metrics_status in {"fail", "incomplete"}:
+        overall_gate_status = blocking_metrics_status
+    elif required_guardrails_status in {"fail", "incomplete"}:
+        overall_gate_status = required_guardrails_status
+
+    overall = {
+        "row_type": "overall",
+        "gate_item": "overall_validation_gate",
+        "domain": "overall",
+        "gate_class": "overall",
+        "required_for_overall_gate": True,
+        "evaluation_status": "evaluated",
+        "status": overall_gate_status,
+        "pass": (overall_gate_status == "pass"),
+        "metric_definition": "",
+        "notes": "",
+        "unit": "",
+        "model_total": np.nan,
+        "reference_total": np.nan,
+        "global_wape_pct_actual": np.nan,
+        "global_wape_pct_threshold": np.nan,
+        "global_wape_pass": None,
+        "country_ape_threshold_pct": np.nan,
+        "country_pass_rate_pct_threshold": np.nan,
+        "country_pass_rate_required": False,
+        "country_pass_rate_all_pct": np.nan,
+        "country_pass_rate_all_num": np.nan,
+        "country_pass_rate_all_den": np.nan,
+        "country_pass_rate_material_pct": np.nan,
+        "country_pass_rate_material_num": np.nan,
+        "country_pass_rate_material_den": np.nan,
+        "country_pass_rate_pass": None,
+        "materiality_threshold": np.nan,
+        "materiality_unit": "",
+        "metric_gate_pass": None,
+        "actual_total_zero_profile_assets": np.nan,
+        "actual_total_zero_profile_capacity_mw": np.nan,
+        "warn_if_total_zero_profile_assets_gt": np.nan,
+        "fail_if_total_zero_profile_assets_gt": np.nan,
+        "warn_if_total_zero_profile_capacity_mw_gt": np.nan,
+        "fail_if_total_zero_profile_capacity_mw_gt": np.nan,
+        "overall_blocking_metrics_status": blocking_metrics_status,
+        "overall_secondary_metrics_status": secondary_metrics_status,
+        "overall_guardrail_reporting_status": guardrail_reporting_status,
+        "overall_required_guardrails_status": required_guardrails_status,
+        "overall_gate_status": overall_gate_status,
+        "configured_metric_rules": int(len([r for r in gate_config.get("metric_rules", []) if isinstance(r, dict)])),
+        "configured_guardrail_rules": int(
+            len([r for r in gate_config.get("guardrail_rules", []) if isinstance(r, dict)])
+        ),
+        "blocking_metric_count": int(len(blocking_metric_rows)),
+        "blocking_metric_fail_count": int(blocking_metric_rows["status"].astype(str).eq("fail").sum())
+        if not blocking_metric_rows.empty
+        else 0,
+        "blocking_metric_incomplete_count": int(
+            blocking_metric_rows["evaluation_status"].astype(str).isin(["partial", "not_evaluated"]).sum()
+        )
+        if not blocking_metric_rows.empty
+        else 0,
+        "secondary_metric_count": int(len(secondary_metric_rows)),
+        "secondary_metric_fail_count": int(secondary_metric_rows["status"].astype(str).eq("fail").sum())
+        if not secondary_metric_rows.empty
+        else 0,
+        "guardrail_count": int(len(guardrail_rows)),
+        "guardrail_fail_count": int(guardrail_rows["status"].astype(str).eq("fail").sum())
+        if not guardrail_rows.empty
+        else 0,
+        "guardrail_warn_count": int(guardrail_rows["status"].astype(str).eq("warn").sum())
+        if not guardrail_rows.empty
+        else 0,
+        "guardrail_incomplete_count": int(
+            guardrail_rows["evaluation_status"].astype(str).isin(["partial", "not_evaluated"]).sum()
+        )
+        if not guardrail_rows.empty
+        else 0,
+    }
+
+    for field in [
+        "overall_blocking_metrics_status",
+        "overall_secondary_metrics_status",
+        "overall_guardrail_reporting_status",
+        "overall_required_guardrails_status",
+        "overall_gate_status",
+    ]:
+        summary_df[field] = overall[field]
+
+    summary_df = pd.concat([summary_df, pd.DataFrame([overall])], ignore_index=True, sort=False)
+
+    if not country_df.empty:
+        country_df = country_df.sort_values(["domain", "metric", "country"]).reset_index(drop=True)
+
+    metric_pass_rate_cols = [
+        "gate_item",
+        "domain",
+        "gate_class",
+        "required_for_overall_gate",
+        "status",
+        "evaluation_status",
+        "unit",
+        "global_wape_pct_actual",
+        "global_wape_pct_threshold",
+        "global_wape_pass",
+        "country_ape_threshold_pct",
+        "country_pass_rate_pct_threshold",
+        "country_pass_rate_required",
+        "country_pass_rate_all_pct",
+        "country_pass_rate_all_num",
+        "country_pass_rate_all_den",
+        "country_pass_rate_material_pct",
+        "country_pass_rate_material_num",
+        "country_pass_rate_material_den",
+        "country_pass_rate_pass",
+        "materiality_threshold",
+        "materiality_unit",
+        "metric_definition",
+        "notes",
+    ]
+    metric_pass_rates_df = summary_df.loc[summary_df["row_type"].astype(str) == "metric"].copy()
+    metric_pass_rates_df = metric_pass_rates_df.reindex(columns=metric_pass_rate_cols)
+
+    summary_col_order = [
+        "row_type",
+        "gate_item",
+        "domain",
+        "gate_class",
+        "required_for_overall_gate",
+        "evaluation_status",
+        "status",
+        "pass",
+        "unit",
+        "model_total",
+        "reference_total",
+        "global_wape_pct_actual",
+        "global_wape_pct_threshold",
+        "global_wape_pass",
+        "country_ape_threshold_pct",
+        "country_pass_rate_pct_threshold",
+        "country_pass_rate_required",
+        "country_pass_rate_all_pct",
+        "country_pass_rate_all_num",
+        "country_pass_rate_all_den",
+        "country_pass_rate_material_pct",
+        "country_pass_rate_material_num",
+        "country_pass_rate_material_den",
+        "country_pass_rate_pass",
+        "materiality_threshold",
+        "materiality_unit",
+        "metric_gate_pass",
+        "actual_total_zero_profile_assets",
+        "actual_total_zero_profile_capacity_mw",
+        "warn_if_total_zero_profile_assets_gt",
+        "fail_if_total_zero_profile_assets_gt",
+        "warn_if_total_zero_profile_capacity_mw_gt",
+        "fail_if_total_zero_profile_capacity_mw_gt",
+        "overall_blocking_metrics_status",
+        "overall_secondary_metrics_status",
+        "overall_guardrail_reporting_status",
+        "overall_required_guardrails_status",
+        "overall_gate_status",
+        "configured_metric_rules",
+        "configured_guardrail_rules",
+        "blocking_metric_count",
+        "blocking_metric_fail_count",
+        "blocking_metric_incomplete_count",
+        "secondary_metric_count",
+        "secondary_metric_fail_count",
+        "guardrail_count",
+        "guardrail_fail_count",
+        "guardrail_warn_count",
+        "guardrail_incomplete_count",
+        "metric_definition",
+        "notes",
+    ]
+    summary_df = summary_df.reindex(columns=summary_col_order)
+
+    country_col_order = [
+        "domain",
+        "gate_class",
+        "required_for_overall_gate",
+        "metric",
+        "country",
+        "unit",
+        "model_value",
+        "reference_value",
+        "abs_error_value",
+        "ape_pct",
+        "country_ape_threshold_pct",
+        "passes_country_ape_threshold",
+        "is_reference_positive",
+        "is_material_country",
+        "materiality_threshold",
+        "materiality_unit",
+        "counts_toward_all_country_pass_rate",
+        "counts_toward_material_country_pass_rate",
+        "metric_definition",
+    ]
+    country_df = country_df.reindex(columns=country_col_order)
+    return summary_df, country_df, metric_pass_rates_df, overall
+
+
+def _df_to_json_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df.empty:
+        return []
+    return json.loads(df.to_json(orient="records"))
+
+
+def _json_sanitize(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(v) for v in value]
+    if isinstance(value, np.generic):
+        return _json_sanitize(value.item())
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return value
+    return value
+
+
+def _write_validation_gate_outputs(
+    *,
+    output_dir: Path,
+    gate_summary: pd.DataFrame,
+    gate_country_status: pd.DataFrame,
+    gate_metric_pass_rates: pd.DataFrame,
+    gate_overall: dict[str, Any],
+    gate_config: dict[str, Any],
+    gate_config_path: Path,
+) -> None:
+    _round_for_csv(gate_summary).to_csv(output_dir / "validation_gate_summary.csv", index=False)
+    _round_for_csv(gate_metric_pass_rates).to_csv(
+        output_dir / "validation_gate_metric_pass_rates.csv", index=False
+    )
+    _round_for_csv(gate_country_status).to_csv(
+        output_dir / "validation_gate_country_metric_status.csv", index=False
+    )
+
+    json_payload = {
+        "config_path": str(gate_config_path),
+        "config_version": gate_config.get("version"),
+        "overall": _json_sanitize(gate_overall),
+        "summary_rows": _df_to_json_records(_round_for_csv(gate_summary)),
+        "artifacts": {
+            "summary_csv": "validation_gate_summary.csv",
+            "metric_pass_rates_csv": "validation_gate_metric_pass_rates.csv",
+            "country_metric_status_csv": "validation_gate_country_metric_status.csv",
+            "demand_metric_definitions_csv": "electricity_demand_metric_definitions.csv",
+        },
+    }
+    (output_dir / "validation_gate_summary.json").write_text(
+        json.dumps(_json_sanitize(json_payload), indent=2, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 def _mapping_rules_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
     cap_rules = (
         pd.DataFrame(
@@ -1523,6 +2432,7 @@ def _write_dashboard(
     capacity_target_pct: float = 20.0,
     electricity_target_pct: float = 10.0,
     demand_target_pct: float = 10.0,
+    demand_metric_definitions: dict[str, str] | None = None,
 ) -> None:
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1546,6 +2456,7 @@ def _write_dashboard(
     cap_status = _status_from_threshold(cap_overall_wape, capacity_target_pct)
     elec_status = _status_from_threshold(elec_overall_wape, electricity_target_pct)
     demand_status = _status_from_threshold(demand_overall_wape, demand_target_pct)
+    demand_defs = demand_metric_definitions or DEMAND_METRIC_DEFINITIONS
 
     cap_share = (
         cap_cmp.groupby("validation_tech", as_index=False)["abs_error_mw"]
@@ -1672,6 +2583,18 @@ def _write_dashboard(
     md.append("")
     md.append("## Are We Good?")
     md.extend(status_lines)
+    md.append("")
+    md.append("## Electricity Demand Metric Definitions")
+    md.append(
+        f"- `electricity_demand`: {demand_defs.get('electricity_demand', DEMAND_METRIC_DEFINITIONS['electricity_demand'])}"
+    )
+    md.append(
+        "- `electricity_demand_total_ac_withdrawal`: "
+        + demand_defs.get(
+            "electricity_demand_total_ac_withdrawal",
+            DEMAND_METRIC_DEFINITIONS["electricity_demand_total_ac_withdrawal"],
+        )
+    )
     md.append("")
     md.append("## Biggest Painpoints")
     md.append("- Capacity by technology contribution: `painpoints_capacity_by_technology.csv`")
@@ -1832,6 +2755,12 @@ def parse_args() -> argparse.Namespace:
         default="minimal",
         help="CSV output volume. 'minimal' keeps essential comparison/flags/summaries; 'full' writes all diagnostics.",
     )
+    parser.add_argument(
+        "--validation-gate-config",
+        type=Path,
+        default=DEFAULT_VALIDATION_GATE_CONFIG_PATH,
+        help="Path to validation gate config (YAML or JSON-compatible YAML).",
+    )
     return parser.parse_args()
 
 
@@ -1839,6 +2768,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    gate_config = _load_validation_gate_config(args.validation_gate_config)
+    demand_metric_definitions = dict(
+        gate_config.get("demand_metric_definitions", DEMAND_METRIC_DEFINITIONS)
+    )
 
     LOGGER.info("Loading network: %s", args.network)
     n = pypsa.Network(args.network)
@@ -1943,9 +2876,21 @@ def main() -> None:
             ]
         )
     ].copy()
+    gate_summary, gate_country_status, gate_metric_pass_rates, gate_overall = _evaluate_validation_gate(
+        gate_config=gate_config,
+        cap_cmp=cap_cmp,
+        elec_cmp=elec_cmp,
+        demand_cmp=demand_cmp,
+        non_elec_cmp=non_elec_cmp,
+        zero_profile_summary=zero_profile_summary,
+    )
 
     write_full_csvs = args.csv_output_profile == "full"
 
+    _demand_metric_definitions_table(demand_metric_definitions).to_csv(
+        args.output_dir / "electricity_demand_metric_definitions.csv",
+        index=False,
+    )
     _round_for_csv(cap_cmp).to_csv(
         args.output_dir / "capacity_comparison_country_technology.csv", index=False
     )
@@ -1971,6 +2916,15 @@ def main() -> None:
     )
     _round_for_csv(zero_profile_summary).to_csv(
         args.output_dir / "renewable_zero_profile_country_carrier_summary.csv", index=False
+    )
+    _write_validation_gate_outputs(
+        output_dir=args.output_dir,
+        gate_summary=gate_summary,
+        gate_country_status=gate_country_status,
+        gate_metric_pass_rates=gate_metric_pass_rates,
+        gate_overall=gate_overall,
+        gate_config=gate_config,
+        gate_config_path=args.validation_gate_config,
     )
 
     if write_full_csvs:
@@ -2041,10 +2995,19 @@ def main() -> None:
         capacity_target_pct=args.capacity_flag_threshold_pct,
         electricity_target_pct=args.electricity_flag_threshold_pct,
         demand_target_pct=args.electricity_flag_threshold_pct,
+        demand_metric_definitions=demand_metric_definitions,
     )
 
     LOGGER.info("Wrote validation outputs to %s", args.output_dir.resolve())
     LOGGER.info("CSV output profile: %s", args.csv_output_profile)
+    LOGGER.info(
+        "Validation gate (%s): overall=%s | blocking_metrics=%s | secondary_metrics=%s | guardrails=%s",
+        args.validation_gate_config,
+        gate_overall.get("overall_gate_status", "unknown"),
+        gate_overall.get("overall_blocking_metrics_status", "unknown"),
+        gate_overall.get("overall_secondary_metrics_status", "unknown"),
+        gate_overall.get("overall_guardrail_reporting_status", "unknown"),
+    )
     LOGGER.info(
         "Capacity flags (>%.1f%% divergence): %d / %d entries",
         args.capacity_flag_threshold_pct,
@@ -2092,6 +3055,14 @@ def main() -> None:
             "Electricity demand component split (global, TWh):\n%s",
             _round_for_csv(global_demand_split).to_string(index=False),
         )
+    LOGGER.info(
+        "Electricity demand metric definitions: electricity_demand = %s; electricity_demand_total_ac_withdrawal = %s",
+        demand_metric_definitions.get("electricity_demand", DEMAND_METRIC_DEFINITIONS["electricity_demand"]),
+        demand_metric_definitions.get(
+            "electricity_demand_total_ac_withdrawal",
+            DEMAND_METRIC_DEFINITIONS["electricity_demand_total_ac_withdrawal"],
+        ),
+    )
 
     LOGGER.info(
         "Non-electric OWID reference is computed as fuel consumption minus fuel electricity output."
