@@ -257,12 +257,12 @@ def _bus_country_lookup(n: pypsa.Network) -> pd.Series:
     Some sectoral fuel buses do not populate `buses.country`; for these,
     infer ISO2 from `buses.location` or bus name prefix.
     """
-    country = n.buses["country"].replace("", np.nan)
-    location_iso2 = (
-        n.buses["location"]
-        .astype(str)
-        .str.extract(r"^([A-Z]{2})\b")[0]
-    )
+    country_col = n.buses["country"] if "country" in n.buses.columns else pd.Series("", index=n.buses.index)
+    country = country_col.replace("", np.nan)
+    if "location" in n.buses.columns:
+        location_iso2 = n.buses["location"].astype(str).str.extract(r"^([A-Z]{2})\b")[0]
+    else:
+        location_iso2 = pd.Series(np.nan, index=n.buses.index, dtype=object)
     index_iso2 = n.buses.index.astype(str).to_series(index=n.buses.index).str.extract(r"^([A-Z]{2})\b")[0]
     return country.fillna(location_iso2).fillna(index_iso2).fillna("")
 
@@ -903,6 +903,337 @@ def _renewable_zero_profile_diagnostics(n: pypsa.Network) -> tuple[pd.DataFrame,
         ["zero_profile_assets", "zero_profile_capacity_mw"], ascending=False
     )
     return asset_diag.sort_values(["profile_all_zero", "capacity_mw"], ascending=[False, False]), summary
+
+
+def _load_nan_diagnostics(n: pypsa.Network) -> pd.DataFrame:
+    """Detect NaNs in AC load time series used for demand constraints."""
+    if n.loads.empty or not hasattr(n.loads_t, "p_set"):
+        return pd.DataFrame(
+            columns=[
+                "component",
+                "asset",
+                "country",
+                "carrier",
+                "nan_cells",
+                "nan_snapshots",
+                "max_abs_p_set_mw",
+            ]
+        )
+
+    bus_country = _bus_country_lookup(n)
+    bus_carrier = (
+        n.buses["carrier"] if "carrier" in n.buses.columns else pd.Series("", index=n.buses.index, dtype=object)
+    )
+    loads = n.loads.copy()
+    loads["country"] = loads["bus"].map(bus_country).fillna("")
+    loads["bus_carrier"] = loads["bus"].map(bus_carrier).fillna("")
+    loads = loads.loc[(loads["country"] != "") & (loads["bus_carrier"] == "AC")].copy()
+    if loads.empty:
+        return pd.DataFrame(
+            columns=[
+                "component",
+                "asset",
+                "country",
+                "carrier",
+                "nan_cells",
+                "nan_snapshots",
+                "max_abs_p_set_mw",
+            ]
+        )
+
+    cols = n.loads_t.p_set.columns.intersection(loads.index)
+    if len(cols) == 0:
+        return pd.DataFrame(
+            columns=[
+                "component",
+                "asset",
+                "country",
+                "carrier",
+                "nan_cells",
+                "nan_snapshots",
+                "max_abs_p_set_mw",
+            ]
+        )
+
+    p_set = n.loads_t.p_set.reindex(columns=cols)
+    nan_mask = p_set.isna()
+    nan_cells = nan_mask.sum(axis=0)
+    hits = nan_cells.loc[nan_cells > 0]
+    if hits.empty:
+        return pd.DataFrame(
+            columns=[
+                "component",
+                "asset",
+                "country",
+                "carrier",
+                "nan_cells",
+                "nan_snapshots",
+                "max_abs_p_set_mw",
+            ]
+        )
+
+    nan_snapshots = nan_mask.loc[:, hits.index].sum(axis=0)
+    max_abs = p_set.loc[:, hits.index].abs().max(axis=0, skipna=True).fillna(0.0)
+    out = loads.loc[hits.index].copy()
+    if "carrier" not in out.columns:
+        out["carrier"] = ""
+    out["component"] = "Load"
+    out["nan_cells"] = pd.to_numeric(hits, errors="coerce").fillna(0).astype(int)
+    out["nan_snapshots"] = pd.to_numeric(nan_snapshots, errors="coerce").fillna(0).astype(int)
+    out["max_abs_p_set_mw"] = pd.to_numeric(max_abs, errors="coerce").fillna(0.0)
+    out = out.reset_index().rename(columns={out.index.name or "index": "asset"})
+    return out[["component", "asset", "country", "carrier", "nan_cells", "nan_snapshots", "max_abs_p_set_mw"]]
+
+
+def _hydro_missing_inflow_diagnostics(n: pypsa.Network) -> pd.DataFrame:
+    """Detect hydro reservoir storage units with capacity but no inflow time series column."""
+    if n.storage_units.empty:
+        return pd.DataFrame(columns=["component", "asset", "country", "carrier", "capacity_mw"])
+
+    bus_country = _bus_country_lookup(n)
+    su = n.storage_units.loc[n.storage_units["carrier"].astype(str).eq("hydro")].copy()
+    if su.empty:
+        return pd.DataFrame(columns=["component", "asset", "country", "carrier", "capacity_mw"])
+
+    cap_col = _capacity_column(su)
+    su["capacity_mw"] = pd.to_numeric(su[cap_col], errors="coerce").fillna(
+        pd.to_numeric(su.get("p_nom"), errors="coerce").fillna(0.0)
+    )
+    su["country"] = su["bus"].map(bus_country).fillna("")
+    su = su.loc[(su["country"] != "") & (su["capacity_mw"] > 0.0)].copy()
+    if su.empty:
+        return pd.DataFrame(columns=["component", "asset", "country", "carrier", "capacity_mw"])
+
+    inflow_cols = set(n.storage_units_t.inflow.columns)
+    missing = su.loc[~su.index.isin(inflow_cols)].copy()
+    if missing.empty:
+        return pd.DataFrame(columns=["component", "asset", "country", "carrier", "capacity_mw"])
+    missing = missing.reset_index().rename(columns={missing.index.name or "index": "asset"})
+    missing["component"] = "StorageUnit"
+    missing["carrier"] = "hydro_reservoir_inflow_missing_column"
+    return missing[["component", "asset", "country", "carrier", "capacity_mw"]]
+
+
+def _guardrail_status_rank(status: str) -> int:
+    return {"pass": 0, "warn": 1, "fail": 2}.get(str(status), 2)
+
+
+def _workflow_guardrail_artifacts(
+    n: pypsa.Network,
+    zero_profile_assets: pd.DataFrame,
+    *,
+    zero_profile_hit_severity: str,
+    hydro_missing_inflow_hit_severity: str,
+    hydro_zero_ror_hit_severity: str,
+    hydro_zero_reservoir_inflow_hit_severity: str,
+    nan_load_hit_severity: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    detail_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+
+    def add_check(
+        *,
+        check_id: str,
+        check_group: str,
+        description: str,
+        severity_if_hit: str,
+        detail: pd.DataFrame | None,
+        hit_count_col: str | None = None,
+        capacity_col: str | None = None,
+        message: str = "",
+    ) -> None:
+        d = pd.DataFrame() if detail is None else detail.copy()
+        if d.empty:
+            status = "pass"
+            hit_count = 0
+            affected_assets = 0
+            affected_capacity_mw = 0.0
+        else:
+            status = severity_if_hit
+            if hit_count_col and hit_count_col in d.columns:
+                hit_count = int(pd.to_numeric(d[hit_count_col], errors="coerce").fillna(0).sum())
+            else:
+                hit_count = int(len(d))
+            affected_assets = int(d["asset"].nunique()) if "asset" in d.columns else int(len(d))
+            affected_capacity_mw = (
+                float(pd.to_numeric(d[capacity_col], errors="coerce").fillna(0.0).sum())
+                if capacity_col and capacity_col in d.columns
+                else 0.0
+            )
+            for _, row in d.iterrows():
+                detail_rows.append(
+                    {
+                        "check_id": check_id,
+                        "check_group": check_group,
+                        "status": status,
+                        "severity_if_hit": severity_if_hit,
+                        "component": row.get("component", ""),
+                        "asset": row.get("asset", ""),
+                        "country": row.get("country", ""),
+                        "carrier": row.get("carrier", ""),
+                        "metric_name": (
+                            "nan_cells"
+                            if check_id == "nan_load_timeseries"
+                            else "capacity_mw"
+                            if ("capacity_mw" in d.columns)
+                            else "count"
+                        ),
+                        "metric_value": (
+                            float(row.get("nan_cells", 0))
+                            if check_id == "nan_load_timeseries"
+                            else float(row.get("capacity_mw", 0.0))
+                            if "capacity_mw" in d.columns
+                            else 1.0
+                        ),
+                        "secondary_metric_name": (
+                            "nan_snapshots" if check_id == "nan_load_timeseries" else ""
+                        ),
+                        "secondary_metric_value": (
+                            float(row.get("nan_snapshots", 0))
+                            if check_id == "nan_load_timeseries"
+                            else np.nan
+                        ),
+                        "message": message,
+                    }
+                )
+
+        summary_rows.append(
+            {
+                "check_id": check_id,
+                "check_group": check_group,
+                "description": description,
+                "status": status,
+                "severity_if_hit": severity_if_hit,
+                "status_rank": _guardrail_status_rank(status),
+                "hit_count": hit_count,
+                "affected_assets": affected_assets,
+                "affected_capacity_mw": affected_capacity_mw,
+                "message": message,
+            }
+        )
+
+    zero_hits = zero_profile_assets.loc[zero_profile_assets.get("profile_all_zero", False)].copy()
+    if not isinstance(zero_hits, pd.DataFrame):
+        zero_hits = pd.DataFrame(columns=zero_profile_assets.columns)
+
+    add_check(
+        check_id="renewable_zero_profile_assets",
+        check_group="profiles",
+        description="Renewable assets with non-zero capacity but zero annual available energy.",
+        severity_if_hit=zero_profile_hit_severity,
+        detail=zero_hits,
+        capacity_col="capacity_mw",
+        message="See renewable_zero_profile_assets.csv for full per-asset diagnostics.",
+    )
+
+    hydro_missing = _hydro_missing_inflow_diagnostics(n)
+    add_check(
+        check_id="hydro_missing_reservoir_inflow_columns",
+        check_group="profiles",
+        description="Hydro reservoir storage units with capacity but missing inflow columns.",
+        severity_if_hit=hydro_missing_inflow_hit_severity,
+        detail=hydro_missing,
+        capacity_col="capacity_mw",
+    )
+
+    hydro_zero_ror = zero_hits.loc[zero_hits.get("carrier", pd.Series(dtype=object)).eq("ror")].copy()
+    add_check(
+        check_id="hydro_zero_ror_profiles",
+        check_group="profiles",
+        description="Run-of-river generators with capacity but zero available energy profile.",
+        severity_if_hit=hydro_zero_ror_hit_severity,
+        detail=hydro_zero_ror,
+        capacity_col="capacity_mw",
+    )
+
+    hydro_zero_reservoir = zero_hits.loc[
+        zero_hits.get("carrier", pd.Series(dtype=object)).eq("hydro_reservoir_inflow")
+    ].copy()
+    add_check(
+        check_id="hydro_zero_reservoir_inflow_profiles",
+        check_group="profiles",
+        description="Hydro reservoir inflow series with capacity but zero annual inflow.",
+        severity_if_hit=hydro_zero_reservoir_inflow_hit_severity,
+        detail=hydro_zero_reservoir,
+        capacity_col="capacity_mw",
+    )
+
+    nan_loads = _load_nan_diagnostics(n)
+    add_check(
+        check_id="nan_load_timeseries",
+        check_group="demand",
+        description="NaNs detected in AC load p_set time series.",
+        severity_if_hit=nan_load_hit_severity,
+        detail=nan_loads,
+        hit_count_col="nan_cells",
+        message="NaN load values can silently distort demand validation and solver feasibility.",
+    )
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(["status_rank", "check_id"], ascending=[False, True])
+    detail_df = pd.DataFrame(
+        detail_rows,
+        columns=[
+            "check_id",
+            "check_group",
+            "status",
+            "severity_if_hit",
+            "component",
+            "asset",
+            "country",
+            "carrier",
+            "metric_name",
+            "metric_value",
+            "secondary_metric_name",
+            "secondary_metric_value",
+            "message",
+        ],
+    )
+    overall_status = "pass"
+    if not summary_df.empty:
+        max_rank = int(summary_df["status_rank"].max())
+        overall_status = {0: "pass", 1: "warn", 2: "fail"}.get(max_rank, "fail")
+    status_obj = {
+        "schema_version": "workflow_guardrails_v1",
+        "overall_status": overall_status,
+        "checks_total": int(len(summary_df)),
+        "checks_fail": int((summary_df["status"] == "fail").sum()) if not summary_df.empty else 0,
+        "checks_warn": int((summary_df["status"] == "warn").sum()) if not summary_df.empty else 0,
+        "checks_pass": int((summary_df["status"] == "pass").sum()) if not summary_df.empty else 0,
+        "detail_rows": int(len(detail_df)),
+    }
+    return summary_df, detail_df, status_obj
+
+
+def _write_workflow_guardrail_artifacts(
+    output_dir: Path,
+    *,
+    network_path: Path,
+    year: int,
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+    status_obj: dict[str, object],
+) -> dict[str, object]:
+    summary_path = output_dir / "workflow_guardrail_summary.csv"
+    detail_path = output_dir / "workflow_guardrail_detail.csv"
+    status_path = output_dir / "workflow_guardrail_status.json"
+
+    _round_for_csv(summary_df).to_csv(summary_path, index=False)
+    _round_for_csv(detail_df).to_csv(detail_path, index=False)
+
+    enriched = dict(status_obj)
+    enriched.update(
+        {
+            "generated_at_utc": pd.Timestamp.utcnow().isoformat(),
+            "network": str(network_path),
+            "year": int(year),
+            "artifacts": {
+                "summary_csv": str(summary_path.name),
+                "detail_csv": str(detail_path.name),
+            },
+        }
+    )
+    status_path.write_text(json.dumps(enriched, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return enriched
 
 
 def _owid_electricity_balance(
@@ -2761,6 +3092,46 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_VALIDATION_GATE_CONFIG_PATH,
         help="Path to validation gate config (YAML or JSON-compatible YAML).",
     )
+    parser.add_argument(
+        "--guardrails-only",
+        action="store_true",
+        help="Run workflow guardrail diagnostics only and emit guardrail artifacts without full validation outputs.",
+    )
+    parser.add_argument(
+        "--fail-on-guardrail-fail",
+        action="store_true",
+        help="Exit non-zero if any workflow guardrail check is classified as fail.",
+    )
+    parser.add_argument(
+        "--guardrail-zero-profile-hit-severity",
+        choices=["pass", "warn", "fail"],
+        default="fail",
+        help="Severity to assign when renewable zero-profile assets are detected.",
+    )
+    parser.add_argument(
+        "--guardrail-hydro-missing-inflow-hit-severity",
+        choices=["pass", "warn", "fail"],
+        default="fail",
+        help="Severity to assign when hydro reservoir inflow columns are missing.",
+    )
+    parser.add_argument(
+        "--guardrail-hydro-zero-ror-hit-severity",
+        choices=["pass", "warn", "fail"],
+        default="fail",
+        help="Severity to assign when run-of-river assets have zero profiles.",
+    )
+    parser.add_argument(
+        "--guardrail-hydro-zero-reservoir-inflow-hit-severity",
+        choices=["pass", "warn", "fail"],
+        default="fail",
+        help="Severity to assign when hydro reservoir inflow profiles are all zero.",
+    )
+    parser.add_argument(
+        "--guardrail-nan-load-hit-severity",
+        choices=["pass", "warn", "fail"],
+        default="fail",
+        help="Severity to assign when NaNs are found in AC load p_set time series.",
+    )
     return parser.parse_args()
 
 
@@ -2782,6 +3153,45 @@ def main() -> None:
         two_2_three_digits_country(c) for c in network_countries if isinstance(c, str) and len(c) == 2
     }
     network_iso3 = {c for c in network_iso3 if isinstance(c, str) and len(c) == 3}
+
+    zero_profile_assets, zero_profile_summary = _renewable_zero_profile_diagnostics(n)
+    guardrail_summary, guardrail_detail, guardrail_status = _workflow_guardrail_artifacts(
+        n,
+        zero_profile_assets,
+        zero_profile_hit_severity=args.guardrail_zero_profile_hit_severity,
+        hydro_missing_inflow_hit_severity=args.guardrail_hydro_missing_inflow_hit_severity,
+        hydro_zero_ror_hit_severity=args.guardrail_hydro_zero_ror_hit_severity,
+        hydro_zero_reservoir_inflow_hit_severity=args.guardrail_hydro_zero_reservoir_inflow_hit_severity,
+        nan_load_hit_severity=args.guardrail_nan_load_hit_severity,
+    )
+    guardrail_status = _write_workflow_guardrail_artifacts(
+        args.output_dir,
+        network_path=args.network,
+        year=args.year,
+        summary_df=guardrail_summary,
+        detail_df=guardrail_detail,
+        status_obj=guardrail_status,
+    )
+    LOGGER.info(
+        "Workflow guardrails: overall=%s (fail=%d, warn=%d, pass=%d).",
+        guardrail_status["overall_status"],
+        guardrail_status["checks_fail"],
+        guardrail_status["checks_warn"],
+        guardrail_status["checks_pass"],
+    )
+    if guardrail_status["overall_status"] == "fail":
+        zero_hits = zero_profile_assets.loc[zero_profile_assets["profile_all_zero"]].copy()
+        if not zero_hits.empty:
+            LOGGER.warning(
+                "Detected %d renewable assets with non-zero capacity but zero annual available energy (see renewable_zero_profile_assets.csv and workflow_guardrail_summary.csv).",
+                len(zero_hits),
+            )
+
+    if args.guardrails_only:
+        LOGGER.info("Guardrails-only mode complete. Wrote artifacts to %s", args.output_dir.resolve())
+        if args.fail_on_guardrail_fail and guardrail_status["overall_status"] == "fail":
+            raise SystemExit(2)
+        return
 
     model_cap, unmapped_cap, cap_mapping_diag = _model_capacity_by_country_tech(n)
     model_cap = model_cap.loc[model_cap.country.isin(network_countries)].copy()
@@ -2821,14 +3231,6 @@ def main() -> None:
     model_elec = model_elec.loc[model_elec.country.isin(network_countries)].copy()
     elec_mapping_diag = _model_electricity_mapping_diagnostics(n)
     elec_mapping_diag = elec_mapping_diag.loc[elec_mapping_diag["carrier"].notna()].copy()
-    zero_profile_assets, zero_profile_summary = _renewable_zero_profile_diagnostics(n)
-    if not zero_profile_assets.empty:
-        zero_hits = zero_profile_assets.loc[zero_profile_assets["profile_all_zero"]].copy()
-        if not zero_hits.empty:
-            LOGGER.warning(
-                "Detected %d renewable assets with non-zero capacity but zero annual available energy (see renewable_zero_profile_assets.csv).",
-                len(zero_hits),
-            )
     ref_elec = _owid_electricity_balance(args.owid_csv, args.year, iso3_filter=network_iso3)
     ref_elec = ref_elec.loc[ref_elec.country.isin(network_countries)].copy()
     elec_cmp, elec_summary = _energy_comparison(model_elec, ref_elec)
@@ -2999,6 +3401,10 @@ def main() -> None:
     )
 
     LOGGER.info("Wrote validation outputs to %s", args.output_dir.resolve())
+    LOGGER.info(
+        "Workflow guardrail status artifact: %s",
+        (args.output_dir / "workflow_guardrail_status.json").resolve(),
+    )
     LOGGER.info("CSV output profile: %s", args.csv_output_profile)
     LOGGER.info(
         "Validation gate (%s): overall=%s | blocking_metrics=%s | secondary_metrics=%s | guardrails=%s",
@@ -3077,6 +3483,8 @@ def main() -> None:
         demand_cmp,
         demand_summary,
     )
+    if args.fail_on_guardrail_fail and guardrail_status["overall_status"] == "fail":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

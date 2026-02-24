@@ -25,6 +25,12 @@ import numpy as np
 import pandas as pd
 import pypsa
 
+from tuner_guardrails import (
+    raise_if_simulated_failure,
+    restore_from_last_good,
+    sync_last_good_from_mutable,
+)
+
 LOG = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -303,6 +309,11 @@ def parse_args():
     p.add_argument("--year", type=int, default=2020)
     p.add_argument("--iterations", type=int, default=6)
     p.add_argument("--override-csv", default="validation/data/fossil_price_tuning_overrides.csv")
+    p.add_argument(
+        "--last-good-override-csv",
+        default="validation/data/fossil_price_tuning_overrides_last_good.csv",
+        help="Rollback snapshot of the last known-good fossil price override CSV.",
+    )
     p.add_argument("--history-csv", default="validation/results_compare/fossil_dispatch_tuning_history.csv")
     p.add_argument("--detail-csv", default="validation/results_compare/fossil_dispatch_tuning_country_fuel_detail.csv")
     p.add_argument("--price-summary-csv", default="validation/results_compare/fossil_dispatch_price_comparison.csv")
@@ -329,6 +340,11 @@ def parse_args():
         ],
     )
     p.add_argument("--unlock-first", action="store_true")
+    p.add_argument(
+        "--simulate-post-write-failure",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -341,6 +357,7 @@ def main():
     owid_csv = _repo_path(args.owid_csv)
     fuel_price_csv = _repo_path(args.fuel_price_csv)
     override_csv = _repo_path(args.override_csv)
+    last_good_override_csv = _repo_path(args.last_good_override_csv)
     history_csv = _repo_path(args.history_csv)
     detail_csv = _repo_path(args.detail_csv)
     price_summary_csv = _repo_path(args.price_summary_csv)
@@ -361,6 +378,16 @@ def main():
     detail_csv.parent.mkdir(parents=True, exist_ok=True)
     price_summary_csv.parent.mkdir(parents=True, exist_ok=True)
     override_csv.parent.mkdir(parents=True, exist_ok=True)
+    last_good_override_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    if not sync_last_good_from_mutable(override_csv, last_good_override_csv):
+        _write_override_csv(last_good_override_csv, base_prices, multipliers, args.year)
+        LOG.info("Seeded last-good fossil overrides: %s", last_good_override_csv)
+    else:
+        LOG.info(
+            "Seeded last-good fossil overrides from current mutable file: %s",
+            last_good_override_csv,
+        )
 
     if not network_target.exists():
         LOG.info("Initial solved network missing, running first solve.")
@@ -463,8 +490,20 @@ def main():
         if detail_last is not None:
             detail_last.to_csv(detail_csv, index=False, float_format="%.4f")
         pd.DataFrame(history_rows).to_csv(history_csv, index=False, float_format="%.4f")
-
-        _run_snakemake(args)
+        try:
+            raise_if_simulated_failure(args.simulate_post_write_failure, "fossil tuner")
+            _run_snakemake(args)
+        except Exception as exc:
+            restored = restore_from_last_good(override_csv, last_good_override_csv)
+            LOG.error(
+                "Fossil solve/update failed after writing overrides. Rolled back to last good overrides at %s (restored=%s, snapshot=%s). Error: %s",
+                override_csv,
+                restored,
+                last_good_override_csv,
+                exc,
+            )
+            raise
+        sync_last_good_from_mutable(override_csv, last_good_override_csv)
 
     # Final exports
     final_price_comp = _write_override_csv(override_csv, base_prices, multipliers, args.year)
