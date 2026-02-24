@@ -1,0 +1,262 @@
+version: 2
+
+demand_metric_definitions:
+  electricity_demand: "load + link (excludes storage charging and Store withdrawals)"
+  electricity_demand_total_ac_withdrawal: "load + link + storage charging + Store withdrawals"
+  electricity_demand_load_component: "AC Load withdrawals only"
+  electricity_demand_link_component: "AC withdrawals attributed to Links"
+  electricity_demand_storage_charging: "AC withdrawals used for StorageUnit charging"
+  electricity_demand_store_component: "AC withdrawals used for Store charging"
+
+metric_rules:
+  # Blocking gate: electricity demand (weighted across all countries).
+  # Country pass rates are reported for diagnostics only because some AC withdrawals are endogenous.
+  - metric: electricity_demand
+    domain: electricity_demand
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 7.5
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 15.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+    notes: "Blocking on global weighted WAPE only. Use electricity_demand_total_ac_withdrawal and component outputs for endogenous-demand diagnostics."
+
+  # Blocking gate: renewable capacity only (country-tech rows, weighted across all countries).
+  # Country pass rates remain reported but non-blocking.
+  - metric: onshore_wind
+    domain: capacity
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 20.0
+    materiality_threshold: 100.0
+    materiality_unit: MW
+  - metric: offshore_wind
+    domain: capacity
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 60.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 25.0
+    materiality_threshold: 50.0
+    materiality_unit: MW
+    notes: "Lenient threshold due offshore split/reference limitations; still blocking because it is renewable capacity."
+  - metric: solar
+    domain: capacity
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 20.0
+    materiality_threshold: 100.0
+    materiality_unit: MW
+  - metric: hydro
+    domain: capacity
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 20.0
+    materiality_threshold: 100.0
+    materiality_unit: MW
+  - metric: geothermal
+    domain: capacity
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 20.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 25.0
+    materiality_threshold: 25.0
+    materiality_unit: MW
+    notes: "Renewable capacity metric with smaller denominators in many countries; use a slightly looser WAPE threshold."
+  - metric: bioenergy
+    domain: capacity
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 20.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 25.0
+    materiality_threshold: 50.0
+    materiality_unit: MW
+    notes: "Renewable capacity metric; threshold is looser than wind/solar/hydro due mapping limitations."
+
+  # Blocking gate: electricity source balance (country-source rows, weighted across all countries).
+  # All technologies that create electricity are included; fossil thresholds are intentionally more lenient.
+  - metric: wind_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 15.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+  - metric: solar_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 15.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+  - metric: hydro_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 15.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+  - metric: nuclear_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 10.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 15.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+  - metric: coal_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 30.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+    notes: "Fossil electricity metric with intentionally more lenient threshold than renewables."
+  - metric: gas_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 60.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 35.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+    notes: "Fossil electricity metric with intentionally more lenient threshold than renewables."
+  - metric: oil_electricity
+    domain: electricity_balance
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 100.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 40.0
+    materiality_threshold: 1.0
+    materiality_unit: TWh
+    notes: "Fossil electricity metric kept secondary and lenient due high noise/small-denominator behavior in many countries; country soft constraints should improve alignment later."
+  - metric: biofuel_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 70.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 35.0
+    materiality_threshold: 1.0
+    materiality_unit: TWh
+    notes: "Included as electricity-producing technology; threshold is lenient due biomass/biofuel mapping limitations."
+  - metric: other_renewable_electricity
+    domain: electricity_balance
+    gate_class: blocking
+    required_for_overall_gate: true
+    global_wape_threshold_pct: 60.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 35.0
+    materiality_threshold: 1.0
+    materiality_unit: TWh
+    notes: "Included as electricity-producing technology; threshold is lenient due OWID/model mapping limitations."
+
+  # Secondary gate (non-blocking, mandatory reporting)
+  - metric: electricity_generation
+    domain: electricity_balance
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 15.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 15.0
+    materiality_threshold: 2.5
+    materiality_unit: TWh
+    notes: "Aggregate electricity-generation cross-check; source-level metrics are the primary blocking checks."
+
+  - metric: nuclear
+    domain: capacity
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 20.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 20.0
+    materiality_threshold: 100.0
+    materiality_unit: MW
+  - metric: gas
+    domain: capacity
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 40.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 500.0
+    materiality_unit: MW
+    notes: "Fossil capacity diagnostic kept secondary with lenient threshold."
+  - metric: coal
+    domain: capacity
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 40.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 500.0
+    materiality_unit: MW
+    notes: "Fossil capacity diagnostic kept secondary with lenient threshold."
+  - metric: fossil_aggregated
+    domain: capacity
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 40.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 1000.0
+    materiality_unit: MW
+    notes: "Aggregated fossil capacity sanity check (IRENA aggregate reference)."
+
+  - metric: oil_non_electric_consumption
+    domain: fossil_non_electric
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 60.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 10.0
+    materiality_unit: TWh
+  - metric: gas_non_electric_consumption
+    domain: fossil_non_electric
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 60.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 10.0
+    materiality_unit: TWh
+  - metric: coal_non_electric_consumption
+    domain: fossil_non_electric
+    gate_class: secondary
+    required_for_overall_gate: false
+    global_wape_threshold_pct: 60.0
+    country_pass_rate_required: false
+    country_ape_threshold_pct: 30.0
+    materiality_threshold: 10.0
+    materiality_unit: TWh
+
+guardrail_rules:
+  - guardrail: renewable_zero_profile_assets
+    gate_class: guardrail
+    required_for_overall_gate: false
+    warn_if_total_zero_profile_assets_gt: 0
+    fail_if_total_zero_profile_assets_gt: null
+    warn_if_total_zero_profile_capacity_mw_gt: 0
+    fail_if_total_zero_profile_capacity_mw_gt: null
+    notes: "WS1 reporting-only guardrail status; hard-fail thresholds can be tightened in WS3."
