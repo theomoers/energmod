@@ -573,38 +573,17 @@ def _apply_hydro_reservoir_inflow_fallback(n, asset_diag, max_capacity_scale=Non
             continue
 
         scale_factor = target_cap / donor_cap if donor_cap > 0.0 else 1.0
+        applied_scale_factor = float(scale_factor)
+        clipped = False
         if (
             max_capacity_scale is not None
             and max_capacity_scale > 0.0
             and scale_factor > float(max_capacity_scale)
         ):
-            actions.append(
-                {
-                    "component": "StorageUnit",
-                    "carrier": "hydro",
-                    "target_asset": t["asset"],
-                    "target_bus": t["bus"],
-                    "target_country": t["country"],
-                    "target_capacity_mw": target_cap,
-                    "issue_before": t["issue"],
-                    "donor_asset": donor_asset,
-                    "donor_bus": donor.get("bus", ""),
-                    "donor_country": donor.get("country", ""),
-                    "donor_capacity_mw": donor_cap,
-                    "donor_available_twh": float(
-                        pd.to_numeric(pd.Series([donor.get("available_twh", np.nan)]), errors="coerce").iloc[0]
-                    ),
-                    "scale_factor": float(scale_factor),
-                    "scale_factor_cap": float(max_capacity_scale),
-                    "distance_xy": float(donor.get("distance_xy")) if pd.notna(donor.get("distance_xy")) else np.nan,
-                    "match_method": donor.get("match_method", ""),
-                    "status": "unpatched",
-                    "reason": "reservoir_capacity_scale_exceeds_cap",
-                }
-            )
-            continue
+            applied_scale_factor = float(max_capacity_scale)
+            clipped = True
         donor_series = n.storage_units_t.inflow[donor_asset].fillna(0.0)
-        n.storage_units_t.inflow.loc[:, str(t["asset"])] = donor_series.values * scale_factor
+        n.storage_units_t.inflow.loc[:, str(t["asset"])] = donor_series.values * applied_scale_factor
 
         actions.append(
             {
@@ -621,11 +600,12 @@ def _apply_hydro_reservoir_inflow_fallback(n, asset_diag, max_capacity_scale=Non
                 "donor_capacity_mw": donor_cap,
                 "donor_available_twh": float(pd.to_numeric(pd.Series([donor.get("available_twh", np.nan)]), errors="coerce").iloc[0]),
                 "scale_factor": float(scale_factor),
+                "applied_scale_factor": float(applied_scale_factor),
                 "scale_factor_cap": float(max_capacity_scale) if max_capacity_scale is not None else np.nan,
                 "distance_xy": float(donor.get("distance_xy")) if pd.notna(donor.get("distance_xy")) else np.nan,
                 "match_method": donor.get("match_method", ""),
                 "status": "patched",
-                "reason": "",
+                "reason": "reservoir_capacity_scale_clipped" if clipped else "",
             }
         )
 
@@ -841,6 +821,7 @@ def apply_hydro_profile_fallback_and_diagnostics(
                 "donor_capacity_mw",
                 "donor_available_twh",
                 "scale_factor",
+                "applied_scale_factor",
                 "scale_factor_cap",
                 "distance_xy",
                 "match_method",
@@ -863,8 +844,8 @@ def apply_hydro_profile_fallback_and_diagnostics(
     after_count = int(asset_after["needs_fallback"].sum()) if not asset_after.empty else 0
     patched_count = int(actions["status"].eq("patched").sum()) if not actions.empty else 0
     unpatched_count = int(actions["status"].eq("unpatched").sum()) if not actions.empty else 0
-    cap_exceeded_count = (
-        int(actions["reason"].eq("reservoir_capacity_scale_exceeds_cap").sum())
+    cap_clipped_count = (
+        int(actions["reason"].eq("reservoir_capacity_scale_clipped").sum())
         if not actions.empty and "reason" in actions.columns
         else 0
     )
@@ -875,18 +856,18 @@ def apply_hydro_profile_fallback_and_diagnostics(
             f"{row.target_asset}<-{row.donor_asset}" for row in sample_rows.itertuples()
         )
 
-    if cap_exceeded_count > 0:
-        cap_rows = actions.loc[actions["reason"].eq("reservoir_capacity_scale_exceeds_cap")].head(5)
+    if cap_clipped_count > 0:
+        cap_rows = actions.loc[actions["reason"].eq("reservoir_capacity_scale_clipped")].head(5)
         cap_sample = ", ".join(
-            f"{row.target_asset}<-{row.donor_asset} ({row.scale_factor:.2f}x>{row.scale_factor_cap:.2f}x)"
+            f"{row.target_asset}<-{row.donor_asset} ({row.scale_factor:.2f}x clipped to {row.applied_scale_factor:.2f}x)"
             for row in cap_rows.itertuples()
         )
         logger.warning(
-            "Hydro reservoir inflow fallback skipped %d asset(s) due to capacity-scale cap %.2fx (sample: %s%s)",
-            cap_exceeded_count,
+            "Hydro reservoir inflow fallback clipped %d asset(s) to capacity-scale cap %.2fx (sample: %s%s)",
+            cap_clipped_count,
             reservoir_scale_cap,
             cap_sample,
-            " ..." if cap_exceeded_count > 5 else "",
+            " ..." if cap_clipped_count > 5 else "",
         )
 
     logger.warning(
@@ -1702,11 +1683,10 @@ def apply_country_wind_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Skipping iterative wind scaling for %s (configured baseyear is %s).",
+            "Applying iterative wind scaling to %s using overrides calibrated from baseyear %s.",
             investment_year,
             baseyear,
         )
-        return
 
     override_csv_cfg = base_cfg.get("wind_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -1842,11 +1822,10 @@ def apply_country_solar_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Skipping iterative solar scaling for %s (configured baseyear is %s).",
+            "Applying iterative solar scaling to %s using overrides calibrated from baseyear %s.",
             investment_year,
             baseyear,
         )
-        return
 
     override_csv_cfg = base_cfg.get("solar_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -1964,11 +1943,10 @@ def apply_country_hydro_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Skipping iterative hydro scaling for %s (configured baseyear is %s).",
+            "Applying iterative hydro scaling to %s using overrides calibrated from baseyear %s.",
             investment_year,
             baseyear,
         )
-        return
 
     override_csv_cfg = base_cfg.get("hydro_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -2115,11 +2093,10 @@ def apply_country_nuclear_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Skipping iterative nuclear scaling for %s (configured baseyear is %s).",
+            "Applying iterative nuclear scaling to %s using overrides calibrated from baseyear %s.",
             investment_year,
             baseyear,
         )
-        return
 
     override_csv_cfg = base_cfg.get("nuclear_iteration_override_csv", "")
     if not override_csv_cfg:

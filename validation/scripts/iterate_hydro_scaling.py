@@ -171,6 +171,39 @@ def _run_cmd(cmd, cwd, env=None, dry_run=False):
     subprocess.run(cmd, cwd=str(cwd), env=env, check=True)
 
 
+def _snakemake_completed_despite_sigsegv(exc, target_path):
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return False
+    # Python may surface SIGSEGV as -11; some wrappers report 139.
+    if int(exc.returncode) not in (-11, 139):
+        return False
+    if target_path is None or not Path(target_path).exists():
+        return False
+
+    log_dir = REPO_ROOT / ".snakemake" / "log"
+    if not log_dir.exists():
+        return False
+
+    recent_logs = sorted(log_dir.glob("*.snakemake.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    completion_markers = (
+        "Finished job 0.",
+        "100%) done",
+    )
+    for log_path in recent_logs:
+        try:
+            text = log_path.read_text(errors="ignore")
+        except Exception:
+            continue
+        if all(marker in text for marker in completion_markers):
+            LOG.warning(
+                "Snakemake exited with SIGSEGV after completion; treating as success (target exists: %s, log=%s).",
+                target_path,
+                log_path,
+            )
+            return True
+    return False
+
+
 def _run_snakemake(args):
     env = os.environ.copy()
     env.setdefault("MPLCONFIGDIR", "/tmp")
@@ -199,7 +232,14 @@ def _run_snakemake(args):
         "--forcerun",
         *args.force_rules,
     ]
-    _run_cmd(cmd, REPO_ROOT, env=env, dry_run=args.dry_run)
+    try:
+        _run_cmd(cmd, REPO_ROOT, env=env, dry_run=args.dry_run)
+    except subprocess.CalledProcessError as exc:
+        if args.dry_run:
+            raise
+        if _snakemake_completed_despite_sigsegv(exc, _repo_path(args.network_target)):
+            return
+        raise
 
 
 def _write_scales_csv(path: Path, scales: pd.DataFrame) -> pd.DataFrame:

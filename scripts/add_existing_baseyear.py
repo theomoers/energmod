@@ -611,7 +611,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
 
                     # Handle profiles that exist but are all-zero (e.g. JP/TW onwind),
                     # by borrowing the nearest non-zero profile from the same technology.
-                    if generator in {"onwind", "offwind-ac", "offwind-dc", "solar"}:
+                    if generator in {"onwind", "solar", "offwind"}:
                         p_max_pu = _replace_zero_profile_columns_with_nearest(
                             n=n,
                             p_max_pu=p_max_pu,
