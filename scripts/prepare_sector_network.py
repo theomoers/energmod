@@ -42,6 +42,9 @@ spatial = SimpleNamespace()
 # Centralized validation/tuning hooks (kept outside this core script for easier reversion).
 if hasattr(_validation_hooks, "align_country_electricity_demand_to_owid"):
     align_country_electricity_demand_to_owid = _validation_hooks.align_country_electricity_demand_to_owid
+    apply_hydro_profile_fallback_and_diagnostics = (
+        _validation_hooks.apply_hydro_profile_fallback_and_diagnostics
+    )
     align_country_hydro_reservoir_inflow_to_owid = _validation_hooks.align_country_hydro_reservoir_inflow_to_owid
     align_country_onwind_profiles_to_owid = _validation_hooks.align_country_onwind_profiles_to_owid
     apply_country_wind_iteration_scaling = _validation_hooks.apply_country_wind_iteration_scaling
@@ -4009,6 +4012,13 @@ if __name__ == "__main__":
     # Endogenous electricity consumption through Links (e.g. heat pumps/electrolysis)
     # is intentionally not scaled here.
     align_country_electricity_demand_to_owid(n, investment_year, snakemake.config)
+    # Patch hydro profile/inflow pathologies after upstream attachment but before hydro scaling.
+    apply_hydro_profile_fallback_and_diagnostics(
+        n,
+        investment_year,
+        snakemake.config,
+        output_network_path=getattr(snakemake.output, "network", None),
+    )
     # Scale hydro reservoir inflow (StorageUnit carrier='hydro') by country
     # against OWID hydro electricity in baseyear.
     align_country_hydro_reservoir_inflow_to_owid(n, investment_year, snakemake.config)

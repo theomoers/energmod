@@ -611,7 +611,7 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
 
                     # Handle profiles that exist but are all-zero (e.g. JP/TW onwind),
                     # by borrowing the nearest non-zero profile from the same technology.
-                    if generator in {"onwind", "offwind-ac", "offwind-dc", "solar"}:
+                    if generator in {"onwind", "solar", "offwind"}:
                         p_max_pu = _replace_zero_profile_columns_with_nearest(
                             n=n,
                             p_max_pu=p_max_pu,
@@ -1036,6 +1036,135 @@ if __name__ == "__main__":
 
         # ensure boolean dtype
         c.df[col] = c.df[col].fillna(False).astype(bool)
+
+        # WS2: In the calibrated 2020 baseyear only, freeze AC line expansion as well.
+        # This keeps 2020 transmission as an operational baseline, while preserving
+        # expansion behavior for later myopic horizons.
+        if int(baseyear) == 2020 and hasattr(n, "lines") and not n.lines.empty:
+            lines = n.lines
+            if "s_nom_extendable" not in lines.columns:
+                lines["s_nom_extendable"] = np.zeros(len(lines), dtype=np.bool_)
+
+            if "build_year" in lines.columns:
+                line_assets = lines.index[pd.to_numeric(lines.build_year, errors="coerce").fillna(0) <= int(baseyear)]
+            else:
+                logger.warning(
+                    "Line component has no build_year column; applying 2020 non-extendability to all lines."
+                )
+                line_assets = lines.index
+
+            if len(line_assets):
+                lines.loc[line_assets, "s_nom_extendable"] = False
+                if "s_nom_min" not in lines.columns:
+                    lines["s_nom_min"] = 0.0
+                lines.loc[line_assets, "s_nom_min"] = pd.to_numeric(
+                    lines.loc[line_assets, "s_nom"], errors="coerce"
+                ).fillna(0.0)
+                lines["s_nom_extendable"] = lines["s_nom_extendable"].fillna(False).astype(bool)
+                logger.info(
+                    "In baseyear 2020: Set %d lines to s_nom_extendable=False and s_nom_min=s_nom.",
+                    len(line_assets),
+                )
+
+        # WS2: Freeze DC transmission links in 2020 as well (transmission expansion starts after 2020).
+        if int(baseyear) == 2020 and hasattr(n, "links") and not n.links.empty:
+            links = n.links
+            dc_mask = links.carrier.astype(str).eq("DC") if "carrier" in links.columns else pd.Series(False, index=links.index)
+            if dc_mask.any():
+                if "p_nom_extendable" not in links.columns:
+                    links["p_nom_extendable"] = np.zeros(len(links), dtype=np.bool_)
+
+                if "build_year" in links.columns:
+                    build_year = pd.to_numeric(links.build_year, errors="coerce").fillna(0)
+                    dc_assets = links.index[dc_mask & (build_year <= int(baseyear))]
+                else:
+                    logger.warning(
+                        "Link component has no build_year column; applying 2020 non-extendability to all DC links."
+                    )
+                    dc_assets = links.index[dc_mask]
+
+                if len(dc_assets):
+                    links.loc[dc_assets, "p_nom_extendable"] = False
+                    if "p_nom_min" not in links.columns:
+                        links["p_nom_min"] = 0.0
+                    links.loc[dc_assets, "p_nom_min"] = pd.to_numeric(
+                        links.loc[dc_assets, "p_nom"], errors="coerce"
+                    ).fillna(0.0)
+                    links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+                    logger.info(
+                        "In baseyear 2020: Set %d DC links to p_nom_extendable=False and p_nom_min=p_nom.",
+                        len(dc_assets),
+                    )
+
+        # WS2: Freeze battery capacity in the 2020 baseyear only; later horizons remain extendable.
+        if int(baseyear) == 2020 and hasattr(n, "stores") and not n.stores.empty:
+            stores = n.stores
+            battery_store_mask = (
+                stores.carrier.astype(str).eq("battery")
+                if "carrier" in stores.columns
+                else pd.Series(False, index=stores.index)
+            )
+            if battery_store_mask.any():
+                if "e_nom_extendable" not in stores.columns:
+                    stores["e_nom_extendable"] = np.zeros(len(stores), dtype=np.bool_)
+                if "build_year" in stores.columns:
+                    store_build_year = pd.to_numeric(stores.build_year, errors="coerce").fillna(0)
+                    battery_store_assets = stores.index[
+                        battery_store_mask & (store_build_year <= int(baseyear))
+                    ]
+                else:
+                    logger.warning(
+                        "Store component has no build_year column; applying 2020 non-extendability to all battery stores."
+                    )
+                    battery_store_assets = stores.index[battery_store_mask]
+
+                if len(battery_store_assets):
+                    stores.loc[battery_store_assets, "e_nom_extendable"] = False
+                    if "e_nom_min" not in stores.columns:
+                        stores["e_nom_min"] = 0.0
+                    stores.loc[battery_store_assets, "e_nom_min"] = pd.to_numeric(
+                        stores.loc[battery_store_assets, "e_nom"], errors="coerce"
+                    ).fillna(0.0)
+                    stores["e_nom_extendable"] = stores["e_nom_extendable"].fillna(False).astype(bool)
+                    logger.info(
+                        "In baseyear 2020: Set %d battery stores to e_nom_extendable=False and e_nom_min=e_nom.",
+                        len(battery_store_assets),
+                    )
+
+        if int(baseyear) == 2020 and hasattr(n, "links") and not n.links.empty:
+            links = n.links
+            battery_link_carriers = {"battery charger", "battery discharger"}
+            battery_link_mask = (
+                links.carrier.astype(str).isin(battery_link_carriers)
+                if "carrier" in links.columns
+                else pd.Series(False, index=links.index)
+            )
+            if battery_link_mask.any():
+                if "p_nom_extendable" not in links.columns:
+                    links["p_nom_extendable"] = np.zeros(len(links), dtype=np.bool_)
+                if "build_year" in links.columns:
+                    link_build_year = pd.to_numeric(links.build_year, errors="coerce").fillna(0)
+                    battery_link_assets = links.index[
+                        battery_link_mask & (link_build_year <= int(baseyear))
+                    ]
+                else:
+                    logger.warning(
+                        "Link component has no build_year column; applying 2020 non-extendability to all battery links."
+                    )
+                    battery_link_assets = links.index[battery_link_mask]
+
+                if len(battery_link_assets):
+                    links.loc[battery_link_assets, "p_nom_extendable"] = False
+                    if "p_nom_min" not in links.columns:
+                        links["p_nom_min"] = 0.0
+                    links.loc[battery_link_assets, "p_nom_min"] = pd.to_numeric(
+                        links.loc[battery_link_assets, "p_nom"], errors="coerce"
+                    ).fillna(0.0)
+                    links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+                    logger.info(
+                        "In baseyear 2020: Set %d battery links to p_nom_extendable=False and p_nom_min=p_nom.",
+                        len(battery_link_assets),
+                    )
 
         for c in n.iterate_components(["Generator", "Link", "StorageUnit"]):
             if "build_year" in c.df.columns:

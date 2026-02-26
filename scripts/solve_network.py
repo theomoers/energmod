@@ -3726,6 +3726,19 @@ def solve_network(n, config, solving, **kwargs):
 
         logger.info("Setting numeric focus parameters for solver...")
 
+        cpu_threads = os.cpu_count() or 1
+        base_solver_opts = kwargs.get("solver_options", {}) or {}
+        configured_threads = (
+            base_solver_opts.get("Threads")
+            if "Threads" in base_solver_opts
+            else base_solver_opts.get("threads", cpu_threads)
+        )
+        try:
+            retry_threads = int(configured_threads)
+        except (TypeError, ValueError):
+            retry_threads = cpu_threads
+        retry_threads = max(1, min(retry_threads, cpu_threads))
+
         robust_solver_options = {
                 "NumericFocus": 3,
                 "Method": 2,  # barrier
@@ -3736,7 +3749,7 @@ def solve_network(n, config, solving, **kwargs):
                 "OptimalityTol": 1e-3,
                 "Presolve": 2,
                 "Aggregate": 1,
-                "Threads": 12,
+                "Threads": retry_threads,
                 "Seed": 123
             }
         

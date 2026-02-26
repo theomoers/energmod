@@ -29,6 +29,11 @@ import numpy as np
 import pandas as pd
 import pypsa
 import ruamel.yaml
+from tuner_guardrails import (
+    raise_if_simulated_failure,
+    restore_from_last_good,
+    sync_last_good_from_mutable,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -293,6 +298,11 @@ def parse_args():
     )
     p.add_argument("--base-config", default="config.myopic.yaml")
     p.add_argument("--overlay-config", default="validation/config.iteration_common.yaml")
+    p.add_argument(
+        "--last-good-overlay-config",
+        default="validation/config.iteration_common_biomass_last_good.yaml",
+        help="Rollback snapshot of the last known-good biomass tuning overlay.",
+    )
     p.add_argument("--owid-csv", default="validation/data/owid-energy-data.csv")
     p.add_argument("--year", type=int, default=2020)
     p.add_argument("--iterations", type=int, default=6)
@@ -323,6 +333,11 @@ def parse_args():
         ],
     )
     p.add_argument("--unlock-first", action="store_true")
+    p.add_argument(
+        "--simulate-post-write-failure",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -335,6 +350,7 @@ def main():
     owid_csv = _repo_path(args.owid_csv)
     base_config = _repo_path(args.base_config)
     overlay_config = _repo_path(args.overlay_config)
+    last_good_overlay_config = _repo_path(args.last_good_overlay_config)
     history_csv = _repo_path(args.history_csv)
     country_detail_csv = _repo_path(args.country_detail_csv)
 
@@ -369,6 +385,20 @@ def main():
 
     history_csv.parent.mkdir(parents=True, exist_ok=True)
     country_detail_csv.parent.mkdir(parents=True, exist_ok=True)
+    last_good_overlay_config.parent.mkdir(parents=True, exist_ok=True)
+
+    if not sync_last_good_from_mutable(overlay_config, last_good_overlay_config):
+        _write_biomass_overlay(
+            last_good_overlay_config,
+            base_solid * factor_solid,
+            base_biogas * factor_biogas,
+        )
+        LOG.info("Seeded last-good biomass overlay: %s", last_good_overlay_config)
+    else:
+        LOG.info(
+            "Seeded last-good biomass overlay from current mutable file: %s",
+            last_good_overlay_config,
+        )
 
     if not network_target.exists():
         LOG.info("Initial solved network missing, running first solve.")
@@ -444,7 +474,20 @@ def main():
             base_solid * factor_solid,
             base_biogas * factor_biogas,
         )
-        _run_snakemake(args)
+        try:
+            raise_if_simulated_failure(args.simulate_post_write_failure, "biomass tuner")
+            _run_snakemake(args)
+        except Exception as exc:
+            restored = restore_from_last_good(overlay_config, last_good_overlay_config)
+            LOG.error(
+                "Biomass solve/update failed after writing overlay. Rolled back to last good overlay at %s (restored=%s, snapshot=%s). Error: %s",
+                overlay_config,
+                restored,
+                last_good_overlay_config,
+                exc,
+            )
+            raise
+        sync_last_good_from_mutable(overlay_config, last_good_overlay_config)
 
     history = pd.DataFrame(history_rows)
     history.to_csv(history_csv, index=False, float_format="%.4f")
