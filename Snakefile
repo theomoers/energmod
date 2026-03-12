@@ -7,6 +7,7 @@ import os
 import warnings
 import pathlib
 import shutil
+import yaml
 
 sys.path.append("./scripts")
 
@@ -82,14 +83,26 @@ def get_learning_enabled():
     Returns:
         True if learning is enabled, False otherwise
     """
-    import yaml
-    
     try:
         with open("config.learning.yaml", "r") as f:
             learning_config = yaml.safe_load(f)
         return learning_config.get("learning", {}).get("enabled", False)
     except FileNotFoundError:
         return False
+
+
+def get_learning_anchor_year():
+    """
+    Read the anchor year used for learning-rate scenario recalibration.
+    Defaults to the first planning horizon when config.learning.yaml is unavailable.
+    """
+    try:
+        with open("config.learning.yaml", "r") as f:
+            learning_config = yaml.safe_load(f) or {}
+        beta_cfg = learning_config.get("learning", {}).get("beta_adjustment", {}) or {}
+        return int(beta_cfg.get("anchor_year", config["scenario"]["planning_horizons"][0]))
+    except FileNotFoundError:
+        return int(config["scenario"]["planning_horizons"][0])
 
 
 HTTP = HTTPRemoteProvider()
@@ -2555,6 +2568,23 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc"
         )
 
+    def solved_anchor_horizon(w):
+        anchor_year = get_learning_anchor_year()
+        current_year = int(w.planning_horizons)
+
+        if current_year == anchor_year:
+            return []
+
+        if anchor_year not in config["scenario"]["planning_horizons"]:
+            return []
+
+        return (
+            RESDIR
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_"
+            + str(anchor_year)
+            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc"
+        )
+
 
     rule add_brownfield:
         params:
@@ -2609,10 +2639,10 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             network=RESDIR
             + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
             network_p=solved_previous_horizon,  # solved network at previous time step - prevents execution for first horizon
+            anchor_network=solved_anchor_horizon,  # solved network at anchor year for A recalibration
             params="data/learning-data/params/learning_params.csv",  # Static template
             learning_config="config.learning.yaml",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
-            basecost="resources/" + RDIR + "costs_2020.csv",
             waccs="data/waccs/wacc_by_country.csv",
         output:
             network=RESDIR
@@ -2684,6 +2714,32 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             "./scripts/solve_network.py"
 
 
+    rule export_postsolve_learning_costs:
+        input:
+            network=RESDIR
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            base_cost_log=RESDIR
+            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+            learning_config="config.learning.yaml",
+            costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
+        output:
+            cost_log=RESDIR
+            + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+        threads: 1
+        resources:
+            mem_mb=5000,
+        log:
+            RESDIR
+            + "logs/export_postsolve_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
+        benchmark:
+            (
+                RESDIR
+                + "benchmarks/export_postsolve_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
+            )
+        script:
+            "./scripts/export_postsolve_learning_costs.py"
+
+
     rule solve_sector_networks_myopic:
         input:
             networks=expand(
@@ -2692,6 +2748,17 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 **config["scenario"],
                 **config["costs"],
                 **config["export"],
+            ),
+            postsolve_learning_cost_logs=(
+                expand(
+                    RESDIR
+                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+                    **config["scenario"],
+                    **config["costs"],
+                    **config["export"],
+                )
+                if get_learning_enabled()
+                else []
             ),
 
 

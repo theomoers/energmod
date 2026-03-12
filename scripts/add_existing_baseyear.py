@@ -656,32 +656,37 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                     return vars(spatial)[fuel].nodes[0]
                 return f"{elec_bus} {fuel}"
 
+            fuel_carrier = carrier[generator]
+            bus_carrier = "solid biomass" if fuel_carrier == "biomass" else fuel_carrier
+
             # For spatial carriers, ensure we have bus names for all capacity locations
-            if "Earth" not in vars(spatial)[carrier[generator]].locations:
+            if "Earth" not in vars(spatial)[fuel_carrier].locations:
                 # Use country-level fuel buses instead of cluster-level
-                required_bus0 = pd.Index([fuel_bus(loc, carrier[generator]) for loc in capacity.index])
+                required_bus0 = pd.Index([fuel_bus(loc, fuel_carrier) for loc in capacity.index])
                 bus0 = required_bus0
             else:
                 # For non-spatial carriers like uranium, use the spatial nodes
-                bus0 = vars(spatial)[carrier[generator]].nodes
+                bus0 = vars(spatial)[fuel_carrier].nodes
 
             # check for missing bus and create them
             missing_bus = pd.Index(bus0).difference(n.buses.index)
             if not missing_bus.empty:
                 logger.info(f"Creating {len(missing_bus)} missing buses for {generator}: {list(missing_bus)}")
+                if bus_carrier == "solid biomass" and bus_carrier not in n.carriers.index:
+                    n.add("Carrier", bus_carrier)
                 # Extract corresponding locations for the buses being added
-                if "Earth" not in vars(spatial)[carrier[generator]].locations:
+                if "Earth" not in vars(spatial)[fuel_carrier].locations:
                     # For country-level fuel buses, extract country codes
                     bus_locations = [bus.split()[0] for bus in missing_bus]
                 else:
                     # For non-spatial carriers, use the single Earth location
-                    bus_locations = vars(spatial)[carrier[generator]].locations
+                    bus_locations = vars(spatial)[fuel_carrier].locations
                     logger.info(f"bus_locations: {bus_locations}")
                 
                 n.madd(
                     "Bus",
                     missing_bus,
-                    carrier=carrier[generator],
+                    carrier=bus_carrier,
                     location=bus_locations,
                     unit="MWh_el",
                 )
@@ -1165,6 +1170,13 @@ if __name__ == "__main__":
                         "In baseyear 2020: Set %d battery links to p_nom_extendable=False and p_nom_min=p_nom.",
                         len(battery_link_assets),
                     )
+
+        if hasattr(_validation_hooks, "_freeze_baseyear_loophole_links"):
+            _validation_hooks._freeze_baseyear_loophole_links(
+                n,
+                baseyear=baseyear,
+                config=snakemake.config,
+            )
 
         for c in n.iterate_components(["Generator", "Link", "StorageUnit"]):
             if "build_year" in c.df.columns:

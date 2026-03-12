@@ -1,0 +1,602 @@
+﻿Region,Sub-region,Country,ISO3 code,M49 code,RE or Non-RE,Group Technology,Technology,Sub-Technology,Producer Type,Year,Electricity Installed Capacity (MW)
+Africa,Northern Africa,Algeria,DZA,12,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,47.85
+Africa,Northern Africa,Algeria,DZA,12,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,388.95
+Africa,Northern Africa,Algeria,DZA,12,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,25
+Africa,Northern Africa,Algeria,DZA,12,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,10
+Africa,Northern Africa,Egypt,EGY,818,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,66.28
+Africa,Northern Africa,Egypt,EGY,818,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2504
+Africa,Northern Africa,Egypt,EGY,818,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,20
+Africa,Northern Africa,Egypt,EGY,818,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,5
+Africa,Northern Africa,Egypt,EGY,818,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2194
+Africa,Northern Africa,Libya,LBY,434,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,6.333
+Africa,Northern Africa,Libya,LBY,434,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2
+Africa,Northern Africa,Morocco,MAR,504,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,23
+Africa,Northern Africa,Morocco,MAR,504,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,371
+Africa,Northern Africa,Morocco,MAR,504,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,540
+Africa,Northern Africa,Morocco,MAR,504,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,5
+Africa,Northern Africa,Morocco,MAR,504,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2123
+Africa,Northern Africa,Sudan (the),SDN,729,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,135.57
+Africa,Northern Africa,Sudan (the),SDN,729,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,54.29
+Africa,Northern Africa,Tunisia,TUN,788,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.076
+Africa,Northern Africa,Tunisia,TUN,788,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,766
+Africa,Northern Africa,Tunisia,TUN,788,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,245
+Africa,Sub-Saharan Africa,Angola,AGO,24,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.46
+Africa,Sub-Saharan Africa,Angola,AGO,24,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,360.43
+Africa,Sub-Saharan Africa,Benin,BEN,204,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,8.858
+Africa,Sub-Saharan Africa,Benin,BEN,204,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,26.4
+Africa,Sub-Saharan Africa,Botswana,BWA,72,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,2.396
+Africa,Sub-Saharan Africa,Botswana,BWA,72,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,7.904
+Africa,Sub-Saharan Africa,Burkina Faso,BFA,854,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,22.042
+Africa,Sub-Saharan Africa,Burkina Faso,BFA,854,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,183.6
+Africa,Sub-Saharan Africa,Burundi,BDI,108,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.625
+Africa,Sub-Saharan Africa,Burundi,BDI,108,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,7.903
+Africa,Sub-Saharan Africa,Cabo Verde,CPV,132,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.796
+Africa,Sub-Saharan Africa,Cabo Verde,CPV,132,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,29.247
+Africa,Sub-Saharan Africa,Cabo Verde,CPV,132,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,26.8
+Africa,Sub-Saharan Africa,Cameroon,CMR,120,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,26.652
+Africa,Sub-Saharan Africa,Cameroon,CMR,120,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,36
+Africa,Sub-Saharan Africa,Central African Republic (the),CAF,140,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.423
+Africa,Sub-Saharan Africa,Central African Republic (the),CAF,140,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,40
+Africa,Sub-Saharan Africa,Chad,TCD,148,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.24
+Africa,Sub-Saharan Africa,Chad,TCD,148,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.5
+Africa,Sub-Saharan Africa,Chad,TCD,148,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,1.1
+Africa,Sub-Saharan Africa,Comoros (the),COM,174,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.07
+Africa,Sub-Saharan Africa,Comoros (the),COM,174,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3
+Africa,Sub-Saharan Africa,Congo (the),COG,178,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.743
+Africa,Sub-Saharan Africa,Côte d'Ivoire,CIV,384,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,10.076
+Africa,Sub-Saharan Africa,Côte d'Ivoire,CIV,384,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,30
+Africa,Sub-Saharan Africa,Democratic Republic of the Congo (the),COD,180,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,21.328
+Africa,Sub-Saharan Africa,Democratic Republic of the Congo (the),COD,180,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3.85
+Africa,Sub-Saharan Africa,Djibouti,DJI,262,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.362
+Africa,Sub-Saharan Africa,Djibouti,DJI,262,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,20
+Africa,Sub-Saharan Africa,Djibouti,DJI,262,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,60
+Africa,Sub-Saharan Africa,Equatorial Guinea,GNQ,226,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.006
+Africa,Sub-Saharan Africa,Eritrea,ERI,232,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,24.785
+Africa,Sub-Saharan Africa,Eritrea,ERI,232,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.825
+Africa,Sub-Saharan Africa,Eswatini,SWZ,748,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.049
+Africa,Sub-Saharan Africa,Eswatini,SWZ,748,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,10.126
+Africa,Sub-Saharan Africa,Ethiopia,ETH,231,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,7.3
+Africa,Sub-Saharan Africa,Ethiopia,ETH,231,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,21.554
+Africa,Sub-Saharan Africa,Ethiopia,ETH,231,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.006
+Africa,Sub-Saharan Africa,Ethiopia,ETH,231,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,324
+Africa,Sub-Saharan Africa,Gabon,GAB,266,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.54
+Africa,Sub-Saharan Africa,Gabon,GAB,266,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,11
+Africa,Sub-Saharan Africa,Gambia (the),GMB,270,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.053
+Africa,Sub-Saharan Africa,Gambia (the),GMB,270,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,23.677
+Africa,Sub-Saharan Africa,Gambia (the),GMB,270,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1.214
+Africa,Sub-Saharan Africa,Ghana,GHA,288,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,14.619
+Africa,Sub-Saharan Africa,Ghana,GHA,288,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,173.363
+Africa,Sub-Saharan Africa,Ghana,GHA,288,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.02
+Africa,Sub-Saharan Africa,Guinea,GIN,324,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,16.796
+Africa,Sub-Saharan Africa,Guinea,GIN,324,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.08
+Africa,Sub-Saharan Africa,Guinea-Bissau,GNB,624,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.98
+Africa,Sub-Saharan Africa,Kenya,KEN,404,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,939.73
+Africa,Sub-Saharan Africa,Kenya,KEN,404,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,123.862
+Africa,Sub-Saharan Africa,Kenya,KEN,404,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,245.02
+Africa,Sub-Saharan Africa,Kenya,KEN,404,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.65
+Africa,Sub-Saharan Africa,Kenya,KEN,404,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,435.5
+Africa,Sub-Saharan Africa,Lesotho,LSO,426,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.515
+Africa,Sub-Saharan Africa,Lesotho,LSO,426,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,28.28
+Africa,Sub-Saharan Africa,Liberia,LBR,430,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.625
+Africa,Sub-Saharan Africa,Madagascar,MDG,450,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,8.167
+Africa,Sub-Saharan Africa,Madagascar,MDG,450,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,49.855
+Africa,Sub-Saharan Africa,Madagascar,MDG,450,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.177
+Africa,Sub-Saharan Africa,Malawi,MWI,454,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.452
+Africa,Sub-Saharan Africa,Malawi,MWI,454,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,101.865
+Africa,Sub-Saharan Africa,Mali,MLI,466,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,41.065
+Africa,Sub-Saharan Africa,Mali,MLI,466,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,95.944
+Africa,Sub-Saharan Africa,Mauritania,MRT,478,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,89.209
+Africa,Sub-Saharan Africa,Mauritania,MRT,478,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,67.8
+Africa,Sub-Saharan Africa,Mauritania,MRT,478,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,4.4
+Africa,Sub-Saharan Africa,Mauritania,MRT,478,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,132.375
+Africa,Sub-Saharan Africa,Mauritius,MUS,480,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.675
+Africa,Sub-Saharan Africa,Mauritius,MUS,480,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,137.235
+Africa,Sub-Saharan Africa,Mauritius,MUS,480,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,10.63
+Africa,Sub-Saharan Africa,Mayotte,MYT,175,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,32.434
+Africa,Sub-Saharan Africa,Mozambique,MOZ,508,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.343
+Africa,Sub-Saharan Africa,Mozambique,MOZ,508,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,103.6
+Africa,Sub-Saharan Africa,Namibia,NAM,516,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.474
+Africa,Sub-Saharan Africa,Namibia,NAM,516,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,155.122
+Africa,Sub-Saharan Africa,Namibia,NAM,516,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,5.231
+Africa,Sub-Saharan Africa,Niger (the),NER,562,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,10.992
+Africa,Sub-Saharan Africa,Niger (the),NER,562,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,72
+Africa,Sub-Saharan Africa,Nigeria,NGA,566,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,123.769
+Africa,Sub-Saharan Africa,Nigeria,NGA,566,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,20.723
+Africa,Sub-Saharan Africa,Réunion,REU,638,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.501
+Africa,Sub-Saharan Africa,Réunion,REU,638,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,237.4
+Africa,Sub-Saharan Africa,Réunion,REU,638,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,15.1
+Africa,Sub-Saharan Africa,Rwanda,RWA,646,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,15.204
+Africa,Sub-Saharan Africa,Rwanda,RWA,646,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,12.35
+Africa,Sub-Saharan Africa,Sao Tome and Principe,STP,678,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.013
+Africa,Sub-Saharan Africa,Sao Tome and Principe,STP,678,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.54
+Africa,Sub-Saharan Africa,Senegal,SEN,686,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,6.731
+Africa,Sub-Saharan Africa,Senegal,SEN,686,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,266
+Africa,Sub-Saharan Africa,Senegal,SEN,686,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,159
+Africa,Sub-Saharan Africa,Seychelles,SYC,690,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,4.545
+Africa,Sub-Saharan Africa,Seychelles,SYC,690,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,13.2
+Africa,Sub-Saharan Africa,Seychelles,SYC,690,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,6
+Africa,Sub-Saharan Africa,Sierra Leone,SLE,694,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,15.295
+Africa,Sub-Saharan Africa,Sierra Leone,SLE,694,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5.126
+Africa,Sub-Saharan Africa,Somalia,SOM,706,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,45.909
+Africa,Sub-Saharan Africa,Somalia,SOM,706,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,3.55
+Africa,Sub-Saharan Africa,South Africa,ZAF,710,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,5.733
+Africa,Sub-Saharan Africa,South Africa,ZAF,710,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,6165
+Africa,Sub-Saharan Africa,South Africa,ZAF,710,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,500
+Africa,Sub-Saharan Africa,South Africa,ZAF,710,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,3442
+Africa,Sub-Saharan Africa,South Sudan,SSD,728,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,2.469
+Africa,Sub-Saharan Africa,South Sudan,SSD,728,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,28
+Africa,Sub-Saharan Africa,Togo,TGO,768,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,16.169
+Africa,Sub-Saharan Africa,Togo,TGO,768,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,50.775
+Africa,Sub-Saharan Africa,Uganda,UGA,800,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,17.131
+Africa,Sub-Saharan Africa,Uganda,UGA,800,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,67.393
+Africa,Sub-Saharan Africa,United Republic of Tanzania (the),TZA,834,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,19.488
+Africa,Sub-Saharan Africa,United Republic of Tanzania (the),TZA,834,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.138
+Africa,Sub-Saharan Africa,United Republic of Tanzania (the),TZA,834,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2.4
+Africa,Sub-Saharan Africa,Zambia,ZMB,894,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,9.836
+Africa,Sub-Saharan Africa,Zambia,ZMB,894,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,186
+Africa,Sub-Saharan Africa,Zimbabwe,ZWE,716,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.1
+Africa,Sub-Saharan Africa,Zimbabwe,ZWE,716,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,67.075
+Americas,Latin America and the Caribbean,Anguilla,AIA,660,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.542
+Americas,Latin America and the Caribbean,Antigua and Barbuda,ATG,28,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.414
+Americas,Latin America and the Caribbean,Antigua and Barbuda,ATG,28,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,15.17
+Americas,Latin America and the Caribbean,Argentina,ARG,32,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,8.374
+Americas,Latin America and the Caribbean,Argentina,ARG,32,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1732.226
+Americas,Latin America and the Caribbean,Argentina,ARG,32,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.905
+Americas,Latin America and the Caribbean,Argentina,ARG,32,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,4319.415
+Americas,Latin America and the Caribbean,Aruba,ABW,533,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,14.804
+Americas,Latin America and the Caribbean,Aruba,ABW,533,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,30
+Americas,Latin America and the Caribbean,Bahamas (the),BHS,44,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,5.74
+Americas,Latin America and the Caribbean,Bahamas (the),BHS,44,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,15.595
+Americas,Latin America and the Caribbean,Bahamas (the),BHS,44,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.3
+Americas,Latin America and the Caribbean,Barbados,BRB,52,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,69.342
+Americas,Latin America and the Caribbean,Barbados,BRB,52,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1.16
+Americas,Latin America and the Caribbean,Belize,BLZ,84,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.059
+Americas,Latin America and the Caribbean,Belize,BLZ,84,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5.9
+Americas,Latin America and the Caribbean,Belize,BLZ,84,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.02
+Americas,Latin America and the Caribbean,Bolivia (Plurinational State of),BOL,68,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,6.66
+Americas,Latin America and the Caribbean,Bolivia (Plurinational State of),BOL,68,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,170.41
+Americas,Latin America and the Caribbean,Bolivia (Plurinational State of),BOL,68,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,135
+Americas,Latin America and the Caribbean,"Bonaire, Sint Eustatius and Saba",BES,535,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.13
+Americas,Latin America and the Caribbean,"Bonaire, Sint Eustatius and Saba",BES,535,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,12.945
+Americas,Latin America and the Caribbean,"Bonaire, Sint Eustatius and Saba",BES,535,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,11.13
+Americas,Latin America and the Caribbean,Brazil,BRA,76,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,4.011
+Americas,Latin America and the Caribbean,Brazil,BRA,76,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,53109.117
+Americas,Latin America and the Caribbean,Brazil,BRA,76,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,32959.31
+Americas,Latin America and the Caribbean,British Virgin Islands,VGB,92,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,2.199
+Americas,Latin America and the Caribbean,British Virgin Islands,VGB,92,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.327
+Americas,Latin America and the Caribbean,British Virgin Islands,VGB,92,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.801
+Americas,Latin America and the Caribbean,Cayman Islands,CYM,136,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,14.1
+Americas,Latin America and the Caribbean,Cayman Islands,CYM,136,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.8
+Americas,Latin America and the Caribbean,Chile,CHL,152,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,95
+Americas,Latin America and the Caribbean,Chile,CHL,152,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.667
+Americas,Latin America and the Caribbean,Chile,CHL,152,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,10939.735
+Americas,Latin America and the Caribbean,Chile,CHL,152,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,114
+Americas,Latin America and the Caribbean,Chile,CHL,152,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,4807.426
+Americas,Latin America and the Caribbean,Colombia,COL,170,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,50.8
+Americas,Latin America and the Caribbean,Colombia,COL,170,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1341.659
+Americas,Latin America and the Caribbean,Colombia,COL,170,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,33.8
+Americas,Latin America and the Caribbean,Costa Rica,CRI,188,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,262.66
+Americas,Latin America and the Caribbean,Costa Rica,CRI,188,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.45
+Americas,Latin America and the Caribbean,Costa Rica,CRI,188,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,72.099
+Americas,Latin America and the Caribbean,Costa Rica,CRI,188,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,402.335
+Americas,Latin America and the Caribbean,Cuba,CUB,192,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.693
+Americas,Latin America and the Caribbean,Cuba,CUB,192,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,284
+Americas,Latin America and the Caribbean,Cuba,CUB,192,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.45
+Americas,Latin America and the Caribbean,Cuba,CUB,192,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,16
+Americas,Latin America and the Caribbean,Curaçao,CUW,531,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.004
+Americas,Latin America and the Caribbean,Curaçao,CUW,531,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,14.357
+Americas,Latin America and the Caribbean,Curaçao,CUW,531,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,69.75
+Americas,Latin America and the Caribbean,Dominica,DMA,212,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.325
+Americas,Latin America and the Caribbean,Dominica,DMA,212,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.001
+Americas,Latin America and the Caribbean,Dominica,DMA,212,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.23
+Americas,Latin America and the Caribbean,Dominican Republic (the),DOM,214,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,19.087
+Americas,Latin America and the Caribbean,Dominican Republic (the),DOM,214,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1403.5
+Americas,Latin America and the Caribbean,Dominican Republic (the),DOM,214,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,432.7
+Americas,Latin America and the Caribbean,Ecuador,ECU,218,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,6.388
+Americas,Latin America and the Caribbean,Ecuador,ECU,218,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,25.161
+Americas,Latin America and the Caribbean,Ecuador,ECU,218,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,4.65
+Americas,Latin America and the Caribbean,Ecuador,ECU,218,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,66.48
+Americas,Latin America and the Caribbean,El Salvador,SLV,222,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,209.4
+Americas,Latin America and the Caribbean,El Salvador,SLV,222,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,4.136
+Americas,Latin America and the Caribbean,El Salvador,SLV,222,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,643.855
+Americas,Latin America and the Caribbean,El Salvador,SLV,222,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,54
+Americas,Latin America and the Caribbean,Falkland Islands (Malvinas),FLK,238,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.07
+Americas,Latin America and the Caribbean,Falkland Islands (Malvinas),FLK,238,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.012
+Americas,Latin America and the Caribbean,Falkland Islands (Malvinas),FLK,238,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.34
+Americas,Latin America and the Caribbean,Falkland Islands (Malvinas),FLK,238,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2.97
+Americas,Latin America and the Caribbean,French Guiana,GUF,254,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.161
+Americas,Latin America and the Caribbean,French Guiana,GUF,254,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,55.111
+Americas,Latin America and the Caribbean,Grenada,GRD,308,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3.78
+Americas,Latin America and the Caribbean,Grenada,GRD,308,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.08
+Americas,Latin America and the Caribbean,Guadeloupe,GLP,312,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,14.5
+Americas,Latin America and the Caribbean,Guadeloupe,GLP,312,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,95
+Americas,Latin America and the Caribbean,Guadeloupe,GLP,312,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,57.025
+Americas,Latin America and the Caribbean,Guatemala,GTM,320,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,49.2
+Americas,Latin America and the Caribbean,Guatemala,GTM,320,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.596
+Americas,Latin America and the Caribbean,Guatemala,GTM,320,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,101.3
+Americas,Latin America and the Caribbean,Guatemala,GTM,320,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,107.4
+Americas,Latin America and the Caribbean,Guyana,GUY,328,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.541
+Americas,Latin America and the Caribbean,Guyana,GUY,328,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,9.945
+Americas,Latin America and the Caribbean,Guyana,GUY,328,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.04
+Americas,Latin America and the Caribbean,Haiti,HTI,332,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.486
+Americas,Latin America and the Caribbean,Haiti,HTI,332,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.392
+Americas,Latin America and the Caribbean,Haiti,HTI,332,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.024
+Americas,Latin America and the Caribbean,Honduras,HND,340,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,39
+Americas,Latin America and the Caribbean,Honduras,HND,340,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,9.18
+Americas,Latin America and the Caribbean,Honduras,HND,340,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,544.632
+Americas,Latin America and the Caribbean,Honduras,HND,340,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,3.9
+Americas,Latin America and the Caribbean,Honduras,HND,340,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,235
+Americas,Latin America and the Caribbean,Jamaica,JAM,388,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.013
+Americas,Latin America and the Caribbean,Jamaica,JAM,388,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,116.56
+Americas,Latin America and the Caribbean,Jamaica,JAM,388,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,102
+Americas,Latin America and the Caribbean,Martinique,MTQ,474,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,92.266
+Americas,Latin America and the Caribbean,Martinique,MTQ,474,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,14
+Americas,Latin America and the Caribbean,Mexico,MEX,484,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,998.5
+Americas,Latin America and the Caribbean,Mexico,MEX,484,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,8.573
+Americas,Latin America and the Caribbean,Mexico,MEX,484,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,11966.56
+Americas,Latin America and the Caribbean,Mexico,MEX,484,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,17
+Americas,Latin America and the Caribbean,Mexico,MEX,484,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,7317.72
+Americas,Latin America and the Caribbean,Montserrat,MSR,500,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.018
+Americas,Latin America and the Caribbean,Nicaragua,NIC,558,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,165.44
+Americas,Latin America and the Caribbean,Nicaragua,NIC,558,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,4.599
+Americas,Latin America and the Caribbean,Nicaragua,NIC,558,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,31.39
+Americas,Latin America and the Caribbean,Nicaragua,NIC,558,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,186.2
+Americas,Latin America and the Caribbean,Panama,PAN,591,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.02
+Americas,Latin America and the Caribbean,Panama,PAN,591,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,743.144
+Americas,Latin America and the Caribbean,Panama,PAN,591,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,336
+Americas,Latin America and the Caribbean,Paraguay,PRY,600,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.166
+Americas,Latin America and the Caribbean,Paraguay,PRY,600,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.02
+Americas,Latin America and the Caribbean,Peru,PER,604,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,45.746
+Americas,Latin America and the Caribbean,Peru,PER,604,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,481.981
+Americas,Latin America and the Caribbean,Peru,PER,604,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1150.69
+Americas,Latin America and the Caribbean,Puerto Rico,PRI,630,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.042
+Americas,Latin America and the Caribbean,Puerto Rico,PRI,630,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,962.603
+Americas,Latin America and the Caribbean,Puerto Rico,PRI,630,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,127.8
+Americas,Latin America and the Caribbean,Saint Barthélemy,BLM,652,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.2
+Americas,Latin America and the Caribbean,Saint Kitts and Nevis,KNA,659,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.001
+Americas,Latin America and the Caribbean,Saint Kitts and Nevis,KNA,659,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4.513
+Americas,Latin America and the Caribbean,Saint Kitts and Nevis,KNA,659,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2.2
+Americas,Latin America and the Caribbean,Saint Lucia,LCA,662,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4.98
+Americas,Latin America and the Caribbean,Saint Martin (French Part),MAF,663,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.1
+Americas,Latin America and the Caribbean,Saint Vincent and the Grenadines,VCT,670,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4.803
+Americas,Latin America and the Caribbean,South Georgia and the South Sandwich Islands,SGS,239,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.006
+Americas,Latin America and the Caribbean,Suriname,SUR,740,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.52
+Americas,Latin America and the Caribbean,Suriname,SUR,740,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,6.332
+Americas,Latin America and the Caribbean,Trinidad and Tobago,TTO,780,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4.624
+Americas,Latin America and the Caribbean,Trinidad and Tobago,TTO,780,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.01
+Americas,Latin America and the Caribbean,Turks and Caicos Islands,TCA,796,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4.019
+Americas,Latin America and the Caribbean,United States Virgin Islands,VIR,850,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,30.493
+Americas,Latin America and the Caribbean,United States Virgin Islands,VIR,850,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.1
+Americas,Latin America and the Caribbean,Uruguay,URY,858,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,13.202
+Americas,Latin America and the Caribbean,Uruguay,URY,858,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,316.566
+Americas,Latin America and the Caribbean,Uruguay,URY,858,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,7.3
+Americas,Latin America and the Caribbean,Uruguay,URY,858,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1516.5
+Americas,Latin America and the Caribbean,Venezuela (Bolivarian Republic of),VEN,862,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,2.87
+Americas,Latin America and the Caribbean,Venezuela (Bolivarian Republic of),VEN,862,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.19
+Americas,Latin America and the Caribbean,Venezuela (Bolivarian Republic of),VEN,862,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,50.2
+Americas,Northern America,Canada,CAN,124,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,6
+Americas,Northern America,Canada,CAN,124,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,6105.41
+Americas,Northern America,Canada,CAN,124,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,18376.318
+Americas,Northern America,Greenland,GRL,304,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.62
+Americas,Northern America,Greenland,GRL,304,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.56
+Americas,Northern America,United States of America (the),USA,840,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,2702.8
+Americas,Northern America,United States of America (the),USA,840,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,175990.277
+Americas,Northern America,United States of America (the),USA,840,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,1480
+Americas,Northern America,United States of America (the),USA,840,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,171.3
+Americas,Northern America,United States of America (the),USA,840,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,152980.961
+Asia,Central Asia,Kazakhstan,KAZ,398,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1196.2
+Asia,Central Asia,Kazakhstan,KAZ,398,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1411.3
+Asia,Central Asia,Kyrgyzstan,KGZ,417,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.08
+Asia,Central Asia,Tajikistan,TJK,762,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.22
+Asia,Central Asia,Uzbekistan,UZB,860,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.325
+Asia,Central Asia,Uzbekistan,UZB,860,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2271.175
+Asia,Central Asia,Uzbekistan,UZB,860,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,500.75
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,25.75
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,439.8
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,886920
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,570
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,39100
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,585.71
+Asia,Eastern Asia,China,CHN,156,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,482060
+Asia,Eastern Asia,"China, Hong Kong Special Administrative Region",HKG,344,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,333.1
+Asia,Eastern Asia,"China, Hong Kong Special Administrative Region",HKG,344,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.8
+Asia,Eastern Asia,Chinese Taipei,TWN,158,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,7.489
+Asia,Eastern Asia,Chinese Taipei,TWN,158,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,14281.145
+Asia,Eastern Asia,Chinese Taipei,TWN,158,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,2962.843
+Asia,Eastern Asia,Chinese Taipei,TWN,158,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,927.404
+Asia,Eastern Asia,Democratic People's Republic of Korea (the),PRK,408,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,142.737
+Asia,Eastern Asia,Democratic People's Republic of Korea (the),PRK,408,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1.6
+Asia,Eastern Asia,Japan,JPN,392,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,461
+Asia,Eastern Asia,Japan,JPN,392,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,91610.333
+Asia,Eastern Asia,Japan,JPN,392,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,290
+Asia,Eastern Asia,Japan,JPN,392,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,5542
+Asia,Eastern Asia,Mongolia,MNG,496,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,13.197
+Asia,Eastern Asia,Mongolia,MNG,496,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,130
+Asia,Eastern Asia,Mongolia,MNG,496,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.989
+Asia,Eastern Asia,Mongolia,MNG,496,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,155
+Asia,Eastern Asia,Republic of Korea (the),KOR,410,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,26645.122
+Asia,Eastern Asia,Republic of Korea (the),KOR,410,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,136
+Asia,Eastern Asia,Republic of Korea (the),KOR,410,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2165.269
+Asia,South-eastern Asia,Brunei Darussalam,BRN,96,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.05
+Asia,South-eastern Asia,Brunei Darussalam,BRN,96,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5.149
+Asia,South-eastern Asia,Cambodia,KHM,116,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,5.753
+Asia,South-eastern Asia,Cambodia,KHM,116,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,871.836
+Asia,South-eastern Asia,Cambodia,KHM,116,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.25
+Asia,South-eastern Asia,Indonesia,IDN,360,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,2687.51
+Asia,South-eastern Asia,Indonesia,IDN,360,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,361.972
+Asia,South-eastern Asia,Indonesia,IDN,360,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,453.46
+Asia,South-eastern Asia,Indonesia,IDN,360,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.48
+Asia,South-eastern Asia,Indonesia,IDN,360,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,151.82
+Asia,South-eastern Asia,Lao People's Democratic Republic (the),LAO,418,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.348
+Asia,South-eastern Asia,Lao People's Democratic Republic (the),LAO,418,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,57.759
+Asia,South-eastern Asia,Malaysia,MYS,458,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,8.098
+Asia,South-eastern Asia,Malaysia,MYS,458,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2298.257
+Asia,South-eastern Asia,Myanmar,MMR,104,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,93.1
+Asia,South-eastern Asia,Myanmar,MMR,104,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,122.9
+Asia,South-eastern Asia,Myanmar,MMR,104,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.006
+Asia,South-eastern Asia,Philippines (the),PHL,608,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,1951.8
+Asia,South-eastern Asia,Philippines (the),PHL,608,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,22.616
+Asia,South-eastern Asia,Philippines (the),PHL,608,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2948.484
+Asia,South-eastern Asia,Philippines (the),PHL,608,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,16.56
+Asia,South-eastern Asia,Philippines (the),PHL,608,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,426.9
+Asia,South-eastern Asia,Singapore,SGP,702,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1157
+Asia,South-eastern Asia,Singapore,SGP,702,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.1
+Asia,South-eastern Asia,Thailand,THA,764,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,0.3
+Asia,South-eastern Asia,Thailand,THA,764,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.916
+Asia,South-eastern Asia,Thailand,THA,764,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3378.45
+Asia,South-eastern Asia,Thailand,THA,764,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,5
+Asia,South-eastern Asia,Thailand,THA,764,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1543.56
+Asia,South-eastern Asia,Timor-Leste,TLS,626,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.091
+Asia,South-eastern Asia,Timor-Leste,TLS,626,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.314
+Asia,South-eastern Asia,Viet Nam,VNM,704,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,5.49
+Asia,South-eastern Asia,Viet Nam,VNM,704,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,18661.85
+Asia,South-eastern Asia,Viet Nam,VNM,704,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,1103.5
+Asia,South-eastern Asia,Viet Nam,VNM,704,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,6
+Asia,South-eastern Asia,Viet Nam,VNM,704,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,5075.3
+Asia,Southern Asia,Afghanistan,AFG,4,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,21.776
+Asia,Southern Asia,Afghanistan,AFG,4,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,31.7
+Asia,Southern Asia,Afghanistan,AFG,4,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.1
+Asia,Southern Asia,Afghanistan,AFG,4,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.3
+Asia,Southern Asia,Bangladesh,BGD,50,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,137.609
+Asia,Southern Asia,Bangladesh,BGD,50,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,708.44
+Asia,Southern Asia,Bangladesh,BGD,50,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,2
+Asia,Southern Asia,Bangladesh,BGD,50,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.9
+Asia,Southern Asia,Bhutan,BTN,64,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.328
+Asia,Southern Asia,Bhutan,BTN,64,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3.042
+Asia,Southern Asia,Bhutan,BTN,64,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.6
+Asia,Southern Asia,India,IND,356,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3406.781
+Asia,Southern Asia,India,IND,356,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,93634.72
+Asia,Southern Asia,India,IND,356,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,342.5
+Asia,Southern Asia,India,IND,356,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,48163.16
+Asia,Southern Asia,Iran (Islamic Republic of),IRN,364,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.378
+Asia,Southern Asia,Iran (Islamic Republic of),IRN,364,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,781.26
+Asia,Southern Asia,Iran (Islamic Republic of),IRN,364,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,376.3
+Asia,Southern Asia,Maldives,MDV,462,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,68.5
+Asia,Southern Asia,Maldives,MDV,462,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,1.407
+Asia,Southern Asia,Nepal,NPL,524,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,60.226
+Asia,Southern Asia,Nepal,NPL,524,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,115.24
+Asia,Southern Asia,Nepal,NPL,524,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.199
+Asia,Southern Asia,Pakistan,PAK,586,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,15.686
+Asia,Southern Asia,Pakistan,PAK,586,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1379.51
+Asia,Southern Asia,Pakistan,PAK,586,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.155
+Asia,Southern Asia,Pakistan,PAK,586,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1845
+Asia,Southern Asia,Sri Lanka,LKA,144,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.659
+Asia,Southern Asia,Sri Lanka,LKA,144,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1442.039
+Asia,Southern Asia,Sri Lanka,LKA,144,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,267
+Asia,Western Asia,Armenia,ARM,51,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,485.4
+Asia,Western Asia,Armenia,ARM,51,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2.9
+Asia,Western Asia,Azerbaijan,AZE,31,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,292.9
+Asia,Western Asia,Azerbaijan,AZE,31,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,63.7
+Asia,Western Asia,Bahrain,BHR,48,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,66.028
+Asia,Western Asia,Bahrain,BHR,48,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2.675
+Asia,Western Asia,Cyprus,CYP,196,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,723.82
+Asia,Western Asia,Cyprus,CYP,196,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,157.5
+Asia,Western Asia,Georgia,GEO,268,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.656
+Asia,Western Asia,Georgia,GEO,268,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,131.95
+Asia,Western Asia,Georgia,GEO,268,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,21.053
+Asia,Western Asia,Iraq,IRQ,368,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,39
+Asia,Western Asia,Iraq,IRQ,368,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.576
+Asia,Western Asia,Israel,ISR,376,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5363.4
+Asia,Western Asia,Israel,ISR,376,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,242
+Asia,Western Asia,Israel,ISR,376,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,343.25
+Asia,Western Asia,Jordan,JOR,400,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.325
+Asia,Western Asia,Jordan,JOR,400,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2073.86
+Asia,Western Asia,Jordan,JOR,400,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.01
+Asia,Western Asia,Jordan,JOR,400,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,631.1
+Asia,Western Asia,Kuwait,KWT,414,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,50.162
+Asia,Western Asia,Kuwait,KWT,414,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,51.5
+Asia,Western Asia,Kuwait,KWT,414,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,2.4
+Asia,Western Asia,Kuwait,KWT,414,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,10
+Asia,Western Asia,Lebanon,LBN,422,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,4.89
+Asia,Western Asia,Lebanon,LBN,422,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1000
+Asia,Western Asia,Lebanon,LBN,422,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,3
+Asia,Western Asia,Oman,OMN,512,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.011
+Asia,Western Asia,Oman,OMN,512,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,672.078
+Asia,Western Asia,Oman,OMN,512,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,50
+Asia,Western Asia,Qatar,QAT,634,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1680.1
+Asia,Western Asia,Saudi Arabia,SAU,682,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4290.374
+Asia,Western Asia,Saudi Arabia,SAU,682,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,50
+Asia,Western Asia,Saudi Arabia,SAU,682,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,403
+Asia,Western Asia,State of Palestine (the),PSE,275,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.833
+Asia,Western Asia,State of Palestine (the),PSE,275,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,195.5
+Asia,Western Asia,Syrian Arab Republic (the),SYR,760,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,2
+Asia,Western Asia,Syrian Arab Republic (the),SYR,760,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,58
+Asia,Western Asia,Syrian Arab Republic (the),SYR,760,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.6
+Asia,Western Asia,Türkiye,TUR,792,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,1734.338
+Asia,Western Asia,Türkiye,TUR,792,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,19882.44
+Asia,Western Asia,Türkiye,TUR,792,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,1
+Asia,Western Asia,Türkiye,TUR,792,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,12973.07
+Asia,Western Asia,United Arab Emirates (the),ARE,784,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,6.197
+Asia,Western Asia,United Arab Emirates (the),ARE,784,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5405.1
+Asia,Western Asia,United Arab Emirates (the),ARE,784,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,600
+Asia,Western Asia,United Arab Emirates (the),ARE,784,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,99.1
+Asia,Western Asia,Yemen,YEM,887,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,269.995
+Asia,Western Asia,Yemen,YEM,887,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,140
+Europe,Eastern Europe,Belarus,BLR,112,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,265
+Europe,Eastern Europe,Belarus,BLR,112,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,122
+Europe,Eastern Europe,Bulgaria,BGR,100,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3908.127
+Europe,Eastern Europe,Bulgaria,BGR,100,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,704.31
+Europe,Eastern Europe,Czechia,CZE,203,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4159.411
+Europe,Eastern Europe,Czechia,CZE,203,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,355.8
+Europe,Eastern Europe,Hungary,HUN,348,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,3
+Europe,Eastern Europe,Hungary,HUN,348,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,7699
+Europe,Eastern Europe,Hungary,HUN,348,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,324
+Europe,Eastern Europe,Kosovo,XKX,412,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,19.548
+Europe,Eastern Europe,Kosovo,XKX,412,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,137.22
+Europe,Eastern Europe,Poland,POL,616,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,20199.126
+Europe,Eastern Europe,Poland,POL,616,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,10059.321
+Europe,Eastern Europe,Republic of Moldova (the),MDA,498,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,344
+Europe,Eastern Europe,Republic of Moldova (the),MDA,498,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,122.53
+Europe,Eastern Europe,Romania,ROU,642,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4687.977
+Europe,Eastern Europe,Romania,ROU,642,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,0.091
+Europe,Eastern Europe,Romania,ROU,642,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,3095.764
+Europe,Eastern Europe,Russian Federation (the),RUS,643,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,81.4
+Europe,Eastern Europe,Russian Federation (the),RUS,643,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2554.38
+Europe,Eastern Europe,Russian Federation (the),RUS,643,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,2566.7
+Europe,Eastern Europe,Slovakia,SVK,703,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,867
+Europe,Eastern Europe,Slovakia,SVK,703,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,4
+Europe,Eastern Europe,Ukraine,UKR,804,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5500
+Europe,Northern Europe,Denmark,DNK,208,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3945
+Europe,Northern Europe,Denmark,DNK,208,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,2813.1
+Europe,Northern Europe,Denmark,DNK,208,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,4807.906
+Europe,Northern Europe,Estonia,EST,233,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1326
+Europe,Northern Europe,Estonia,EST,233,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,572
+Europe,Northern Europe,Faroe Islands,FRO,234,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.261
+Europe,Northern Europe,Faroe Islands,FRO,234,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,67.68
+Europe,Northern Europe,Finland,FIN,246,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1203.206
+Europe,Northern Europe,Finland,FIN,246,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,32
+Europe,Northern Europe,Finland,FIN,246,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,8328
+Europe,Northern Europe,Iceland,ISL,352,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,787.58
+Europe,Northern Europe,Iceland,ISL,352,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.001
+Europe,Northern Europe,Iceland,ISL,352,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,0.036
+Europe,Northern Europe,Iceland,ISL,352,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,3.64
+Europe,Northern Europe,Ireland,IRL,372,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,165.272
+Europe,Northern Europe,Ireland,IRL,372,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1175.054
+Europe,Northern Europe,Ireland,IRL,372,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,25.2
+Europe,Northern Europe,Ireland,IRL,372,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,4916.751
+Europe,Northern Europe,Latvia,LVA,428,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,466
+Europe,Northern Europe,Latvia,LVA,428,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,128.268
+Europe,Northern Europe,Lithuania,LTU,440,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,171
+Europe,Northern Europe,Lithuania,LTU,440,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2396
+Europe,Northern Europe,Lithuania,LTU,440,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1828
+Europe,Northern Europe,Norway,NOR,578,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,18.792
+Europe,Northern Europe,Norway,NOR,578,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,782.863
+Europe,Northern Europe,Norway,NOR,578,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,90.3
+Europe,Northern Europe,Norway,NOR,578,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,5061.7
+Europe,Northern Europe,Sweden,SWE,752,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,19
+Europe,Northern Europe,Sweden,SWE,752,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4944
+Europe,Northern Europe,Sweden,SWE,752,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,193
+Europe,Northern Europe,Sweden,SWE,752,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,17046
+Europe,Northern Europe,United Kingdom of Great Britain and Northern Ireland (the),GBR,826,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,17603.079
+Europe,Northern Europe,United Kingdom of Great Britain and Northern Ireland (the),GBR,826,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,14745.075
+Europe,Northern Europe,United Kingdom of Great Britain and Northern Ireland (the),GBR,826,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,16156.873
+Europe,Southern Europe,Albania,ALB,8,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,306.734
+Europe,Southern Europe,Andorra,AND,20,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,8.727
+Europe,Southern Europe,Bosnia and Herzegovina,BIH,70,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,212.19
+Europe,Southern Europe,Bosnia and Herzegovina,BIH,70,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,219
+Europe,Southern Europe,Croatia,HRV,191,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,10
+Europe,Southern Europe,Croatia,HRV,191,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,859.6
+Europe,Southern Europe,Croatia,HRV,191,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1191.2
+Europe,Southern Europe,Greece,GRC,300,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,9268.653
+Europe,Southern Europe,Greece,GRC,300,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,5357.203
+Europe,Southern Europe,Italy,ITA,380,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,771.79
+Europe,Southern Europe,Italy,ITA,380,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,36008.396
+Europe,Southern Europe,Italy,ITA,380,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,4.72
+Europe,Southern Europe,Italy,ITA,380,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,30.994
+Europe,Southern Europe,Italy,ITA,380,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,12961.306
+Europe,Southern Europe,Malta,MLT,470,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,233.25
+Europe,Southern Europe,Malta,MLT,470,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.057
+Europe,Southern Europe,Montenegro,MNE,499,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,30.155
+Europe,Southern Europe,Montenegro,MNE,499,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,118
+Europe,Southern Europe,North Macedonia,MKD,807,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,833
+Europe,Southern Europe,North Macedonia,MKD,807,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,73.6
+Europe,Southern Europe,Portugal,PRT,620,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,29.1
+Europe,Southern Europe,Portugal,PRT,620,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,171.21
+Europe,Southern Europe,Portugal,PRT,620,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5636.791
+Europe,Southern Europe,Portugal,PRT,620,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,24.999
+Europe,Southern Europe,Portugal,PRT,620,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,5558.141
+Europe,Southern Europe,Serbia,SRB,688,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,114.561
+Europe,Southern Europe,Serbia,SRB,688,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,126.505
+Europe,Southern Europe,Serbia,SRB,688,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,604
+Europe,Southern Europe,Slovenia,SVN,705,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1309.37
+Europe,Southern Europe,Slovenia,SVN,705,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,3.328
+Europe,Southern Europe,Spain,ESP,724,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,36.797
+Europe,Southern Europe,Spain,ESP,724,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,36248.606
+Europe,Southern Europe,Spain,ESP,724,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,2302.013
+Europe,Southern Europe,Spain,ESP,724,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,5
+Europe,Southern Europe,Spain,ESP,724,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,31806.495
+Europe,Western Europe,Austria,AUT,40,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,0.25
+Europe,Western Europe,Austria,AUT,40,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,8.697
+Europe,Western Europe,Austria,AUT,40,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,8472.296
+Europe,Western Europe,Austria,AUT,40,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,4035
+Europe,Western Europe,Belgium,BEL,56,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,9751.9
+Europe,Western Europe,Belgium,BEL,56,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,2261.8
+Europe,Western Europe,Belgium,BEL,56,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,3336.96
+Europe,Western Europe,France,FRA,250,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,16.15
+Europe,Western Europe,France,FRA,250,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,373.41
+Europe,Western Europe,France,FRA,250,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,21154.678
+Europe,Western Europe,France,FRA,250,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,1486.5
+Europe,Western Europe,France,FRA,250,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,23105.114
+Europe,Western Europe,Germany,DEU,276,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,44
+Europe,Western Europe,Germany,DEU,276,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,89943
+Europe,Western Europe,Germany,DEU,276,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,9215
+Europe,Western Europe,Germany,DEU,276,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,63608
+Europe,Western Europe,Luxembourg,LUX,442,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,523.256
+Europe,Western Europe,Luxembourg,LUX,442,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,210.335
+Europe,Western Europe,Netherlands (Kingdom of the),NLD,528,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,24048.437
+Europe,Western Europe,Netherlands (Kingdom of the),NLD,528,Total Renewable,Wind energy,Offshore wind energy,Offshore wind energy,On-grid electricity,2024,4747.5
+Europe,Western Europe,Netherlands (Kingdom of the),NLD,528,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,6931.618
+Europe,Western Europe,Switzerland,CHE,756,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,7793.829
+Europe,Western Europe,Switzerland,CHE,756,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,101.8
+Oceania,Australia and New Zealand,Australia,AUS,36,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,0.1
+Oceania,Australia and New Zealand,Australia,AUS,36,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,38469
+Oceania,Australia and New Zealand,Australia,AUS,36,Total Renewable,Solar energy,Solar thermal energy,Concentrated solar power,On-grid electricity,2024,3
+Oceania,Australia and New Zealand,Australia,AUS,36,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,15288
+Oceania,Australia and New Zealand,New Zealand,NZL,554,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,On-grid electricity,2024,1275.4
+Oceania,Australia and New Zealand,New Zealand,NZL,554,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,570
+Oceania,Australia and New Zealand,New Zealand,NZL,554,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1263
+Oceania,Melanesia,Fiji,FJI,242,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,7.165
+Oceania,Melanesia,Fiji,FJI,242,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3.772
+Oceania,Melanesia,Fiji,FJI,242,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,10.175
+Oceania,Melanesia,New Caledonia,NCL,540,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.96
+Oceania,Melanesia,New Caledonia,NCL,540,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,214.528
+Oceania,Melanesia,New Caledonia,NCL,540,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,57.985
+Oceania,Melanesia,Papua New Guinea,PNG,598,Total Renewable,Geothermal energy,Geothermal energy,Geothermal energy,Off-grid electricity,2024,51
+Oceania,Melanesia,Papua New Guinea,PNG,598,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.437
+Oceania,Melanesia,Papua New Guinea,PNG,598,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.45
+Oceania,Melanesia,Solomon Islands,SLB,90,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.079
+Oceania,Melanesia,Solomon Islands,SLB,90,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3.11
+Oceania,Melanesia,Vanuatu,VUT,548,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.263
+Oceania,Melanesia,Vanuatu,VUT,548,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.772
+Oceania,Melanesia,Vanuatu,VUT,548,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,3.13
+Oceania,Micronesia,Guam,GUM,316,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,104.797
+Oceania,Micronesia,Guam,GUM,316,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.275
+Oceania,Micronesia,Kiribati,KIR,296,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.36
+Oceania,Micronesia,Kiribati,KIR,296,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.816
+Oceania,Micronesia,Marshall Islands (the),MHL,584,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.726
+Oceania,Micronesia,Marshall Islands (the),MHL,584,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.457
+Oceania,Micronesia,Marshall Islands (the),MHL,584,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.011
+Oceania,Micronesia,Micronesia (Federated States of),FSM,583,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.137
+Oceania,Micronesia,Micronesia (Federated States of),FSM,583,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,4.739
+Oceania,Micronesia,Micronesia (Federated States of),FSM,583,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.825
+Oceania,Micronesia,Nauru,NRU,520,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.158
+Oceania,Micronesia,Nauru,NRU,520,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,3.005
+Oceania,Micronesia,Palau,PLW,585,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.538
+Oceania,Micronesia,Palau,PLW,585,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,19.34
+Oceania,Polynesia,American Samoa,ASM,16,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.504
+Oceania,Polynesia,American Samoa,ASM,16,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,5.606
+Oceania,Polynesia,Cook Islands (the),COK,184,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,2.606
+Oceania,Polynesia,Cook Islands (the),COK,184,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.964
+Oceania,Polynesia,French Polynesia,PYF,258,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,3.3
+Oceania,Polynesia,French Polynesia,PYF,258,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,69.272
+Oceania,Polynesia,French Polynesia,PYF,258,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,Off-grid electricity,2024,0.248
+Oceania,Polynesia,Niue,NIU,570,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.815
+Oceania,Polynesia,Samoa,WSM,882,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,15.734
+Oceania,Polynesia,Samoa,WSM,882,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.55
+Oceania,Polynesia,Tokelau,TKL,772,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,1.02
+Oceania,Polynesia,Tokelau,TKL,772,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,0.015
+Oceania,Polynesia,Tonga,TON,776,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,0.621
+Oceania,Polynesia,Tonga,TON,776,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,14.912
+Oceania,Polynesia,Tonga,TON,776,Total Renewable,Wind energy,Onshore wind energy,Onshore wind energy,On-grid electricity,2024,1.397
+Oceania,Polynesia,Tuvalu,TUV,798,Total Renewable,Solar energy,Solar photovoltaic,Off-grid Solar photovoltaic,Off-grid electricity,2024,1.556
+Oceania,Polynesia,Tuvalu,TUV,798,Total Renewable,Solar energy,Solar photovoltaic,On-grid Solar photovoltaic,On-grid electricity,2024,2.997

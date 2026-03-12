@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - runtime environment normally provides PyYAML
     yaml = None
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.append(str(SCRIPTS_DIR))
@@ -46,6 +46,19 @@ from _helpers import (
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_VALIDATION_GATE_CONFIG_PATH = REPO_ROOT / "validation" / "config.validation_gate.yaml"
+
+
+def _repo_relative_path_str(path: Path) -> str:
+    """Prefer repo-relative paths in validation artifacts/logs."""
+    path = Path(path)
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        pass
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT.resolve()))
+    except (ValueError, OSError, RuntimeError):
+        return str(path)
 
 
 DEMAND_METRIC_DEFINITIONS = {
@@ -2905,7 +2918,7 @@ def _write_validation_gate_outputs(
     )
 
     json_payload = {
-        "config_path": str(gate_config_path),
+        "config_path": _repo_relative_path_str(gate_config_path),
         "config_version": gate_config.get("version"),
         "overall": _json_sanitize(gate_overall),
         "summary_rows": _df_to_json_records(_round_for_csv(gate_summary)),
@@ -3400,7 +3413,6 @@ def _print_summary(
 
 def parse_args() -> argparse.Namespace:
     default_network = (
-        "/Users/tlm2160/Library/Mobile Documents/com~apple~CloudDocs/Documents/Research 2/CKI/energmod/"
         "results/Global_200/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc"
     )
     parser = argparse.ArgumentParser(
@@ -3555,8 +3567,8 @@ def main() -> None:
             year=args.year,
             allowlist_rules=allowlist_rules,
         )
-        baseyear_extendability_summary["allowlist_path"] = str(
-            args.baseyear_extendability_allowlist.resolve()
+        baseyear_extendability_summary["allowlist_path"] = _repo_relative_path_str(
+            args.baseyear_extendability_allowlist
         )
         unexpected_extendable = baseyear_extendability_audit.loc[
             baseyear_extendability_audit["classification"] == "unexpected"
@@ -3587,7 +3599,9 @@ def main() -> None:
                 len(baseyear_extendability_audit),
             )
     else:
-        baseyear_extendability_summary["allowlist_path"] = str(args.baseyear_extendability_allowlist)
+        baseyear_extendability_summary["allowlist_path"] = _repo_relative_path_str(
+            args.baseyear_extendability_allowlist
+        )
 
     network_countries = set(n.buses.country.dropna())
     network_countries.discard("")
@@ -3630,7 +3644,10 @@ def main() -> None:
             )
 
     if args.guardrails_only:
-        LOGGER.info("Guardrails-only mode complete. Wrote artifacts to %s", args.output_dir.resolve())
+        LOGGER.info(
+            "Guardrails-only mode complete. Wrote artifacts to %s",
+            _repo_relative_path_str(args.output_dir),
+        )
         if args.fail_on_guardrail_fail and guardrail_status["overall_status"] == "fail":
             raise SystemExit(2)
         return
@@ -3848,10 +3865,10 @@ def main() -> None:
         demand_metric_definitions=demand_metric_definitions,
     )
 
-    LOGGER.info("Wrote validation outputs to %s", args.output_dir.resolve())
+    LOGGER.info("Wrote validation outputs to %s", _repo_relative_path_str(args.output_dir))
     LOGGER.info(
         "Workflow guardrail status artifact: %s",
-        (args.output_dir / "workflow_guardrail_status.json").resolve(),
+        _repo_relative_path_str(args.output_dir / "workflow_guardrail_status.json"),
     )
     LOGGER.info("CSV output profile: %s", args.csv_output_profile)
     LOGGER.info(

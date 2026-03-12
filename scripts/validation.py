@@ -20,6 +20,9 @@ from _helpers import BASE_DIR, three_2_two_digits_country
 logger = logging.getLogger(__name__)
 
 
+BASEYEAR_BLOCKED_EXTENDABLE_LINK_CARRIERS = ("H2 Fuel Cell",)
+
+
 def _get_bus_country_for_clustering(n):
     country = (
         n.buses["country"]
@@ -154,6 +157,112 @@ def _replace_zero_profile_columns_with_nearest(
         )
 
     return p_max_pu
+
+
+def apply_renewable_profile_fallbacks(n, investment_year, config):
+    """
+    Patch missing or all-zero renewable p_max_pu profiles without changing
+    valid profiles.
+
+    This is intentionally separate from the baseyear OWID/scaling hooks so
+    later planning years keep their original CFs except where profiles are
+    missing or pathological.
+    """
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    base_cfg = global_cfg.get("baseyear_generation", {})
+    if not bool(base_cfg.get("renewable_profile_fallback_enabled", True)):
+        return {
+            "enabled": False,
+            "carriers": {},
+        }
+
+    if n.generators.empty:
+        return {
+            "enabled": True,
+            "carriers": {},
+        }
+
+    if n.generators_t.p_max_pu.empty:
+        n.generators_t.p_max_pu = pd.DataFrame(index=n.snapshots)
+
+    fallback_specs = [
+        ("onwind", "onwind", ""),
+        ("solar", "solar", ""),
+        ("offwind-ac", "offwind", "-ac"),
+        ("offwind-dc", "offwind", "-dc"),
+    ]
+
+    summary = {}
+    for carrier, generator, suffix in fallback_specs:
+        idx = n.generators.index[n.generators.carrier.astype(str).eq(carrier)]
+        if len(idx) == 0:
+            continue
+
+        ts_cols_existing = n.generators_t.p_max_pu.columns.intersection(idx)
+        missing_cols = idx.difference(ts_cols_existing)
+
+        patch_cols = pd.Index(ts_cols_existing)
+        if len(missing_cols) > 0:
+            patch_cols = patch_cols.append(missing_cols)
+
+        if len(patch_cols) == 0:
+            continue
+
+        p_max_pu_patch = n.generators_t.p_max_pu.reindex(columns=patch_cols).copy()
+        if len(missing_cols) > 0:
+            p_max_pu_patch.loc[:, missing_cols] = 0.0
+
+        zero_before = (
+            p_max_pu_patch.fillna(0.0).sum(axis=0).abs() <= 1e-12
+        )
+        pathological_before = int(zero_before.sum())
+        if pathological_before == 0:
+            continue
+
+        p_max_pu_patch = _replace_zero_profile_columns_with_nearest(
+            n=n,
+            p_max_pu=p_max_pu_patch,
+            generator=generator,
+            suffix=suffix,
+            source_year=investment_year,
+            target_year=investment_year,
+        )
+
+        for col in p_max_pu_patch.columns:
+            n.generators_t.p_max_pu.loc[:, col] = p_max_pu_patch[col].values
+
+        zero_after = (
+            p_max_pu_patch.fillna(0.0).sum(axis=0).abs() <= 1e-12
+        )
+        pathological_after = int(zero_after.sum())
+        patched = pathological_before - pathological_after
+
+        summary[carrier] = {
+            "generators": int(len(idx)),
+            "missing_profiles": int(len(missing_cols)),
+            "pathologies_before": pathological_before,
+            "patched": int(patched),
+            "residual_after": pathological_after,
+        }
+
+    if summary:
+        logger.warning(
+            "Renewable profile fallback summary for %s: %s",
+            investment_year,
+            "; ".join(
+                (
+                    f"{carrier}(gens={stats['generators']}, missing={stats['missing_profiles']}, "
+                    f"before={stats['pathologies_before']}, patched={stats['patched']}, "
+                    f"residual={stats['residual_after']})"
+                )
+                for carrier, stats in summary.items()
+            ),
+        )
+
+    return {
+        "enabled": True,
+        "carriers": summary,
+    }
 
 
 
@@ -935,6 +1044,86 @@ def _electric_load_energy_by_load_mwh(n, load_index):
     return weighted
 
 
+def _baseline_electricity_demand_network_path(base_cfg):
+    candidates = [
+        base_cfg.get("electricity_demand_baseline_network"),
+        base_cfg.get("hydro_baseline_network"),
+        base_cfg.get("onwind_baseline_network"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return _repo_path(candidate)
+    return None
+
+
+def _country_ac_end_use_link_withdrawal_twh(
+    n,
+    output_bus_carrier_substrings=("heat",),
+):
+    if n.links.empty or n.links_t.p0.empty:
+        return pd.Series(dtype=float)
+
+    if "bus0" not in n.links.columns:
+        return pd.Series(dtype=float)
+
+    input_bus = n.links["bus0"]
+    input_carrier = input_bus.map(n.buses.carrier).fillna("").astype(str)
+    mask = input_carrier.eq("AC")
+    if not mask.any():
+        return pd.Series(dtype=float)
+
+    substrings = [
+        str(value).strip().lower()
+        for value in (output_bus_carrier_substrings or ())
+        if str(value).strip()
+    ]
+    if substrings:
+        output_mask = pd.Series(False, index=n.links.index, dtype=bool)
+        for port in [1, 2, 3, 4]:
+            bus_col = f"bus{port}"
+            if bus_col not in n.links.columns:
+                continue
+            output_carrier = (
+                n.links[bus_col]
+                .map(n.buses.carrier)
+                .fillna("")
+                .astype(str)
+                .str.lower()
+            )
+            port_mask = pd.Series(False, index=n.links.index, dtype=bool)
+            for substring in substrings:
+                port_mask |= output_carrier.str.contains(re.escape(substring), na=False)
+            output_mask |= port_mask
+        mask &= output_mask
+
+    selected = n.links.index[mask]
+    if len(selected) == 0:
+        return pd.Series(dtype=float)
+
+    weights = n.snapshot_weightings["generators"]
+    link_cols = n.links_t.p0.columns.intersection(selected)
+    if len(link_cols) == 0:
+        return pd.Series(dtype=float)
+
+    bus_country = _bus_country_lookup(n)
+    link_country = input_bus.loc[link_cols].map(bus_country).fillna("")
+    valid = link_country.ne("")
+    link_cols = link_cols[valid.values]
+    link_country = link_country.loc[valid]
+    if len(link_cols) == 0:
+        return pd.Series(dtype=float)
+
+    energy_mwh = (
+        n.links_t.p0.reindex(columns=link_cols)
+        .fillna(0.0)
+        .clip(lower=0.0)
+        .mul(weights, axis=0)
+        .sum(axis=0)
+        .astype(float)
+    )
+    return energy_mwh.groupby(link_country).sum() / 1e6
+
+
 def align_country_electricity_demand_to_owid(n, investment_year, config):
     global_cfg = config.get("global_specific", {})
     base_cfg = global_cfg.get("baseyear_generation", {})
@@ -984,13 +1173,44 @@ def align_country_electricity_demand_to_owid(n, investment_year, config):
     energy_mwh_by_load = _electric_load_energy_by_load_mwh(n, elec_loads)
     model_twh_before = energy_mwh_by_load.groupby(load_country).sum() / 1e6
 
+    estimated_end_use_link_twh = pd.Series(dtype=float)
+    baseline_network = None
+    baseline_path = _baseline_electricity_demand_network_path(base_cfg)
+    if baseline_path is not None:
+        if os.path.exists(baseline_path):
+            try:
+                n_baseline = pypsa.Network(baseline_path)
+                estimated_end_use_link_twh = _country_ac_end_use_link_withdrawal_twh(
+                    n_baseline,
+                    output_bus_carrier_substrings=base_cfg.get(
+                        "electricity_demand_end_use_link_output_bus_carrier_substrings",
+                        ["heat"],
+                    ),
+                )
+                baseline_network = baseline_path
+            except Exception as exc:
+                logger.warning(
+                    "OWID electricity-demand alignment: failed to load baseline network %s (%s); falling back to direct-load-only alignment.",
+                    baseline_path,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "OWID electricity-demand alignment: baseline network not found at %s; falling back to direct-load-only alignment.",
+                baseline_path,
+            )
+
+    effective_ref_twh = ref_twh.sub(estimated_end_use_link_twh, fill_value=0.0).clip(lower=0.0)
+
     comp_before = pd.DataFrame(
         {
             "model_twh": model_twh_before,
-            "reference_twh": ref_twh.reindex(model_twh_before.index),
+            "reference_twh": effective_ref_twh.reindex(model_twh_before.index),
+            "owid_reference_twh": ref_twh.reindex(model_twh_before.index),
+            "estimated_end_use_link_twh": estimated_end_use_link_twh.reindex(model_twh_before.index).fillna(0.0),
         }
     ).dropna(subset=["reference_twh"])
-    eligible = comp_before["model_twh"].gt(0.0) & comp_before["reference_twh"].gt(0.0)
+    eligible = comp_before["model_twh"].gt(0.0) & comp_before["reference_twh"].ge(0.0)
     factors_by_country = (
         comp_before.loc[eligible, "reference_twh"] / comp_before.loc[eligible, "model_twh"]
     )
@@ -1021,25 +1241,33 @@ def align_country_electricity_demand_to_owid(n, investment_year, config):
     comp_after = pd.DataFrame(
         {
             "model_twh": model_twh_after,
-            "reference_twh": ref_twh.reindex(model_twh_after.index),
+            "reference_twh": effective_ref_twh.reindex(model_twh_after.index),
+            "owid_reference_twh": ref_twh.reindex(model_twh_after.index),
+            "estimated_end_use_link_twh": estimated_end_use_link_twh.reindex(model_twh_after.index).fillna(0.0),
         }
     ).dropna(subset=["reference_twh"])
 
-    before_abs_err = (comp_before["model_twh"] - comp_before["reference_twh"]).abs().sum()
-    after_abs_err = (comp_after["model_twh"] - comp_after["reference_twh"]).abs().sum()
-    ref_sum = comp_after["reference_twh"].sum()
+    before_total_twh = comp_before["model_twh"] + comp_before["estimated_end_use_link_twh"]
+    after_total_twh = comp_after["model_twh"] + comp_after["estimated_end_use_link_twh"]
+    before_abs_err = (before_total_twh - comp_before["owid_reference_twh"]).abs().sum()
+    after_abs_err = (after_total_twh - comp_after["owid_reference_twh"]).abs().sum()
+    ref_sum = comp_after["owid_reference_twh"].sum()
     before_wape = 100.0 * before_abs_err / ref_sum if ref_sum > 0 else np.nan
     after_wape = 100.0 * after_abs_err / ref_sum if ref_sum > 0 else np.nan
 
     logger.info(
-        "Aligned country electricity demand to OWID for %s: countries_scaled=%d, global_model_before=%.1f TWh, global_model_after=%.1f TWh, global_reference=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%",
+        "Aligned country electricity demand to OWID for %s: countries_scaled=%d, global_direct_before=%.1f TWh, global_direct_after=%.1f TWh, baseline_end_use_links=%.1f TWh, global_total_before=%.1f TWh, global_total_after=%.1f TWh, global_reference=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%, baseline_network=%s",
         baseyear,
         len(factors_by_country),
         comp_before["model_twh"].sum(),
         comp_after["model_twh"].sum(),
-        comp_after["reference_twh"].sum(),
+        comp_after["estimated_end_use_link_twh"].sum(),
+        before_total_twh.sum(),
+        after_total_twh.sum(),
+        comp_after["owid_reference_twh"].sum(),
         before_wape,
         after_wape,
+        baseline_network if baseline_network is not None else "None",
     )
 
 
@@ -1683,10 +1911,11 @@ def apply_country_wind_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Applying iterative wind scaling to %s using overrides calibrated from baseyear %s.",
+            "Skipping iterative wind scaling for %s (configured baseyear is %s).",
             investment_year,
             baseyear,
         )
+        return
 
     override_csv_cfg = base_cfg.get("wind_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -1822,10 +2051,11 @@ def apply_country_solar_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Applying iterative solar scaling to %s using overrides calibrated from baseyear %s.",
+            "Skipping iterative solar scaling for %s (configured baseyear is %s).",
             investment_year,
             baseyear,
         )
+        return
 
     override_csv_cfg = base_cfg.get("solar_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -2270,6 +2500,138 @@ def _sanitize_constraint_token(value):
     return re.sub(r"[^A-Za-z0-9_]+", "_", str(value)).strip("_")
 
 
+def _normalize_string_set(value):
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set, pd.Index, np.ndarray)):
+        return {str(v).strip() for v in value if str(v).strip()}
+    text = str(value).strip()
+    return {text} if text else set()
+
+
+def _baseyear_blocked_extendable_link_carriers(config):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("baseyear_generation", {}) if isinstance(global_cfg, dict) else {}
+    carriers = cfg.get(
+        "blocked_extendable_link_carriers",
+        BASEYEAR_BLOCKED_EXTENDABLE_LINK_CARRIERS,
+    )
+    return _normalize_string_set(carriers)
+
+
+def _freeze_baseyear_loophole_links(n, baseyear, config=None):
+    try:
+        current_year = int(float(baseyear))
+    except Exception:
+        logger.warning(
+            "Could not parse baseyear '%s' while freezing loophole-prone links.",
+            baseyear,
+        )
+        return 0
+
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("baseyear_generation", {}) if isinstance(global_cfg, dict) else {}
+    target_year = int(cfg.get("year", 2020))
+    if current_year != target_year or not hasattr(n, "links") or n.links.empty:
+        return 0
+
+    blocked_carriers = _baseyear_blocked_extendable_link_carriers(config)
+    if not blocked_carriers:
+        return 0
+
+    links = n.links
+    if "carrier" not in links.columns:
+        return 0
+    if "p_nom_extendable" not in links.columns:
+        links["p_nom_extendable"] = np.zeros(len(links), dtype=np.bool_)
+
+    blocked_norm = {carrier.casefold() for carrier in blocked_carriers}
+    carrier_mask = links.carrier.fillna("").astype(str).str.casefold().isin(blocked_norm)
+    if not carrier_mask.any():
+        return 0
+
+    if "build_year" in links.columns:
+        build_year = pd.to_numeric(links.build_year, errors="coerce").fillna(0)
+        candidate_mask = carrier_mask & build_year.le(float(current_year))
+    else:
+        logger.warning(
+            "Link component has no build_year column; applying loophole freeze to all matching baseyear link carriers."
+        )
+        candidate_mask = carrier_mask
+
+    extendable_mask = links.p_nom_extendable.fillna(False).astype(bool)
+    frozen_assets = links.index[candidate_mask & extendable_mask]
+    if len(frozen_assets) == 0:
+        return 0
+
+    links.loc[frozen_assets, "p_nom_extendable"] = False
+    if "p_nom_min" not in links.columns:
+        links["p_nom_min"] = 0.0
+    links.loc[frozen_assets, "p_nom_min"] = pd.to_numeric(
+        links.loc[frozen_assets, "p_nom"],
+        errors="coerce",
+    ).fillna(0.0)
+    links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+
+    frozen_counts = (
+        links.loc[frozen_assets, "carrier"].astype(str).value_counts().to_dict()
+    )
+    logger.info(
+        "In baseyear %s: Set %d blocked link assets to p_nom_extendable=False and p_nom_min=p_nom (carrier_counts=%s).",
+        current_year,
+        len(frozen_assets),
+        frozen_counts,
+    )
+    return int(len(frozen_assets))
+
+
+def _geothermal_template_from_network(n):
+    gens = n.generators.loc[n.generators.carrier.astype(str).eq("geothermal")].copy()
+    if gens.empty:
+        return None
+
+    template = {}
+    numeric_defaults = {
+        "marginal_cost": 0.0,
+        "capital_cost": 0.0,
+        "efficiency": 1.0,
+        "lifetime": np.inf,
+        "p_max_pu": 1.0,
+    }
+    for col, default in numeric_defaults.items():
+        if col not in gens.columns:
+            template[col] = default
+            continue
+        values = pd.to_numeric(gens[col], errors="coerce")
+        values = values.replace([np.inf, -np.inf], np.nan).dropna()
+        template[col] = float(values.median()) if not values.empty else default
+
+    return template
+
+
+def _pick_country_geothermal_fallback_bus(n, country, bus_country, geo_country_gens):
+    if not geo_country_gens.empty:
+        existing_bus = str(geo_country_gens.iloc[0]["bus"])
+        if existing_bus in n.buses.index:
+            return existing_bus
+
+    bus_country = bus_country.astype(str).str.strip().str.upper()
+    bus_carrier = (
+        n.buses["carrier"].astype(str)
+        if "carrier" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    ac_buses = n.buses.index[bus_country.eq(country) & bus_carrier.eq("AC")]
+    if len(ac_buses) > 0:
+        return str(pd.Index(ac_buses).sort_values()[0])
+
+    any_country_bus = n.buses.index[bus_country.eq(country)]
+    if len(any_country_bus) > 0:
+        return str(pd.Index(any_country_bus).sort_values()[0])
+
+    return None
+
+
 def _country_metric_key(country, metric):
     return f"{country}{COUNTRY_METRIC_KEY_SEP}{metric}"
 
@@ -2523,6 +2885,118 @@ def _owid_country_metric_reference(owid_csv, year, metrics):
     )
     ref["reference_twh"] = pd.to_numeric(ref["reference_twh"], errors="coerce").fillna(0.0)
     return ref
+
+
+def _irena_country_capacity_reference(irena_csv, year, carrier_technology_map, fallback_to_latest=True):
+    irena = pd.read_csv(irena_csv)
+
+    tech_to_carrier = {}
+    for carrier, techs in (carrier_technology_map or {}).items():
+        if isinstance(techs, str):
+            techs = [techs]
+        for tech in techs or []:
+            tech_to_carrier[str(tech)] = str(carrier)
+    if not tech_to_carrier:
+        return pd.DataFrame(columns=["country", "carrier", "reference_mw"]), int(year)
+
+    requested_year = int(year)
+
+    # Wide legacy format: one column per year (e.g. irena_capacity_by_technology.csv)
+    wide_years = sorted(int(c) for c in irena.columns if isinstance(c, str) and c.isdigit())
+    if {"Technology", "Country"}.issubset(irena.columns) and wide_years:
+        chosen_year = requested_year
+        if str(chosen_year) not in irena.columns:
+            if not fallback_to_latest:
+                raise ValueError(
+                    f"Year column '{requested_year}' not found in {irena_csv}. "
+                    f"Available years: {wide_years[0]}-{wide_years[-1]}"
+                )
+            earlier_or_equal = [y for y in wide_years if y <= requested_year]
+            chosen_year = max(earlier_or_equal) if earlier_or_equal else wide_years[-1]
+            logger.warning(
+                "IRENA capacity reference year %s not found in %s; using %s instead.",
+                requested_year,
+                irena_csv,
+                chosen_year,
+            )
+
+        year_col = str(chosen_year)
+        ref = irena[["Technology", "Country", year_col]].copy()
+        ref["Technology"] = ref["Technology"].astype(str).str.strip()
+        ref["country"] = ref["Country"].astype(str).str.strip().str.upper()
+        ref["carrier"] = ref["Technology"].map(tech_to_carrier)
+        ref["reference_mw"] = pd.to_numeric(ref[year_col], errors="coerce").fillna(0.0)
+        ref = ref.loc[
+            ref["carrier"].notna()
+            & ref["country"].str.match(r"^[A-Z]{2}$", na=False)
+        ].copy()
+        if ref.empty:
+            return pd.DataFrame(columns=["country", "carrier", "reference_mw"]), chosen_year
+        ref = (
+            ref.groupby(["country", "carrier"], as_index=False)["reference_mw"]
+            .sum(min_count=1)
+            .fillna({"reference_mw": 0.0})
+        )
+        return ref, chosen_year
+
+    # Long row-wise format: one `Year` column + installed capacity values
+    required_long_cols = {"Technology", "Year", "Electricity Installed Capacity (MW)"}
+    if required_long_cols.issubset(irena.columns) and (
+        "ISO3 code" in irena.columns or "Country" in irena.columns
+    ):
+        irena["Year"] = pd.to_numeric(irena["Year"], errors="coerce")
+        available_years = sorted(int(y) for y in irena["Year"].dropna().unique())
+        if not available_years:
+            raise ValueError(f"No valid `Year` rows found in IRENA capacity file: {irena_csv}")
+
+        chosen_year = requested_year
+        if chosen_year not in available_years:
+            if not fallback_to_latest:
+                raise ValueError(
+                    f"Year row '{requested_year}' not found in {irena_csv}. "
+                    f"Available years: {available_years[0]}-{available_years[-1]}"
+                )
+            earlier_or_equal = [y for y in available_years if y <= requested_year]
+            chosen_year = max(earlier_or_equal) if earlier_or_equal else available_years[-1]
+            logger.warning(
+                "IRENA capacity reference year %s not found in %s; using %s instead.",
+                requested_year,
+                irena_csv,
+                chosen_year,
+            )
+
+        ref = irena.loc[irena["Year"].eq(chosen_year)].copy()
+        ref["Technology"] = ref["Technology"].astype(str).str.strip()
+        ref["carrier"] = ref["Technology"].map(tech_to_carrier)
+        if "ISO3 code" in ref.columns:
+            ref["country"] = ref["ISO3 code"].apply(_safe_iso3_to_iso2)
+        else:
+            ref["country"] = ref["Country"].astype(str).str.strip().str.upper()
+            ref["country"] = ref["country"].where(
+                ref["country"].str.match(r"^[A-Z]{2}$", na=False),
+                np.nan,
+            )
+        ref["reference_mw"] = pd.to_numeric(
+            ref["Electricity Installed Capacity (MW)"], errors="coerce"
+        ).fillna(0.0)
+        ref = ref.loc[
+            ref["carrier"].notna() & ref["country"].notna()
+        ].copy()
+        if ref.empty:
+            return pd.DataFrame(columns=["country", "carrier", "reference_mw"]), chosen_year
+        ref["country"] = ref["country"].astype(str).str.upper()
+        ref = (
+            ref.groupby(["country", "carrier"], as_index=False)["reference_mw"]
+            .sum(min_count=1)
+            .fillna({"reference_mw": 0.0})
+        )
+        return ref, chosen_year
+
+    raise ValueError(
+        f"Unsupported IRENA capacity file schema in {irena_csv}. "
+        "Expected wide year columns or long format with `Year` and "
+        "`Electricity Installed Capacity (MW)`."
+    )
 
 
 def _country_ac_load_twh(n):
@@ -2787,6 +3261,815 @@ def add_baseyear_generation_band(n, planning_year, config):
         absolute_tolerance_twh,
         min_country_electric_load_twh,
         slack_penalty_eur_per_mwh,
+    )
+
+
+def add_year2025_geothermal_extendable_fallback(n, planning_year, config):
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+    if not bool(cfg.get("geothermal_extendable_fallback", False)):
+        return
+
+    try:
+        current_year = int(planning_year)
+    except Exception:
+        logger.warning(
+            "Could not parse planning year '%s' for geothermal extendable fallback",
+            planning_year,
+        )
+        return
+
+    target_year = int(cfg.get("year", 2025))
+    if current_year != target_year:
+        logger.info(
+            "Skipping geothermal extendable fallback for %s (configured for %s)",
+            planning_year,
+            target_year,
+        )
+        return
+
+    irena_csv = _repo_path(
+        cfg.get("irena_csv", "validation/data/irena_capacity_by_technology.csv")
+    )
+    if not os.path.exists(irena_csv):
+        logger.warning(
+            "Geothermal extendable fallback skipped: file not found at %s",
+            irena_csv,
+        )
+        return
+
+    tolerance = float(cfg.get("tolerance", 0.10))
+    lower_multiplier = cfg.get("lower_multiplier")
+    upper_multiplier = cfg.get("upper_multiplier")
+    lower_multiplier = (
+        float(lower_multiplier) if lower_multiplier is not None else None
+    )
+    upper_multiplier = (
+        float(upper_multiplier) if upper_multiplier is not None else None
+    )
+    absolute_tolerance_mw = float(cfg.get("absolute_tolerance_mw", 0.0))
+    min_reference_mw = float(cfg.get("min_reference_mw", 0.0))
+    reference_year = int(cfg.get("reference_year", target_year))
+    fallback_to_latest = bool(cfg.get("fallback_to_latest_available", True))
+
+    constraint_technology_map = cfg.get(
+        "irena_technology_by_constraint",
+        cfg.get(
+            "irena_technology_by_carrier",
+            {
+                "solar": ["PV"],
+                "onwind": ["Onshore"],
+            },
+        ),
+    )
+
+    try:
+        ref, used_reference_year = _irena_country_capacity_reference(
+            irena_csv=irena_csv,
+            year=reference_year,
+            carrier_technology_map=constraint_technology_map,
+            fallback_to_latest=fallback_to_latest,
+        )
+    except Exception as exc:
+        logger.warning("Geothermal extendable fallback skipped: %s", exc)
+        return
+
+    ref = ref.loc[ref["carrier"].astype(str).eq("geothermal")].copy()
+    if ref.empty:
+        logger.info(
+            "Geothermal extendable fallback skipped: no geothermal IRENA rows found for %s",
+            target_year,
+        )
+        return
+
+    template = _geothermal_template_from_network(n)
+    if template is None:
+        logger.warning(
+            "Geothermal extendable fallback skipped: no geothermal generators available to derive standard parameters."
+        )
+        return
+
+    gen = n.generators.copy()
+    if gen.empty:
+        return
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    gen["country"] = (
+        gen["bus"].map(bus_country).fillna("").astype(str).str.strip().str.upper()
+    )
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen["p_nom"] = pd.to_numeric(gen.get("p_nom", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_min"] = (
+        pd.to_numeric(gen.get("p_nom_min", 0.0), errors="coerce").fillna(0.0)
+    )
+    gen["p_nom_extendable"] = (
+        gen.get("p_nom_extendable", False).fillna(False).astype(bool)
+    )
+    geothermal = gen.loc[
+        gen["carrier"].eq("geothermal")
+        & gen["country"].str.match(r"^[A-Z]{2}$", na=False)
+    ].copy()
+
+    ext_groups = {
+        country: pd.Index(d.index)
+        for country, d in geothermal.loc[geothermal["p_nom_extendable"]].groupby("country")
+    }
+    fixed_capacity = (
+        geothermal.loc[~geothermal["p_nom_extendable"]]
+        .groupby("country")["p_nom"]
+        .sum()
+        if not geothermal.empty
+        else pd.Series(dtype=float)
+    )
+
+    added = 0
+    skipped_existing_extendable = 0
+    skipped_no_bus = 0
+    skipped_duplicate = 0
+
+    for row in ref.itertuples(index=False):
+        country = str(row.country).upper()
+        target_mw = float(row.reference_mw)
+        if target_mw < min_reference_mw:
+            continue
+
+        existing_capacity_mw = float(fixed_capacity.get(country, 0.0))
+        ext_idx = ext_groups.get(country, pd.Index([]))
+        if len(ext_idx) > 0:
+            skipped_existing_extendable += 1
+            continue
+
+        if lower_multiplier is not None or upper_multiplier is not None:
+            lower_mult = 1.0 if lower_multiplier is None else lower_multiplier
+            upper_mult = (
+                (1.0 + tolerance) if upper_multiplier is None else upper_multiplier
+            )
+            lower_total = max(target_mw * lower_mult, 0.0)
+            upper_total = target_mw * upper_mult
+        else:
+            band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
+            lower_total = max(target_mw - band_mw, 0.0)
+            upper_total = target_mw + band_mw
+
+        if existing_capacity_mw + 1e-6 >= lower_total:
+            continue
+
+        additional_headroom_mw = max(upper_total - existing_capacity_mw, 0.0)
+        if additional_headroom_mw <= 1e-6:
+            continue
+
+        geo_country_gens = geothermal.loc[geothermal["country"].eq(country)]
+        bus = _pick_country_geothermal_fallback_bus(
+            n,
+            country=country,
+            bus_country=bus_country,
+            geo_country_gens=geo_country_gens,
+        )
+        if bus is None:
+            skipped_no_bus += 1
+            logger.warning(
+                "Geothermal extendable fallback skipped for %s: no valid bus found.",
+                country,
+            )
+            continue
+
+        base_name = f"{bus} geothermal-{current_year}-irena-fallback"
+        gen_name = base_name
+        suffix = 2
+        while gen_name in n.generators.index:
+            existing = n.generators.loc[gen_name]
+            if (
+                str(existing.get("carrier", "")) == "geothermal"
+                and str(existing.get("bus", "")) == bus
+                and bool(existing.get("p_nom_extendable", False))
+            ):
+                skipped_duplicate += 1
+                gen_name = None
+                break
+            gen_name = f"{base_name}-{suffix}"
+            suffix += 1
+        if gen_name is None:
+            continue
+
+        add_kwargs = {
+            "bus": bus,
+            "carrier": "geothermal",
+            "p_nom": 0.0,
+            "p_nom_min": 0.0,
+            "p_nom_max": additional_headroom_mw,
+            "p_nom_extendable": True,
+            "marginal_cost": template["marginal_cost"],
+            "capital_cost": template["capital_cost"],
+            "efficiency": template["efficiency"],
+            "build_year": current_year,
+            "lifetime": template["lifetime"],
+        }
+        if "p_max_pu" in n.generators.columns:
+            add_kwargs["p_max_pu"] = template["p_max_pu"]
+
+        n.add("Generator", gen_name, **add_kwargs)
+        added += 1
+        ext_groups[country] = ext_groups.get(country, pd.Index([])).append(
+            pd.Index([gen_name])
+        )
+
+        logger.info(
+            "Added geothermal extendable fallback generator for %s on bus %s with p_nom_max=%.2f MW to satisfy the %s country-capacity band (existing_fixed=%.2f MW, lower=%.2f MW, upper=%.2f MW).",
+            country,
+            bus,
+            additional_headroom_mw,
+            used_reference_year,
+            existing_capacity_mw,
+            lower_total,
+            upper_total,
+        )
+
+    logger.info(
+        "Geothermal extendable fallback summary for %s: added=%d, skipped_existing_extendable=%d, skipped_no_bus=%d, skipped_duplicate=%d",
+        planning_year,
+        added,
+        skipped_existing_extendable,
+        skipped_no_bus,
+        skipped_duplicate,
+    )
+
+
+def add_year2025_irena_country_capacity_band(n, planning_year, config):
+    """
+    Add hard country-level renewable capacity constraints around IRENA references.
+
+    The config block is `global_specific.year2025_capacity`. Constraints apply only when
+    `planning_year` matches `cfg["year"]`. Total capacity is generator `p_nom` by
+    (country, configured constraint group), including fixed and extendable assets.
+    Supports either symmetric `tolerance` bands or explicit one-sided multipliers.
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+
+    target_year = int(cfg.get("year", 2025))
+    try:
+        current_year = int(float(planning_year))
+    except Exception:
+        logger.warning(
+            "Could not parse planning year '%s' for year2025 capacity constraints",
+            planning_year,
+        )
+        return
+
+    if current_year != target_year:
+        logger.info(
+            "Skipping 2025 country-capacity constraints for %s (configured for %s)",
+            planning_year,
+            target_year,
+        )
+        return
+
+    irena_csv = _repo_path(cfg.get("irena_csv", "validation/data/irena_capacity_by_technology.csv"))
+    if not os.path.exists(irena_csv):
+        logger.warning(
+            "IRENA country-capacity constraint skipped: file not found at %s",
+            irena_csv,
+        )
+        return
+
+    tolerance = float(cfg.get("tolerance", 0.10))
+    lower_multiplier = cfg.get("lower_multiplier")
+    upper_multiplier = cfg.get("upper_multiplier")
+    lower_multiplier = float(lower_multiplier) if lower_multiplier is not None else None
+    upper_multiplier = float(upper_multiplier) if upper_multiplier is not None else None
+    absolute_tolerance_mw = float(cfg.get("absolute_tolerance_mw", 0.0))
+    min_reference_mw = float(cfg.get("min_reference_mw", 0.0))
+    reference_year = int(cfg.get("reference_year", target_year))
+    fallback_to_latest = bool(cfg.get("fallback_to_latest_available", True))
+    units = str(cfg.get("units", "GW")).lower()
+    unit_scale = {"mw": 1.0, "gw": 1e3, "tw": 1e6}.get(units, 1e3)
+    constraint_technology_map = cfg.get(
+        "irena_technology_by_constraint",
+        cfg.get(
+            "irena_technology_by_carrier",
+            {
+                "solar": ["PV"],
+                "onwind": ["Onshore"],
+            },
+        ),
+    )
+    model_carriers_by_constraint = cfg.get(
+        "model_carriers_by_constraint",
+        {
+            key: [key] for key in (constraint_technology_map or {}).keys()
+        },
+    )
+
+    try:
+        ref, used_reference_year = _irena_country_capacity_reference(
+            irena_csv=irena_csv,
+            year=reference_year,
+            carrier_technology_map=constraint_technology_map,
+            fallback_to_latest=fallback_to_latest,
+        )
+    except Exception as exc:
+        logger.warning("IRENA country-capacity constraint skipped: %s", exc)
+        return
+
+    if ref.empty:
+        logger.warning(
+            "IRENA country-capacity constraint skipped: no mapped rows found in %s",
+            irena_csv,
+        )
+        return
+
+    gen = n.generators.copy()
+    if gen.empty:
+        logger.warning("IRENA country-capacity constraint skipped: network has no generators")
+        return
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    gen["country"] = gen["bus"].map(bus_country).fillna("").astype(str).str.strip().str.upper()
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen["p_nom"] = pd.to_numeric(gen.get("p_nom", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_min"] = pd.to_numeric(gen.get("p_nom_min", 0.0), errors="coerce").fillna(0.0)
+    if "p_nom_max" in gen.columns:
+        gen["p_nom_max"] = pd.to_numeric(gen["p_nom_max"], errors="coerce")
+    else:
+        gen["p_nom_max"] = np.nan
+    gen["p_nom_extendable"] = gen.get("p_nom_extendable", False).fillna(False).astype(bool)
+    model_carrier_to_constraint = {}
+    for constraint_name, carriers in (model_carriers_by_constraint or {}).items():
+        if isinstance(carriers, str):
+            carriers = [carriers]
+        for c in carriers or []:
+            model_carrier_to_constraint[str(c)] = str(constraint_name)
+    gen["constraint_carrier"] = gen["carrier"].map(model_carrier_to_constraint)
+    gen = gen.loc[gen["country"].str.match(r"^[A-Z]{2}$", na=False)].copy()
+    gen = gen.loc[gen["constraint_carrier"].notna()].copy()
+    if gen.empty:
+        logger.warning("IRENA country-capacity constraint skipped: no generators with country labels")
+        return
+
+    network_countries = set(gen["country"].unique())
+    ref = ref.loc[ref["country"].isin(network_countries)].copy()
+    if ref.empty:
+        logger.warning(
+            "IRENA country-capacity constraint skipped: no reference rows overlap network countries"
+        )
+        return
+
+    p_nom_var = n.model["Generator-p_nom"]
+    all_ext_gen = gen.loc[gen["p_nom_extendable"]].copy()
+    fixed_gen = gen.loc[~gen["p_nom_extendable"]].copy()
+
+    positive_headroom_ext = pd.Series(dtype=bool)
+    degenerate_ext_gen = pd.DataFrame(columns=gen.columns)
+    ext_gen = all_ext_gen
+    if not all_ext_gen.empty:
+        positive_headroom_ext = (
+            all_ext_gen["p_nom_max"].isna()
+            | all_ext_gen["p_nom_max"].gt(all_ext_gen["p_nom_min"] + 1e-9)
+        )
+        degenerate_ext_gen = all_ext_gen.loc[~positive_headroom_ext].copy()
+        ext_gen = all_ext_gen.loc[positive_headroom_ext].copy()
+        if not degenerate_ext_gen.empty:
+            carrier_counts = (
+                degenerate_ext_gen["constraint_carrier"].astype(str).value_counts().to_dict()
+            )
+            logger.info(
+                "Treating %d zero-headroom extendable generators as fixed-equivalent capacity for 2025 IRENA bands (constraint_carrier_counts=%s).",
+                len(degenerate_ext_gen),
+                carrier_counts,
+            )
+
+    fixed_capacity = (
+        fixed_gen.groupby(["country", "constraint_carrier"])["p_nom"].sum()
+        if not fixed_gen.empty
+        else pd.Series(dtype=float)
+    )
+    if not degenerate_ext_gen.empty:
+        fixed_like_capacity = (
+            pd.concat(
+                [
+                    degenerate_ext_gen["p_nom"],
+                    degenerate_ext_gen["p_nom_min"],
+                ],
+                axis=1,
+            )
+            .max(axis=1)
+            .groupby(
+                [
+                    degenerate_ext_gen["country"],
+                    degenerate_ext_gen["constraint_carrier"],
+                ]
+            )
+            .sum()
+        )
+        if fixed_capacity.empty:
+            fixed_capacity = fixed_like_capacity.astype(float)
+        else:
+            fixed_capacity = fixed_capacity.add(
+                fixed_like_capacity,
+                fill_value=0.0,
+            )
+    ext_min_capacity = (
+        ext_gen.groupby(["country", "constraint_carrier"])["p_nom_min"].sum()
+        if not ext_gen.empty
+        else pd.Series(dtype=float)
+    )
+    ext_max_capacity = pd.Series(dtype=float)
+    if not ext_gen.empty:
+        ext_max_rows = []
+        for key, d in ext_gen.groupby(["country", "constraint_carrier"]):
+            max_vals = pd.to_numeric(d["p_nom_max"], errors="coerce")
+            total_max = np.inf if max_vals.isna().any() else float(max_vals.sum())
+            ext_max_rows.append((key[0], key[1], total_max))
+        if ext_max_rows:
+            ext_max_capacity = (
+                pd.DataFrame(
+                    ext_max_rows,
+                    columns=["country", "constraint_carrier", "ext_max_capacity_mw"],
+                )
+                .set_index(["country", "constraint_carrier"])["ext_max_capacity_mw"]
+            )
+
+    ext_groups = {}
+    if not ext_gen.empty:
+        for (country, carrier), d in ext_gen.groupby(["country", "constraint_carrier"]):
+            ext_groups[(country, carrier)] = pd.Index(d.index)
+
+    added = 0
+    skipped_low_reference = 0
+    skipped_no_variable_but_satisfied = 0
+    missing_variable_violations = 0
+    skipped_infeasible_by_upper_bound = 0
+    skipped_infeasible_by_lower_bound = 0
+    clipped_fixed_upper_overshoot = 0
+
+    for row in ref.itertuples(index=False):
+        country = str(row.country).upper()
+        carrier = str(row.carrier)
+        target_mw = float(row.reference_mw)
+
+        if target_mw < min_reference_mw:
+            skipped_low_reference += 1
+            continue
+
+        key = (country, carrier)
+        existing_capacity_mw = float(fixed_capacity.get(key, 0.0))
+        ext_idx = ext_groups.get(key, pd.Index([]))
+
+        if lower_multiplier is not None or upper_multiplier is not None:
+            lower_mult = 1.0 if lower_multiplier is None else lower_multiplier
+            upper_mult = (1.0 + tolerance) if upper_multiplier is None else upper_multiplier
+            lower_total = max(target_mw * lower_mult, 0.0)
+            upper_total = target_mw * upper_mult
+        else:
+            band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
+            lower_total = max(target_mw - band_mw, 0.0)
+            upper_total = target_mw + band_mw
+        if len(ext_idx) == 0:
+            if existing_capacity_mw + 1e-6 < lower_total or existing_capacity_mw - 1e-6 > upper_total:
+                missing_variable_violations += 1
+                logger.warning(
+                    "Cannot enforce IRENA country-capacity band for %s/%s: no extendable generators and fixed capacity %.2f %s is outside [%.2f, %.2f] %s.",
+                    country,
+                    carrier,
+                    existing_capacity_mw / unit_scale,
+                    units.upper(),
+                    lower_total / unit_scale,
+                    upper_total / unit_scale,
+                    units.upper(),
+                )
+            else:
+                skipped_no_variable_but_satisfied += 1
+            continue
+
+        ext_min_mw = float(ext_min_capacity.get(key, 0.0))
+        ext_max_mw = ext_max_capacity.get(key, np.inf)
+        try:
+            ext_max_mw = float(ext_max_mw)
+        except Exception:
+            ext_max_mw = np.inf
+
+        min_total_feasible = existing_capacity_mw + ext_min_mw
+        max_total_feasible = existing_capacity_mw + ext_max_mw
+
+        if min_total_feasible - 1e-6 > upper_total:
+            # Pragmatic fallback: if fixed capacity already overshoots the upper band,
+            # clip the fixed offset used by this validation constraint.
+            clipped_existing_capacity_mw = max(upper_total - ext_min_mw, 0.0)
+            if clipped_existing_capacity_mw + 1e-6 < existing_capacity_mw:
+                logger.warning(
+                    "Clipping effective fixed capacity for IRENA country-capacity band %s/%s from %.2f to %.2f %s to respect upper bound %.2f %s (extendable p_nom_min=%.2f).",
+                    country,
+                    carrier,
+                    existing_capacity_mw / unit_scale,
+                    clipped_existing_capacity_mw / unit_scale,
+                    units.upper(),
+                    upper_total / unit_scale,
+                    units.upper(),
+                    ext_min_mw / unit_scale,
+                )
+                existing_capacity_mw = clipped_existing_capacity_mw
+                min_total_feasible = existing_capacity_mw + ext_min_mw
+                max_total_feasible = existing_capacity_mw + ext_max_mw
+                clipped_fixed_upper_overshoot += 1
+
+            if min_total_feasible - 1e-6 > upper_total:
+                skipped_infeasible_by_upper_bound += 1
+                logger.warning(
+                    "Skipping IRENA country-capacity band for %s/%s: minimum feasible total %.2f %s exceeds upper bound %.2f %s even after clipping (fixed=%.2f, extendable p_nom_min=%.2f).",
+                    country,
+                    carrier,
+                    min_total_feasible / unit_scale,
+                    units.upper(),
+                    upper_total / unit_scale,
+                    units.upper(),
+                    existing_capacity_mw / unit_scale,
+                    ext_min_mw / unit_scale,
+                )
+                continue
+
+        if max_total_feasible + 1e-6 < lower_total:
+            skipped_infeasible_by_lower_bound += 1
+            logger.warning(
+                "Skipping IRENA country-capacity band for %s/%s: maximum feasible total %.2f %s is below lower bound %.2f %s (fixed=%.2f, extendable p_nom_max=%s).",
+                country,
+                carrier,
+                max_total_feasible / unit_scale,
+                units.upper(),
+                lower_total / unit_scale,
+                units.upper(),
+                existing_capacity_mw / unit_scale,
+                "inf" if not np.isfinite(ext_max_mw) else f"{ext_max_mw / unit_scale:.2f}",
+            )
+            continue
+
+        lower_var = lower_total - existing_capacity_mw
+        upper_var = upper_total - existing_capacity_mw
+        lhs = p_nom_var.loc[ext_idx].sum()
+        country_token = _sanitize_constraint_token(country)
+        carrier_token = _sanitize_constraint_token(carrier)
+
+        n.model.add_constraints(
+            lhs >= lower_var,
+            name=f"year2025_irena_country_capacity_min__{country_token}__{carrier_token}",
+        )
+        n.model.add_constraints(
+            lhs <= upper_var,
+            name=f"year2025_irena_country_capacity_max__{country_token}__{carrier_token}",
+        )
+        added += 1
+
+    logger.info(
+        "Added %d IRENA country-capacity constraints for planning year %s (reference_year=%s, tolerance=%s%%, lower_multiplier=%s, upper_multiplier=%s, min_reference=%.2f MW, skipped_low_reference=%d, skipped_fixed_only_satisfied=%d, fixed_only_violations=%d, clipped_fixed_upper_overshoot=%d, skipped_infeasible_upper=%d, skipped_infeasible_lower=%d)",
+        added,
+        planning_year,
+        used_reference_year,
+        100.0 * tolerance,
+        lower_multiplier if lower_multiplier is not None else "default",
+        upper_multiplier if upper_multiplier is not None else "default",
+        min_reference_mw,
+        skipped_low_reference,
+        skipped_no_variable_but_satisfied,
+        missing_variable_violations,
+        clipped_fixed_upper_overshoot,
+        skipped_infeasible_by_upper_bound,
+        skipped_infeasible_by_lower_bound,
+    )
+
+
+def add_year2025_irena_nodal_distribution_constraints(n, planning_year, config):
+    """
+    Limit 2025 renewable build concentration by adding linear nodal share constraints.
+
+    The configured nodal_distribution_limit parameters are interpreted as caps on a bus'
+    share of country-level *new build* for the configured carriers. The constraint is added
+    on the live Generator-p_nom optimization variables instead of rewriting p_nom_max.
+    """
+
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+
+    cap_cfg = cfg.get("nodal_distribution_limit", {})
+    if not cap_cfg or not bool(cap_cfg.get("enable", False)):
+        return
+
+    target_year = int(cfg.get("year", 2025))
+    try:
+        current_year = int(float(planning_year))
+    except Exception:
+        logger.warning(
+            "Could not parse planning year '%s' for 2025 nodal distribution constraints",
+            planning_year,
+        )
+        return
+
+    if current_year != target_year:
+        logger.info(
+            "Skipping 2025 nodal distribution constraints for %s (configured for %s)",
+            planning_year,
+            target_year,
+        )
+        return
+
+    carriers = [str(c) for c in cap_cfg.get("carriers", ["onwind", "solar"])]
+    if not carriers:
+        return
+
+    max_baseyear_share_multiplier = float(
+        cap_cfg.get("max_baseyear_share_multiplier", 1.5)
+    )
+    new_bus_share_multiplier = float(cap_cfg.get("new_bus_share_multiplier", 0.5))
+    new_bus_flattening_exponent = float(
+        cap_cfg.get("new_bus_flattening_exponent", 0.5)
+    )
+    if max_baseyear_share_multiplier < 0.0 or new_bus_share_multiplier < 0.0:
+        logger.warning(
+            "2025 nodal distribution constraints skipped: share multipliers must be non-negative."
+        )
+        return
+    if new_bus_flattening_exponent <= 0.0:
+        logger.warning(
+            "2025 nodal distribution constraints skipped: new_bus_flattening_exponent must be positive."
+        )
+        return
+
+    if "Generator-p_nom" not in n.model.variables:
+        logger.warning(
+            "2025 nodal distribution constraints skipped: Generator-p_nom variable is unavailable."
+        )
+        return
+
+    gen = n.generators.copy()
+    if gen.empty:
+        return
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    gen["country"] = (
+        gen["bus"].map(bus_country).fillna("").astype(str).str.strip().str.upper()
+    )
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen = gen.loc[
+        gen["carrier"].isin(carriers)
+        & gen["country"].str.match(r"^[A-Z]{2}$", na=False)
+    ].copy()
+    if gen.empty:
+        logger.warning(
+            "2025 nodal distribution constraints skipped: no generators matched configured carriers %s.",
+            ",".join(carriers),
+        )
+        return
+
+    gen["p_nom"] = pd.to_numeric(gen.get("p_nom", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_min"] = pd.to_numeric(
+        gen.get("p_nom_min", 0.0), errors="coerce"
+    ).fillna(0.0)
+    if "p_nom_max" in gen.columns:
+        gen["p_nom_max"] = pd.to_numeric(gen["p_nom_max"], errors="coerce")
+    else:
+        gen["p_nom_max"] = np.nan
+    gen["p_nom_extendable"] = (
+        gen.get("p_nom_extendable", False).fillna(False).astype(bool)
+    )
+    if "build_year" in gen.columns:
+        gen["build_year"] = pd.to_numeric(gen["build_year"], errors="coerce")
+    else:
+        gen["build_year"] = np.nan
+
+    candidate = gen.loc[
+        gen["p_nom_extendable"]
+        & gen["p_nom_max"].notna()
+        & np.isfinite(gen["p_nom_max"])
+        & gen["p_nom_max"].gt(0.0)
+    ].copy()
+    current_year_candidates = candidate.loc[candidate["build_year"].eq(current_year)]
+    if not current_year_candidates.empty:
+        candidate = current_year_candidates.copy()
+    if candidate.empty:
+        logger.warning(
+            "2025 nodal distribution constraints skipped: no extendable %s generators found for %s.",
+            ",".join(carriers),
+            planning_year,
+        )
+        return
+
+    existing = gen.loc[~gen.index.isin(candidate.index)].copy()
+    existing["existing_capacity_mw"] = np.maximum(existing["p_nom"], existing["p_nom_min"])
+    existing_by_bus = (
+        existing.groupby(["country", "carrier", "bus"])["existing_capacity_mw"].sum()
+        if not existing.empty
+        else pd.Series(dtype=float)
+    )
+    country_existing = (
+        existing.groupby(["country", "carrier"])["existing_capacity_mw"].sum()
+        if not existing.empty
+        else pd.Series(dtype=float)
+    )
+    candidate_by_bus = candidate.groupby(["country", "carrier", "bus"])["p_nom_max"].sum()
+
+    p_nom_var = n.model["Generator-p_nom"]
+    added = 0
+    groups_with_constraints = 0
+    skipped_single_bus_groups = 0
+    skipped_low_share_sum_groups = 0
+    sample_constraints = []
+
+    for (country, carrier), rows in candidate.groupby(["country", "carrier"]):
+        buses = pd.Index(rows["bus"].astype(str).unique())
+        if len(buses) <= 1:
+            skipped_single_bus_groups += 1
+            continue
+
+        bus_index = pd.MultiIndex.from_arrays(
+            [
+                pd.Index([country] * len(buses)),
+                pd.Index([carrier] * len(buses)),
+                buses,
+            ],
+            names=["country", "carrier", "bus"],
+        )
+        bus_existing = existing_by_bus.reindex(bus_index, fill_value=0.0)
+        bus_existing.index = buses
+        bus_technical = candidate_by_bus.reindex(bus_index, fill_value=0.0)
+        bus_technical.index = buses
+
+        flattened_weights = bus_technical.clip(lower=0.0).pow(new_bus_flattening_exponent)
+        if flattened_weights.sum() <= 0.0:
+            continue
+        flattened_share = flattened_weights / flattened_weights.sum()
+
+        existing_total_mw = float(country_existing.get((country, carrier), 0.0))
+        if existing_total_mw > 0.0:
+            base_share = bus_existing / existing_total_mw
+            share_cap = new_bus_share_multiplier * flattened_share
+            existing_bus_mask = base_share.gt(0.0)
+            share_cap.loc[existing_bus_mask] = (
+                max_baseyear_share_multiplier * base_share.loc[existing_bus_mask]
+            )
+        else:
+            share_cap = flattened_share
+
+        share_cap = share_cap.clip(lower=0.0, upper=1.0)
+        share_cap_sum = float(share_cap.sum())
+        if share_cap_sum < 1.0 - 1e-9:
+            skipped_low_share_sum_groups += 1
+            logger.warning(
+                "Skipping 2025 nodal distribution constraints for %s/%s: bus share caps sum to %.4f across %d candidate buses, which would overconstrain positive build.",
+                country,
+                carrier,
+                share_cap_sum,
+                len(buses),
+            )
+            continue
+
+        country_idx = pd.Index(rows.index)
+        country_lhs = p_nom_var.loc[country_idx].sum()
+        ext_min_country = float(rows["p_nom_min"].sum())
+        country_token = _sanitize_constraint_token(country)
+        carrier_token = _sanitize_constraint_token(carrier)
+
+        group_added = 0
+        for bus, row_index in rows.groupby("bus").groups.items():
+            bus_share_cap = float(share_cap.get(bus, np.nan))
+            if not np.isfinite(bus_share_cap) or bus_share_cap >= 1.0 - 1e-9:
+                continue
+
+            row_index = pd.Index(row_index)
+            bus_lhs = p_nom_var.loc[row_index].sum()
+            ext_min_bus = float(rows.loc[row_index, "p_nom_min"].sum())
+            lhs = bus_lhs - bus_share_cap * country_lhs
+            rhs = ext_min_bus - bus_share_cap * ext_min_country
+            bus_token = _sanitize_constraint_token(bus)
+            n.model.add_constraints(
+                lhs <= rhs,
+                name=f"year2025_irena_nodal_distribution_max__{country_token}__{carrier_token}__{bus_token}",
+            )
+            added += 1
+            group_added += 1
+            if len(sample_constraints) < 6:
+                sample_constraints.append(
+                    f"{country}/{carrier}/{bus}:share_cap={bus_share_cap:.4f}"
+                )
+
+        if group_added > 0:
+            groups_with_constraints += 1
+
+    logger.info(
+        "Added %d 2025 nodal distribution constraints for planning year %s: constrained_groups=%d, skipped_single_bus_groups=%d, skipped_low_share_sum_groups=%d, carriers=%s, max_baseyear_share_multiplier=%.3f, new_bus_share_multiplier=%.3f, new_bus_flattening_exponent=%.3f, sample=%s",
+        added,
+        planning_year,
+        groups_with_constraints,
+        skipped_single_bus_groups,
+        skipped_low_share_sum_groups,
+        ",".join(carriers),
+        max_baseyear_share_multiplier,
+        new_bus_share_multiplier,
+        new_bus_flattening_exponent,
+        ", ".join(sample_constraints) if sample_constraints else "none",
     )
 
 

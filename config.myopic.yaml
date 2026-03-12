@@ -25,14 +25,12 @@ scenario:
   - "AB"  # AB=central (baseline), NZ=fast_electrification, DF=fossil era
   #- "NZ"
   #- "DF"
-  learning_rate:  # Learning rate adjustments: format tech.method-value (e.g., s.m1.1, w.o0.05)
-  - "base" # empirical lr
-  #- "s.m1.5"  
-  #- "s.m0.5"  
-  #- "w.m1.5"  
-  #- "w.m0.5"  
-  #- "all.m1.5"  
-  #- "all.m0.5"  
+  learning_rate:  # Canonical format: tech_code.methodvalue, e.g. s.o0.10 or w.m1.10; use "base" for no adjustment
+  - "base"
+  - "s.o0.10"  
+  - "s.o-0.10"
+  - "all.o0.10"
+  - "all.m0.90"
 
 foresight: myopic
 
@@ -88,7 +86,7 @@ enable:
   progress_bar: true # show progress bar during downloading routines and other long-running tasks
 
 global_specific:
-  save_lpfile: false
+  save_lpfile: true
   remove_faulty_offshore_shapes: true # for offwind profiles, remove faulty shapes that cause crashes
   global_clustering: true # must be true to apply minimum clustering per country
   minimum_clustering_per_countries:
@@ -103,11 +101,13 @@ global_specific:
     baseyear_generation_constraint: true # 2020 country-level electricity generation constrained to OWID historical values
     year: 2020
     owid_csv: validation/data/owid-energy-data.csv
+    electricity_demand_baseline_network: results/Global_200/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+    electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
     tolerance: 0.10
     absolute_tolerance_twh: 0.25
     min_reference_twh: 1.0
     min_country_electric_load_twh: 0.5
-    slack_penalty_eur_per_mwh: 1000.0
+    slack_penalty_eur_per_mwh: 200.0
     units: TWh
     link_bus_carrier: AC
     gen_bus_carrier: AC
@@ -122,49 +122,6 @@ global_specific:
       - wind_electricity
       - other_renewable_electricity
       - electricity_generation
-
-    hydro_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
-    hydro_inflow_alignment: true
-    hydro_inflow_min_reference_twh: 1.0
-    hydro_inflow_min_model_twh: 0.1
-    hydro_inflow_scale_min: 0.25
-    hydro_inflow_scale_max: 20.0
-    hydro_inflow_alignment_alpha: 1.0
-    hydro_iteration_scaling_enabled: false
-    hydro_iteration_override_csv: validation/data/hydro_iteration_scaling_overrides.csv
-    hydro_iteration_scale_min: 0.05
-    hydro_iteration_scale_max: 20.0
-    hydro_ror_p_max_pu_cap: 1.0
-
-    onwind_profile_alignment: true
-    onwind_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
-    onwind_min_reference_twh: 1.0
-    onwind_min_model_twh: 0.1
-    onwind_scale_min: 0.25
-    onwind_scale_max: 4.0
-    onwind_alignment_alpha: 1.0
-    onwind_p_max_pu_cap: 1.0
-
-    wind_iteration_scaling_enabled: true
-    wind_iteration_override_csv: validation/data/wind_iteration_scaling_overrides_global200_2020_validated.csv
-    wind_iteration_scale_min: 0.05
-    wind_iteration_scale_max: 20.0
-    offwind_p_max_pu_cap: 1.0
-
-    solar_iteration_scaling_enabled: false
-    solar_iteration_override_csv: validation/data/solar_iteration_scaling_overrides.csv
-    solar_iteration_scale_min: 0.05
-    solar_iteration_scale_max: 20.0
-    solar_p_max_pu_cap: 1.0
-
-    nuclear_iteration_scaling_enabled: false
-    nuclear_iteration_override_csv: validation/data/nuclear_iteration_scaling_overrides.csv
-    nuclear_iteration_scale_min: 0.05
-    nuclear_iteration_scale_max: 20.0
-    nuclear_p_max_pu_cap: 1.0
-
-    fossil_price_tuning_enabled: false
-    fossil_price_override_csv: validation/data/fossil_price_tuning_overrides.csv
 
   year2025_generation: 
     year2025_generation_constraint: false
@@ -201,13 +158,33 @@ global_specific:
       geothermal: ["geothermal"]
 
   year2025_capacity:
-    year2025_capacity_constraint: false
+    year2025_capacity_constraint: true
     year: 2025
-    tolerance: 0.1
     units: GW
-    targets:
-      solar: 2130.64 # Target installed capacity in GW from 2024
-      onwind: 1136.0 # Target installed capacity in GW from 2024
+    irena_csv: validation/data/IRENA_2024CAPA.csv
+    reference_year: 2024
+    fallback_to_latest_available: false
+    geothermal_extendable_fallback: true
+    lower_multiplier: 1.0 # 2025 must be at least 2024 installed capacity
+    upper_multiplier: 1.5 # allow up to +20% growth from 2024 to 2025
+    min_reference_mw: 1.0
+    absolute_tolerance_mw: 0.0
+    irena_technology_by_constraint:
+      solar: ["Solar photovoltaic"] # excludes CSP / solar thermal
+      onwind: ["Onshore wind energy"]
+      offshore_wind: ["Offshore wind energy"]
+      geothermal: ["Geothermal energy"]
+    model_carriers_by_constraint:
+      solar: [solar]
+      onwind: [onwind]
+      offshore_wind: [offwind-ac, offwind-dc]
+      geothermal: [geothermal]
+    nodal_distribution_limit:
+      enable: false
+      carriers: [onwind, solar]
+      max_baseyear_share_multiplier: 1.5
+      new_bus_share_multiplier: 0.5
+      new_bus_flattening_exponent: 0.5
 
 permstore:
   enable: true
@@ -376,8 +353,8 @@ sector:
 
   biomass_transport: false # biomass transport between nodes
   biomass_transport_default_cost: 0.1 #EUR/km/MWh
-  solid_biomass_potential: 100.0 # TWh/a, Potential of whole modelled area
-  biogas_potential: 40.0 # TWh/a, Potential of whole modelled area
+  solid_biomass_potential: 8500 # TWh/a, Potential of whole modelled area
+  biogas_potential: 500 # TWh/a, Potential of whole modelled area
 
   efficiency_heat_oil_to_elec: 0.9
   efficiency_heat_biomass_to_elec: 0.9
@@ -539,10 +516,11 @@ solving:
       parallel: "on"
       random_seed: 123
     gurobi-default:
-      threads: 10
+      threads: 16
       method: 2 # barrier
       crossover: 0
-      BarConvTol: 1.e-5 # 1.e-6
+      BarConvTol: 1.e-5
+      ScaleFlag: -1
       Seed: 123
       AggFill: 0
       PreDual: 0
@@ -648,7 +626,7 @@ solving:
     glpk-default: {} # Used in CI
 
   mem: 100000 #memory in MB; 20 GB enough for 50+B+I+H2; 100 GB for 181+B+I+H2
-  threads: 64
+  threads: 16
 
 plotting:  
   tech_colors:

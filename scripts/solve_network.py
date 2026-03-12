@@ -113,6 +113,17 @@ pypsa.pf.logger.setLevel(logging.WARNING)
 # Baseyear generation validation helpers moved to scripts/validation.py
 
 
+def _infer_planning_year(n):
+    try:
+        return snakemake.wildcards.planning_horizons
+    except (NameError, AttributeError):
+        if hasattr(n, "investment_periods") and len(n.investment_periods) > 0:
+            return str(n.investment_periods[0])
+        if hasattr(n.snapshots, "levels") and len(n.snapshots.levels) > 0:
+            return str(n.snapshots.levels[0][0])
+    return None
+
+
 def _safe_solver_log(smk):
     """Return a usable log filename if present (named 'solver' or first log), else None."""
     lf = None
@@ -3355,18 +3366,7 @@ def extra_functionality(n, snapshots):
         set_h2_colors(n)
 
     # Get planning_year - use first investment period for multi-period networks
-    try:
-        planning_year = snakemake.wildcards.planning_horizons
-    except (NameError, AttributeError):
-        # For rolling horizon/perfect foresight, use first investment period
-        if hasattr(n, "investment_periods") and len(n.investment_periods) > 0:
-            planning_year = str(n.investment_periods[0])
-        else:
-            # Fallback: use first snapshot year if available
-            if hasattr(n.snapshots, "levels") and len(n.snapshots.levels) > 0:
-                planning_year = str(n.snapshots.levels[0][0])
-            else:
-                planning_year = None
+    planning_year = _infer_planning_year(n)
 
     if planning_year is not None:
         add_baseyear_generation_band(
@@ -3381,12 +3381,26 @@ def extra_functionality(n, snapshots):
             config=config,
         )
 
-        # Add 2025 capacity targets
-        add_year2025_capacity_targets(
-            n,
-            planning_year=planning_year,
-            config=config,
-        )
+        # Add 2025 capacity targets (prefer centralized country-level IRENA hook)
+        if hasattr(_validation_hooks, "add_year2025_irena_country_capacity_band"):
+            _validation_hooks.add_year2025_irena_country_capacity_band(
+                n,
+                planning_year=planning_year,
+                config=config,
+            )
+        else:
+            add_year2025_capacity_targets(
+                n,
+                planning_year=planning_year,
+                config=config,
+            )
+
+        if hasattr(_validation_hooks, "add_year2025_irena_nodal_distribution_constraints"):
+            _validation_hooks.add_year2025_irena_nodal_distribution_constraints(
+                n,
+                planning_year=planning_year,
+                config=config,
+            )
 
     add_co2_sequestration_limit(n, snapshots)
     
@@ -3417,6 +3431,16 @@ def solve_network(n, config, solving, **kwargs):
             n.opts = globals().get("opts", [])
 
     n = apply_optional_sector_clustering(n, config)
+
+    planning_year = _infer_planning_year(n)
+    if planning_year is not None and hasattr(
+        _validation_hooks, "add_year2025_geothermal_extendable_fallback"
+    ):
+        _validation_hooks.add_year2025_geothermal_extendable_fallback(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
 
     skip_iterations = cf_solving.get("skip_iterations", False)
     if not n.lines.s_nom_extendable.any():

@@ -100,6 +100,9 @@ global_specific:
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_generation:
     baseyear_generation_constraint: true # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
+    # Optional solved baseyear network used to estimate non-Load electric end-use
+    # withdrawals (e.g. heat links) before scaling direct AC/low-voltage loads.
+    electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
     tolerance: 0.05 # +- x% tolerance for baseyear generation constraint
     units: TWh
     targets: # in TWh -- for 2020 currently only

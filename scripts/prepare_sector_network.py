@@ -45,6 +45,7 @@ if hasattr(_validation_hooks, "align_country_electricity_demand_to_owid"):
     apply_hydro_profile_fallback_and_diagnostics = (
         _validation_hooks.apply_hydro_profile_fallback_and_diagnostics
     )
+    apply_renewable_profile_fallbacks = _validation_hooks.apply_renewable_profile_fallbacks
     align_country_hydro_reservoir_inflow_to_owid = _validation_hooks.align_country_hydro_reservoir_inflow_to_owid
     align_country_onwind_profiles_to_owid = _validation_hooks.align_country_onwind_profiles_to_owid
     apply_country_wind_iteration_scaling = _validation_hooks.apply_country_wind_iteration_scaling
@@ -387,6 +388,41 @@ def add_carrier_buses(n, carrier, nodes=None, fuel_price_dict=None):
         marginal_cost=marginal_cost,
     )
 
+
+def ensure_biomass_resource_bus(n):
+    """Ensure the finite biomass resource bus exists before biomass links are added."""
+    if "solid biomass" not in n.carriers.index:
+        n.add("Carrier", "solid biomass")
+
+    biomass_buses = pd.Index(spatial.biomass.nodes)
+    biomass_buses_new = biomass_buses.difference(n.buses.index)
+    if len(biomass_buses_new):
+        n.madd(
+            "Bus",
+            biomass_buses_new,
+            location=biomass_buses_new.to_series().map(
+                dict(zip(spatial.biomass.nodes, spatial.biomass.locations))
+            ),
+            carrier="solid biomass",
+        )
+
+
+def broadcast_madd_value(values, target_index, label):
+    """Broadcast a single static value across madd rows while preserving aligned vectors."""
+    if isinstance(values, str) or np.isscalar(values):
+        return values
+
+    target_len = len(pd.Index(target_index))
+    seq = pd.Index(values)
+    if len(seq) == 1:
+        return seq[0]
+    if len(seq) == target_len:
+        return values
+    raise ValueError(
+        f"{label} length {len(seq)} does not match target length {target_len}"
+    )
+
+
 def match_geothermal_capacity_from_csv(n, baseyear, geothermal_csv_path, costs=None, 
                                         create_synthetic=False, 
                                         regions_shapefile=None):
@@ -585,8 +621,18 @@ def add_generation(
     conventionals = options.get("conventional_generation", fallback)
 
     for generator, carrier in conventionals.items():
-        add_carrier_buses(n, carrier, fuel_price_dict=fuel_price_dict)
-        carrier_nodes = vars(spatial)[carrier].nodes
+        if generator == "biomass":
+            ensure_biomass_resource_bus(n)
+            if generator not in n.carriers.index:
+                n.add("Carrier", generator, co2_emissions=0.0)
+            carrier_nodes = broadcast_madd_value(
+                spatial.biomass.nodes,
+                spatial.nodes,
+                "biomass generation bus0",
+            )
+        else:
+            add_carrier_buses(n, carrier, fuel_price_dict=fuel_price_dict)
+            carrier_nodes = vars(spatial)[carrier].nodes
         link_names = spatial.nodes + " " + generator
         n.madd(
             "Link",
@@ -727,7 +773,11 @@ def add_hydrogen(n, costs):
         },
         "Solid biomass steam reforming": {
             "cost_name": "H2 production solid biomass steam reforming",
-            "bus0": spatial.biomass.nodes,
+            "bus0": broadcast_madd_value(
+                spatial.biomass.nodes,
+                spatial.nodes,
+                "solid biomass steam reforming bus0",
+            ),
             "bus1": spatial.nodes + " green H2",
             "bus2": spatial.nodes,
             "bus3": "co2 atmosphere",
@@ -741,7 +791,11 @@ def add_hydrogen(n, costs):
         },
         "Biomass gasification": {
             "cost_name": "H2 production biomass gasification",
-            "bus0": spatial.biomass.nodes,
+            "bus0": broadcast_madd_value(
+                spatial.biomass.nodes,
+                spatial.nodes,
+                "biomass gasification bus0",
+            ),
             "bus1": spatial.nodes + " green H2",
             "bus2": spatial.nodes,
             "bus3": "co2 atmosphere",
@@ -755,7 +809,11 @@ def add_hydrogen(n, costs):
         },
         "Biomass gasification CC": {
             "cost_name": "H2 production biomass gasification CC",
-            "bus0": spatial.biomass.nodes,
+            "bus0": broadcast_madd_value(
+                spatial.biomass.nodes,
+                spatial.nodes,
+                "biomass gasification CC bus0",
+            ),
             "bus1": spatial.nodes + " green H2",
             "bus2": spatial.nodes,
             "bus3": "co2 atmosphere",
@@ -1428,8 +1486,10 @@ def add_biomass(n, costs):
     biogas_pot_spatial = biogas_pot / len(spatial.gas.biogas)
     logger.info("Biomass potentials spatially resolved equally across all nodes")
 
-    n.add("Carrier", "biogas")
-    n.add("Carrier", "solid biomass")
+    if "biogas" not in n.carriers.index:
+        n.add("Carrier", "biogas")
+    if "solid biomass" not in n.carriers.index:
+        n.add("Carrier", "solid biomass")
 
     biogas_buses = pd.Index(spatial.gas.biogas)
     biogas_buses_new = biogas_buses.difference(n.buses.index)
@@ -1475,7 +1535,11 @@ def add_biomass(n, costs):
     n.madd(
         "Link",
         spatial.nodes + " biomass EOP",
-        bus0=spatial.biomass.nodes,
+        bus0=broadcast_madd_value(
+            spatial.biomass.nodes,
+            spatial.nodes,
+            "biomass EOP bus0",
+        ),
         bus1=spatial.nodes,
         # bus2="co2 atmosphere",
         marginal_cost=costs.at[biomass_gen, "efficiency"]
@@ -2163,7 +2227,11 @@ def add_industry(n, costs):
     n.madd(
         "Link",
         spatial.biomass.industry,
-        bus0=spatial.biomass.nodes,
+        bus0=broadcast_madd_value(
+            spatial.biomass.nodes,
+            spatial.biomass.industry,
+            "solid biomass for industry bus0",
+        ),
         bus1=spatial.biomass.industry,
         carrier="solid biomass for industry",
         p_nom_extendable=True,
@@ -2179,7 +2247,11 @@ def add_industry(n, costs):
         n.madd(
             "Link",
             spatial.biomass.industry_cc,
-            bus0=spatial.biomass.nodes,
+            bus0=broadcast_madd_value(
+                spatial.biomass.nodes,
+                spatial.biomass.industry_cc,
+                "solid biomass for industry CC bus0",
+            ),
             bus1=spatial.biomass.industry,
             bus2="co2 atmosphere",
             bus3=biomass_cc_bus3,
@@ -3055,7 +3127,11 @@ def add_services(n, costs):
         "Load",
         spatial.nodes,
         suffix=" services biomass",
-        bus=spatial.biomass.nodes,
+        bus=broadcast_madd_value(
+            spatial.biomass.nodes,
+            spatial.nodes,
+            "services biomass bus",
+        ),
         carrier="services biomass",
         p_set=p_set_biomass,
     )
@@ -3181,6 +3257,201 @@ def group_by_node(df, multiindex=False):
     return ret
 
 
+def _resolve_validation_repo_path(path_like):
+    if hasattr(_validation_hooks, "_repo_path"):
+        return _validation_hooks._repo_path(path_like)
+
+    path = os.path.expanduser(str(path_like))
+    if os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
+
+
+def _get_year2025_country_capacity_upper_bounds(config, carriers):
+    global_cfg = config.get("global_specific", {})
+    year_cfg = global_cfg.get("year2025_capacity", {})
+    if not year_cfg or not bool(year_cfg.get("year2025_capacity_constraint", False)):
+        return pd.Series(dtype=float), None, None
+    if not hasattr(_validation_hooks, "_irena_country_capacity_reference"):
+        logger.warning(
+            "Renewable nodal share cap skipped: validation helper _irena_country_capacity_reference is unavailable."
+        )
+        return pd.Series(dtype=float), None, None
+
+    irena_csv = _resolve_validation_repo_path(
+        year_cfg.get("irena_csv", "validation/data/irena_capacity_by_technology.csv")
+    )
+    if not os.path.exists(irena_csv):
+        logger.warning(
+            "Renewable nodal share cap skipped: IRENA capacity file not found at %s.",
+            irena_csv,
+        )
+        return pd.Series(dtype=float), None, None
+
+    target_year = int(year_cfg.get("year", 2025))
+    reference_year = int(year_cfg.get("reference_year", target_year))
+    fallback_to_latest = bool(year_cfg.get("fallback_to_latest_available", True))
+    tolerance = float(year_cfg.get("tolerance", 0.10))
+    upper_multiplier = year_cfg.get("upper_multiplier")
+    upper_multiplier = (
+        float(upper_multiplier) if upper_multiplier is not None else 1.0 + tolerance
+    )
+
+    constraint_technology_map = year_cfg.get(
+        "irena_technology_by_constraint",
+        year_cfg.get(
+            "irena_technology_by_carrier",
+            {
+                "solar": ["PV"],
+                "onwind": ["Onshore"],
+            },
+        ),
+    )
+    model_carriers_by_constraint = year_cfg.get(
+        "model_carriers_by_constraint",
+        {key: [key] for key in (constraint_technology_map or {}).keys()},
+    )
+
+    try:
+        ref, used_reference_year = _validation_hooks._irena_country_capacity_reference(
+            irena_csv=irena_csv,
+            year=reference_year,
+            carrier_technology_map=constraint_technology_map,
+            fallback_to_latest=fallback_to_latest,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Renewable nodal share cap skipped: unable to load IRENA country capacities from %s (%s).",
+            irena_csv,
+            exc,
+        )
+        return pd.Series(dtype=float), None, None
+
+    if ref.empty:
+        logger.warning(
+            "Renewable nodal share cap skipped: no overlapping IRENA country-capacity rows found in %s.",
+            irena_csv,
+        )
+        return pd.Series(dtype=float), None, None
+
+    rows = []
+    for row in ref.itertuples(index=False):
+        for model_carrier in model_carriers_by_constraint.get(str(row.carrier), []):
+            model_carrier = str(model_carrier)
+            if model_carrier in carriers:
+                rows.append(
+                    (
+                        str(row.country).upper(),
+                        model_carrier,
+                        max(float(row.reference_mw) * upper_multiplier, 0.0),
+                    )
+                )
+
+    if not rows:
+        return pd.Series(dtype=float), used_reference_year, upper_multiplier
+
+    bounds = (
+        pd.DataFrame(rows, columns=["country", "carrier", "upper_mw"])
+        .drop_duplicates()
+        .groupby(["country", "carrier"])["upper_mw"]
+        .max()
+    )
+    return bounds, used_reference_year, upper_multiplier
+
+
+def apply_renewable_nodal_share_caps(n, investment_year, config):
+    global_cfg = config.get("global_specific", {})
+    year_cfg = global_cfg.get("year2025_capacity", {})
+    cap_cfg = year_cfg.get("nodal_distribution_limit", {})
+    if not cap_cfg or not bool(cap_cfg.get("enable", False)):
+        return
+
+    target_year = int(year_cfg.get("year", 2025))
+    if int(investment_year) != target_year:
+        return
+
+    logger.info(
+        "Skipping prenetwork nodal share-cap mutation for %s; nodal_distribution_limit is enforced as a solve-time linear constraint.",
+        investment_year,
+    )
+
+
+def apply_country_onwind_mean_cf_caps(n, investment_year):
+    """Clip country-internal onwind CF outliers by scaling their full profile."""
+
+    if n.generators.empty or n.generators_t.p_max_pu.empty:
+        return 0
+
+    gen = n.generators.copy()
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen = gen.loc[gen["carrier"].eq("onwind"), ["bus"]].copy()
+    if gen.empty:
+        return 0
+
+    profiles = n.generators_t.p_max_pu.reindex(columns=gen.index)
+    profiles = profiles.loc[:, profiles.notna().any(axis=0)]
+    if profiles.empty:
+        return 0
+    gen = gen.loc[profiles.columns].copy()
+
+    if "generators" in n.snapshot_weightings:
+        weights = pd.to_numeric(
+            n.snapshot_weightings["generators"], errors="coerce"
+        ).reindex(n.snapshots)
+        weights = weights.fillna(0.0)
+    else:
+        weights = pd.Series(1.0, index=n.snapshots)
+    if float(weights.sum()) <= 0.0:
+        weights = pd.Series(1.0, index=n.snapshots)
+
+    bus_country = (
+        n.buses["country"]
+        if "country" in n.buses.columns
+        else pd.Series(index=n.buses.index, dtype=object)
+    )
+    gen["country"] = gen["bus"].map(bus_country)
+    fallback_country = gen["bus"].astype(str).str.split().str[0]
+    gen["country"] = (
+        gen["country"].fillna(fallback_country).astype(str).str.strip().str.upper()
+    )
+    gen = gen.loc[gen["country"].str.len().eq(2)].copy()
+    if gen.empty:
+        return 0
+
+    profiles = profiles.loc[:, gen.index]
+    mean_cf = profiles.mul(weights, axis=0).sum(axis=0) / float(weights.sum())
+    gen["mean_cf"] = mean_cf.reindex(gen.index)
+    gen["country_node_count"] = gen.groupby("country")["mean_cf"].transform("count")
+    gen["country_median_cf"] = gen.groupby("country")["mean_cf"].transform("median")
+    gen["country_cap_cf"] = 2.0 * gen["country_median_cf"]
+
+    to_clip = gen.loc[
+        gen["country_node_count"].ge(4)
+        & gen["country_median_cf"].gt(0.0)
+        & gen["mean_cf"].gt(gen["country_cap_cf"] + 1e-9)
+    ].copy()
+    if to_clip.empty:
+        return 0
+
+    scale = to_clip["country_cap_cf"] / to_clip["mean_cf"]
+    n.generators_t.p_max_pu.loc[:, to_clip.index] = (
+        n.generators_t.p_max_pu.loc[:, to_clip.index].mul(scale, axis=1).clip(lower=0.0)
+    )
+
+    sample = ", ".join(
+        f"{name} {row.mean_cf:.3f}->{row.country_cap_cf:.3f} (country={row.country}, median={row.country_median_cf:.3f})"
+        for name, row in to_clip.head(6).iterrows()
+    )
+    logger.info(
+        "Applied country onwind mean-CF cap for %s: clipped_generators=%d, countries=%d, cap_rule='mean_cf <= 2.0 * country_median_cf' sample=%s",
+        investment_year,
+        len(to_clip),
+        to_clip["country"].nunique(),
+        sample,
+    )
+    return int(len(to_clip))
+
+
 def normalize_and_group(df, multiindex=False):
     """
     Function to concatenate normalize_by_country and group_by_node.
@@ -3300,7 +3571,11 @@ def add_residential(n, costs):
         "Load",
         spatial.nodes,
         suffix=" residential biomass",
-        bus=spatial.biomass.nodes,
+        bus=broadcast_madd_value(
+            spatial.biomass.nodes,
+            spatial.nodes,
+            "residential biomass bus",
+        ),
         carrier="residential biomass",
         p_set=p_set_biomass,
     )
@@ -4019,6 +4294,9 @@ if __name__ == "__main__":
         snakemake.config,
         output_network_path=getattr(snakemake.output, "network", None),
     )
+    # Patch missing/all-zero wind/solar/offshore profiles in every planning year
+    # without reapplying baseyear country-level CF scaling.
+    apply_renewable_profile_fallbacks(n, investment_year, snakemake.config)
     # Scale hydro reservoir inflow (StorageUnit carrier='hydro') by country
     # against OWID hydro electricity in baseyear.
     align_country_hydro_reservoir_inflow_to_owid(n, investment_year, snakemake.config)
@@ -4033,6 +4311,11 @@ if __name__ == "__main__":
     apply_country_solar_iteration_scaling(n, investment_year, snakemake.config)
     # Optional per-country iterative nuclear availability overrides.
     apply_country_nuclear_iteration_scaling(n, investment_year, snakemake.config)
+    # Clip within-country onwind availability outliers before capacity constraints.
+    apply_country_onwind_mean_cf_caps(n, investment_year)
+    # Legacy compatibility hook; the actual nodal_distribution_limit is now enforced
+    # as a solve-time linear constraint in solve_network/validation.
+    apply_renewable_nodal_share_caps(n, investment_year, snakemake.config)
 
     # TODO add co2 limit here, if necessary
     # co2_limit_pu = eval(sopts[0][5:])

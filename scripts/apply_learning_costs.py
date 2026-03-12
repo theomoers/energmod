@@ -16,7 +16,7 @@ WORKFLOW (Exogenous Learning):
 - lag_periods=0: Immediate learning (NOT handled here, use learning.py SOS2/MILP)
 - lag_periods=1: Lagged learning (handled here, exogenous LP)
   * 2020: Uses 2018 historical capacity (2-year historical lag)
-  * 2025: Uses 2020 solved capacity
+  * 2025: Uses 2020 solved capacity 
   * 2030: Uses 2025 solved capacity
   * 2035: Uses 2030 solved capacity
   * And so on...
@@ -42,6 +42,7 @@ Updated: 2025-12-18
 """
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -67,6 +68,12 @@ BOS_multiplier = 246.7088 / (137 / 1.14)
 DEFAULT_GLOBAL_SCALE_FACTORS = {
     "battery_energy": 17.76,  # Model covers 66/1173 = 5.63% of global battery storage (2020)
     "battery_power": 17.76,   # Apply same global scaling to battery inverter learning
+}
+
+# Mapping of horizon year to historical capacity year for exogenous cost updates.
+# This is separate from the anchor-year reconstruction used for beta adjustment.
+COST_HISTORICAL_CAPACITY_YEARS = {
+    2020: 2018,
 }
 
 
@@ -108,6 +115,35 @@ def get_global_scale_factors(learning_cfg):
 
     logger.info(f"Using global scale factors: {factors}")
     return factors
+
+
+def normalize_optional_input(value):
+    """Normalize optional Snakemake inputs where missing values may appear as empty lists."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value or None
+
+
+def extract_year_from_network_path(network_path):
+    """Extract the planning-horizon year token from a myopic network path."""
+    if not network_path:
+        return None
+
+    year_match = re.search(r'_(\d{4})(?=_)', str(network_path))
+    if not year_match:
+        return None
+    return int(year_match.group(1))
+
+
+def get_cost_lag_year(planning_horizons, current_year):
+    """Return the deployment year used to price the current horizon."""
+    if current_year in COST_HISTORICAL_CAPACITY_YEARS:
+        return COST_HISTORICAL_CAPACITY_YEARS[current_year]
+
+    prev_horizon = get_previous_horizon(planning_horizons, current_year)
+    if prev_horizon is None:
+        raise ValueError(f"No lag year available for horizon {current_year}")
+    return prev_horizon
 
 def validate_learning_parameters(tech, A, beta, learning_rate, L_current, L_max=None):
     """
@@ -241,7 +277,7 @@ def parse_learning_rate_wildcard(learning_rate_str):
     """
     Parse learning rate wildcard into beta adjustment configuration.
     
-    Format: tech.method-value or "base" for no adjustment
+    Format: tech.methodvalue or "base" for no adjustment.
     Examples:
         - "base": No adjustment
         - "s.m1.1": Solar learning rate ×1.1 (10% faster learning)
@@ -295,16 +331,20 @@ def parse_learning_rate_wildcard(learning_rate_str):
     tech_specific_methods = {}  # Track method per technology
     
     for adj in adjustments:
-        # Parse format: tech.method-value
+        # Parse format: tech.methodvalue
         # E.g., "s.m1.2" -> tech="s", method="m", value="1.2"
         if '.' not in adj:
-            logger.warning(f"Invalid learning rate format: {adj}, skipping")
-            continue
+            raise ValueError(
+                f"Invalid learning rate wildcard '{adj}'. "
+                "Use explicit syntax tech.methodvalue, e.g. 's.o0.10' or 'w.m1.10'."
+            )
         
         parts = adj.split('.')
         if len(parts) < 2:
-            logger.warning(f"Invalid learning rate format: {adj}, skipping")
-            continue
+            raise ValueError(
+                f"Invalid learning rate wildcard '{adj}'. "
+                "Use explicit syntax tech.methodvalue, e.g. 's.o0.10' or 'w.m1.10'."
+            )
         
         tech_code = parts[0]
         method_value = '.'.join(parts[1:])  # Rejoin in case value has decimal point
@@ -317,14 +357,15 @@ def parse_learning_rate_wildcard(learning_rate_str):
             method = 'offset'
             value_str = method_value[1:]
         else:
-            logger.warning(f"Invalid method in {adj}, expected 'm' or 'o'")
-            continue
+            raise ValueError(
+                f"Invalid learning rate wildcard '{adj}'. "
+                "Use explicit syntax tech.methodvalue, e.g. 's.o0.10' or 'w.m1.10'."
+            )
         
         try:
             value = float(value_str)
         except ValueError:
-            logger.warning(f"Invalid numeric value in {adj}: {value_str}")
-            continue
+            raise ValueError(f"Invalid numeric value in learning rate wildcard '{adj}': {value_str}")
         
         # Apply to appropriate tech
         if tech_code == 'all':
@@ -335,7 +376,10 @@ def parse_learning_rate_wildcard(learning_rate_str):
             tech_specific[tech_name] = value
             tech_specific_methods[tech_name] = method  # Store method per tech
         else:
-            logger.warning(f"Unknown tech code: {tech_code}")
+            raise ValueError(
+                f"Unknown tech code '{tech_code}' in learning rate wildcard '{adj}'. "
+                "Supported codes: s, w, b, bi, e, h, all."
+            )
     
     # Build config dict
     if global_method:
@@ -358,13 +402,22 @@ def parse_learning_rate_wildcard(learning_rate_str):
             "tech_specific_methods": tech_specific_methods,
         }
     
-    logger.info(f"Parsed learning_rate wildcard '{learning_rate_str}':")
-    logger.info(f"  Enabled: {config['enabled']}")
-    logger.info(f"  Method: {config['method']}")
+    logger.info(f"Parsed learning_rate wildcard '{learning_rate_str}'")
     if global_method:
-        logger.info(f"  Global {config['method']}: {global_value}")
+        logger.info(f"  Global adjustment: {global_method}={global_value}")
     if tech_specific:
-        logger.info(f"  Tech-specific: {tech_specific}")
+        tech_specific_summary = {
+            tech: {
+                "method": tech_specific_methods.get(tech, config["method"]),
+                "value": value,
+            }
+            for tech, value in tech_specific.items()
+        }
+        logger.info(f"  Tech-specific adjustments: {tech_specific_summary}")
+    if not global_method and not tech_specific:
+        raise ValueError(
+            f"Learning rate wildcard '{learning_rate_str}' did not define any valid adjustments"
+        )
     
     return config
 
@@ -391,64 +444,6 @@ def load_config_learning(config_file):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
     return config["learning"]
-
-
-def load_investment_cost_from_costs(costs_file, tech_key):
-    """
-    Load investment (overnight) cost from cost CSV file.
-    
-    Args:
-        costs_file: Path to costs CSV (e.g., costs_2020.csv)
-        tech_key: Technology key (e.g., 'solar_power')
-    
-    Returns:
-        Investment cost in EUR/kW or EUR/kWh
-    
-    Raises:
-        FileNotFoundError: If cost file doesn't exist
-        ValueError: If investment cost data not found for technology
-    """
-    if not Path(costs_file).exists():
-        raise FileNotFoundError(f"Cost file not found: {costs_file}")
-    
-    # Map to cost file technology name
-    cost_tech_name = TECH_TO_COST_NAME.get(tech_key)
-    if cost_tech_name is None:
-        raise ValueError(f"No cost file mapping for {tech_key} in TECH_TO_COST_NAME")
-    
-    try:
-        df = pd.read_csv(costs_file)
-        
-        # Filter for this technology and investment parameter
-        inv_data = df[(df['technology'] == cost_tech_name) & (df['parameter'] == 'investment')]
-        
-        if inv_data.empty:
-            raise ValueError(
-                f"No investment cost data found for technology '{cost_tech_name}' in {costs_file}. "
-                f"Check that the cost file contains investment parameter for this technology."
-            )
-        
-        inv_value = inv_data.iloc[0]['value']
-        unit = inv_data.iloc[0]['unit']
-        
-        # Convert to EUR/kW or EUR/kWh
-        if 'EUR/kW' in unit:
-            inv_cost = inv_value
-        elif 'USD/kW' in unit:
-            # Assuming EUR/USD ~ 1.0 for simplicity, adjust if needed
-            inv_cost = inv_value
-        else:
-            raise ValueError(
-                f"Unexpected investment unit for {cost_tech_name}: {unit}. Expected 'EUR/kW' or similar."
-            )
-        
-        logger.debug(f"  Loaded investment cost for {tech_key}: {inv_cost:.2f} {unit}")
-        return inv_cost
-        
-    except Exception as e:
-        if isinstance(e, (FileNotFoundError, ValueError)):
-            raise
-        raise ValueError(f"Error loading investment cost for {tech_key} from {costs_file}: {e}")
 
 
 def load_fom_from_costs(costs_file, tech_key):
@@ -569,28 +564,46 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
         logger.info("Beta adjustment DISABLED - using base parameters")
         params_adjusted = params.copy()
         params_adjusted["beta_base"] = params_adjusted["beta"]  # Store base beta
+        params_adjusted["A_base"] = params_adjusted["A_over_unit"]
+        learning_rates = {}
+        for tech in params_adjusted.index:
+            beta_value = params_adjusted.loc[tech, "beta"]
+            learning_rate = 1 - 2**(-beta_value)
+            A_value = params_adjusted.loc[tech, "A_over_unit"]
+            learning_rates[tech] = {
+                "beta_base": float(beta_value),
+                "beta_scenario": float(beta_value),
+                "lr_base": float(learning_rate),
+                "lr_scenario": float(learning_rate),
+                "A_base": float(A_value),
+                "A_scenario": float(A_value),
+            }
+        params_adjusted.attrs["learning_rates"] = learning_rates
         return params_adjusted
     
-    logger.info("Learning rate adjustment ENABLED (operates on LR, not β)")
     method = beta_cfg.get("method", "multiplier")
     multiplier = beta_cfg.get("multiplier", 1.0)
     offset = beta_cfg.get("offset", 0.0)
     tech_specific = beta_cfg.get("tech_specific", {})
     tech_specific_methods = beta_cfg.get("tech_specific_methods", {})  # Get per-tech methods
     anchor_year = beta_cfg.get("anchor_year", 2020)
-    
-    logger.info(f"  Global method: {method}")
-    logger.info(f"  Global multiplier: {multiplier}")
-    logger.info(f"  Global offset: {offset}")
-    logger.info(f"  Anchor year: {anchor_year}")
+
+    logger.info(f"Applying learning-rate adjustment anchored to {anchor_year}")
     if tech_specific_methods:
         logger.info(f"  Tech-specific methods: {tech_specific_methods}")
+    elif multiplier != 1.0 or offset != 0.0:
+        logger.info(
+            f"  Global adjustment: method={method}, multiplier={multiplier}, offset={offset}"
+        )
     
     params_adjusted = params.copy()
     params_adjusted["beta_base"] = params_adjusted["beta"]  # Store original beta
+    params_adjusted["A_base"] = params_adjusted["A_over_unit"]
     
     # Dictionary to store learning rates for metadata
     learning_rates = {}
+    adjusted_techs = []
+    missing_anchor = []
     
     for tech in params_adjusted.index:
         A_base = params_adjusted.loc[tech, "A_over_unit"]
@@ -598,7 +611,7 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
         
         # Get anchor deployment
         if tech not in state_anchor.index:
-            logger.warning(f"  {tech} not in anchor state, skipping beta adjustment")
+            missing_anchor.append(tech)
             continue
         
         L_anchor = state_anchor.loc[tech, "L_realized_GW"]
@@ -644,20 +657,23 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
         
         # Log the beta values for transparency
         if beta_base != beta_scenario:
+            adjusted_techs.append(tech)
             logger.info(f"  {tech}: β = {beta_scenario:.4f} (base: {beta_base:.4f})")
-        
-        # Store learning rates for metadata
-        learning_rates[tech] = {
-            "beta_base": float(beta_base),
-            "beta_scenario": float(beta_scenario),
-            "lr_base": float(lr_base),
-            "lr_scenario": float(lr_scenario)
-        }
         
         # Recalibrate A to maintain anchor point
         A_scenario = recalibrate_A_for_beta_scenario(
             A_base, beta_base, beta_scenario, L_anchor, tech
         )
+
+        # Store learning rates and A values for metadata
+        learning_rates[tech] = {
+            "beta_base": float(beta_base),
+            "beta_scenario": float(beta_scenario),
+            "lr_base": float(lr_base),
+            "lr_scenario": float(lr_scenario),
+            "A_base": float(A_base),
+            "A_scenario": float(A_scenario),
+        }
         
         # Update parameters
         params_adjusted.loc[tech, "beta"] = beta_scenario
@@ -665,90 +681,22 @@ def apply_beta_adjustment(params, state_anchor, learning_cfg):
     
     # Store learning rates in the params_adjusted for passing to main
     params_adjusted.attrs["learning_rates"] = learning_rates
+    params_adjusted.attrs["beta_adjustment_summary"] = {
+        "anchor_year": anchor_year,
+        "adjusted_techs": adjusted_techs,
+        "missing_anchor": missing_anchor,
+    }
+
+    if missing_anchor:
+        logger.warning(f"Missing anchor state for technologies: {missing_anchor}")
+
+    if not adjusted_techs:
+        raise ValueError(
+            "Learning rate adjustment was enabled but no technologies were adjusted. "
+            "Check the anchor-state inputs and learning-rate wildcard."
+        )
     
     return params_adjusted
-
-
-def validate_learning_parameter_A(params, state_2020, costs_2020_file, learning_cfg, tolerance=0.15):
-    """
-    Validate that learning parameters predict 2020 investment costs correctly.
-    
-    Uses learning curve c = A × L^(-β) with 2020 deployment to predict costs,
-    then compares with actual 2020 investment costs from cost CSV.
-    
-    Args:
-        params: DataFrame with learning parameters (A_over_unit, beta, unit)
-        state_2020: DataFrame with 2020 deployment state (L_realized_GW)
-        costs_2020_file: Path to 2020 cost CSV file
-        learning_cfg: Learning configuration dict
-        tolerance: Acceptable relative difference (default 15%)
-    
-    Raises:
-        AssertionError: If predicted cost differs from 2020 investment cost by more than tolerance
-    """
-    logger.info(f"Loading 2020 costs from {costs_2020_file}")
-    
-    for tech in params.index:
-        A = params.loc[tech, "A_over_unit"]
-        beta = params.loc[tech, "beta"]
-        unit = params.loc[tech, "unit"]
-        
-        # Get 2020 cumulative deployment
-        if tech not in state_2020.index:
-            logger.warning(f"  {tech} not found in 2020 state, skipping validation")
-            continue
-        
-        L_2020 = state_2020.loc[tech, "L_realized_GW"]
-        
-        # Load investment cost from 2020 cost file
-        try:
-            c_investment_2020 = load_investment_cost_from_costs(costs_2020_file, tech)
-        except Exception as e:
-            logger.warning(f"  Could not load investment cost for {tech} from 2020 costs: {e}")
-            logger.warning(f"  Skipping validation for {tech}")
-            continue
-        
-        # Calculate predicted cost using learning curve: c = A × L^(-β)
-        c_predicted_2020_cell = A * (L_2020 ** (-beta))
-        
-        # For batteries, apply BOS multiplier (learning at cell level, costs at system level)
-        if tech == 'battery_energy':
-            c_predicted_2020 = c_predicted_2020_cell * BOS_multiplier
-            logger.debug(f"    Applied BOS multiplier: {c_predicted_2020_cell:.2f} (cell) × {BOS_multiplier:.4f} = {c_predicted_2020:.2f} (system)")
-        else:
-            c_predicted_2020 = c_predicted_2020_cell
-        
-        # Compare predicted cost with actual 2020 investment cost
-        rel_diff = abs(c_predicted_2020 - c_investment_2020) / c_investment_2020
-        
-        # Check if beta was adjusted
-        beta_base = params.loc[tech, "beta_base"] if "beta_base" in params.columns else beta
-        beta_adjusted = beta != beta_base
-        
-        logger.info(f"  {tech}:")
-        logger.info(f"    2020 deployment:    {L_2020:.1f} GW")
-        if beta_adjusted:
-            logger.info(f"    A parameter:        {A:.2f} EUR/{unit} (recalibrated)")
-            logger.info(f"    β parameter:        {beta:.4f} (adjusted from {beta_base:.4f})")
-        else:
-            logger.info(f"    A parameter:        {A:.2f} EUR/{unit}")
-            logger.info(f"    β parameter:        {beta:.4f}")
-        logger.info(f"    Predicted cost:     {c_predicted_2020:.2f} EUR/{unit}")
-        logger.info(f"    2020 investment:    {c_investment_2020:.2f} EUR/{unit}")
-        logger.info(f"    Relative diff:      {rel_diff*100:.1f}%")
-        
-        if rel_diff > tolerance:
-            raise AssertionError(
-                f"Learning curve prediction for {tech} differs from 2020 investment cost by {rel_diff*100:.1f}%\n"
-                f"  Predicted (A × L^(-β)): {c_predicted_2020:.2f} EUR/{unit}\n"
-                f"  2020 investment cost:   {c_investment_2020:.2f} EUR/{unit}\n"
-                f"  Parameters: A={A:.2f}, β={beta:.3f}, L_2020={L_2020:.1f} GW\n"
-                f"  Tolerance = {tolerance*100:.1f}%\n"
-                f"  This suggests learning parameters may not correctly represent 2020 costs. "
-                f"Check learning parameter calibration or 2020 cost file."
-            )
-        else:
-            logger.info(f"    PASS (within {tolerance*100:.0f}% tolerance)")
 
 
 def load_learning_params(params_file):
@@ -773,42 +721,90 @@ def load_learning_params(params_file):
     return params
 
 
-def load_learning_state(state_file=None):
+def build_anchor_state(
+    params,
+    learning_cfg,
+    global_scale_factors,
+    anchor_year,
+    anchor_network_path=None,
+):
     """
-    Load realized deployment state from previous horizon.
-    
-    Note: State files are now deprecated. This function remains for backwards compatibility
-    but returns an empty DataFrame when no state file is provided.
-    
-    Args:
-        state_file: Optional path to learning_state_{prev_year}.csv
-    
+    Build anchor deployment state used to recalibrate A when learning rates change.
+
+    Preference order:
+    1. Use an explicit solved anchor-year network when available.
+    2. Fall back to historical cumulative deployment for the anchor year.
+
     Returns:
-        DataFrame with columns: L_realized_GW, K_realized_GW, K_prev_GW (may be empty)
+        DataFrame indexed by technology with column L_realized_GW.
     """
-    if state_file is None:
-        logger.info("No state file provided - using empty state (capacity extracted from networks)")
-        return pd.DataFrame(columns=["L_realized_GW", "K_realized_GW", "K_prev_GW"])
-    
-    logger.info(f"Loading learning state from {state_file}")
-    state = pd.read_csv(state_file, index_col="technology")
-    
-    required_cols = ["L_realized_GW", "K_realized_GW", "K_prev_GW"]
-    missing = set(required_cols) - set(state.columns)
-    if missing:
-        raise ValueError(f"Learning state missing columns: {missing}")
-    
-    logger.info(f"  Loaded state for {len(state)} technologies")
-    return state
+    anchor_network_path = normalize_optional_input(anchor_network_path)
+    records = {}
+
+    if anchor_network_path:
+        network_year = extract_year_from_network_path(anchor_network_path)
+        if network_year is not None and network_year != anchor_year:
+            logger.warning(
+                f"Anchor network year mismatch: expected {anchor_year}, got {network_year}. "
+                f"Path: {anchor_network_path}"
+            )
+
+        logger.info(f"Building anchor state for {anchor_year} from solved network {anchor_network_path}")
+        tech_mapping = learning_cfg.get("tech_mapping", {})
+        realized_capacity = extract_capacity_from_network(
+            anchor_network_path, tech_mapping, global_scale_factors
+        )
+
+        for tech in params.index:
+            if tech not in realized_capacity:
+                logger.warning(f"  {tech} not found in anchor network, skipping")
+                continue
+            records[tech] = {"L_realized_GW": float(realized_capacity[tech])}
+    else:
+        logger.info(f"Building anchor state for {anchor_year} from historical deployment data")
+        for tech in params.index:
+            if tech == "battery_power":
+                logger.warning(
+                    "  battery_power has no dedicated historical power series; "
+                    "provide an anchor network to adjust this technology"
+                )
+                continue
+
+            hist_file = get_historical_datafile(tech)
+            if hist_file is None:
+                logger.warning(f"  No historical data configured for {tech}, skipping")
+                continue
+
+            try:
+                capacity = load_capacity_from_historical_csv(tech, anchor_year, learning_cfg)
+            except Exception as exc:
+                logger.warning(
+                    f"  Could not load anchor deployment for {tech} in {anchor_year}: {exc}"
+                )
+                continue
+
+            records[tech] = {"L_realized_GW": float(capacity)}
+
+    anchor_state = pd.DataFrame.from_dict(records, orient="index")
+    anchor_state.index.name = "technology"
+    anchor_state.attrs["anchor_year"] = int(anchor_year)
+    anchor_state.attrs["anchor_source"] = "network" if anchor_network_path else "historical"
+    anchor_state.attrs["anchor_network"] = str(anchor_network_path or "")
+
+    if anchor_state.empty:
+        raise ValueError(
+            f"Could not construct anchor state for {anchor_year}. "
+            "Provide an anchor network or ensure historical learning data is available."
+        )
+
+    logger.info(f"  Built anchor state for {len(anchor_state)} technologies")
+    return anchor_state
 
 
 def load_capacity_from_historical_csv(tech, year, learning_cfg):
     """
     Load capacity from historical CSV files for a specific year.
-    
-    Used for 2020 (loads 2018 data) and 2025 (loads 2023 data) when we have
-    recent historical estimates instead of using solved capacity.
-    
+
     Args:
         tech: Technology key (e.g., 'solar_power', 'onwind_power')
         year: Year to extract from historical data
@@ -836,7 +832,8 @@ def load_capacity_from_historical_csv(tech, year, learning_cfg):
         )
     
     capacity = year_data['capacity_GW'].iloc[0]
-    logger.info(f"    Found {year} capacity: {capacity:.2f} GW")
+    unit = "GWh" if tech in ENERGY_TECHS else "GW"
+    logger.info(f"    Found {year} capacity: {capacity:.2f} {unit}")
     return capacity
 
 
@@ -932,7 +929,6 @@ def extract_capacity_from_network(network_path, tech_mapping, global_scale_facto
 
 def calculate_learning_costs(
     params,
-    state,
     learning_cfg,
     current_year,
     planning_horizons,
@@ -955,7 +951,6 @@ def calculate_learning_costs(
     
     Args:
         params: DataFrame with learning parameters (A, β) from learning_params.csv
-        state: DataFrame with previous deployment state (optional, for logging only)
         learning_cfg: Learning configuration dict (must include lag_periods)
         current_year: Current planning horizon year
         planning_horizons: List of all planning horizons
@@ -984,23 +979,55 @@ def calculate_learning_costs(
     
     logger.info(f"Using lagged learning with lag_periods={lag_periods} (exogenous costs)")
     
-    # Mapping of horizon year to historical data year (with ~2 year lag)
-    HISTORICAL_CAPACITY_YEARS = {
-        2020: 2018,  # Use 2018 data for 2020 costs (2-year historical lag)
-    }
-    
     # Determine lag year based on previous planning horizon
-    # With lag_periods=1, we use the immediately previous horizon
-    prev_horizon = get_previous_horizon(planning_horizons, current_year)
-    if prev_horizon is None:
-        lag_year = 2018  # For 2020, use historical 2018
-    else:
-        lag_year = prev_horizon
+    lag_year = get_cost_lag_year(planning_horizons, current_year)
     
     logger.info(f"Calculating costs for {current_year} based on capacity from {lag_year} (lag_periods={lag_periods})")
     
     # Find available historical horizons
     horizons = sorted([h for h in planning_horizons if h <= lag_year])
+
+    # For 2025+, extract lagged realized capacities once to avoid repeated imports/log spam.
+    realized_capacity = None
+    if current_year not in COST_HISTORICAL_CAPACITY_YEARS:
+        if lag_year not in horizons:
+            raise ValueError(
+                f"Cannot find capacity for lag year {lag_year}. "
+                f"Available horizons <= {lag_year}: {horizons}. "
+                f"For lag_periods={lag_periods} in year {current_year}, need solved network from {lag_year}."
+            )
+
+        if prev_network_path is None:
+            raise ValueError(
+                f"No previous network path provided for {current_year}. "
+                f"Cannot extract capacity from {lag_year} for learning curve calculation. "
+                f"This is required for exogenous learning with lag_periods={lag_periods}."
+            )
+
+        # Verify the previous network is from the expected lag year.
+        # Extract a 4-digit year token robustly from myopic filenames, e.g.:
+        # ..._2020_0.071_AB_0.0export_base.nc
+        network_year = extract_year_from_network_path(prev_network_path)
+        if network_year is not None:
+            if network_year != lag_year:
+                logger.warning(
+                    f"Network year mismatch! Expected {lag_year} for {current_year} costs "
+                    f"(lag_periods={lag_periods}), but network path indicates year {network_year}. "
+                    f"Path: {prev_network_path}"
+                )
+            else:
+                logger.info(f"✓ Verified: Using {network_year} network for {current_year} costs (exogenous lag)")
+        else:
+            logger.warning(
+                "Could not extract year from network path to verify lag period. "
+                f"Path: {prev_network_path}"
+            )
+
+        logger.info(f"Extracting solved capacities from {lag_year} network once for all technologies")
+        tech_mapping = learning_cfg.get("tech_mapping", {})
+        realized_capacity = extract_capacity_from_network(
+            prev_network_path, tech_mapping, global_scale_factors
+        )
     
     learning_costs = {}
     
@@ -1024,9 +1051,9 @@ def calculate_learning_costs(
         learning_rate = 1.0 - (2.0 ** (-beta))
         
         # Load cumulative capacity: historical (2020) or solved based on lag_year
-        if current_year in HISTORICAL_CAPACITY_YEARS:
+        if current_year in COST_HISTORICAL_CAPACITY_YEARS:
             # For 2020: Use historical capacity data
-            historical_year = HISTORICAL_CAPACITY_YEARS[current_year]
+            historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
             logger.info(f"    Using {historical_year} historical capacity (fixed 2-year historical lag)")
             
             try:
@@ -1041,52 +1068,7 @@ def calculate_learning_costs(
                 ) from e
         
         else:
-            # For 2025+: Extract capacity from previous horizon's solved network
-            logger.info(f"    Extracting solved capacity from {lag_year} network (lag_periods={lag_periods})")
-            
-            # Find the network file for lag_year
-            if lag_year not in horizons:
-                raise ValueError(
-                    f"Cannot find capacity for lag year {lag_year}. "
-                    f"Available horizons <= {lag_year}: {horizons}. "
-                    f"For lag_periods={lag_periods} in year {current_year}, need solved network from {lag_year}."
-                )
-            
-            # Verify previous network path is provided
-            if prev_network_path is None:
-                raise ValueError(
-                    f"No previous network path provided for {current_year}. "
-                    f"Cannot extract capacity from {lag_year} for learning curve calculation. "
-                    f"This is required for exogenous learning with lag_periods={lag_periods}."
-                )
-            
-            # Verify the previous network is from the expected lag year.
-            # Extract a 4-digit year token robustly from myopic filenames, e.g.:
-            # ..._2020_0.071_AB_0.0export_base.nc
-            import re
-            year_match = re.search(r'_(\d{4})(?=_)', str(prev_network_path))
-            if year_match:
-                network_year = int(year_match.group(1))
-                if network_year != lag_year:
-                    logger.warning(
-                        f"Network year mismatch! Expected {lag_year} for {current_year} costs "
-                        f"(lag_periods={lag_periods}), but network path indicates year {network_year}. "
-                        f"Path: {prev_network_path}"
-                    )
-                else:
-                    logger.info(f"    ✓ Verified: Using {network_year} network for {current_year} costs (exogenous lag)")
-            else:
-                logger.warning(
-                    f"Could not extract year from network path to verify lag period. "
-                    f"Path: {prev_network_path}"
-                )
-            
-            # Extract capacity from lag_year network
-            tech_mapping = learning_cfg.get("tech_mapping", {})
-            realized_capacity = extract_capacity_from_network(
-                prev_network_path, tech_mapping, global_scale_factors
-            )
-            
+            # For 2025+: Use pre-extracted capacities from previous horizon network
             if tech not in realized_capacity:
                 raise ValueError(
                     f"Technology {tech} not found in network from {lag_year}. "
@@ -1124,14 +1106,20 @@ def calculate_learning_costs(
         )
         
         # Store both adjusted and base parameters for transparency
+        A_base = params.loc[tech, "A_base"] if "A_base" in params.columns else A
         beta_base = params.loc[tech, "beta_base"] if "beta_base" in params.columns else beta
+        lr_base = 1.0 - (2.0 ** (-beta_base))
         
         learning_costs[tech] = {
             "capital_cost": capital_cost,
             "cumulative_capacity_GW": cumulative_capacity,
             "A": A,
+            "A_base": A_base,
+            "A_scenario": A,
             "beta": beta,
             "beta_base": beta_base,
+            "lr_base": lr_base,
+            "lr_scenario": learning_rate,
             "beta_adjusted": beta != beta_base,
             "unit": unit,
             "c_overnight": c_overnight,
@@ -1235,6 +1223,18 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
     
     # Reverse mapping: carrier -> tech
     carrier_to_tech = {carrier: tech for carrier, tech in tech_mapping.items()}
+
+    # Sector model battery links are often represented as charger/discharger carriers
+    # rather than "battery inverter". In prepare_sector_network, inverter CAPEX is
+    # assigned to charger only, while discharger has no capital_cost.
+    # Keep the same convention here to avoid double counting inverter CAPEX.
+    if "battery_power" in learning_costs and not n.links.empty:
+        link_carriers = set(n.links.carrier.unique())
+        if "battery charger" in link_carriers:
+            carrier_to_tech.setdefault("battery charger", "battery_power")
+            logger.info(
+                "Applying battery_power learning costs to link carrier: ['battery charger']"
+            )
     
     # Map learning tech names to carrier names for regional WACC lookup
     LEARNING_TO_WACC_TECH = {
@@ -1498,6 +1498,29 @@ def save_cost_log(learning_costs, output_file):
     
     df = pd.DataFrame.from_dict(learning_costs, orient="index")
     df.index.name = "technology"
+    preferred_columns = [
+        "planning_horizon",
+        "lag_year",
+        "anchor_year",
+        "anchor_source",
+        "anchor_network",
+        "cumulative_capacity_GW",
+        "A_base",
+        "A_scenario",
+        "A",
+        "beta_base",
+        "beta",
+        "lr_base",
+        "lr_scenario",
+        "beta_adjusted",
+        "capital_cost",
+        "unit",
+        "c_overnight",
+        "wacc_dict",
+    ]
+    ordered_columns = [col for col in preferred_columns if col in df.columns]
+    remaining_columns = [col for col in df.columns if col not in ordered_columns]
+    df = df[ordered_columns + remaining_columns]
     df.to_csv(output_file)
 
 
@@ -1530,6 +1553,19 @@ def get_previous_horizon(planning_horizons, current_year):
     if idx == 0:
         return None
     return horizons[idx - 1]
+
+
+def use_base_learning_for_horizon(planning_horizons, current_year):
+    """
+    Return True when learning-rate scenarios should be suppressed for this horizon.
+
+    Policy: always use base learning parameters for the first two planning horizons
+    (e.g., 2020 and 2025 in a 5-year myopic setup).
+    """
+    horizons = sorted(planning_horizons)
+    if len(horizons) < 2:
+        return True
+    return current_year in set(horizons[:2])
 
 
 def main(snakemake):
@@ -1581,27 +1617,67 @@ def main(snakemake):
     
     # Load learning data
     params_base = load_learning_params(snakemake.input.params)
-    
-    # State files are now deprecated - kept for backwards compatibility only
-    state_file = snakemake.input.get('state', None)
-    state = load_learning_state(state_file) if state_file else load_learning_state()
-    
-    # Apply beta adjustments if enabled (recalibrates A to maintain anchor point)
-    params = apply_beta_adjustment(params_base, state, learning_cfg)
-    
-    # Log learning curve approach
+
+    prev_network_path = normalize_optional_input(snakemake.input.get('network_p', None))
+    anchor_network_path = normalize_optional_input(
+        snakemake.input.get('anchor_network', None)
+    )
+
     beta_cfg = learning_cfg.get("beta_adjustment", {})
-    if beta_cfg.get("enabled", False):
-        logger.info("Using ADJUSTED learning parameters with anchor recalibration")
-        logger.info(f"  Base parameters from: learning_params.csv")
-        logger.info(f"  Beta adjustment: {beta_cfg.get('method', 'multiplier')}")
-        logger.info(f"  A recalibrated to maintain anchor point")
+    beta_adjustment_requested = beta_cfg.get("enabled", False)
+    anchor_year = int(beta_cfg.get("anchor_year", 2020))
+    anchor_state = pd.DataFrame(columns=["L_realized_GW"])
+    anchor_state.attrs["anchor_source"] = ""
+    anchor_state.attrs["anchor_network"] = ""
+    force_base_for_horizon = (
+        beta_adjustment_requested
+        and use_base_learning_for_horizon(planning_horizons, year)
+    )
+
+    if force_base_for_horizon:
+        logger.info(
+            f"Ignoring learning-rate scenario adjustments for horizon {year}; "
+            "the first two planning horizons always use base learning parameters."
+        )
+        anchor_state.attrs["anchor_source"] = "forced_base_first_two_horizons"
+        params = apply_beta_adjustment(
+            params_base,
+            anchor_state,
+            {"beta_adjustment": {"enabled": False}},
+        )
+    else:
+        if beta_adjustment_requested:
+            anchor_state = build_anchor_state(
+                params_base,
+                learning_cfg,
+                global_scale_factors,
+                anchor_year,
+                anchor_network_path=anchor_network_path,
+            )
+
+        # Apply beta adjustments if enabled (recalibrates A to maintain anchor point)
+        params = apply_beta_adjustment(params_base, anchor_state, learning_cfg)
+
+    # Log learning curve approach
+    if beta_adjustment_requested and not force_base_for_horizon:
+        adjustment_summary = params.attrs.get("beta_adjustment_summary", {})
+        logger.info(
+            f"Using anchor-recalibrated learning parameters for "
+            f"{adjustment_summary.get('adjusted_techs', [])}"
+        )
+        if get_previous_horizon(planning_horizons, year) == anchor_year:
+            logger.info(
+                f"{year} costs are still evaluated at anchor-year capacity {anchor_year}; "
+                "visible cost differences may first appear in the next horizon"
+            )
+    elif beta_adjustment_requested and force_base_for_horizon:
+        logger.info(
+            f"Using BASE learning parameters A and β from learning_params.csv for {year} "
+            "(scenario adjustments are deferred to later horizons)."
+        )
     else:
         logger.info("Using BASE learning parameters A and β from learning_params.csv")
-        logger.info("No beta adjustment - using calibrated values directly")
-    
-    # Get previous network path for extracting solved capacity (2030+)
-    prev_network_path = snakemake.input.get('network_p', None)
+
     if prev_network_path:
         logger.info(f"Previous network available: {prev_network_path}")
     else:
@@ -1624,7 +1700,6 @@ def main(snakemake):
     
     learning_costs = calculate_learning_costs(
         params,
-        state,
         learning_cfg,
         year,
         planning_horizons,
@@ -1633,6 +1708,24 @@ def main(snakemake):
         global_scale_factors,
         wacc_dict,
     )
+
+    cost_log_context = {
+        "planning_horizon": int(year),
+        "lag_year": int(get_cost_lag_year(planning_horizons, year)),
+        "anchor_year": int(anchor_year),
+        "anchor_source": (
+            anchor_state.attrs.get("anchor_source", "")
+            if beta_cfg.get("enabled", False)
+            else "disabled"
+        ),
+        "anchor_network": (
+            anchor_state.attrs.get("anchor_network", "")
+            if beta_cfg.get("enabled", False)
+            else ""
+        ),
+    }
+    for tech_costs in learning_costs.values():
+        tech_costs.update(cost_log_context)
     
     # Extract learning rates from params if beta adjustment was applied
     learning_rates = None

@@ -37,17 +37,21 @@ learning:
     battery_energy: 17.76
     battery_power: 17.76
   
-  # Learning rate scenario adjustment
-  # Allows varying β while maintaining 2020 anchor point accuracy
+  # Learning-rate scenario adjustment.
+  # Scenarios modify learning rates (LR), not beta directly.
+  # beta is recomputed from LR and A is recalibrated at anchor_year.
   beta_adjustment:
     enabled: false           # Set to true to adjust learning rates
-    method: "multiplier"     # "multiplier" (multiply base β) or "offset" (add to base β)
-    multiplier: 1.0          # Multiply base β by this factor (e.g., 1.2 = 20% faster learning)
-    offset: 0.0              # Add this to base β (e.g., 0.1 or -0.1)
-    # Technology-specific adjustments (optional, overrides global multiplier/offset)
+    method: "multiplier"     # "multiplier" scales LR, "offset" adds LR points
+    multiplier: 1.0          # Example: 1.10 = 10% faster learning rate
+    offset: 0.0              # Example: 0.10 = +10 percentage points in LR
+    # Technology-specific adjustments override the global setting.
     tech_specific:
-      # solar_power: 1.2       # Example: 20% faster learning for solar
-      # onwind_power: 0.8      # Example: 20% slower learning for wind
+      # solar_power: 1.10
+      # onwind_power: 0.05
+    tech_specific_methods:
+      # solar_power: "multiplier"
+      # onwind_power: "offset"
     anchor_year: 2020        # Year to anchor the learning curve (maintains accurate costs)
   
   guardrails:

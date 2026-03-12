@@ -29,6 +29,14 @@ rules:
     carrier_regex: "(?i)co2"
     rationale: "CO2 accounting chains may be extendable and are not physical electricity assets."
 
+  - id: baseyear_h2_fuel_cell_blocked
+    classification: unexpected
+    component: Link
+    carrier: H2 Fuel Cell
+    rationale: >
+      2020 policy: H2 Fuel Cell links must not remain extendable, otherwise gas-to-H2-to-power
+      expansion can bypass the historical generation-band constraints.
+
   - id: non_transmission_non_battery_links_allowed_2020
     classification: allowed
     component: Link
