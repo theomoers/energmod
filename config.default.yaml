@@ -129,7 +129,7 @@ global_specific:
 
 permstore:
   enable: true
-  path: /shared/share_cki25/energymodels/pypsa-earth/permstorage # keeping track of files that don't change -- "big beautiful run 1"
+  path: permstorage # repo-local default; override explicitly if using external shared permstorage
   scenario: "baseA"
   use:
     shapes: true

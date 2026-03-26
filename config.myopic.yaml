@@ -31,6 +31,18 @@ scenario:
   - "s.o-0.10"
   - "all.o0.10"
   - "all.m0.90"
+  learning_model:
+  - "legacy_curve"
+
+learning_monte_carlo:
+  enable: false
+  include_legacy_curve: false
+  stochastic_models:
+  - "shared_state_bayesian_regime_wright"
+  - "way_fixed_rho_benchmark_035"
+  - "correlated_geometric_random_walk"
+  seeds:
+  - 0
 
 foresight: myopic
 
@@ -188,7 +200,7 @@ global_specific:
 
 permstore:
   enable: true
-  path: /Users/tlm2160/Library/Mobile Documents/com~apple~CloudDocs/Documents/Research 2/CKI/energmod/permstorage
+  path: permstorage
   scenario: "Global_200"
   use:
     shapes: true

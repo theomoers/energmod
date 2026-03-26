@@ -1,0 +1,4 @@
+technology,A_over_unit,beta,beta_raw,unit,anchor_year,anchor_cost_per_unit,anchor_cumulative_capacity,source_model
+solar_power,5494.245449178993,0.3186413084570966,0.3186413084570966,kW,2024,499.66145007800003,1852.3589,fd_wright_deterministic
+onwind_power,752.7513572585094,1e-06,-0.06611854452387236,kW,2024,752.746120884,1049.782,fd_wright_deterministic
+battery_energy,81.62905036092482,0.00791784841367519,0.00791784841367519,kWh,2025,76.2053294936,5904.058,fd_wright_deterministic

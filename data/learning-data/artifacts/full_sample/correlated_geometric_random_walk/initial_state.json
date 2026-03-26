@@ -1,0 +1,21 @@
+{
+  "last_applied_year": 2025,
+  "model_name": "correlated_geometric_random_walk",
+  "technology_states": {
+    "battery_energy": {
+      "last_dlog_capex": -0.08855339734162371,
+      "last_log_capex": 11.241186680089882,
+      "state_type": "geometric_random_walk"
+    },
+    "onwind_power": {
+      "last_dlog_capex": -0.1441788942034261,
+      "last_log_capex": 13.53148329307132,
+      "state_type": "geometric_random_walk"
+    },
+    "solar_power": {
+      "last_dlog_capex": -0.11601269641553102,
+      "last_log_capex": 13.121686048224701,
+      "state_type": "geometric_random_walk"
+    }
+  }
+}

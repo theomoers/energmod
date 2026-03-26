@@ -1,92 +1,32 @@
-# Learning Curves Configuration for PyPSA-Earth
+# Learning runtime configuration for the myopic sector-coupled path.
+#
+# Contract:
+# - `learning_rate` remains the deterministic legacy wildcard in Snakemake.
+# - If `learning.engine=stochastic_forecast`, `learning_rate` must be `base`.
+# - `learning_model` / `learning.selected_model` selects the runtime model.
+# - Supported stochastic models are:
+#   - shared_state_bayesian_regime_wright
+#   - way_fixed_rho_benchmark_035
+#   - correlated_geometric_random_walk
+# - `battery_power` remains on the default `costs_{year}.csv` path for now.
 
 learning:
-  enabled: true 
-  
-  method: predicted_end  # Pricing method: 'predicted_end' uses end-of-horizon prediction
-  
-  historical_data:
-    solar_power: "data/learning-data/historical/solar.csv"
-    onwind_power: "data/learning-data/historical/wind.csv"
-    battery_energy: "data/learning-data/historical/batteries.csv"
-    battery_power: "data/learning-data/historical/batteries.csv"
-    electrolyser_power: "data/learning-data/historical/electrolyzers.csv"
-  
-  # Column names in historical data files (flexible matching)
-  # The code will search for columns containing these keywords (case-insensitive)
-  historical_columns:
-    year_col: "Year"  # Column containing year values
-    capacity_col: "Cumulative production"  # Column containing capacity (GW/GWh)
-  
-  # Forecasting method configuration
-  forecast:
-    method: "log_linear"  # Use log-linear (exponential) regression
-    min_data_points: 3    # Minimum historical data points required for fitting
-    
-  tech_mapping:
-    solar: solar_power
-    onwind: onwind_power
-    battery: battery_energy
-    battery inverter: battery_power
-    H2 Electrolysis: electrolyser_power
-    H2 Store: h2_energy
-
-  # Scale modeled deployment to global deployment for learning curves.
-  # Factor = global / modeled capacity (applied when reading solved networks).
-  global_scale_factors:
-    battery_energy: 17.76
-    battery_power: 17.76
-  
-  # Learning-rate scenario adjustment.
-  # Scenarios modify learning rates (LR), not beta directly.
-  # beta is recomputed from LR and A is recalibrated at anchor_year.
-  beta_adjustment:
-    enabled: false           # Set to true to adjust learning rates
-    method: "multiplier"     # "multiplier" scales LR, "offset" adds LR points
-    multiplier: 1.0          # Example: 1.10 = 10% faster learning rate
-    offset: 0.0              # Example: 0.10 = +10 percentage points in LR
-    # Technology-specific adjustments override the global setting.
-    tech_specific:
-      # solar_power: 1.10
-      # onwind_power: 0.05
-    tech_specific_methods:
-      # solar_power: "multiplier"
-      # onwind_power: "offset"
-    anchor_year: 2020        # Year to anchor the learning curve (maintains accurate costs)
-  
-  guardrails:
-    use_theta: true
-    theta: 0.6
-    
-    # Technology-specific deployment caps (γ_k)
-    # Maximum deployment over one period as fraction of existing capacity
-    use_gamma: true
-    gamma_default: 0.6
-    gamma:
-      solar_power: 0.8 # 0.8        # Solar: +80% max per period (e.g., 100 GW → 180 GW)
-      onwind_power: 0.6 # 0.6       # Onwind: +60% max per period
-      battery_power: 1.0      # Battery power: can double per period
-      battery_energy: 1.2     # Battery energy: +120% max per period
-      electrolyser_power: 1.5 # Electrolysers: +150% max (aggressive scale-up)
-      h2_energy: 1.0          # H2 storage: can double per period
-  
-  # Financial Parameters for Cost Calculations
-  # Used to convert overnight CAPEX (from learning curves) to capital_cost
-  # Formula: capital_cost = (annuity + FOM/100) * investment
-  # where annuity = WACC / (1 - (1+WACC)^(-lifetime))
-  
-  finance:
-    # Weighted Average Cost of Capital (discount rate)
-    wacc: # discount rate
-      default: 0.07           # Default 7% for all technologies (from config.myopic.yaml)
-      battery_energy: 0.08    # Higher WACC for battery storage
-      battery_power: 0.08
-    
-    # Technical lifetime (years)
-    lifetime: #from cost files
-      solar_power: 35
-      onwind_power: 27
-      battery_power: 10
-      battery_energy: 20
-      electrolyser_power: 15
-      h2_energy: 30
+  enabled: true
+  engine: legacy_curve   # legacy_curve | stochastic_forecast
+  selected_model: legacy_curve  # legacy_curve | shared_state_bayesian_regime_wright | correlated_geometric_random_walk | way_fixed_rho_benchmark_035
+  training_window: origin_cutoff  # origin_cutoff | full_sample ; affects stochastic_forecast artifact selection
+  training_window_origin_year: 2020  # metadata/check only for origin_cutoff
+  artifact_manifest: "data/learning-data/manifest.json"
+  sample_mode: "single_draw"   # single_draw | median ; median is for debugging/smoke tests only
+  seed: 0                      # used only by stochastic_forecast
+  monte_carlo:
+    enable: false
+    include_legacy_curve: false
+    stochastic_models:
+      - shared_state_bayesian_regime_wright
+      - way_fixed_rho_benchmark_035
+      - correlated_geometric_random_walk
+    draws: 5
+    seed_mode: random          # random | sequential
+    random_seed: 12345         # makes the random seed draw generation reproducible
+    seed_upper_bound: 1000000000

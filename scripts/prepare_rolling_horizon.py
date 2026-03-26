@@ -12,6 +12,8 @@ periods, saves the first period's results, and rolls forward.
 """
 
 import logging
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -26,7 +28,7 @@ from add_existing_baseyear import add_build_year_to_new_assets
 from temporal_clustering import _persist_period_id, _restore_period_id
 
 # Rolling-horizon endogenous learning attachments
-from forecast_deployment import load_historical_capacity
+from learning.learning_data_io import load_historical_capacity
 from learning_clean import cumulative_cost_curve, experience_curve
 
 # Allow for PyPSA versions <0.35
@@ -152,7 +154,11 @@ def attach_learning_parameters(n: pypsa.Network, years: list[int], config: dict,
     gf = float(learning_cfg.get("global_factor", 1.0))
 
     # Load learning curve params (A_over_unit, beta, unit)
-    params_path = "data/learning-data/params/learning_params.csv"
+    manifest_path = Path("data/learning-data/manifest.json")
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Learning manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    params_path = Path("data/learning-data") / manifest["legacy_curve"]["params_csv"]
     params = pd.read_csv(params_path).set_index("technology")
     missing = [t for t in techs if t not in params.index]
     if missing:
@@ -358,47 +364,6 @@ def attach_learning_parameters(n: pypsa.Network, years: list[int], config: dict,
             logger.info(f"    Total cumulative cost to {final_E:.0f} GW: {final_TC:.2e} EUR")
             logger.info(f"    Average cost per GW added: {avg_cost_per_GW:.2e} EUR/GW = {avg_cost_per_GW/1e6:.2f} million EUR/GW")
         
-        # #region agent log
-        import json
-        import numpy as np
-        with open('/shared/share_cki25/.cursor/debug.log', 'a') as f:
-            # Calculate expected unit cost at anchor and at a sample point
-            # experience_curve is already imported at the top from learning_clean
-            c_at_anchor_check = experience_curve(E_anchor, learning_rate, c0_per_GW, E_anchor)
-            c_at_sample = experience_curve(E_points[1], learning_rate, c0_per_GW, E_anchor)
-            # Calculate expected TC manually for verification
-            alpha = np.log2(1.0 / (1.0 - learning_rate))
-            TC_expected_sample = (1.0 / (1.0 - alpha)) * (E_points[1] * c_at_sample - E_anchor * c0_per_GW)
-            # Calculate slope
-            slope_expected = (TC_points[1] - TC_points[0]) / (E_points[1] - E_points[0])  # EUR/GW
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "I",
-                "location": "prepare_rolling_horizon.py:315",
-                "message": "TC calculation with A in EUR/kW (CORRECTED UNITS)",
-                "data": {
-                    "tech": tech,
-                    "E_anchor_GW": float(E_anchor),
-                    "A_EUR_per_kW": float(A_per_kW),
-                    "A_EUR_per_GW": float(A_per_GW),
-                    "c0_EUR_per_kW": float(c0_per_kW),
-                    "c0_EUR_per_GW": float(c0_per_GW),
-                    "c_at_anchor_EUR_per_GW": float(c_at_anchor_check),
-                    "E_sample_GW": float(E_points[1]),
-                    "c_at_sample_EUR_per_GW": float(c_at_sample),
-                    "TC_sample_calculated": float(TC_points[1]),
-                    "TC_sample_expected": float(TC_expected_sample),
-                    "slope_EUR_per_GW": float(slope_expected),
-                    "slope_EUR_per_MW": float(slope_expected / 1000.0),
-                    "slope_EUR_per_kW": float(slope_expected / 1_000_000.0),
-                    "alpha": float(alpha),
-                    "learning_rate": float(learning_rate)
-                },
-                "timestamp": int(__import__('time').time() * 1000)
-            }) + '\n')
-        # #endregion
-        
         logger.info(f"  Cumulative costs (TC_points) at breakpoints:")
         for i, (ep, tcp) in enumerate(zip(E_points, TC_points)):
             logger.info(f"      Point {i}: E = {ep:.4f} GW → TC = {tcp:.2e} EUR")
@@ -407,26 +372,6 @@ def attach_learning_parameters(n: pypsa.Network, years: list[int], config: dict,
         E_previous[tech] = {first_year: float(E_anchor)}
         TC_previous[tech] = {first_year: float(0.0)}  # by construction with initial_capacity=E_anchor
         
-        # #region agent log
-        import json
-        with open('/shared/share_cki25/.cursor/debug.log', 'a') as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "A",
-                "location": "prepare_rolling_horizon.py:240",
-                "message": "Stored interpolation points units",
-                "data": {
-                    "tech": tech,
-                    "E_points_stored_GW": [float(E_points[0]), float(E_points[-1])],
-                    "TC_points_stored_EUR": [float(TC_points[0]), float(TC_points[-1])],
-                    "E_previous_GW": float(E_anchor),
-                    "TC_previous_EUR": 0.0
-                },
-                "timestamp": int(__import__('time').time() * 1000)
-            }) + '\n')
-        # #endregion
-
         # Precompute anchor segment index for lag=1 pricing of first period
         seg_idx = int(np.clip(np.searchsorted(E_points, E_anchor, side="right") - 1, 0, segments - 1))
         anchor_segment[tech] = seg_idx
@@ -889,4 +834,3 @@ if __name__ == "__main__":
     n.export_to_netcdf(snakemake.output.network)
     
     logger.info(f"Rolling horizon network saved to {snakemake.output.network}")
-

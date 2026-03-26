@@ -1,59 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-Apply learning curve-based technology costs to PyPSA-Earth myopic networks.
+Apply learning-driven technology costs to PyPSA-Earth myopic networks.
 
-This unified script handles the complete learning cost workflow:
-1. Load Bayesian learning parameters (A, β) from learning_params.csv (same for all horizons)
-2. Load cumulative capacity: historical or solved from previous planning horizon
-3. Calculate costs using learning curve: c = A * L^(-β)
-4. Update network costs in-memory
-5. Save metadata and logs
+This script updates overnight CAPEX before each myopic solve and writes the
+runtime state needed for the next horizon. The deterministic legacy Wright path
+uses the exported regression parameters directly. The stochastic paths use the
+bundled runtime artifacts for the shortlisted models.
 
-Called once per horizon BEFORE solving.
+Key timing rule:
+- costs used to solve horizon t are fixed before that solve
+- deployment realized in horizon t only affects costs applied in horizon t+5
 
-WORKFLOW (Exogenous Learning):
-- Flexible lag configuration via lag_periods parameter
-- lag_periods=0: Immediate learning (NOT handled here, use learning.py SOS2/MILP)
-- lag_periods=1: Lagged learning (handled here, exogenous LP)
-  * 2020: Uses 2018 historical capacity (2-year historical lag)
-  * 2025: Uses 2020 solved capacity 
-  * 2030: Uses 2025 solved capacity
-  * 2035: Uses 2030 solved capacity
-  * And so on...
-
-Mathematical Framework:
-- Learning curve: c_k(L) = A_k * L^(-β_k)
-- For 2020: L from historical CSV (2018 data)
-- For 2025+: L from previous horizon's solved network
-- Capital cost: (annuity + FOM) * investment, where FOM is decimal (e.g., 0.01578)
-
-Global vs. Modeled Deployment:
-- Learning curves use GLOBAL cumulative deployment (L) from historical data
-- Model only captures fraction of global deployment (e.g., 5.63% for battery storage in 2020)
-- Costs reflect global learning dynamics, applied uniformly to modeled capacity
-
-Units Consistency:
-- Power technologies (solar, wind, battery_power, electrolyser): MW/GW (unit='kW')
-- Energy technologies (battery_energy, h2_energy): MWh/GWh (unit='kWh')
-- Validation enforced to prevent mismatches
+For deployment-conditioned stochastic models, the t+5 update is based on
+realized cumulative deployment between the previous committed horizon and the
+current committed horizon. The runtime does not forecast annual deployment
+within the block.
 
 Created: 2025-11-06
-Updated: 2025-12-18
+Updated: 2026-03-26
 """
 
 import logging
 import re
 from pathlib import Path
+import json
 
 import numpy as np
 import pandas as pd
 import pypsa
 import yaml
 from _helpers import configure_logging, create_logger
-from forecast_deployment import (
-    get_historical_datafile,
-    load_historical_capacity,
-)
+from learning.learning_data_io import load_historical_capacity
 
 # Battery Balance of System (BOS) multiplier
 # Learning happens at cell/pack level (USD historical data), but model uses system costs (EUR)
@@ -70,10 +47,48 @@ DEFAULT_GLOBAL_SCALE_FACTORS = {
     "battery_power": 17.76,   # Apply same global scaling to battery inverter learning
 }
 
-# Mapping of horizon year to historical capacity year for exogenous cost updates.
-# This is separate from the anchor-year reconstruction used for beta adjustment.
+DEFAULT_TECH_MAPPING = {
+    "solar": "solar_power",
+    "onwind": "onwind_power",
+    "battery": "battery_energy",
+    "battery inverter": "battery_power",
+    "H2 Electrolysis": "electrolyser_power",
+    "H2 Store": "h2_energy",
+}
+
+DEFAULT_FINANCE = {
+    "wacc": {
+        "default": 0.07,
+        "battery_energy": 0.08,
+        "battery_power": 0.08,
+    },
+    "lifetime": {
+        "solar_power": 35,
+        "onwind_power": 27,
+        "battery_power": 10,
+        "battery_energy": 20,
+        "electrolyser_power": 15,
+        "h2_energy": 30,
+    },
+}
+
+SUPPORTED_LEARNING_ENGINES = {"legacy_curve", "stochastic_forecast"}
+SUPPORTED_STOCHASTIC_MODELS = {
+    "shared_state_bayesian_regime_wright",
+    "way_fixed_rho_benchmark_035",
+    "correlated_geometric_random_walk",
+}
+SUPPORTED_SAMPLE_MODES = {"single_draw", "median"}
+SUPPORTED_TRAINING_WINDOWS = {"origin_cutoff", "full_sample"}
+BATTERY_POWER_TREATMENT = "deterministic_default_costs"
+LEGACY_LEARNING_SEED = "deterministic"
+
+# Mapping of solve horizon to the historical lag-year whose learned cost is treated
+# as known and therefore applied deterministically.
+# 2020 solve uses learned_cost[2015]; 2025 solve uses learned_cost[2020].
 COST_HISTORICAL_CAPACITY_YEARS = {
-    2020: 2018,
+    2020: 2015,
+    2025: 2020,
 }
 
 
@@ -446,6 +461,194 @@ def load_config_learning(config_file):
     return config["learning"]
 
 
+def load_learning_manifest(learning_cfg, config_file):
+    manifest_path = Path(learning_cfg.get("artifact_manifest", "data/learning-data/manifest.json"))
+    if not manifest_path.is_absolute():
+        manifest_path = Path(config_file).resolve().parent / manifest_path
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Learning artifact manifest not found: {manifest_path}")
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    learning_cfg["_manifest"] = manifest
+    learning_cfg["_manifest_root"] = manifest_path.parent
+    learning_cfg["_manifest_path"] = str(manifest_path)
+    learning_cfg["_manifest_schema_version"] = str(manifest.get("schema_version", "unknown"))
+    learning_cfg["_manifest_sha256"] = __import__("hashlib").sha256(
+        manifest_text.encode("utf-8")
+    ).hexdigest()
+    return manifest
+
+
+def get_learning_engine(learning_cfg, learning_model=None):
+    if learning_model and learning_model != "legacy_curve":
+        return "stochastic_forecast"
+    return str(learning_cfg.get("engine", "legacy_curve"))
+
+
+def get_selected_learning_model(learning_cfg, learning_model=None):
+    if learning_model:
+        return str(learning_model)
+    return str(learning_cfg.get("selected_model", "legacy_curve"))
+
+
+def get_runtime_conditioning_type(learning_engine, selected_model):
+    if learning_engine == "legacy_curve":
+        return "deployment_conditioned"
+    if selected_model == "correlated_geometric_random_walk":
+        return "time_conditioned"
+    return "deployment_conditioned"
+
+
+def build_runtime_metadata(learning_cfg, learning_engine, selected_model):
+    return {
+        "engine": str(learning_engine),
+        "selected_model": str(selected_model),
+        "model_name": str(selected_model),
+        "training_window": str(learning_cfg.get("training_window", "")),
+        "training_window_origin_year": int(learning_cfg.get("training_window_origin_year", 2020)),
+        "sample_mode": str(learning_cfg.get("sample_mode", "single_draw")),
+        "seed": int(learning_cfg.get("seed", 0)),
+        "learning_seed": str(learning_cfg.get("_learning_seed_label", "")),
+        "runtime_conditioning": get_runtime_conditioning_type(learning_engine, selected_model),
+        "manifest_path": str(learning_cfg.get("_manifest_path", "")),
+        "manifest_schema_version": str(learning_cfg.get("_manifest_schema_version", "unknown")),
+        "manifest_sha256": str(learning_cfg.get("_manifest_sha256", "")),
+        "battery_power_treatment": BATTERY_POWER_TREATMENT,
+    }
+
+
+def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
+    if learning_engine not in SUPPORTED_LEARNING_ENGINES:
+        raise ValueError(
+            f"Unsupported learning.engine='{learning_engine}'. "
+            f"Supported values: {sorted(SUPPORTED_LEARNING_ENGINES)}"
+        )
+
+    sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
+    if sample_mode not in SUPPORTED_SAMPLE_MODES:
+        raise ValueError(
+            f"Unsupported learning.sample_mode='{sample_mode}'. "
+            f"Supported values: {sorted(SUPPORTED_SAMPLE_MODES)}"
+        )
+
+    training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
+    if training_window not in SUPPORTED_TRAINING_WINDOWS:
+        raise ValueError(
+            f"Unsupported learning.training_window='{training_window}'. "
+            f"Supported values: {sorted(SUPPORTED_TRAINING_WINDOWS)}"
+        )
+
+    seed = learning_cfg.get("seed", 0)
+    if not isinstance(seed, (int, np.integer)):
+        raise ValueError(
+            f"learning.seed must be an integer, got {seed!r} ({type(seed).__name__})"
+        )
+
+    if learning_engine == "legacy_curve":
+        if selected_model != "legacy_curve":
+            raise ValueError(
+                "learning.engine='legacy_curve' requires "
+                "learning.selected_model='legacy_curve'. "
+                f"Got selected_model='{selected_model}'."
+            )
+    else:
+        if selected_model not in SUPPORTED_STOCHASTIC_MODELS:
+            raise ValueError(
+                f"Unsupported stochastic learning model '{selected_model}'. "
+                f"Supported values: {sorted(SUPPORTED_STOCHASTIC_MODELS)}"
+            )
+
+
+def resolve_runtime_seed(learning_cfg, learning_engine, selected_model, learning_seed=None):
+    default_seed = int(learning_cfg.get("seed", 0))
+
+    if learning_engine == "legacy_curve":
+        token = LEGACY_LEARNING_SEED if learning_seed in (None, "") else str(learning_seed)
+        if token != LEGACY_LEARNING_SEED:
+            raise ValueError(
+                "legacy_curve requires learning_seed='deterministic'. "
+                f"Got learning_seed={token!r}."
+            )
+        learning_cfg["seed"] = 0
+        learning_cfg["_learning_seed_label"] = LEGACY_LEARNING_SEED
+        return
+
+    token = str(default_seed) if learning_seed in (None, "") else str(learning_seed)
+    if token == LEGACY_LEARNING_SEED:
+        raise ValueError(
+            "stochastic_forecast requires a numeric learning_seed token, "
+            f"got {token!r} for model {selected_model}."
+        )
+
+    if re.fullmatch(r"s\d+", token):
+        seed = int(token[1:])
+    elif re.fullmatch(r"\d+", token):
+        seed = int(token)
+    else:
+        raise ValueError(
+            "Invalid learning_seed token. Expected 'deterministic' for legacy_curve "
+            f"or 'sNNNN' / integer token for stochastic_forecast, got {token!r}."
+        )
+
+    learning_cfg["seed"] = seed
+    learning_cfg["_learning_seed_label"] = f"s{seed:04d}"
+
+
+def get_tech_mapping(learning_cfg):
+    mapping = dict(DEFAULT_TECH_MAPPING)
+    mapping.update(learning_cfg.get("tech_mapping", {}) or {})
+    return mapping
+
+
+def get_learning_finance(learning_cfg):
+    finance = {
+        "wacc": dict(DEFAULT_FINANCE["wacc"]),
+        "lifetime": dict(DEFAULT_FINANCE["lifetime"]),
+    }
+    cfg_finance = learning_cfg.get("finance", {}) or {}
+    finance["wacc"].update(cfg_finance.get("wacc", {}) or {})
+    finance["lifetime"].update(cfg_finance.get("lifetime", {}) or {})
+    return finance
+
+
+def get_manifest_historical_datafile(learning_cfg, tech_key):
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    relative = ((manifest.get("historical_files", {}) or {}).get(tech_key))
+    if not relative:
+        return None
+    return str((root / relative).resolve())
+
+
+def get_training_window_config(learning_cfg):
+    training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
+    origin_year = int(learning_cfg.get("training_window_origin_year", 2020))
+    return training_window, origin_year
+
+
+def get_legacy_params_path(learning_cfg):
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    legacy = manifest.get("legacy_curve", {}) or {}
+    training_window, origin_year = get_training_window_config(learning_cfg)
+    training_windows = legacy.get("training_windows", {}) or {}
+    if training_window not in training_windows:
+        raise ValueError(
+            f"Manifest is missing legacy_curve parameters for training window '{training_window}'."
+        )
+    mode_info = training_windows[training_window]
+    manifest_origin_year = mode_info.get("origin_year", None)
+    if training_window == "origin_cutoff" and manifest_origin_year is not None and int(manifest_origin_year) != int(origin_year):
+        raise ValueError(
+            "learning.training_window_origin_year does not match the bundled legacy_curve origin_cutoff parameters. "
+            f"Config requested {origin_year}, manifest contains {manifest_origin_year}."
+        )
+    relative = mode_info.get("params_csv")
+    if not relative:
+        raise ValueError(f"Manifest is missing legacy_curve.params_csv for training window '{training_window}'")
+    return str((root / relative).resolve())
+
+
 def load_fom_from_costs(costs_file, tech_key):
     """
     Load Fixed O&M (FOM) percentage from cost CSV file.
@@ -750,7 +953,7 @@ def build_anchor_state(
             )
 
         logger.info(f"Building anchor state for {anchor_year} from solved network {anchor_network_path}")
-        tech_mapping = learning_cfg.get("tech_mapping", {})
+        tech_mapping = get_tech_mapping(learning_cfg)
         realized_capacity = extract_capacity_from_network(
             anchor_network_path, tech_mapping, global_scale_factors
         )
@@ -770,7 +973,7 @@ def build_anchor_state(
                 )
                 continue
 
-            hist_file = get_historical_datafile(tech)
+            hist_file = get_manifest_historical_datafile(learning_cfg, tech)
             if hist_file is None:
                 logger.warning(f"  No historical data configured for {tech}, skipping")
                 continue
@@ -813,11 +1016,11 @@ def load_capacity_from_historical_csv(tech, year, learning_cfg):
     Returns:
         Capacity in GW for the specified year
     """
-    hist_file = get_historical_datafile(tech)
+    hist_file = get_manifest_historical_datafile(learning_cfg, tech)
     if hist_file is None:
         raise ValueError(
             f"No historical data file configured for {tech}. "
-            f"Check TECH_TO_DATAFILE mapping in forecast_deployment.py"
+            "Check the learning artifact manifest."
         )
     
     logger.info(f"  Loading {year} capacity for {tech} from historical data")
@@ -835,6 +1038,586 @@ def load_capacity_from_historical_csv(tech, year, learning_cfg):
     unit = "GWh" if tech in ENERGY_TECHS else "GW"
     logger.info(f"    Found {year} capacity: {capacity:.2f} {unit}")
     return capacity
+
+
+def load_stochastic_model_artifacts(learning_cfg, selected_model):
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    stochastic = (manifest.get("stochastic_forecast", {}) or {})
+    training_windows = (stochastic.get("training_windows", {}) or {})
+    training_window, origin_year = get_training_window_config(learning_cfg)
+    if training_window not in training_windows:
+        raise ValueError(
+            f"Selected training window '{training_window}' not found in learning manifest. "
+            f"Available windows: {sorted(training_windows.keys())}"
+        )
+    window_info = training_windows[training_window]
+    if training_window == "origin_cutoff":
+        manifest_origin_year = window_info.get("origin_year", None)
+        if manifest_origin_year is not None and int(manifest_origin_year) != int(origin_year):
+            raise ValueError(
+                "learning.training_window_origin_year does not match the bundled origin_cutoff artifacts. "
+                f"Config requested {origin_year}, manifest contains {manifest_origin_year}."
+            )
+    models = (window_info.get("models", {}) or {})
+    if selected_model not in models:
+        raise ValueError(f"Selected stochastic model '{selected_model}' not found in manifest")
+    model_info = models[selected_model]
+    artifact_dir = root / model_info["artifact_dir"]
+    artifacts = {}
+    for tech in model_info["technologies"]:
+        path = artifact_dir / f"{tech}.json"
+        artifacts[tech] = json.loads(path.read_text(encoding="utf-8"))
+    initial_state_path = root / model_info["initial_state"]
+    initial_state = json.loads(initial_state_path.read_text(encoding="utf-8"))
+    return artifacts, initial_state
+
+
+def load_runtime_state(prev_state_path, initial_state):
+    prev_state_path = normalize_optional_input(prev_state_path)
+    if prev_state_path:
+        return json.loads(Path(prev_state_path).read_text(encoding="utf-8"))
+    return json.loads(json.dumps(initial_state))
+
+
+def load_stochastic_runtime_state(learning_cfg, selected_model, current_year, prev_state_path):
+    artifacts, initial_state = load_stochastic_model_artifacts(learning_cfg, selected_model)
+    if int(current_year) > min(COST_HISTORICAL_CAPACITY_YEARS) and prev_state_path is None:
+        raise ValueError(
+            f"Stochastic runtime for {current_year} requires previous committed learning state"
+        )
+    state = load_runtime_state(prev_state_path, initial_state)
+    validate_stochastic_runtime_state(state, selected_model, artifacts)
+    return artifacts, state
+
+
+def build_capacity_history(tech, learning_cfg, state, base_year):
+    hist_file = get_manifest_historical_datafile(learning_cfg, tech)
+    if hist_file is None:
+        raise ValueError(f"No historical data file configured for {tech} in manifest")
+    hist = load_historical_capacity(hist_file, tech)
+    hist = hist[hist["capacity_GW"] > 0].copy()
+    hist["year"] = pd.to_numeric(hist["year"], errors="coerce").astype(int)
+    hist = hist[hist["year"] <= int(base_year)].copy()
+
+    realized_map = ((state.get("capacity_history", {}) or {}).get(tech, {})) or {}
+    realized_rows = []
+    for year_key, value in realized_map.items():
+        realized_rows.append({"year": int(year_key), "capacity_GW": float(value)})
+    if realized_rows:
+        realized = pd.DataFrame(realized_rows)
+        hist = pd.concat([hist[["year", "capacity_GW"]], realized], ignore_index=True)
+        hist = hist.sort_values("year").drop_duplicates(subset="year", keep="last")
+    hist = hist.sort_values("year").reset_index(drop=True)
+    return hist
+
+
+def compute_realized_block_growth(tech, learning_cfg, state, block_end_year, block_years):
+    history = build_capacity_history(tech, learning_cfg, state, block_end_year)
+    history = history[history["capacity_GW"] > 0].copy()
+    if history.empty:
+        raise ValueError(f"No positive capacity history available for {tech}")
+
+    end_year = int(block_end_year)
+    start_year = int(block_end_year) - int(block_years)
+
+    end_row = history[history["year"] == end_year]
+    start_row = history[history["year"] == start_year]
+    if end_row.empty or start_row.empty:
+        raise ValueError(
+            f"Need realized/historical cumulative capacity at both {start_year} and {end_year} for {tech} "
+            "to compute block experience growth."
+        )
+
+    q_start = float(start_row["capacity_GW"].iloc[-1])
+    q_end = float(end_row["capacity_GW"].iloc[-1])
+    if q_start <= 0.0 or q_end <= 0.0:
+        raise ValueError(
+            f"Invalid cumulative capacity history for {tech}: start={q_start}, end={q_end}. "
+            "Both values must be > 0."
+        )
+    if q_end < q_start:
+        raise ValueError(
+            f"Cumulative capacity declines for {tech} between {start_year} and {end_year}: "
+            f"{q_start} -> {q_end}. Refusing to propagate learning on non-monotone cumulative deployment."
+        )
+
+    return float(np.log(q_end) - np.log(q_start))
+
+
+def validate_stochastic_runtime_state(state, selected_model, artifacts):
+    technology_states = (state.get("technology_states", {}) or {})
+    missing_techs = sorted(set(artifacts.keys()) - set(technology_states.keys()))
+    if missing_techs:
+        raise ValueError(
+            f"Stochastic runtime state for {selected_model} is missing technology states: {missing_techs}"
+        )
+
+    for tech in artifacts:
+        state_tech = technology_states[tech] or {}
+        if "last_log_capex" not in state_tech:
+            raise ValueError(
+                f"Stochastic runtime state for {selected_model}/{tech} is missing last_log_capex"
+            )
+        if selected_model == "correlated_geometric_random_walk" and "last_dlog_capex" not in state_tech:
+            raise ValueError(
+                f"Stochastic runtime state for {selected_model}/{tech} is missing last_dlog_capex"
+            )
+        if selected_model == "way_fixed_rho_benchmark_035" and "last_innovation" not in state_tech:
+            raise ValueError(
+                f"Stochastic runtime state for {selected_model}/{tech} is missing last_innovation"
+            )
+
+    if selected_model == "shared_state_bayesian_regime_wright":
+        shared_state = state.get("shared_regime_state", {}) or {}
+        if "initial_regime_probs" not in shared_state:
+            raise ValueError("Shared-state runtime state is missing initial_regime_probs")
+
+
+def _state_to_runtime_learning_costs(
+    artifacts,
+    state,
+    current_year,
+    learning_cfg,
+    costs_file,
+    global_scale_factors,
+    prev_network_path,
+    wacc_dict,
+    runtime_metadata,
+):
+    tech_mapping = get_tech_mapping(learning_cfg)
+    runtime_capacity_map = _get_runtime_capacity_map(
+        current_year,
+        prev_network_path,
+        learning_cfg,
+        tech_mapping,
+        global_scale_factors,
+    )
+    learning_costs = {}
+    for tech in artifacts:
+        if tech not in runtime_capacity_map:
+            raise ValueError(f"Technology {tech} missing in runtime capacity map")
+        state_tech = (state.get("technology_states", {}) or {}).get(tech, {}) or {}
+        log_cost = float(state_tech["last_log_capex"])
+        c_overnight = float(np.exp(log_cost) / 1000.0)
+        capital_cost = convert_to_capital_cost(
+            c_overnight,
+            tech,
+            _cost_unit_for_runtime(tech),
+            learning_cfg,
+            costs_file,
+        )
+        learning_costs[tech] = {
+            "capital_cost": capital_cost,
+            "cumulative_capacity_GW": float(runtime_capacity_map[tech]),
+            "A": None,
+            "A_base": None,
+            "A_scenario": None,
+            "beta": None,
+            "beta_base": None,
+            "lr_base": None,
+            "lr_scenario": None,
+            "beta_adjusted": False,
+            "unit": _cost_unit_for_runtime(tech),
+            "c_overnight": c_overnight,
+            "wacc_dict": wacc_dict,
+            **runtime_metadata,
+            "log_capex_runtime": log_cost,
+        }
+    return learning_costs
+
+
+def _single_or_median(values, sample_mode):
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim == 0:
+        return float(arr)
+    if sample_mode == "median":
+        return float(np.median(arr))
+    return float(arr[0])
+
+
+def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode):
+    params = artifact["parameter_summary"]
+    sigma = float(params["sigma"])
+    alpha = float(params["alpha"])
+    rho = float(params["rho"])
+    last_log = float(state["last_log_capex"])
+    last_dlog = float(state["last_dlog_capex"])
+    n = 1 if sample_mode == "single_draw" else 201
+    log_cost = np.full(n, last_log, dtype=float)
+    dlog_prev = np.full(n, last_dlog, dtype=float)
+    for _ in range(int(elapsed_years)):
+        eps = sigma * rng.standard_normal(n)
+        dlog = alpha + rho * dlog_prev + eps
+        log_cost = log_cost + dlog
+        dlog_prev = dlog
+    return {
+        "final_log_cost": _single_or_median(log_cost, sample_mode),
+        "state": {
+            "last_log_capex": _single_or_median(log_cost, sample_mode),
+            "last_dlog_capex": _single_or_median(dlog_prev, sample_mode),
+            "state_type": state.get("state_type", "geometric_random_walk"),
+        },
+    }
+
+
+def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, rng, sample_mode):
+    params = artifact["parameter_summary"]
+    alpha = float(params["alpha"])
+    beta = float(params["slope_dlog_experience"])
+    theta = float(params["theta_ma1"])
+    sigma = float(params["sigma"])
+    last_log = float(state["last_log_capex"])
+    if "last_innovation" not in state:
+        raise ValueError("Way runtime state is missing last_innovation")
+    last_eps = float(state["last_innovation"])
+    n = 1 if sample_mode == "single_draw" else 201
+    log_cost = np.full(n, last_log, dtype=float)
+    eps_prev = np.full(n, last_eps, dtype=float)
+    years = int(elapsed_years)
+    if years < 0:
+        raise ValueError(f"Elapsed years for Way runtime must be >= 0, got {years}")
+    if years == 0:
+        return {
+            "final_log_cost": _single_or_median(log_cost, sample_mode),
+            "state": {
+                "last_log_capex": _single_or_median(log_cost, sample_mode),
+                "last_innovation": _single_or_median(eps_prev, sample_mode),
+                "theta_ma1": theta,
+                "state_type": state.get("state_type", "ma1_wright_fixed_rho"),
+            },
+        }
+    x_curr = float(block_dlog_experience) / float(years)
+    for _ in range(years):
+        eps = sigma * rng.standard_normal(n)
+        dlog = alpha + beta * x_curr + eps + theta * eps_prev
+        log_cost = log_cost + dlog
+        eps_prev = eps
+    return {
+        "final_log_cost": _single_or_median(log_cost, sample_mode),
+        "state": {
+            "last_log_capex": _single_or_median(log_cost, sample_mode),
+            "last_innovation": _single_or_median(eps_prev, sample_mode),
+            "theta_ma1": theta,
+            "state_type": state.get("state_type", "ma1_wright_fixed_rho"),
+        },
+    }
+
+
+def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tech, elapsed_years, rng, sample_mode):
+    techs = list(artifacts.keys())
+    sample_artifact = next(iter(artifacts.values()))
+    horizons = int(elapsed_years)
+    n = 1 if sample_mode == "single_draw" else 201
+    if horizons < 0:
+        raise ValueError(f"Elapsed years for shared-state runtime must be >= 0, got {horizons}")
+
+    p_ss_all = np.asarray(sample_artifact["uncertainty_terms"].get("p_slow_slow_draws", []), dtype=float)
+    p_ff_all = np.asarray(sample_artifact["uncertainty_terms"].get("p_fast_fast_draws", []), dtype=float)
+    if p_ss_all.size == 0 or p_ff_all.size == 0:
+        raise ValueError("Shared-state runtime artifacts are missing transition-probability draws")
+    draw_idx = rng.integers(0, len(p_ss_all), size=n)
+    p_ss = p_ss_all[draw_idx]
+    p_ff = p_ff_all[draw_idx]
+
+    shared_state = state.get("shared_regime_state", {}) or {}
+    if "initial_regime_probs" not in shared_state:
+        raise ValueError("Shared-state runtime state is missing initial_regime_probs")
+    init_probs = list(shared_state["initial_regime_probs"])
+    current_regime_value = shared_state.get("current_regime", 0)
+    if current_regime_value is None:
+        current_regime = (rng.random(n) > float(init_probs[0])).astype(int)
+    else:
+        current_regime = np.full(n, int(current_regime_value), dtype=int)
+
+    tech_states = {}
+    log_costs = {}
+    param_cache = {}
+    for tech, artifact in artifacts.items():
+        state_tech = state["technology_states"][tech]
+        log_costs[tech] = np.full(n, float(state_tech["last_log_capex"]), dtype=float)
+        unc = artifact.get("uncertainty_terms", {}) or {}
+        params = artifact["parameter_summary"]
+        def _draws(key, mean_key):
+            arr = np.asarray(unc.get(key, []), dtype=float)
+            if arr.size == 0:
+                raise ValueError(f"Shared-state runtime artifacts for {tech} are missing {key}")
+            return arr[draw_idx]
+        param_cache[tech] = {
+            "alpha_slow": _draws("alpha_slow_draws", "alpha_slow_mean"),
+            "alpha_fast": _draws("alpha_fast_draws", "alpha_fast_mean"),
+            "beta_slow": _draws("beta_slow_draws", "beta_slow_mean"),
+            "beta_fast": _draws("beta_fast_draws", "beta_fast_mean"),
+            "sigma": _draws("sigma_draws", "sigma_mean"),
+        }
+
+    if horizons == 0:
+        for tech in techs:
+            tech_states[tech] = {
+                "last_log_capex": _single_or_median(log_costs[tech], sample_mode),
+            }
+        regime_scalar = _single_or_median(current_regime, sample_mode)
+        probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
+        return {
+            "final_log_costs": {tech: _single_or_median(log_costs[tech], sample_mode) for tech in techs},
+            "technology_states": tech_states,
+            "shared_regime_state": {
+                "current_regime": int(round(regime_scalar)),
+                "initial_regime_probs": probs,
+            },
+        }
+
+    x_step_by_tech = {
+        tech: float(block_dlog_experience_by_tech[tech]) / float(horizons)
+        for tech in techs
+    }
+
+    for step in range(horizons):
+        stay = rng.random(n)
+        stay_prob = np.where(current_regime == 0, p_ss, p_ff)
+        current_regime = np.where(stay <= stay_prob, current_regime, 1 - current_regime)
+        for tech in techs:
+            x_curr = x_step_by_tech[tech]
+            pars = param_cache[tech]
+            alpha = np.where(current_regime == 0, pars["alpha_slow"], pars["alpha_fast"])
+            beta = np.where(current_regime == 0, pars["beta_slow"], pars["beta_fast"])
+            dlog = alpha + beta * x_curr + pars["sigma"] * rng.standard_normal(n)
+            log_costs[tech] = log_costs[tech] + dlog
+
+    for tech in techs:
+        tech_states[tech] = {
+            "last_log_capex": _single_or_median(log_costs[tech], sample_mode),
+        }
+    regime_scalar = _single_or_median(current_regime, sample_mode)
+    probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
+    return {
+        "final_log_costs": {tech: _single_or_median(log_costs[tech], sample_mode) for tech in techs},
+        "technology_states": tech_states,
+        "shared_regime_state": {
+            "current_regime": int(round(regime_scalar)),
+            "initial_regime_probs": probs,
+        },
+    }
+
+
+def calculate_stochastic_learning_costs(
+    learning_cfg,
+    selected_model,
+    current_year,
+    planning_horizons,
+    prev_network_path,
+    prev_state_path,
+    costs_file,
+    global_scale_factors,
+    wacc_dict=None,
+):
+    artifacts, state = load_stochastic_runtime_state(
+        learning_cfg,
+        selected_model,
+        current_year,
+        prev_state_path,
+    )
+    sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
+    seed = int(learning_cfg.get("seed", 0))
+    runtime_metadata = build_runtime_metadata(
+        learning_cfg, "stochastic_forecast", selected_model
+    )
+
+    if current_year not in COST_HISTORICAL_CAPACITY_YEARS and prev_network_path is None:
+        raise ValueError(f"Stochastic runtime for {current_year} requires previous solved network")
+    if current_year not in COST_HISTORICAL_CAPACITY_YEARS and prev_state_path is None:
+        raise ValueError(
+            f"Stochastic runtime for {current_year} requires previous committed learning state"
+        )
+
+    learning_costs = _state_to_runtime_learning_costs(
+        artifacts=artifacts,
+        state=state,
+        current_year=current_year,
+        learning_cfg=learning_cfg,
+        costs_file=costs_file,
+        global_scale_factors=global_scale_factors,
+        prev_network_path=prev_network_path,
+        wacc_dict=wacc_dict,
+        runtime_metadata=runtime_metadata,
+    )
+
+    proposed_state = json.loads(json.dumps(state))
+    proposed_state.update(runtime_metadata)
+    return learning_costs, proposed_state
+
+
+def update_stochastic_runtime_state(
+    learning_cfg,
+    selected_model,
+    current_year,
+    state,
+    costs_file,
+    solved_capacity_by_tech,
+    wacc_dict=None,
+):
+    artifacts, _ = load_stochastic_model_artifacts(learning_cfg, selected_model)
+    validate_stochastic_runtime_state(state, selected_model, artifacts)
+    sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
+    seed = int(learning_cfg.get("seed", 0))
+    rng = np.random.default_rng(seed + 1000 * int(current_year))
+    runtime_metadata = build_runtime_metadata(
+        learning_cfg, "stochastic_forecast", selected_model
+    )
+    passthrough_fields = {}
+    for key in ("committed_from_network", "enabled"):
+        if key in state:
+            passthrough_fields[key] = state[key]
+
+    base_year = int(state.get("last_applied_year", current_year))
+    elapsed_years = max(0, int(current_year) - base_year)
+    if elapsed_years < 0:
+        raise ValueError(
+            f"Invalid stochastic runtime state transition: current_year={current_year}, last_applied_year={base_year}"
+        )
+
+    if selected_model == "shared_state_bayesian_regime_wright":
+        if int(current_year) <= base_year:
+            shared_result = {
+                "final_log_costs": {
+                    tech: float(state["technology_states"][tech]["last_log_capex"]) for tech in artifacts
+                },
+                "technology_states": {
+                    tech: {"last_log_capex": float(state["technology_states"][tech]["last_log_capex"])} for tech in artifacts
+                },
+                "shared_regime_state": state.get("shared_regime_state", {}),
+            }
+        else:
+            block_dlog_by_tech = {
+                tech: compute_realized_block_growth(tech, learning_cfg, state, current_year, elapsed_years)
+                for tech in artifacts
+            }
+            shared_result = simulate_shared_state_runtime(
+                artifacts,
+                state,
+                block_dlog_by_tech,
+                elapsed_years,
+                rng,
+                sample_mode,
+            )
+
+        next_state = {
+            **passthrough_fields,
+            **runtime_metadata,
+            "last_applied_year": int(current_year),
+            "technology_states": shared_result["technology_states"],
+            "shared_regime_state": shared_result["shared_regime_state"],
+            "capacity_history": state.get("capacity_history", {}),
+            "modeled_capacity_history": state.get("modeled_capacity_history", {}),
+        }
+        learning_costs = {}
+        for tech in artifacts:
+            log_cost = float(shared_result["final_log_costs"][tech])
+            c_overnight = float(np.exp(log_cost) / 1000.0)
+            capital_cost = convert_to_capital_cost(
+                c_overnight,
+                tech,
+                _cost_unit_for_runtime(tech),
+                learning_cfg,
+                costs_file,
+            )
+            if tech not in solved_capacity_by_tech:
+                raise ValueError(f"Technology {tech} missing in solved capacity map")
+            learning_costs[tech] = {
+                "capital_cost": capital_cost,
+                "cumulative_capacity_GW": float(solved_capacity_by_tech[tech]),
+                "A": None,
+                "A_base": None,
+                "A_scenario": None,
+                "beta": None,
+                "beta_base": None,
+                "lr_base": None,
+                "lr_scenario": None,
+                "beta_adjusted": False,
+                "unit": _cost_unit_for_runtime(tech),
+                "c_overnight": c_overnight,
+                "wacc_dict": wacc_dict,
+                **runtime_metadata,
+                "log_capex_runtime": log_cost,
+            }
+        return learning_costs, next_state
+
+    next_state = {
+        **passthrough_fields,
+        **runtime_metadata,
+        "last_applied_year": int(current_year),
+        "technology_states": {},
+        "capacity_history": state.get("capacity_history", {}),
+        "modeled_capacity_history": state.get("modeled_capacity_history", {}),
+    }
+    learning_costs = {}
+    for tech, artifact in artifacts.items():
+        state_tech = state["technology_states"][tech]
+        if selected_model == "correlated_geometric_random_walk":
+            result = simulate_cgrw_runtime(artifact, state_tech, elapsed_years, rng, sample_mode)
+        else:
+            block_dlog = compute_realized_block_growth(tech, learning_cfg, state, current_year, elapsed_years)
+            result = simulate_way_runtime(artifact, state_tech, block_dlog, elapsed_years, rng, sample_mode)
+        log_cost = float(result["final_log_cost"])
+        next_state["technology_states"][tech] = result["state"]
+        c_overnight = float(np.exp(log_cost) / 1000.0)
+        capital_cost = convert_to_capital_cost(
+            c_overnight,
+            tech,
+            _cost_unit_for_runtime(tech),
+            learning_cfg,
+            costs_file,
+        )
+        if tech not in solved_capacity_by_tech:
+            raise ValueError(f"Technology {tech} missing in solved capacity map")
+        learning_costs[tech] = {
+            "capital_cost": capital_cost,
+            "cumulative_capacity_GW": float(solved_capacity_by_tech[tech]),
+            "A": None,
+            "A_base": None,
+            "A_scenario": None,
+            "beta": None,
+            "beta_base": None,
+            "lr_base": None,
+            "lr_scenario": None,
+            "beta_adjusted": False,
+            "unit": _cost_unit_for_runtime(tech),
+            "c_overnight": c_overnight,
+            "wacc_dict": wacc_dict,
+            **runtime_metadata,
+            "log_capex_runtime": log_cost,
+        }
+    return learning_costs, next_state
+
+
+def _cost_unit_for_runtime(tech):
+    return "kWh" if tech in ENERGY_TECHS else "kW"
+
+
+def _runtime_capacity_for_log(tech, learning_cfg, state, current_year, prev_network_path, tech_mapping, global_scale_factors):
+    if current_year in COST_HISTORICAL_CAPACITY_YEARS:
+        hist_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
+        return float(load_capacity_from_historical_csv(tech, hist_year, learning_cfg))
+    if prev_network_path is None:
+        raise ValueError(f"Missing previous solved network for runtime capacity extraction of {tech} in {current_year}")
+    realized = extract_capacity_from_network(prev_network_path, tech_mapping, global_scale_factors)
+    if tech not in realized:
+        raise ValueError(f"Technology {tech} missing in previous solved network")
+    return float(realized[tech])
+
+
+def _get_runtime_capacity_map(current_year, prev_network_path, learning_cfg, tech_mapping, global_scale_factors):
+    if current_year in COST_HISTORICAL_CAPACITY_YEARS:
+        historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
+        return {
+            tech: float(load_capacity_from_historical_csv(tech, historical_year, learning_cfg))
+            for tech in ("solar_power", "onwind_power", "battery_energy")
+        }
+    if prev_network_path is None:
+        raise ValueError(
+            f"Missing previous solved network for runtime capacity extraction in {current_year}"
+        )
+    return extract_capacity_from_network(prev_network_path, tech_mapping, global_scale_factors)
 
 
 def extract_capacity_from_network(network_path, tech_mapping, global_scale_factors):
@@ -944,8 +1727,8 @@ def calculate_learning_costs(
     - Uses lag_periods parameter from config to determine capacity lag
     - lag_periods=0: NOT handled here (use learning.py for immediate endogenous learning)
     - lag_periods=1: Uses previous period's capacity (exogenous costs calculated here)
-      * For 2020: Uses 2018 historical capacity (2-year historical lag)
-      * For 2025: Uses 2020 solved capacity
+      * For 2020: Uses 2015 historical cumulative capacity
+      * For 2025: Uses 2020 historical cumulative capacity
       * For 2030: Uses 2025 solved capacity
       * And so on...
     
@@ -987,7 +1770,7 @@ def calculate_learning_costs(
     # Find available historical horizons
     horizons = sorted([h for h in planning_horizons if h <= lag_year])
 
-    # For 2025+, extract lagged realized capacities once to avoid repeated imports/log spam.
+    # For 2030+, extract lagged realized capacities once to avoid repeated imports/log spam.
     realized_capacity = None
     if current_year not in COST_HISTORICAL_CAPACITY_YEARS:
         if lag_year not in horizons:
@@ -1024,7 +1807,7 @@ def calculate_learning_costs(
             )
 
         logger.info(f"Extracting solved capacities from {lag_year} network once for all technologies")
-        tech_mapping = learning_cfg.get("tech_mapping", {})
+        tech_mapping = get_tech_mapping(learning_cfg)
         realized_capacity = extract_capacity_from_network(
             prev_network_path, tech_mapping, global_scale_factors
         )
@@ -1050,11 +1833,14 @@ def calculate_learning_costs(
         # LR = 1 - 2^(-beta)
         learning_rate = 1.0 - (2.0 ** (-beta))
         
-        # Load cumulative capacity: historical (2020) or solved based on lag_year
+        # Load cumulative capacity: historical bootstrap horizons or solved lagged horizon.
         if current_year in COST_HISTORICAL_CAPACITY_YEARS:
-            # For 2020: Use historical capacity data
+            # For 2020/2025: Use historical cumulative capacity data only.
             historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
-            logger.info(f"    Using {historical_year} historical capacity (fixed 2-year historical lag)")
+            logger.info(
+                f"    Using {historical_year} historical cumulative capacity "
+                f"(deterministic historical bootstrap for {current_year})"
+            )
             
             try:
                 cumulative_capacity = load_capacity_from_historical_csv(tech, historical_year, learning_cfg)
@@ -1156,7 +1942,7 @@ def convert_to_capital_cost(c_overnight, tech, unit, learning_cfg, costs_file, w
     Returns:
         capital_cost in EUR/MW-yr or EUR/MWh-yr
     """
-    finance = learning_cfg["finance"]
+    finance = get_learning_finance(learning_cfg)
     
     # Get financial parameters - use override if provided (for regional WACCs)
     if wacc_override is not None:
@@ -1284,7 +2070,7 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
                 unit = learning_costs[tech]["unit"]
                 
                 # Get FOM and lifetime from config
-                finance = learning_cfg["finance"]
+                finance = get_learning_finance(learning_cfg)
                 lifetime = finance["lifetime"][tech]
                 fom = load_fom_from_costs(costs_file, tech)
                 
@@ -1484,6 +2270,7 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
     
     logger.info(f"Saving updated network to {output_path}")
     logger.info(f"  Updated {updates_count} carrier types across components")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     n.export_to_netcdf(output_path)
     
     return n, updates_log
@@ -1504,6 +2291,16 @@ def save_cost_log(learning_costs, output_file):
         "anchor_year",
         "anchor_source",
         "anchor_network",
+        "engine",
+        "selected_model",
+        "model_name",
+        "sample_mode",
+        "seed",
+        "runtime_conditioning",
+        "manifest_schema_version",
+        "manifest_sha256",
+        "manifest_path",
+        "battery_power_treatment",
         "cumulative_capacity_GW",
         "A_base",
         "A_scenario",
@@ -1522,6 +2319,13 @@ def save_cost_log(learning_costs, output_file):
     remaining_columns = [col for col in df.columns if col not in ordered_columns]
     df = df[ordered_columns + remaining_columns]
     df.to_csv(output_file)
+
+
+def save_learning_state(state_payload, output_file):
+    """Save proposed learning state for the next myopic horizon."""
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(state_payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def get_timestep(planning_horizons, current_year):
@@ -1578,18 +2382,44 @@ def main(snakemake):
     logger.info("=" * 70)
     
     learning_cfg = load_config_learning(snakemake.input.learning_config)
+    load_learning_manifest(learning_cfg, snakemake.input.learning_config)
+    learning_model = getattr(snakemake.wildcards, "learning_model", None)
+    learning_seed = getattr(snakemake.wildcards, "learning_seed", None)
+    learning_engine = get_learning_engine(learning_cfg, learning_model)
+    selected_model = get_selected_learning_model(learning_cfg, learning_model)
+    resolve_runtime_seed(learning_cfg, learning_engine, selected_model, learning_seed)
+    validate_runtime_contract(learning_cfg, learning_engine, selected_model)
+    runtime_metadata = build_runtime_metadata(learning_cfg, learning_engine, selected_model)
+    logger.info("Learning runtime: engine=%s, model=%s", learning_engine, selected_model)
+    logger.info(
+        "Runtime contract: sample_mode=%s, seed=%s, learning_seed=%s, battery_power=%s, conditioning=%s",
+        runtime_metadata["sample_mode"],
+        runtime_metadata["seed"],
+        runtime_metadata["learning_seed"],
+        BATTERY_POWER_TREATMENT,
+        runtime_metadata["runtime_conditioning"],
+    )
+    logger.info(
+        "Learning manifest: schema_version=%s, sha256=%s",
+        runtime_metadata["manifest_schema_version"],
+        runtime_metadata["manifest_sha256"],
+    )
     
     # Parse learning_rate wildcard and override beta_adjustment config
+    learning_rate_str = None
     if hasattr(snakemake.wildcards, 'learning_rate'):
         learning_rate_str = snakemake.wildcards.learning_rate
         logger.info(f"Learning rate wildcard detected: '{learning_rate_str}'")
-        
-        # Parse wildcard into beta adjustment config
-        wildcard_beta_cfg = parse_learning_rate_wildcard(learning_rate_str)
-        
-        # Override the beta_adjustment section in learning_cfg
-        learning_cfg["beta_adjustment"] = wildcard_beta_cfg
-        logger.info("Beta adjustment config overridden by learning_rate wildcard")
+        if learning_engine == "legacy_curve":
+            # Parse wildcard into beta adjustment config
+            wildcard_beta_cfg = parse_learning_rate_wildcard(learning_rate_str)
+            learning_cfg["beta_adjustment"] = wildcard_beta_cfg
+            logger.info("Beta adjustment config overridden by learning_rate wildcard")
+        elif learning_rate_str != "base":
+            raise ValueError(
+                "Non-base learning_rate scenarios are only supported for legacy_curve. "
+                f"Got learning_model={selected_model}, learning_rate={learning_rate_str}."
+            )
     
     # Check if learning is enabled
     if not learning_cfg.get("enabled", False):
@@ -1602,6 +2432,14 @@ def main(snakemake):
         # Create empty log file
         Path(snakemake.output.cost_log).parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame().to_csv(snakemake.output.cost_log)
+        save_learning_state(
+            {
+                **runtime_metadata,
+                "enabled": False,
+                "last_applied_year": int(year),
+            },
+            snakemake.output.state_proposed,
+        )
         return
     
     logger.info("Learning is ENABLED")
@@ -1611,17 +2449,150 @@ def main(snakemake):
     planning_horizons = snakemake.params.planning_horizons
     timestep = get_timestep(planning_horizons, year)
     
-    # NEW WORKFLOW: Apply learning costs for ALL horizons including 2020
-    # 2020 uses 2018 historical data, 2025+ uses solved capacity from previous horizon
+    # Apply learning costs for all horizons.
+    # 2020 and 2025 are deterministic historical bootstraps; 2030+ uses
+    # the strictly lagged solved block.
     logger.info(f"Timestep: {timestep} years since previous horizon (or first horizon if {year} == 2020)")
     
     # Load learning data
-    params_base = load_learning_params(snakemake.input.params)
-
     prev_network_path = normalize_optional_input(snakemake.input.get('network_p', None))
+    prev_state_path = normalize_optional_input(snakemake.input.get('prev_state', None))
     anchor_network_path = normalize_optional_input(
         snakemake.input.get('anchor_network', None)
     )
+    costs_file = snakemake.input.costs
+    logger.info(f"Using costs file: {costs_file}")
+    prior_state_payload = {}
+    if prev_state_path:
+        prior_state_payload = json.loads(Path(prev_state_path).read_text(encoding="utf-8"))
+
+    # Load regional WACCs if available
+    wacc_dict = None
+    if hasattr(snakemake.input, 'waccs') and snakemake.input.waccs:
+        logger.info(f"Loading regional WACCs from {snakemake.input.waccs}")
+        wacc_dict = load_country_waccs(snakemake.input.waccs)
+        logger.info(f"  Loaded WACCs for {len(wacc_dict)} renewable technologies")
+    else:
+        logger.info("No regional WACC file provided - using global WACCs from config")
+
+    if learning_engine != "legacy_curve":
+        if year in COST_HISTORICAL_CAPACITY_YEARS:
+            logger.info(
+                "Using deterministic historical bootstrap for stochastic horizon %s based on historical year %s",
+                year,
+                COST_HISTORICAL_CAPACITY_YEARS[year],
+            )
+            params = load_learning_params(get_legacy_params_path(learning_cfg))
+            learning_costs = calculate_learning_costs(
+                params,
+                learning_cfg,
+                year,
+                planning_horizons,
+                prev_network_path=None,
+                costs_file=costs_file,
+                global_scale_factors=global_scale_factors,
+                wacc_dict=wacc_dict,
+            )
+            _, state = load_stochastic_runtime_state(
+                learning_cfg,
+                selected_model,
+                year,
+                prev_state_path,
+            )
+            proposed_state = json.loads(json.dumps(state))
+            proposed_state.update(runtime_metadata)
+            cost_log_context = {
+                **runtime_metadata,
+                "planning_horizon": int(year),
+                "lag_year": int(get_cost_lag_year(planning_horizons, year)),
+                "anchor_year": int(get_cost_lag_year(planning_horizons, year)),
+                "anchor_source": "historical_deterministic_bootstrap",
+                "anchor_network": "",
+            }
+            for tech_costs in learning_costs.values():
+                tech_costs.update(cost_log_context)
+
+            logger.info(
+                "battery_power remains on deterministic default costs from costs_%s.csv in stochastic runtime",
+                year,
+            )
+            logger.info(
+                "Stochastic runtime uses deterministic historical bootstrap logic for %s",
+                year,
+            )
+
+            tech_mapping = get_tech_mapping(learning_cfg)
+            n, updates_log = update_network_costs(
+                snakemake.input.network,
+                learning_costs,
+                tech_mapping,
+                snakemake.output.network,
+                learning_cfg,
+                costs_file,
+                learning_rates=None,
+            )
+            save_cost_log(learning_costs, snakemake.output.cost_log)
+            save_learning_state(proposed_state, snakemake.output.state_proposed)
+
+            logger.info("=" * 70)
+            logger.info(f"Stochastic learning cost application completed for {year}")
+            logger.info("=" * 70)
+            return
+
+        if prev_network_path:
+            logger.info(f"Previous network available: {prev_network_path}")
+        else:
+            logger.info("No previous network (first horizon: 2020)")
+        learning_costs, proposed_state = calculate_stochastic_learning_costs(
+            learning_cfg,
+            selected_model,
+            year,
+            planning_horizons,
+            prev_network_path,
+            prev_state_path,
+            costs_file,
+            global_scale_factors,
+            wacc_dict,
+        )
+        cost_log_context = {
+            **runtime_metadata,
+            "planning_horizon": int(year),
+            "lag_year": int(get_cost_lag_year(planning_horizons, year)),
+            "anchor_year": int(proposed_state.get("last_applied_year", year)),
+            "anchor_source": "stochastic_runtime_state",
+            "anchor_network": str(prev_network_path or ""),
+        }
+        for tech_costs in learning_costs.values():
+            tech_costs.update(cost_log_context)
+
+        logger.info(
+            "battery_power remains on deterministic default costs from costs_%s.csv in stochastic runtime",
+            year,
+        )
+        logger.info(
+            "Stochastic runtime uses %s carry-forward logic",
+            runtime_metadata["runtime_conditioning"],
+        )
+
+        tech_mapping = get_tech_mapping(learning_cfg)
+        n, updates_log = update_network_costs(
+            snakemake.input.network,
+            learning_costs,
+            tech_mapping,
+            snakemake.output.network,
+            learning_cfg,
+            costs_file,
+            learning_rates=None,
+        )
+        save_cost_log(learning_costs, snakemake.output.cost_log)
+        save_learning_state(proposed_state, snakemake.output.state_proposed)
+
+        logger.info("=" * 70)
+        logger.info(f"Stochastic learning cost application completed for {year}")
+        logger.info("=" * 70)
+        return
+
+    params_base = load_learning_params(get_legacy_params_path(learning_cfg))
 
     beta_cfg = learning_cfg.get("beta_adjustment", {})
     beta_adjustment_requested = beta_cfg.get("enabled", False)
@@ -1683,20 +2654,10 @@ def main(snakemake):
     else:
         logger.info("No previous network (first horizon: 2020)")
     
-    logger.info("Calculating learning-based costs (2020: historical 2018, 2025+: solved capacity from previous horizon)...")
-    
-    # Get costs file for this year
-    costs_file = snakemake.input.costs
-    logger.info(f"Using costs file: {costs_file}")
-    
-    # Load regional WACCs if available
-    wacc_dict = None
-    if hasattr(snakemake.input, 'waccs') and snakemake.input.waccs:
-        logger.info(f"Loading regional WACCs from {snakemake.input.waccs}")
-        wacc_dict = load_country_waccs(snakemake.input.waccs)
-        logger.info(f"  Loaded WACCs for {len(wacc_dict)} renewable technologies")
-    else:
-        logger.info("No regional WACC file provided - using global WACCs from config")
+    logger.info(
+        "Calculating learning-based costs "
+        "(2020: historical 2015, 2025: historical 2020, 2030+: realized solved capacity from previous horizon)..."
+    )
     
     learning_costs = calculate_learning_costs(
         params,
@@ -1710,6 +2671,7 @@ def main(snakemake):
     )
 
     cost_log_context = {
+        **runtime_metadata,
         "planning_horizon": int(year),
         "lag_year": int(get_cost_lag_year(planning_horizons, year)),
         "anchor_year": int(anchor_year),
@@ -1726,6 +2688,15 @@ def main(snakemake):
     }
     for tech_costs in learning_costs.values():
         tech_costs.update(cost_log_context)
+
+    logger.info(
+        "battery_power remains on deterministic default costs from costs_%s.csv in legacy_curve runtime",
+        year,
+    )
+    logger.info(
+        "Legacy runtime uses %s update logic",
+        runtime_metadata["runtime_conditioning"],
+    )
     
     # Extract learning rates from params if beta adjustment was applied
     learning_rates = None
@@ -1733,7 +2704,7 @@ def main(snakemake):
         learning_rates = params.attrs["learning_rates"]
     
     # Update network (single export with all metadata)
-    tech_mapping = learning_cfg["tech_mapping"]
+    tech_mapping = get_tech_mapping(learning_cfg)
     n, updates_log = update_network_costs(
         snakemake.input.network,
         learning_costs,
@@ -1746,6 +2717,24 @@ def main(snakemake):
     
     # Save cost log (includes costs, capacities, and all learning parameters)
     save_cost_log(learning_costs, snakemake.output.cost_log)
+    save_learning_state(
+        {
+            **runtime_metadata,
+            "last_applied_year": int(year),
+            "capacity_history": prior_state_payload.get("capacity_history", {}),
+            "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+            "technology_states": {
+                tech: {
+                    "capital_cost": float(values["capital_cost"]),
+                    "c_overnight": float(values["c_overnight"]),
+                    "cumulative_capacity_GW": float(values["cumulative_capacity_GW"]),
+                    "unit": values["unit"],
+                }
+                for tech, values in learning_costs.items()
+            },
+        },
+        snakemake.output.state_proposed,
+    )
     
     logger.info("=" * 70)
     logger.info(f"Exogenous learning cost application completed for {year}")
@@ -1769,7 +2758,8 @@ if __name__ == "__main__":
             discountrate="0.071",
             demand="AB",
             h2export="10",
-            learning_rate="base"
+            learning_rate="base",
+            learning_model="legacy_curve",
         )
 
         logger.warning("Running apply_learning_costs.py outside Snakemake!")

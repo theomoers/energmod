@@ -1,0 +1,118 @@
+{
+  "battery_treatment": {
+    "battery_power": "deterministic_only",
+    "stochastic_learning_technology": "battery_energy"
+  },
+  "historical_files": {
+    "battery_energy": "artifacts/support/legacy_curve/historical/batteries.csv",
+    "battery_power": "artifacts/support/legacy_curve/historical/batteries.csv",
+    "onwind_power": "artifacts/support/legacy_curve/historical/wind.csv",
+    "solar_power": "artifacts/support/legacy_curve/historical/solar.csv"
+  },
+  "initial_year": 2020,
+  "legacy_curve": {
+    "note": "Updated deterministic Wright export from learning_estimation.",
+    "supported_training_windows": [
+      "origin_cutoff",
+      "full_sample"
+    ],
+    "technologies": [
+      "solar_power",
+      "onwind_power",
+      "battery_energy"
+    ],
+    "training_windows": {
+      "full_sample": {
+        "origin_year": null,
+        "params_csv": "artifacts/support/legacy_curve/params/learning_params_full_sample.csv",
+        "sample_end_year": 2025
+      },
+      "origin_cutoff": {
+        "origin_year": 2020,
+        "params_csv": "artifacts/support/legacy_curve/params/learning_params_origin_2020.csv",
+        "sample_end_year": 2020
+      }
+    }
+  },
+  "schema_version": "energymod-learning-bundle-v1",
+  "stochastic_forecast": {
+    "initial_year": 2020,
+    "supported_models": [
+      "shared_state_bayesian_regime_wright",
+      "way_fixed_rho_benchmark_035",
+      "correlated_geometric_random_walk"
+    ],
+    "supported_training_windows": [
+      "origin_cutoff",
+      "full_sample"
+    ],
+    "training_windows": {
+      "full_sample": {
+        "models": {
+          "correlated_geometric_random_walk": {
+            "artifact_dir": "artifacts/full_sample/correlated_geometric_random_walk",
+            "initial_state": "artifacts/full_sample/correlated_geometric_random_walk/initial_state.json",
+            "technologies": [
+              "solar_power",
+              "onwind_power",
+              "battery_energy"
+            ]
+          },
+          "shared_state_bayesian_regime_wright": {
+            "artifact_dir": "artifacts/full_sample/shared_state_bayesian_regime_wright",
+            "initial_state": "artifacts/full_sample/shared_state_bayesian_regime_wright/initial_state.json",
+            "technologies": [
+              "solar_power",
+              "onwind_power",
+              "battery_energy"
+            ]
+          },
+          "way_fixed_rho_benchmark_035": {
+            "artifact_dir": "artifacts/full_sample/way_fixed_rho_benchmark_035",
+            "initial_state": "artifacts/full_sample/way_fixed_rho_benchmark_035/initial_state.json",
+            "technologies": [
+              "solar_power",
+              "onwind_power",
+              "battery_energy"
+            ]
+          }
+        },
+        "origin_year": null,
+        "sample_end_year": 2025
+      },
+      "origin_cutoff": {
+        "models": {
+          "correlated_geometric_random_walk": {
+            "artifact_dir": "artifacts/origin_2020/correlated_geometric_random_walk",
+            "initial_state": "artifacts/origin_2020/correlated_geometric_random_walk/initial_state.json",
+            "technologies": [
+              "solar_power",
+              "onwind_power",
+              "battery_energy"
+            ]
+          },
+          "shared_state_bayesian_regime_wright": {
+            "artifact_dir": "artifacts/origin_2020/shared_state_bayesian_regime_wright",
+            "initial_state": "artifacts/origin_2020/shared_state_bayesian_regime_wright/initial_state.json",
+            "technologies": [
+              "solar_power",
+              "onwind_power",
+              "battery_energy"
+            ]
+          },
+          "way_fixed_rho_benchmark_035": {
+            "artifact_dir": "artifacts/origin_2020/way_fixed_rho_benchmark_035",
+            "initial_state": "artifacts/origin_2020/way_fixed_rho_benchmark_035/initial_state.json",
+            "technologies": [
+              "solar_power",
+              "onwind_power",
+              "battery_energy"
+            ]
+          }
+        },
+        "origin_year": 2020,
+        "sample_end_year": 2020
+      }
+    }
+  }
+}

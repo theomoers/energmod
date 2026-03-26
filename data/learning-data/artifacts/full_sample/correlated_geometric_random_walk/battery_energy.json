@@ -1,0 +1,63 @@
+{
+  "family": "benchmark",
+  "fit_summary": {
+    "aic": -44.573580230675404,
+    "bic": -40.176372522276225,
+    "converged": 1,
+    "fit_fragile": 0,
+    "intercept_dlog": -0.10670317622301775,
+    "last_dlog_capex": -0.08855339734162371,
+    "last_log_capex": 11.241186680089882,
+    "llf": 25.286790115337702,
+    "mu": -0.12554856410310153,
+    "rho": 0.1501043680962195,
+    "sigma": 0.10979385395137627,
+    "warning_count": 0
+  },
+  "metadata": {
+    "export_scope": "energymod_runtime",
+    "initial_year": 2020,
+    "runtime_technology_scope": [
+      "solar_power",
+      "onwind_power",
+      "battery_energy"
+    ],
+    "sample_end_year": 2025,
+    "training_window": "full_sample"
+  },
+  "model_label": "Correlated geometric random walk",
+  "model_name": "correlated_geometric_random_walk",
+  "parameter_summary": {
+    "alpha": -0.10670317622301775,
+    "last_dlog_capex": -0.08855339734162371,
+    "last_log_capex": 11.241186680089882,
+    "rho": 0.1501043680962195,
+    "sigma": 0.10979385395137627
+  },
+  "sample_window": {
+    "conditioning_mode": "conditional_realized_experience",
+    "forecast_horizons": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "forecast_origin_year": 2025,
+    "model_name": "correlated_geometric_random_walk",
+    "n_train_diff_obs": 33,
+    "n_train_obs": 34,
+    "technology": "battery_energy",
+    "train_end_year": 2025,
+    "train_start_year": 1992
+  },
+  "schema_version": "annual-model-artifact-v1",
+  "state_variables": {
+    "last_dlog_capex": -0.08855339734162371,
+    "last_log_capex": 11.241186680089882,
+    "state_type": "geometric_random_walk"
+  },
+  "technology": "battery_energy",
+  "uncertainty_terms": {},
+  "version_hash": "6ab782ee7e68260bdc1009051d486701fd1e322938588d8dec2ef63e6bcfaf88"
+}

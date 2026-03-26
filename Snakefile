@@ -4,6 +4,7 @@
 
 import sys
 import os
+import random
 import warnings
 import pathlib
 import shutil
@@ -14,6 +15,7 @@ sys.path.append("./scripts")
 from shutil import copyfile, move
 
 from snakemake.remote.HTTP import RemoteProvider as HTTPRemoteProvider
+from snakemake.exceptions import WorkflowError
 
 from _helpers import (
     create_country_list,
@@ -175,6 +177,163 @@ else:
     COSTS = "data/costs.csv"
 ATLITE_NPROCESSES = config["atlite"].get("nprocesses", 4)
 
+SUPPORTED_STOCHASTIC_LEARNING_MODELS = [
+    "shared_state_bayesian_regime_wright",
+    "way_fixed_rho_benchmark_035",
+    "correlated_geometric_random_walk",
+]
+SUPPORTED_RUNTIME_LEARNING_MODELS = ["legacy_curve", *SUPPORTED_STOCHASTIC_LEARNING_MODELS]
+LEGACY_LEARNING_SEED = "deterministic"
+
+
+def load_learning_runtime_config():
+    return config.get("learning", {}) or {}
+
+
+def normalize_learning_seed_token(seed):
+    try:
+        seed_int = int(seed)
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError(f"Learning Monte Carlo seeds must be integers, got {seed!r}.") from exc
+    if seed_int < 0:
+        raise WorkflowError(f"Learning Monte Carlo seeds must be >= 0, got {seed_int}.")
+    return f"s{seed_int:04d}"
+
+
+def get_default_learning_seed_token():
+    learning_cfg = load_learning_runtime_config()
+    return normalize_learning_seed_token(learning_cfg.get("seed", 0))
+
+
+def get_learning_monte_carlo_config():
+    learning_cfg = load_learning_runtime_config()
+    return learning_cfg.get("monte_carlo", {}) or {}
+
+
+def get_learning_monte_carlo_seeds(mc_cfg):
+    draws = int(mc_cfg.get("draws", 0) or 0)
+    if draws <= 0:
+        raise WorkflowError(
+            "learning.monte_carlo.enable=true requires learning.monte_carlo.draws > 0."
+        )
+
+    seed_mode = str(mc_cfg.get("seed_mode", "random"))
+    random_seed = int(mc_cfg.get("random_seed", load_learning_runtime_config().get("seed", 0) or 0))
+
+    if seed_mode == "sequential":
+        return list(range(draws))
+
+    if seed_mode == "random":
+        seed_upper_bound = int(mc_cfg.get("seed_upper_bound", 1_000_000_000) or 1_000_000_000)
+        if seed_upper_bound <= 0:
+            raise WorkflowError(
+                "learning.monte_carlo.seed_upper_bound must be > 0 when seed_mode='random'."
+            )
+        if draws > seed_upper_bound:
+            raise WorkflowError(
+                "learning.monte_carlo.draws cannot exceed learning.monte_carlo.seed_upper_bound."
+            )
+        rng = random.Random(random_seed)
+        return rng.sample(range(seed_upper_bound), draws)
+
+    raise WorkflowError(
+        "Unsupported learning.monte_carlo.seed_mode: "
+        f"{seed_mode}. Supported values: ['random', 'sequential']"
+    )
+
+
+def build_learning_run_pairs(stochastic_only=False):
+    scenario_models = [str(m) for m in (config["scenario"].get("learning_model", ["legacy_curve"]) or ["legacy_curve"])]
+    scenario_learning_rates = [str(rate) for rate in (config["scenario"].get("learning_rate", []) or [])]
+    unsupported = sorted(set(scenario_models) - set(SUPPORTED_RUNTIME_LEARNING_MODELS))
+    if unsupported:
+        raise WorkflowError(
+            f"Unsupported scenario.learning_model entries: {unsupported}. "
+            f"Supported values: {SUPPORTED_RUNTIME_LEARNING_MODELS}"
+        )
+    if any(model != "legacy_curve" for model in scenario_models) and any(
+        rate != "base" for rate in scenario_learning_rates
+    ):
+        raise WorkflowError(
+            "Stochastic learning models require scenario.learning_rate to contain only 'base'. "
+            f"Got learning_model={scenario_models}, learning_rate={scenario_learning_rates}."
+        )
+
+    mc_cfg = get_learning_monte_carlo_config()
+    mc_enabled = bool(mc_cfg.get("enable", False))
+    pairs = []
+
+    if mc_enabled:
+        seeds = get_learning_monte_carlo_seeds(mc_cfg)
+        stochastic_models = [str(m) for m in (mc_cfg.get("stochastic_models", []) or [])]
+        if not stochastic_models:
+            raise WorkflowError(
+                "learning.monte_carlo.enable=true requires a non-empty "
+                "learning.monte_carlo.stochastic_models list."
+            )
+        unsupported_stochastic = sorted(
+            set(stochastic_models) - set(SUPPORTED_STOCHASTIC_LEARNING_MODELS)
+        )
+        if unsupported_stochastic:
+            raise WorkflowError(
+                "Unsupported learning.monte_carlo.stochastic_models entries: "
+                f"{unsupported_stochastic}. Supported values: {SUPPORTED_STOCHASTIC_LEARNING_MODELS}"
+            )
+        if any(str(rate) != "base" for rate in (config["scenario"].get("learning_rate", []) or [])):
+            raise WorkflowError(
+                "learning.monte_carlo.enable=true requires scenario.learning_rate to contain only 'base'."
+            )
+        if not stochastic_only and bool(mc_cfg.get("include_legacy_curve", False)):
+            pairs.append(("legacy_curve", LEGACY_LEARNING_SEED))
+        for model in stochastic_models:
+            for seed in seeds:
+                pairs.append((model, normalize_learning_seed_token(seed)))
+    else:
+        default_seed_token = get_default_learning_seed_token()
+        for model in scenario_models:
+            if model == "legacy_curve":
+                if not stochastic_only:
+                    pairs.append((model, LEGACY_LEARNING_SEED))
+            else:
+                pairs.append((model, default_seed_token))
+
+    if not pairs:
+        raise WorkflowError(
+            "No learning model/seed runs were generated. Check scenario.learning_model and "
+            "learning.monte_carlo."
+        )
+
+    # preserve order while dropping duplicates
+    deduped = []
+    seen = set()
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(pair)
+    return deduped
+
+
+def expand_learning_myopic_targets(pattern, stochastic_only=False):
+    scenario_kwargs = {
+        key: value
+        for key, value in config["scenario"].items()
+        if key not in {"learning_model", "learning_seed"}
+    }
+    outputs = []
+    for learning_model, learning_seed in build_learning_run_pairs(stochastic_only=stochastic_only):
+        outputs.extend(
+            expand(
+                pattern,
+                learning_model=[learning_model],
+                learning_seed=[learning_seed],
+                **scenario_kwargs,
+                **config["costs"],
+                **config["export"],
+            )
+        )
+    return outputs
+
 
 wildcard_constraints:
     simpl="[a-zA-Z0-9]*|all",
@@ -187,7 +346,12 @@ wildcard_constraints:
     demand="[-+a-zA-Z0-9\.\s]*",
     h2export="[0-9]+(\.[0-9]+)?",
     learning_rate="[a-zA-Z0-9\.\_\-]*",
+    learning_model="[a-zA-Z0-9\.\_\-]*",
+    learning_seed="[a-zA-Z0-9\.\_\-]*",
     planning_horizons="20[2-9][0-9]|2100",
+
+
+LEARNING_RUN_PAIRS = build_learning_run_pairs(stochastic_only=False)
 
 
 if config["custom_rules"] is not []:
@@ -2525,7 +2689,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             n_pre_cluster="networks/" + RDIR + "elec_s{simpl}.nc",
         output:
             RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
         wildcard_constraints:
             # TODO: The first planning_horizon needs to be aligned across scenarios
             # snakemake does not support passing functions to wildcard_constraints
@@ -2536,10 +2700,10 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             mem_mb=2000,
         log:
             RESDIR
-            + "logs/add_existing_baseyear_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
+            + "logs/add_existing_baseyear_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.log",
         benchmark:
             RESDIR
-            +"benchmarks/add_existing_baseyear/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
+            +"benchmarks/add_existing_baseyear/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}"
         script:
             "scripts/add_existing_baseyear.py"
 
@@ -2565,7 +2729,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             RESDIR
             + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_"
             + planning_horizon_p
-            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc"
+            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc"
         )
 
     def solved_anchor_horizon(w):
@@ -2582,7 +2746,20 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             RESDIR
             + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_"
             + str(anchor_year)
-            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc"
+            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc"
+        )
+
+    def committed_learning_state_previous_horizon(w):
+        planning_horizons = config["scenario"]["planning_horizons"]
+        i = planning_horizons.index(int(w.planning_horizons))
+        if i == 0:
+            return []
+        planning_horizon_p = str(planning_horizons[i - 1])
+        return (
+            RESDIR
+            + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_"
+            + planning_horizon_p
+            + "_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json"
         )
 
 
@@ -2615,17 +2792,17 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             battery_capacities="data/energy_storage/battery_storage_capa_bycountry.csv",
         output:
             RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
         threads: 4
         resources:
             mem_mb=10000,
         log:
             RESDIR
-            + "logs/add_brownfield_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
+            + "logs/add_brownfield_elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.log",
         benchmark:
             (
                 RESDIR
-                + "benchmarks/add_brownfield/elec_s{simpl}_ec_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
+                + "benchmarks/add_brownfield/elec_s{simpl}_ec_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}"
             )
         script:
             "./scripts/add_brownfield.py"
@@ -2637,31 +2814,33 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             planning_horizons=config["scenario"]["planning_horizons"],
         input:
             network=RESDIR
-            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
             network_p=solved_previous_horizon,  # solved network at previous time step - prevents execution for first horizon
+            prev_state=committed_learning_state_previous_horizon,
             anchor_network=solved_anchor_horizon,  # solved network at anchor year for A recalibration
-            params="data/learning-data/params/learning_params.csv",  # Static template
             learning_config="config.learning.yaml",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             waccs="data/waccs/wacc_by_country.csv",
         output:
             network=RESDIR
-            + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
             cost_log=RESDIR
-            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            state_proposed=RESDIR
+            + "learning/state_proposed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
         threads: 1
         resources:
             mem_mb=5000,
         log:
             RESDIR
-            + "logs/apply_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
+            + "logs/apply_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.log",
         benchmark:
             (
                 RESDIR
-                + "benchmarks/apply_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
+                + "benchmarks/apply_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}"
             )
         script:
-            "./scripts/apply_learning_costs.py"
+            "./scripts/learning/apply_learning_costs.py"
 
     #ruleorder: add_brownfield > apply_learning_costs
 
@@ -2678,17 +2857,17 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             overrides=BASE_DIR + "/data/override_component_attrs",
             # Use learning-enabled network if learning is enabled (including first horizon with historical data)
             network=lambda w: (
-                RESDIR + f"prenetworks-learning/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.nc"
+                RESDIR + f"prenetworks-learning/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.nc"
                 if get_learning_enabled()
-                else RESDIR + f"prenetworks-brownfield/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.nc"
+                else RESDIR + f"prenetworks-brownfield/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.planning_horizons}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.nc"
             ),
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             configs=SDIR + "configs/config.yaml",  # included to trigger copy_config rule
         output:
             network=RESDIR
-            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
             lpfile=RESDIR
-            + "postnetworks/lpfiles/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.lp"
+            + "postnetworks/lpfiles/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.lp"
             if config["solving"].get("save_lpfile", False)
             else [],
             # config=RESDIR
@@ -2697,18 +2876,18 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             "copy-minimal" if os.name == "nt" else "shallow"
         log:
             solver=RESDIR
-            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_solver.log",
+            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}_solver.log",
             python=RESDIR
-            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_python.log",
+            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}_python.log",
             memory=RESDIR
-            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_memory.log",
+            + "logs/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}_memory.log",
         threads: config["solving"]["threads"],
         resources:
             mem_mb=config["solving"]["mem"],
         benchmark:
             (
                 RESDIR
-                + "benchmarks/solve_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
+                + "benchmarks/solve_network/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}"
             )
         script:
             "./scripts/solve_network.py"
@@ -2717,45 +2896,77 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
     rule export_postsolve_learning_costs:
         input:
             network=RESDIR
-            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
             base_cost_log=RESDIR
-            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+            + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            proposed_state=RESDIR
+            + "learning/state_proposed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
             learning_config="config.learning.yaml",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
         output:
             cost_log=RESDIR
-            + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+            + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            state_committed=RESDIR
+            + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
         threads: 1
         resources:
             mem_mb=5000,
         log:
             RESDIR
-            + "logs/export_postsolve_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.log",
+            + "logs/export_postsolve_learning_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.log",
         benchmark:
             (
                 RESDIR
-                + "benchmarks/export_postsolve_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}"
+                + "benchmarks/export_postsolve_learning_costs/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}"
             )
         script:
-            "./scripts/export_postsolve_learning_costs.py"
+            "./scripts/learning/export_postsolve_learning_costs.py"
 
 
     rule solve_sector_networks_myopic:
         input:
-            networks=expand(
+            networks=lambda wildcards: expand_learning_myopic_targets(
                 RESDIR
-                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
-                **config["scenario"],
-                **config["costs"],
-                **config["export"],
+                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
             ),
             postsolve_learning_cost_logs=(
-                expand(
+                lambda wildcards: expand_learning_myopic_targets(
                     RESDIR
-                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
-                    **config["scenario"],
-                    **config["costs"],
-                    **config["export"],
+                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+                )
+                if get_learning_enabled()
+                else []
+            ),
+            postsolve_learning_states=(
+                lambda wildcards: expand_learning_myopic_targets(
+                    RESDIR
+                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+                )
+                if get_learning_enabled()
+                else []
+            ),
+
+    rule solve_sector_networks_myopic_stochastic_mc:
+        input:
+            networks=lambda wildcards: expand_learning_myopic_targets(
+                RESDIR
+                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
+                stochastic_only=True,
+            ),
+            postsolve_learning_cost_logs=(
+                lambda wildcards: expand_learning_myopic_targets(
+                    RESDIR
+                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+                    stochastic_only=True,
+                )
+                if get_learning_enabled()
+                else []
+            ),
+            postsolve_learning_states=(
+                lambda wildcards: expand_learning_myopic_targets(
+                    RESDIR
+                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+                    stochastic_only=True,
                 )
                 if get_learning_enabled()
                 else []
