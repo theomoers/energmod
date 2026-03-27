@@ -58,4 +58,17 @@ if [[ -n "$SCENARIO_TAG_RAW" ]]; then
 fi
 echo "Run mode: $RUN_MODE"
 cd "$JOB_DIR"
-exec bash scripts/learning/run_learning_stochastic_job.sh "$MODEL" "$SEED" --mode "$RUN_MODE" ${DRY_RUN_FLAG:+"$DRY_RUN_FLAG"}
+RUNNER="${LEARNING_CLUSTER_JOB_RUNNER:-bash scripts/learning/run_learning_stochastic_job.sh}"
+
+set +e
+# shellcheck disable=SC2086
+$RUNNER "$MODEL" "$SEED" --mode "$RUN_MODE" ${DRY_RUN_FLAG:+"$DRY_RUN_FLAG"}
+STATUS=$?
+set -e
+
+if [[ "$STATUS" -eq 0 ]]; then
+  cd "$JOB_ROOT"
+  rm -rf "$JOB_DIR"
+fi
+
+exit "$STATUS"

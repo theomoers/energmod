@@ -18,6 +18,7 @@ from learning_runtime_smoke_utils import (
     SHORTLIST_MODELS,
     build_mock_network,
     format_learning_seed,
+    solve_mock_network,
 )
 
 
@@ -34,6 +35,8 @@ def _first(value):
 
 def build_synthetic_config(output_root, mode, single_model, mc_models, mc_seeds):
     cfg = yaml.safe_load((ENERGYMOD_ROOT / "config.myopic.yaml").read_text(encoding="utf-8"))
+    learning_cfg = yaml.safe_load((ENERGYMOD_ROOT / "config.learning.yaml").read_text(encoding="utf-8"))
+    cfg["learning"] = learning_cfg.get("learning", {})
 
     cfg["results_dir"] = "results/"
     cfg["summary_dir"] = "results/"
@@ -76,6 +79,9 @@ def build_synthetic_config(output_root, mode, single_model, mc_models, mc_seeds)
     cfg["learning"]["monte_carlo"]["seed_mode"] = "sequential"
     cfg["learning"]["monte_carlo"]["random_seed"] = 0
     cfg["learning"]["monte_carlo"]["seed_upper_bound"] = 1000000
+    cfg["learning"]["compact_outputs"]["enable"] = False
+    cfg["learning"]["compact_outputs"]["cleanup_heavy_raws"] = True
+    cfg["learning"]["compact_outputs"]["price_shadow_resolution"] = "annual_summary"
 
     config_path = output_root / f"config.synthetic.{mode}.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +173,25 @@ def build_cost_log_filename(cfg, workspace_root, year, learning_model, learning_
     return results_root_from_config(cfg, workspace_root) / "learning" / filename
 
 
+def build_bootstrap_cost_log_filename(cfg, workspace_root, year, learning_model):
+    scenario = cfg["scenario"]
+    simpl = _first(scenario["simpl"])
+    clusters = _first(scenario["clusters"])
+    ll = _first(scenario["ll"])
+    opts = _first(scenario["opts"])
+    sopts = _first(scenario["sopts"])
+    demand = _first(scenario["demand"])
+    learning_rate = _first(scenario["learning_rate"])
+    discountrate = _first(cfg["costs"]["discountrate"])
+    h2export = _first(cfg["export"]["h2export"])
+
+    filename = (
+        f"cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{year}_{discountrate}_{demand}_"
+        f"{h2export}export_{learning_rate}_model_{learning_model}.csv"
+    )
+    return results_root_from_config(cfg, workspace_root) / "learning" / filename
+
+
 def build_state_filename(cfg, workspace_root, year, learning_model, learning_seed):
     scenario = cfg["scenario"]
     simpl = _first(scenario["simpl"])
@@ -186,6 +211,155 @@ def build_state_filename(cfg, workspace_root, year, learning_model, learning_see
     return results_root_from_config(cfg, workspace_root) / "learning" / filename
 
 
+def build_bootstrap_state_filename(cfg, workspace_root, year, learning_model):
+    scenario = cfg["scenario"]
+    simpl = _first(scenario["simpl"])
+    clusters = _first(scenario["clusters"])
+    ll = _first(scenario["ll"])
+    opts = _first(scenario["opts"])
+    sopts = _first(scenario["sopts"])
+    demand = _first(scenario["demand"])
+    learning_rate = _first(scenario["learning_rate"])
+    discountrate = _first(cfg["costs"]["discountrate"])
+    h2export = _first(cfg["export"]["h2export"])
+
+    filename = (
+        f"state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{year}_{discountrate}_{demand}_"
+        f"{h2export}export_{learning_rate}_model_{learning_model}.json"
+    )
+    return results_root_from_config(cfg, workspace_root) / "learning" / filename
+
+
+def build_postnetwork_filename(cfg, workspace_root, year, learning_model, learning_seed=None):
+    scenario = cfg["scenario"]
+    simpl = _first(scenario["simpl"])
+    clusters = _first(scenario["clusters"])
+    ll = _first(scenario["ll"])
+    opts = _first(scenario["opts"])
+    sopts = _first(scenario["sopts"])
+    demand = _first(scenario["demand"])
+    learning_rate = _first(scenario["learning_rate"])
+    discountrate = _first(cfg["costs"]["discountrate"])
+    h2export = _first(cfg["export"]["h2export"])
+
+    seed_suffix = f"_seed_{learning_seed}" if learning_seed is not None else ""
+    filename = (
+        f"elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{year}_{discountrate}_{demand}_"
+        f"{h2export}export_{learning_rate}_model_{learning_model}{seed_suffix}.nc"
+    )
+    return results_root_from_config(cfg, workspace_root) / "postnetworks" / filename
+
+
+def build_prenetwork_learning_filename(cfg, workspace_root, year, learning_model, learning_seed):
+    scenario = cfg["scenario"]
+    simpl = _first(scenario["simpl"])
+    clusters = _first(scenario["clusters"])
+    ll = _first(scenario["ll"])
+    opts = _first(scenario["opts"])
+    sopts = _first(scenario["sopts"])
+    demand = _first(scenario["demand"])
+    learning_rate = _first(scenario["learning_rate"])
+    discountrate = _first(cfg["costs"]["discountrate"])
+    h2export = _first(cfg["export"]["h2export"])
+
+    filename = (
+        f"elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{year}_{discountrate}_{demand}_"
+        f"{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc"
+    )
+    return results_root_from_config(cfg, workspace_root) / "prenetworks-learning" / filename
+
+
+def build_compact_complete_path(cfg, workspace_root, learning_model, learning_seed):
+    scenario = cfg["scenario"]
+    simpl = _first(scenario["simpl"])
+    clusters = _first(scenario["clusters"])
+    ll = _first(scenario["ll"])
+    opts = _first(scenario["opts"])
+    sopts = _first(scenario["sopts"])
+    demand = _first(scenario["demand"])
+    learning_rate = _first(scenario["learning_rate"])
+    discountrate = _first(cfg["costs"]["discountrate"])
+    h2export = _first(cfg["export"]["h2export"])
+    scenario_tag = str(cfg["run"]["sector_name"])
+    return (
+        results_root_from_config(cfg, workspace_root)
+        / "learning-compact"
+        / scenario_tag
+        / learning_model
+        / f"seed_{learning_seed}"
+        / (
+            f"compact_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_"
+            f"{h2export}export_{learning_rate}.json"
+        )
+    )
+
+
+def build_compact_cleanup_marker_path(cfg, workspace_root, learning_model, learning_seed):
+    scenario = cfg["scenario"]
+    simpl = _first(scenario["simpl"])
+    clusters = _first(scenario["clusters"])
+    ll = _first(scenario["ll"])
+    opts = _first(scenario["opts"])
+    sopts = _first(scenario["sopts"])
+    demand = _first(scenario["demand"])
+    learning_rate = _first(scenario["learning_rate"])
+    discountrate = _first(cfg["costs"]["discountrate"])
+    h2export = _first(cfg["export"]["h2export"])
+    scenario_tag = str(cfg["run"]["sector_name"])
+    return (
+        results_root_from_config(cfg, workspace_root)
+        / "learning-compact"
+        / scenario_tag
+        / learning_model
+        / f"seed_{learning_seed}"
+        / (
+            f"raw_cleanup_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_"
+            f"{h2export}export_{learning_rate}.txt"
+        )
+    )
+
+
+def write_mock_learning_outputs(cost_log_path, state_path, model_name, learning_seed, year):
+    cost_log_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "technology": "solar_power",
+                "c_overnight": 750.0 - year / 100.0,
+                "capital_cost": 120.0 - year / 1000.0,
+                "selected_model": model_name,
+                "learning_seed": learning_seed,
+                "training_window": "origin_cutoff",
+            },
+            {
+                "technology": "onwind_power",
+                "c_overnight": 1150.0 - year / 100.0,
+                "capital_cost": 180.0 - year / 1000.0,
+                "selected_model": model_name,
+                "learning_seed": learning_seed,
+                "training_window": "origin_cutoff",
+            },
+        ]
+    ).to_csv(cost_log_path, index=False)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "planning_horizon": int(year),
+                "selected_model": model_name,
+                "learning_seed": learning_seed,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def relative_target(path, workspace_root):
+    return str(Path(path).resolve().relative_to(Path(workspace_root).resolve()))
+
+
 def create_synthetic_brownfields(cfg, workspace_root, model_seed_pairs):
     outputs = {}
     for model_name, learning_seed in model_seed_pairs:
@@ -202,6 +376,24 @@ def create_synthetic_brownfields(cfg, workspace_root, model_seed_pairs):
             build_mock_network(year).export_to_netcdf(path)
             per_model[str(year)] = str(path)
         outputs[f"{model_name}:{learning_seed}"] = per_model
+    return outputs
+
+
+def create_synthetic_bootstrap_outputs(cfg, workspace_root, model_names, root):
+    outputs = {}
+    for index, model_name in enumerate(model_names):
+        input_path = create_temp_network_file(root / f"bootstrap_input_{model_name}_{index}.nc", 2020)
+        network_path = build_postnetwork_filename(cfg, workspace_root, 2020, model_name)
+        network_path.parent.mkdir(parents=True, exist_ok=True)
+        solve_mock_network(input_path, network_path)
+        cost_log_path = build_bootstrap_cost_log_filename(cfg, workspace_root, 2020, model_name)
+        state_path = build_bootstrap_state_filename(cfg, workspace_root, 2020, model_name)
+        write_mock_learning_outputs(cost_log_path, state_path, model_name, LEGACY_LEARNING_SEED, 2020)
+        outputs[model_name] = {
+            "network": str(network_path),
+            "cost_log": str(cost_log_path),
+            "state": str(state_path),
+        }
     return outputs
 
 
@@ -343,24 +535,32 @@ def run_single_smoke(root, model_name, seed):
         workspace_root,
         [(model_name, token)],
     )
+    bootstrap_inputs = create_synthetic_bootstrap_outputs(
+        cfg,
+        workspace_root,
+        [model_name],
+        root,
+    )
     targets = [
-        str(
+        relative_target(
             build_cost_log_filename(
                 cfg,
                 workspace_root,
                 2025,
                 model_name,
                 token,
-            ).relative_to(workspace_root)
+            ),
+            workspace_root,
         ),
-        str(
+        relative_target(
             build_state_filename(
                 cfg,
                 workspace_root,
                 2025,
                 model_name,
                 token,
-            ).relative_to(workspace_root)
+            ),
+            workspace_root,
         ),
     ]
     result = run_snakemake_targets(
@@ -379,6 +579,7 @@ def run_single_smoke(root, model_name, seed):
         "targets": targets,
         "config": str(config_path),
         "synthetic_inputs": synthetic_inputs,
+        "bootstrap_inputs": bootstrap_inputs,
         "outputs": outputs,
     }
     (root / "summary.single.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -405,27 +606,35 @@ def run_mc_smoke(root, model_name, seeds):
         workspace_root,
         pairs,
     )
+    bootstrap_inputs = create_synthetic_bootstrap_outputs(
+        cfg,
+        workspace_root,
+        [model_name],
+        root,
+    )
     targets = []
     for _, token in pairs:
         targets.extend(
             [
-                str(
+                relative_target(
                     build_cost_log_filename(
                         cfg,
                         workspace_root,
                         2025,
                         model_name,
                         token,
-                    ).relative_to(workspace_root)
+                    ),
+                    workspace_root,
                 ),
-                str(
+                relative_target(
                     build_state_filename(
                         cfg,
                         workspace_root,
                         2025,
                         model_name,
                         token,
-                    ).relative_to(workspace_root)
+                    ),
+                    workspace_root,
                 ),
             ]
         )
@@ -446,11 +655,278 @@ def run_mc_smoke(root, model_name, seeds):
         "targets": targets,
         "config": str(config_path),
         "synthetic_inputs": synthetic_inputs,
+        "bootstrap_inputs": bootstrap_inputs,
         "outputs": outputs,
         "divergence": divergence,
     }
     (root / "summary.mc.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary
+
+
+def run_compact_cleanup_smoke(root, model_name, seed):
+    root.mkdir(parents=True, exist_ok=True)
+    workspace_root = root / "workspace"
+    prepare_workspace(workspace_root)
+    populate_workspace_resources(workspace_root)
+    write_workspace_learning_config(workspace_root, seed)
+    config_path = build_synthetic_config(
+        workspace_root,
+        "single",
+        model_name,
+        [],
+        [],
+    )
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    cfg["scenario"]["planning_horizons"] = [2020, 2025]
+    cfg["learning"]["compact_outputs"]["enable"] = True
+    cfg["learning"]["compact_outputs"]["cleanup_heavy_raws"] = True
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    token = format_learning_seed(model_name, seed)
+
+    bootstrap_network = build_postnetwork_filename(cfg, workspace_root, 2020, model_name)
+    bootstrap_network.parent.mkdir(parents=True, exist_ok=True)
+    solve_mock_network(
+        input_path=create_temp_network_file(root / "bootstrap_2020_input.nc", 2020),
+        output_path=bootstrap_network,
+    )
+    bootstrap_cost = build_bootstrap_cost_log_filename(cfg, workspace_root, 2020, model_name)
+    bootstrap_state = build_bootstrap_state_filename(cfg, workspace_root, 2020, model_name)
+    write_mock_learning_outputs(bootstrap_cost, bootstrap_state, model_name, LEGACY_LEARNING_SEED, 2020)
+
+    branch_brownfield = build_brownfield_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_learning = build_prenetwork_learning_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_postnetwork = build_postnetwork_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_brownfield.parent.mkdir(parents=True, exist_ok=True)
+    branch_learning.parent.mkdir(parents=True, exist_ok=True)
+    branch_postnetwork.parent.mkdir(parents=True, exist_ok=True)
+    input_2025 = create_temp_network_file(root / "branch_2025_input.nc", 2025)
+    shutil.copy2(input_2025, branch_brownfield)
+    shutil.copy2(input_2025, branch_learning)
+    solve_mock_network(input_2025, branch_postnetwork)
+
+    branch_cost = build_cost_log_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_state = build_state_filename(cfg, workspace_root, 2025, model_name, token)
+    write_mock_learning_outputs(branch_cost, branch_state, model_name, token, 2025)
+
+    cleanup_marker = build_compact_cleanup_marker_path(cfg, workspace_root, model_name, token)
+    result = run_snakemake_targets(
+        [relative_target(cleanup_marker, workspace_root)],
+        config_path,
+        workspace_root,
+        allowed_rules=["export_stochastic_run_bundle", "cleanup_stochastic_branch_raw_artifacts"],
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Synthetic compact-output smoke failed.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+    compact_complete = build_compact_complete_path(cfg, workspace_root, model_name, token)
+    if not compact_complete.exists():
+        raise FileNotFoundError(f"Expected compact output marker missing: {compact_complete}")
+    if not cleanup_marker.exists():
+        raise FileNotFoundError(f"Expected cleanup marker missing: {cleanup_marker}")
+
+    bundle_dir = compact_complete.parent
+    expected_csvs = [
+        "learning_costs.csv",
+        "system_summary.csv",
+        "generation_country_carrier.csv",
+        "capacity_country_carrier.csv",
+        "deployment_country_carrier.csv",
+        "deployment_node_carrier.csv",
+        "power_emissions_country_carrier.csv",
+        "sector_emissions.csv",
+        "sector_demands_country.csv",
+        "electricity_price_node_year.csv",
+        "electricity_price_country_year.csv",
+        "constraint_shadow_system_year.csv",
+        "constraint_shadow_asset_year.csv",
+        "lcoe_electricity_tech_year.csv",
+        "run_manifest.json",
+        "compact_complete.json",
+    ]
+    missing = [name for name in expected_csvs if not (bundle_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"Compact bundle missing files: {missing}")
+
+    for raw_path in (branch_brownfield, branch_learning, branch_postnetwork):
+        if raw_path.exists():
+            raise RuntimeError(f"Expected compact cleanup to remove {raw_path}")
+    if not branch_cost.exists() or not branch_state.exists():
+        raise RuntimeError("Compact cleanup removed solved learning outputs that should have been retained.")
+
+    summary = {
+        "mode": "compact_cleanup",
+        "compact_complete": str(compact_complete),
+        "cleanup_marker": str(cleanup_marker),
+        "bundle_dir": str(bundle_dir),
+    }
+    (root / "summary.compact_cleanup.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def run_compact_failure_smoke(root, model_name, seed):
+    root.mkdir(parents=True, exist_ok=True)
+    workspace_root = root / "workspace"
+    prepare_workspace(workspace_root)
+    populate_workspace_resources(workspace_root)
+    write_workspace_learning_config(workspace_root, seed)
+    config_path = build_synthetic_config(
+        workspace_root,
+        "single",
+        model_name,
+        [],
+        [],
+    )
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    cfg["scenario"]["planning_horizons"] = [2020, 2025]
+    cfg["learning"]["compact_outputs"]["enable"] = True
+    cfg["learning"]["compact_outputs"]["cleanup_heavy_raws"] = True
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    token = format_learning_seed(model_name, seed)
+    bootstrap_network = build_postnetwork_filename(cfg, workspace_root, 2020, model_name)
+    bootstrap_network.parent.mkdir(parents=True, exist_ok=True)
+    solve_mock_network(
+        input_path=create_temp_network_file(root / "bootstrap_fail_2020_input.nc", 2020),
+        output_path=bootstrap_network,
+    )
+    bootstrap_cost = build_bootstrap_cost_log_filename(cfg, workspace_root, 2020, model_name)
+    bootstrap_state = build_bootstrap_state_filename(cfg, workspace_root, 2020, model_name)
+    write_mock_learning_outputs(bootstrap_cost, bootstrap_state, model_name, LEGACY_LEARNING_SEED, 2020)
+
+    branch_brownfield = build_brownfield_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_learning = build_prenetwork_learning_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_postnetwork = build_postnetwork_filename(cfg, workspace_root, 2025, model_name, token)
+    input_2025 = create_temp_network_file(root / "branch_fail_2025_input.nc", 2025)
+    branch_brownfield.parent.mkdir(parents=True, exist_ok=True)
+    branch_learning.parent.mkdir(parents=True, exist_ok=True)
+    branch_postnetwork.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(input_2025, branch_brownfield)
+    shutil.copy2(input_2025, branch_learning)
+    solve_mock_network(input_2025, branch_postnetwork)
+    branch_cost = build_cost_log_filename(cfg, workspace_root, 2025, model_name, token)
+    branch_state = build_state_filename(cfg, workspace_root, 2025, model_name, token)
+    write_mock_learning_outputs(branch_cost, branch_state, model_name, token, 2025)
+
+    compact_complete = build_compact_complete_path(cfg, workspace_root, model_name, token)
+    env = os.environ.copy()
+    env["LEARNING_COMPACT_FORCE_FAIL"] = "1"
+    cmd = [
+        sys.executable,
+        "-m",
+        "snakemake",
+        "-j1",
+        relative_target(compact_complete, workspace_root),
+        "--configfile",
+        str(config_path),
+        "config.learning.yaml",
+        "--rerun-trigger",
+        "mtime",
+        "--allowed-rules",
+        "export_stochastic_run_bundle",
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=workspace_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        raise RuntimeError("Forced compact-output failure smoke unexpectedly succeeded.")
+    if not branch_brownfield.exists() or not branch_learning.exists() or not branch_postnetwork.exists():
+        raise RuntimeError("Compact-output failure smoke removed raw artifacts on failure.")
+    summary = {
+        "mode": "compact_failure",
+        "stderr_tail": result.stderr[-1000:],
+    }
+    (root / "summary.compact_failure.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def run_cluster_wrapper_cleanup_smoke(root):
+    root.mkdir(parents=True, exist_ok=True)
+    job_root = root / "cluster_workdirs"
+    job_root.mkdir(parents=True, exist_ok=True)
+    success_runner = root / "success_runner.sh"
+    failure_runner = root / "failure_runner.sh"
+    success_runner.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    failure_runner.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    success_runner.chmod(0o755)
+    failure_runner.chmod(0o755)
+
+    base_env = os.environ.copy()
+    base_env["LEARNING_SCENARIO_NAME"] = "wrapper_smoke"
+
+    success_env = base_env.copy()
+    success_env["LEARNING_CLUSTER_JOB_RUNNER"] = str(success_runner)
+    success = subprocess.run(
+        [
+            "bash",
+            str(ENERGYMOD_ROOT / "scripts" / "learning" / "run_learning_cluster_job.sh"),
+            DEFAULT_SINGLE_MODEL,
+            "7",
+            str(job_root),
+        ],
+        cwd=ENERGYMOD_ROOT,
+        env=success_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    success_dir = job_root / f"energymod_wrapper_smoke_{DEFAULT_SINGLE_MODEL}_s0007"
+    if success.returncode != 0:
+        raise RuntimeError(f"Wrapper cleanup smoke success path failed:\n{success.stderr}")
+    if success_dir.exists():
+        raise RuntimeError(f"Expected wrapper success path to remove {success_dir}")
+
+    failure_env = base_env.copy()
+    failure_env["LEARNING_CLUSTER_JOB_RUNNER"] = str(failure_runner)
+    failure = subprocess.run(
+        [
+            "bash",
+            str(ENERGYMOD_ROOT / "scripts" / "learning" / "run_learning_cluster_job.sh"),
+            DEFAULT_SINGLE_MODEL,
+            "8",
+            str(job_root),
+        ],
+        cwd=ENERGYMOD_ROOT,
+        env=failure_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    failure_dir = job_root / f"energymod_wrapper_smoke_{DEFAULT_SINGLE_MODEL}_s0008"
+    if failure.returncode == 0:
+        raise RuntimeError("Wrapper cleanup smoke failure path unexpectedly succeeded.")
+    if not failure_dir.exists():
+        raise RuntimeError(f"Expected wrapper failure path to keep {failure_dir}")
+
+    summary = {
+        "mode": "cluster_wrapper_cleanup",
+        "success_dir_removed": str(success_dir),
+        "failure_dir_retained": str(failure_dir),
+    }
+    (root / "summary.cluster_wrapper_cleanup.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def create_temp_network_file(path, planning_year):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    build_mock_network(planning_year).export_to_netcdf(path)
+    return path
 
 
 def main():
@@ -469,9 +945,25 @@ def main():
     output_root = Path(args.output_root).resolve()
     single_summary = run_single_smoke(output_root / "single", args.single_model, args.single_seed)
     mc_summary = run_mc_smoke(output_root / "mc", args.mc_model, args.mc_seeds)
+    compact_cleanup_summary = run_compact_cleanup_smoke(
+        output_root / "compact_cleanup",
+        args.single_model,
+        args.single_seed,
+    )
+    compact_failure_summary = run_compact_failure_smoke(
+        output_root / "compact_failure",
+        args.single_model,
+        args.single_seed + 1,
+    )
+    cluster_wrapper_cleanup_summary = run_cluster_wrapper_cleanup_smoke(
+        output_root / "cluster_wrapper_cleanup"
+    )
     summary = {
         "single": single_summary,
         "mc": mc_summary,
+        "compact_cleanup": compact_cleanup_summary,
+        "compact_failure": compact_failure_summary,
+        "cluster_wrapper_cleanup": cluster_wrapper_cleanup_summary,
     }
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

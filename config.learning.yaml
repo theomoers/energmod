@@ -30,3 +30,7 @@ learning:
     seed_mode: random      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000
+  compact_outputs:
+    enable: false
+    cleanup_heavy_raws: true
+    price_shadow_resolution: annual_summary

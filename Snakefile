@@ -340,6 +340,42 @@ def get_learning_execution_mode():
     return str(learning_cfg.get("execution_mode", "full"))
 
 
+def get_learning_compact_outputs_config():
+    learning_cfg = load_learning_runtime_config()
+    return learning_cfg.get("compact_outputs", {}) or {}
+
+
+def is_learning_compact_outputs_enabled():
+    cfg = get_learning_compact_outputs_config()
+    return bool(cfg.get("enable", False))
+
+
+def should_cleanup_learning_compact_raws():
+    cfg = get_learning_compact_outputs_config()
+    return bool(cfg.get("enable", False)) and bool(cfg.get("cleanup_heavy_raws", True))
+
+
+def sanitize_learning_compact_token(value, fallback="default"):
+    raw = str(value or "").strip()
+    if not raw:
+        return fallback
+    token = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    token = token.strip("._-")
+    return token or fallback
+
+
+def get_learning_compact_scenario_tag():
+    return sanitize_learning_compact_token(
+        os.environ.get("LEARNING_SCENARIO_NAME")
+        or run.get("sector_name")
+        or run.get("name")
+        or "default"
+    )
+
+
+LEARNING_COMPACT_SCENARIO_TAG = get_learning_compact_scenario_tag()
+
+
 def get_learning_bootstrap_horizons():
     horizons = [int(h) for h in (config["scenario"].get("planning_horizons", []) or [])]
     return horizons[:1]
@@ -500,6 +536,138 @@ def expand_learning_branch_shared_targets(pattern):
         **config["costs"],
         **config["export"],
     )
+
+
+def expand_learning_seed_targets(pattern, stochastic_only=False):
+    scenario_kwargs = {
+        key: value
+        for key, value in config["scenario"].items()
+        if key not in {"learning_model", "learning_seed", "planning_horizons"}
+    }
+    outputs = []
+    for learning_model, learning_seed in build_learning_run_pairs(stochastic_only=stochastic_only):
+        outputs.extend(
+            expand(
+                pattern,
+                learning_model=[learning_model],
+                learning_seed=[learning_seed],
+                **scenario_kwargs,
+                **config["costs"],
+                **config["export"],
+            )
+        )
+    return outputs
+
+
+def compact_learning_bundle_dir(w):
+    return (
+        RESDIR
+        + f"learning-compact/{LEARNING_COMPACT_SCENARIO_TAG}/{w.learning_model}/seed_{w.learning_seed}"
+    )
+
+
+def compact_learning_complete_path(w):
+    return (
+        compact_learning_bundle_dir(w)
+        + f"/compact_complete_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.json"
+    )
+
+
+def compact_learning_cleanup_marker_path(w):
+    return (
+        compact_learning_bundle_dir(w)
+        + f"/raw_cleanup_complete_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.txt"
+    )
+
+
+def compact_learning_bootstrap_network_inputs(w):
+    return [
+        RESDIR
+        + f"postnetworks/elec_s{w.simpl}_{w.clusters}_ec_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}.nc"
+        for year in get_learning_bootstrap_horizons()
+    ]
+
+
+def compact_learning_branch_network_inputs(w):
+    return [
+        RESDIR
+        + f"postnetworks/elec_s{w.simpl}_{w.clusters}_ec_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.nc"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_network_inputs(w):
+    return compact_learning_bootstrap_network_inputs(w) + compact_learning_branch_network_inputs(w)
+
+
+def compact_learning_bootstrap_cost_log_inputs(w):
+    return [
+        RESDIR
+        + f"learning/cost_log_solved_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}.csv"
+        for year in get_learning_bootstrap_horizons()
+    ]
+
+
+def compact_learning_branch_cost_log_inputs(w):
+    return [
+        RESDIR
+        + f"learning/cost_log_solved_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_cost_log_inputs(w):
+    return compact_learning_bootstrap_cost_log_inputs(w) + compact_learning_branch_cost_log_inputs(w)
+
+
+def compact_learning_bootstrap_state_inputs(w):
+    return [
+        RESDIR
+        + f"learning/state_committed_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}.json"
+        for year in get_learning_bootstrap_horizons()
+    ]
+
+
+def compact_learning_branch_state_inputs(w):
+    return [
+        RESDIR
+        + f"learning/state_committed_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.json"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_state_inputs(w):
+    return compact_learning_bootstrap_state_inputs(w) + compact_learning_branch_state_inputs(w)
+
+
+def compact_learning_branch_brownfield_inputs(w):
+    return [
+        RESDIR
+        + f"prenetworks-brownfield/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.nc"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_branch_prenetwork_inputs(w):
+    return [
+        RESDIR
+        + f"prenetworks-learning/elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.nc"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_branch_postnetwork_inputs(w):
+    return compact_learning_branch_network_inputs(w)
+
+
+def compact_learning_branch_lpfile_inputs(w):
+    if not config["solving"].get("save_lpfile", False):
+        return []
+    return [
+        RESDIR
+        + f"postnetworks/lpfiles/elec_s{w.simpl}_{w.clusters}_ec_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.lp"
+        for year in get_learning_branch_horizons()
+    ]
 
 
 wildcard_constraints:
@@ -3430,6 +3598,49 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
         script:
             "./scripts/learning/export_postsolve_learning_costs.py"
 
+    rule export_stochastic_run_bundle:
+        input:
+            networks=compact_learning_network_inputs,
+            cost_logs=compact_learning_cost_log_inputs,
+            states=compact_learning_state_inputs,
+            learning_config="config.learning.yaml",
+        output:
+            complete=RESDIR
+            + f"learning-compact/{LEARNING_COMPACT_SCENARIO_TAG}/{{learning_model}}/seed_{{learning_seed}}/"
+            + "compact_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.json",
+        params:
+            planning_horizons=config["scenario"]["planning_horizons"],
+            bundle_dir=RESDIR
+            + f"learning-compact/{LEARNING_COMPACT_SCENARIO_TAG}/{{learning_model}}/seed_{{learning_seed}}",
+            scenario_tag=LEARNING_COMPACT_SCENARIO_TAG,
+        threads: 1
+        resources:
+            mem_mb=6000,
+        log:
+            RESDIR
+            + "logs/export_stochastic_run_bundle_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.log",
+        script:
+            "./scripts/learning/export_stochastic_run_bundle.py"
+
+
+    rule cleanup_stochastic_branch_raw_artifacts:
+        input:
+            complete=lambda w: compact_learning_complete_path(w),
+            brownfield=compact_learning_branch_brownfield_inputs,
+            learning_prenetworks=compact_learning_branch_prenetwork_inputs,
+            postnetworks=compact_learning_branch_postnetwork_inputs,
+            lpfiles=compact_learning_branch_lpfile_inputs,
+        output:
+            marker=RESDIR
+            + f"learning-compact/{LEARNING_COMPACT_SCENARIO_TAG}/{{learning_model}}/seed_{{learning_seed}}/"
+            + "raw_cleanup_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.txt",
+        shell:
+            r"""
+            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.lpfiles}
+            mkdir -p "$(dirname {output.marker})"
+            printf 'branch raws cleaned\n' > {output.marker}
+            """
+
 
     rule solve_sector_networks_myopic_learning_bootstrap:
         input:
@@ -3512,28 +3723,54 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 if get_learning_enabled()
                 else []
             ),
-            networks=lambda wildcards: expand_learning_branch_targets(
-                RESDIR
-                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
-                stochastic_only=True,
+            compact_completion_markers=(
+                lambda wildcards: expand_learning_seed_targets(
+                    RESDIR
+                    + f"learning-compact/{LEARNING_COMPACT_SCENARIO_TAG}/{{learning_model}}/seed_{{learning_seed}}/"
+                    + (
+                        "raw_cleanup_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.txt"
+                        if should_cleanup_learning_compact_raws()
+                        else "compact_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.json"
+                    ),
+                    stochastic_only=True,
+                )
+                if get_learning_enabled() and is_learning_compact_outputs_enabled()
+                else []
+            ),
+            networks=(
+                lambda wildcards: []
+                if get_learning_enabled() and is_learning_compact_outputs_enabled()
+                else expand_learning_branch_targets(
+                    RESDIR
+                    + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
+                    stochastic_only=True,
+                )
             ),
             postsolve_learning_cost_logs=(
-                lambda wildcards: expand_learning_branch_targets(
-                    RESDIR
-                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
-                    stochastic_only=True,
+                lambda wildcards: []
+                if get_learning_enabled() and is_learning_compact_outputs_enabled()
+                else (
+                    expand_learning_branch_targets(
+                        RESDIR
+                        + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+                        stochastic_only=True,
+                    )
+                    if get_learning_enabled()
+                    else []
                 )
-                if get_learning_enabled()
-                else []
             ),
             postsolve_learning_states=(
-                lambda wildcards: expand_learning_branch_targets(
-                    RESDIR
-                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
-                    stochastic_only=True,
+                lambda wildcards: []
+                if get_learning_enabled() and is_learning_compact_outputs_enabled()
+                else (
+                    expand_learning_branch_targets(
+                        RESDIR
+                        + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+                        stochastic_only=True,
+                    )
+                    if get_learning_enabled()
+                    else []
                 )
-                if get_learning_enabled()
-                else []
             ),
 
 
