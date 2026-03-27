@@ -47,6 +47,14 @@ OUTPUT_TABLE_SPECS = {
         "annual_generation_mwh",
         "annual_generation_twh",
     ],
+    "ac_energy_balance_country_carrier.csv": [
+        "year",
+        "country",
+        "component",
+        "carrier",
+        "energy_balance_mwh",
+        "energy_balance_twh",
+    ],
     "capacity_country_carrier.csv": [
         "year",
         "component",
@@ -54,6 +62,24 @@ OUTPUT_TABLE_SPECS = {
         "carrier",
         "capacity_unit",
         "capacity_value",
+    ],
+    "battery_operations_country_year.csv": [
+        "year",
+        "country",
+        "carrier",
+        "charge_input_from_ac_mwh",
+        "charge_to_store_mwh",
+        "discharge_from_store_mwh",
+        "discharge_to_ac_mwh",
+        "net_ac_supply_mwh",
+        "throughput_mwh",
+        "charging_losses_mwh",
+        "discharging_losses_mwh",
+        "total_losses_mwh",
+        "store_energy_capacity_mwh",
+        "charger_power_capacity_mw",
+        "discharger_power_capacity_mw",
+        "estimated_cycles",
     ],
     "deployment_country_carrier.csv": [
         "year",
@@ -483,6 +509,44 @@ def _collect_generation_records(n: pypsa.Network) -> pd.DataFrame:
     )
 
 
+def _ac_energy_balance_country_carrier(n: pypsa.Network) -> pd.DataFrame:
+    try:
+        balance = n.statistics.energy_balance(
+            bus_carrier="AC",
+            aggregate_time="sum",
+            aggregate_groups="sum",
+            groupby=n.statistics.groupers.get_country_and_carrier,
+            nice_names=True,
+        )
+    except Exception:
+        return _empty_frame("ac_energy_balance_country_carrier.csv")
+
+    if not isinstance(balance, pd.Series):
+        balance = balance.rename("energy_balance_mwh")
+    frame = balance.rename("energy_balance_mwh").reset_index()
+    required_columns = {"component", "country", "carrier", "energy_balance_mwh"}
+    if not required_columns.issubset(frame.columns):
+        return _empty_frame("ac_energy_balance_country_carrier.csv")
+
+    frame = frame.loc[
+        frame["component"].isin(["Generator", "Link", "StorageUnit", "Load"])
+        & frame["country"].fillna("").astype(str).ne("")
+        & pd.to_numeric(frame["energy_balance_mwh"], errors="coerce").fillna(0.0).gt(0.0)
+    ].copy()
+    if frame.empty:
+        return _empty_frame("ac_energy_balance_country_carrier.csv")
+
+    frame["country"] = frame["country"].astype(str)
+    frame["carrier"] = frame["carrier"].astype(str)
+    frame["energy_balance_mwh"] = pd.to_numeric(frame["energy_balance_mwh"], errors="coerce").fillna(0.0)
+    frame["energy_balance_twh"] = frame["energy_balance_mwh"] / 1e6
+    return (
+        frame.groupby(["country", "component", "carrier"], as_index=False)[["energy_balance_mwh", "energy_balance_twh"]]
+        .sum()
+        .sort_values(["country", "carrier", "component"], ignore_index=True)
+    )
+
+
 def _collect_capacity_records(n: pypsa.Network) -> pd.DataFrame:
     bus_country = _bus_country_lookup(n)
     frames = []
@@ -582,6 +646,102 @@ def _capacity_country_summary(capacity_df: pd.DataFrame, year: int) -> pd.DataFr
     )
     result.insert(0, "year", int(year))
     return result
+
+
+def _battery_operations_country_year(n: pypsa.Network) -> pd.DataFrame:
+    if n.links.empty or n.stores.empty:
+        return _empty_frame("battery_operations_country_year.csv")
+
+    weights = _snapshot_weights(n, "objective")
+    bus_country = _bus_country_lookup(n)
+    rows = []
+
+    battery_stores = n.stores.loc[n.stores["carrier"].astype(str).str.lower().eq("battery")].copy() if "carrier" in n.stores.columns else pd.DataFrame()
+    if battery_stores.empty:
+        return _empty_frame("battery_operations_country_year.csv")
+
+    store_capacity_col = "e_nom_opt" if "e_nom_opt" in battery_stores.columns else ("e_nom" if "e_nom" in battery_stores.columns else None)
+    store_summary = (
+        battery_stores.assign(
+            country=battery_stores["bus"].map(bus_country).fillna("").astype(str),
+            store_energy_capacity_mwh=pd.to_numeric(battery_stores[store_capacity_col], errors="coerce").fillna(0.0) if store_capacity_col else 0.0,
+        )
+        .groupby("country", as_index=False)["store_energy_capacity_mwh"]
+        .sum()
+    )
+
+    links = n.links.copy()
+    if "carrier" not in links.columns:
+        return _empty_frame("battery_operations_country_year.csv")
+
+    capacity_col = _capacity_column(links, "p_nom_opt", "p_nom")
+
+    charger_mask = links["carrier"].astype(str).str.lower().eq("battery charger")
+    if charger_mask.any() and "p0" in n.links_t and "p1" in n.links_t:
+        chargers = links.loc[charger_mask].copy()
+        chargers["country"] = chargers["bus0"].map(bus_country).fillna("").astype(str)
+        charger_ac_draw = (
+            n.links_t.p0.reindex(columns=chargers.index, fill_value=0.0).clip(lower=0.0).mul(weights, axis=0).sum(axis=0)
+        )
+        charger_to_store = (
+            (-n.links_t.p1.reindex(columns=chargers.index, fill_value=0.0)).clip(lower=0.0).mul(weights, axis=0).sum(axis=0)
+        )
+        charger_power = pd.to_numeric(chargers[capacity_col], errors="coerce").fillna(0.0) if capacity_col else pd.Series(0.0, index=chargers.index)
+        charger_rows = pd.DataFrame(
+            {
+                "country": chargers["country"].values,
+                "charge_input_from_ac_mwh": charger_ac_draw.to_numpy(dtype=float),
+                "charge_to_store_mwh": charger_to_store.to_numpy(dtype=float),
+                "charger_power_capacity_mw": charger_power.to_numpy(dtype=float),
+            }
+        )
+    else:
+        charger_rows = pd.DataFrame(columns=["country", "charge_input_from_ac_mwh", "charge_to_store_mwh", "charger_power_capacity_mw"])
+
+    discharger_mask = links["carrier"].astype(str).str.lower().eq("battery discharger")
+    if discharger_mask.any() and "p0" in n.links_t and "p1" in n.links_t:
+        dischargers = links.loc[discharger_mask].copy()
+        dischargers["country"] = dischargers["bus1"].map(bus_country).fillna("").astype(str)
+        discharge_from_store = (
+            n.links_t.p0.reindex(columns=dischargers.index, fill_value=0.0).clip(lower=0.0).mul(weights, axis=0).sum(axis=0)
+        )
+        discharge_to_ac = (
+            (-n.links_t.p1.reindex(columns=dischargers.index, fill_value=0.0)).clip(lower=0.0).mul(weights, axis=0).sum(axis=0)
+        )
+        discharger_power = pd.to_numeric(dischargers[capacity_col], errors="coerce").fillna(0.0) if capacity_col else pd.Series(0.0, index=dischargers.index)
+        discharger_rows = pd.DataFrame(
+            {
+                "country": dischargers["country"].values,
+                "discharge_from_store_mwh": discharge_from_store.to_numpy(dtype=float),
+                "discharge_to_ac_mwh": discharge_to_ac.to_numpy(dtype=float),
+                "discharger_power_capacity_mw": discharger_power.to_numpy(dtype=float),
+            }
+        )
+    else:
+        discharger_rows = pd.DataFrame(columns=["country", "discharge_from_store_mwh", "discharge_to_ac_mwh", "discharger_power_capacity_mw"])
+
+    charger_country = charger_rows.groupby("country", as_index=False).sum(numeric_only=True) if not charger_rows.empty else pd.DataFrame(columns=["country"])
+    discharger_country = discharger_rows.groupby("country", as_index=False).sum(numeric_only=True) if not discharger_rows.empty else pd.DataFrame(columns=["country"])
+
+    result = store_summary.merge(charger_country, on="country", how="outer").merge(discharger_country, on="country", how="outer").fillna(0.0)
+    if result.empty:
+        return _empty_frame("battery_operations_country_year.csv")
+
+    result["carrier"] = "battery"
+    result["net_ac_supply_mwh"] = result["discharge_to_ac_mwh"] - result["charge_input_from_ac_mwh"]
+    result["throughput_mwh"] = result["charge_to_store_mwh"] + result["discharge_from_store_mwh"]
+    result["charging_losses_mwh"] = (result["charge_input_from_ac_mwh"] - result["charge_to_store_mwh"]).clip(lower=0.0)
+    result["discharging_losses_mwh"] = (result["discharge_from_store_mwh"] - result["discharge_to_ac_mwh"]).clip(lower=0.0)
+    result["total_losses_mwh"] = result["charging_losses_mwh"] + result["discharging_losses_mwh"]
+    result["estimated_cycles"] = np.where(
+        result["store_energy_capacity_mwh"] > 0.0,
+        result["discharge_to_ac_mwh"] / result["store_energy_capacity_mwh"],
+        np.nan,
+    )
+
+    result = result.loc[result["country"].astype(str).ne("")].copy()
+    result = result.loc[:, OUTPUT_TABLE_SPECS["battery_operations_country_year.csv"][1:]]
+    return result.sort_values(["country"], ignore_index=True)
 
 
 def _deployment_summaries(current_capacity: pd.DataFrame, previous_capacity: pd.DataFrame, year: int, previous_year: int | None):
@@ -1052,7 +1212,9 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
     )
     previous_year = None
     generation_frames = []
+    ac_balance_frames = []
     capacity_frames = []
+    battery_operation_frames = []
     deployment_country_frames = []
     deployment_node_frames = []
     power_emissions_frames = []
@@ -1079,9 +1241,31 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
             else _empty_frame("generation_country_carrier.csv")
         )
 
+        ac_balance = _ac_energy_balance_country_carrier(network)
+        if "year" in ac_balance.columns:
+            ac_balance["year"] = int(year)
+        else:
+            ac_balance.insert(0, "year", int(year))
+        ac_balance_frames.append(
+            ac_balance.loc[:, OUTPUT_TABLE_SPECS["ac_energy_balance_country_carrier.csv"]]
+            if not ac_balance.empty
+            else _empty_frame("ac_energy_balance_country_carrier.csv")
+        )
+
         capacity = _collect_capacity_records(network)
         capacity_country = _capacity_country_summary(capacity, year)
         capacity_frames.append(capacity_country)
+
+        battery_operations = _battery_operations_country_year(network)
+        if "year" in battery_operations.columns:
+            battery_operations["year"] = int(year)
+        else:
+            battery_operations.insert(0, "year", int(year))
+        battery_operation_frames.append(
+            battery_operations.loc[:, OUTPUT_TABLE_SPECS["battery_operations_country_year.csv"]]
+            if not battery_operations.empty
+            else _empty_frame("battery_operations_country_year.csv")
+        )
 
         deployment_node, deployment_country = _deployment_summaries(capacity, previous_capacity, year, previous_year)
         deployment_node_frames.append(deployment_node)
@@ -1192,7 +1376,9 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
 
     tables["learning_costs.csv"] = learning_costs
     tables["generation_country_carrier.csv"] = pd.concat(generation_frames, ignore_index=True)
+    tables["ac_energy_balance_country_carrier.csv"] = pd.concat(ac_balance_frames, ignore_index=True)
     tables["capacity_country_carrier.csv"] = pd.concat(capacity_frames, ignore_index=True)
+    tables["battery_operations_country_year.csv"] = pd.concat(battery_operation_frames, ignore_index=True)
     tables["deployment_country_carrier.csv"] = pd.concat(deployment_country_frames, ignore_index=True)
     tables["deployment_node_carrier.csv"] = pd.concat(deployment_node_frames, ignore_index=True)
     tables["power_emissions_country_carrier.csv"] = pd.concat(power_emissions_frames, ignore_index=True)
