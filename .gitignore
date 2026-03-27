@@ -71,6 +71,9 @@ validation/state_snapshots/
 validation/.tmp/
 validation/.DS_Store
 validation/data/.DS_Store
+cluster_submissions/
+cluster_workdirs/
+tests/
 
 # Specific configuration files
 configs/scenarios/config.*.yaml

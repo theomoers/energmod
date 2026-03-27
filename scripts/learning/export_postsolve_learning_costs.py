@@ -9,9 +9,15 @@ network of the current planning horizon.
 
 import json
 import logging
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+
+SCRIPTS_DIR = Path.cwd() / "scripts"
+if (SCRIPTS_DIR / "_helpers.py").exists():
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 from _helpers import mock_snakemake
 from learning.apply_learning_costs import (
@@ -25,8 +31,10 @@ from learning.apply_learning_costs import (
     get_tech_mapping,
     load_config_learning,
     load_learning_manifest,
+    resolve_runtime_seed,
     save_cost_log,
     update_stochastic_runtime_state,
+    validate_runtime_contract,
 )
 from learning.learning_data_io import load_historical_capacity
 
@@ -56,8 +64,14 @@ def _load_historical_cumulative(tech, year, learning_cfg):
 def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learning_cfg, current_year):
     cumulative_history = payload.get("capacity_history", {}) or {}
     modeled_history = payload.get("modeled_capacity_history", {}) or {}
+    tracked_techs = set((payload.get("technology_states", {}) or {}).keys())
+    tracked_techs.update(cumulative_history.keys())
+    tracked_techs.update(modeled_history.keys())
 
     for tech, solved_capacity in solved_capacity_by_tech.items():
+        if tracked_techs and tech not in tracked_techs:
+            logger.info("Skipping untracked technology in committed learning state: %s", tech)
+            continue
         tech_cumulative = cumulative_history.get(tech, {}) or {}
         tech_modeled = modeled_history.get(tech, {}) or {}
         current_year_str = str(int(current_year))
@@ -315,8 +329,20 @@ def main(snakemake):
         current_year,
     )
 
-    learning_model = get_selected_learning_model(learning_cfg, base_df["selected_model"].iloc[0])
+    learning_model = getattr(snakemake.wildcards, "learning_model", None)
+    if learning_model in (None, ""):
+        learning_model = str(base_df["selected_model"].iloc[0])
+
+    learning_seed = getattr(snakemake.wildcards, "learning_seed", None)
+    if learning_seed in (None, "") and "learning_seed" in base_df.columns:
+        seed_value = base_df["learning_seed"].iloc[0]
+        if pd.notna(seed_value) and str(seed_value).strip():
+            learning_seed = str(seed_value)
+
+    learning_model = get_selected_learning_model(learning_cfg, learning_model)
     learning_engine = get_learning_engine(learning_cfg, learning_model)
+    resolve_runtime_seed(learning_cfg, learning_engine, learning_model, learning_seed)
+    validate_runtime_contract(learning_cfg, learning_engine, learning_model)
 
     if learning_engine != "legacy_curve":
         learning_costs, payload = update_stochastic_runtime_state(

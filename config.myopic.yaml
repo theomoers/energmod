@@ -27,22 +27,8 @@ scenario:
   #- "DF"
   learning_rate:  # Canonical format: tech_code.methodvalue, e.g. s.o0.10 or w.m1.10; use "base" for no adjustment
   - "base"
-  - "s.o0.10"  
-  - "s.o-0.10"
-  - "all.o0.10"
-  - "all.m0.90"
   learning_model:
   - "legacy_curve"
-
-learning_monte_carlo:
-  enable: false
-  include_legacy_curve: false
-  stochastic_models:
-  - "shared_state_bayesian_regime_wright"
-  - "way_fixed_rho_benchmark_035"
-  - "correlated_geometric_random_walk"
-  seeds:
-  - 0
 
 foresight: myopic
 
@@ -98,7 +84,7 @@ enable:
   progress_bar: true # show progress bar during downloading routines and other long-running tasks
 
 global_specific:
-  save_lpfile: true
+  save_lpfile: false
   remove_faulty_offshore_shapes: true # for offwind profiles, remove faulty shapes that cause crashes
   global_clustering: true # must be true to apply minimum clustering per country
   minimum_clustering_per_countries:
@@ -200,7 +186,7 @@ global_specific:
 
 permstore:
   enable: true
-  path: permstorage
+  path: /shared/share_cki25/energymodels/pypsa-earth/permstorage
   scenario: "Global_200"
   use:
     shapes: true
@@ -528,7 +514,7 @@ solving:
       parallel: "on"
       random_seed: 123
     gurobi-default:
-      threads: 16
+      threads: 36
       method: 2 # barrier
       crossover: 0
       BarConvTol: 1.e-5
@@ -546,7 +532,7 @@ solving:
       FeasibilityTol: 1.e-4 
       OptimalityTol: 1.e-4 
       ScaleFlag: -1 
-      threads: 32
+      threads: 36
       Seed: 123
       DualReductions: 0
       InfUnbdInfo: 1
@@ -637,8 +623,8 @@ solving:
     cbc-default: {} # Used in CI
     glpk-default: {} # Used in CI
 
-  mem: 100000 #memory in MB; 20 GB enough for 50+B+I+H2; 100 GB for 181+B+I+H2
-  threads: 16
+  mem: 12000 # MB; lean default for MC runs, still above observed ~7.2 GB peak
+  threads: 36
 
 plotting:  
   tech_colors:

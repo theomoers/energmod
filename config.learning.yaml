@@ -12,21 +12,19 @@
 
 learning:
   enabled: true
-  engine: legacy_curve   # legacy_curve | stochastic_forecast
-  selected_model: legacy_curve  # legacy_curve | shared_state_bayesian_regime_wright | correlated_geometric_random_walk | way_fixed_rho_benchmark_035
+  engine: stochastic_forecast   # legacy_curve | stochastic_forecast
+  selected_model: shared_state_bayesian_regime_wright  # legacy_curve | shared_state_bayesian_regime_wright | correlated_geometric_random_walk | way_fixed_rho_benchmark_035
   training_window: origin_cutoff  # origin_cutoff | full_sample ; affects stochastic_forecast artifact selection
   training_window_origin_year: 2020  # metadata/check only for origin_cutoff
   artifact_manifest: "data/learning-data/manifest.json"
   sample_mode: "single_draw"   # single_draw | median ; median is for debugging/smoke tests only
   seed: 0                      # used only by stochastic_forecast
   monte_carlo:
-    enable: false
+    enable: true
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-      - way_fixed_rho_benchmark_035
-      - correlated_geometric_random_walk
-    draws: 5
-    seed_mode: random          # random | sequential
+    draws: 3
+    seed_mode: random      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000

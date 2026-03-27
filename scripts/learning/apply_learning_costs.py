@@ -21,6 +21,7 @@ Updated: 2026-03-26
 """
 
 import logging
+import sys
 import re
 from pathlib import Path
 import json
@@ -29,6 +30,11 @@ import numpy as np
 import pandas as pd
 import pypsa
 import yaml
+
+SCRIPTS_DIR = Path.cwd() / "scripts"
+if (SCRIPTS_DIR / "_helpers.py").exists():
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 from _helpers import configure_logging, create_logger
 from learning.learning_data_io import load_historical_capacity
 
@@ -85,10 +91,10 @@ LEGACY_LEARNING_SEED = "deterministic"
 
 # Mapping of solve horizon to the historical lag-year whose learned cost is treated
 # as known and therefore applied deterministically.
-# 2020 solve uses learned_cost[2015]; 2025 solve uses learned_cost[2020].
+# Only 2020 is a historical bootstrap horizon: 2020 solve uses learned_cost[2015].
+# From 2025 onward, the usual lagged rule applies.
 COST_HISTORICAL_CAPACITY_YEARS = {
     2020: 2015,
-    2025: 2020,
 }
 
 
@@ -514,6 +520,139 @@ def build_runtime_metadata(learning_cfg, learning_engine, selected_model):
         "manifest_schema_version": str(learning_cfg.get("_manifest_schema_version", "unknown")),
         "manifest_sha256": str(learning_cfg.get("_manifest_sha256", "")),
         "battery_power_treatment": BATTERY_POWER_TREATMENT,
+    }
+
+
+def _implied_lr_from_learning_exponent(beta):
+    """Convert a Wright-style learning exponent to a learning rate."""
+    if beta is None:
+        return None
+    return float(1.0 - (2.0 ** (-float(beta))))
+
+
+def _implied_lr_from_experience_slope(beta_slope):
+    """Convert a dlog(cost) / dlog(experience) slope to a learning rate."""
+    if beta_slope is None:
+        return None
+    return float(1.0 - (2.0 ** (float(beta_slope))))
+
+
+def _json_scalar(value):
+    """Normalize runtime diagnostics into JSON/CSV-safe scalar values."""
+    if value is None:
+        return None
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, str):
+        return value
+    return value
+
+
+def _serialize_stochastic_snapshot(snapshot):
+    """Flatten model diagnostics for CSV export while keeping a JSON snapshot."""
+    if not snapshot:
+        return {}
+
+    sanitized = {key: _json_scalar(value) for key, value in snapshot.items()}
+    fields = {
+        "stochastic_parameter_snapshot": json.dumps(sanitized, sort_keys=True),
+    }
+    for key, value in sanitized.items():
+        fields[f"stochastic_{key}"] = value
+    return fields
+
+
+def _shared_runtime_snapshot(pars, current_regime, regime_probs, p_ss, p_ff, sample_mode):
+    alpha_slow = _single_or_median(pars["alpha_slow"], sample_mode)
+    alpha_fast = _single_or_median(pars["alpha_fast"], sample_mode)
+    beta_slow_slope = _single_or_median(pars["beta_slow"], sample_mode)
+    beta_fast_slope = _single_or_median(pars["beta_fast"], sample_mode)
+    sigma = _single_or_median(pars["sigma"], sample_mode)
+    p_slow_slow = _single_or_median(p_ss, sample_mode)
+    p_fast_fast = _single_or_median(p_ff, sample_mode)
+    regime = int(round(_single_or_median(current_regime, sample_mode)))
+    active_slope = beta_slow_slope if regime == 0 else beta_fast_slope
+
+    return {
+        "family": "shared_state_bayesian_regime_wright",
+        "current_regime": regime,
+        "regime_prob_slow": float(regime_probs[0]),
+        "regime_prob_fast": float(regime_probs[1]),
+        "p_slow_slow": p_slow_slow,
+        "p_fast_fast": p_fast_fast,
+        "alpha_slow": alpha_slow,
+        "alpha_fast": alpha_fast,
+        "beta_slow_experience": beta_slow_slope,
+        "beta_fast_experience": beta_fast_slope,
+        "implied_learning_exponent_slow": float(-beta_slow_slope),
+        "implied_learning_exponent_fast": float(-beta_fast_slope),
+        "implied_learning_exponent_runtime": float(-active_slope),
+        "implied_learning_rate_slow": _implied_lr_from_experience_slope(beta_slow_slope),
+        "implied_learning_rate_fast": _implied_lr_from_experience_slope(beta_fast_slope),
+        "implied_learning_rate_runtime": _implied_lr_from_experience_slope(active_slope),
+        "sigma": sigma,
+    }
+
+
+def _way_runtime_snapshot(artifact):
+    params = artifact["parameter_summary"]
+    learning_exponent = params.get("learning_exponent")
+    return {
+        "family": "way_fixed_rho_benchmark_035",
+        "alpha": float(params["alpha"]),
+        "slope_dlog_experience": float(params["slope_dlog_experience"]),
+        "learning_exponent": None if learning_exponent is None else float(learning_exponent),
+        "implied_learning_rate": _implied_lr_from_learning_exponent(learning_exponent),
+        "theta_ma1": float(params["theta_ma1"]),
+        "sigma": float(params["sigma"]),
+    }
+
+
+def _cgrw_runtime_snapshot(artifact):
+    params = artifact["parameter_summary"]
+    return {
+        "family": "correlated_geometric_random_walk",
+        "alpha": float(params["alpha"]),
+        "rho": float(params["rho"]),
+        "sigma": float(params["sigma"]),
+        "implied_learning_rate": None,
+    }
+
+
+def _generic_stochastic_fields_from_snapshot(snapshot):
+    """Map model-specific diagnostics onto generic beta/lr columns when possible."""
+    if not snapshot:
+        return {
+            "A": None,
+            "A_base": None,
+            "A_scenario": None,
+            "beta": None,
+            "beta_base": None,
+            "lr_base": None,
+            "lr_scenario": None,
+            "beta_adjusted": False,
+        }
+
+    if "implied_learning_exponent_runtime" in snapshot:
+        beta = snapshot.get("implied_learning_exponent_runtime")
+        lr = snapshot.get("implied_learning_rate_runtime")
+    else:
+        beta = snapshot.get("learning_exponent")
+        lr = snapshot.get("implied_learning_rate")
+
+    return {
+        "A": None,
+        "A_base": None,
+        "A_scenario": None,
+        "beta": beta,
+        "beta_base": None,
+        "lr_base": None,
+        "lr_scenario": lr,
+        "beta_adjusted": False,
     }
 
 
@@ -1194,7 +1333,7 @@ def _state_to_runtime_learning_costs(
         global_scale_factors,
     )
     learning_costs = {}
-    for tech in artifacts:
+    for tech, artifact in artifacts.items():
         if tech not in runtime_capacity_map:
             raise ValueError(f"Technology {tech} missing in runtime capacity map")
         state_tech = (state.get("technology_states", {}) or {}).get(tech, {}) or {}
@@ -1207,22 +1346,22 @@ def _state_to_runtime_learning_costs(
             learning_cfg,
             costs_file,
         )
+        snapshot = state_tech.get("parameter_snapshot", None)
+        if not snapshot:
+            if runtime_metadata.get("selected_model") == "way_fixed_rho_benchmark_035":
+                snapshot = _way_runtime_snapshot(artifact)
+            elif runtime_metadata.get("selected_model") == "correlated_geometric_random_walk":
+                snapshot = _cgrw_runtime_snapshot(artifact)
         learning_costs[tech] = {
             "capital_cost": capital_cost,
             "cumulative_capacity_GW": float(runtime_capacity_map[tech]),
-            "A": None,
-            "A_base": None,
-            "A_scenario": None,
-            "beta": None,
-            "beta_base": None,
-            "lr_base": None,
-            "lr_scenario": None,
-            "beta_adjusted": False,
+            **_generic_stochastic_fields_from_snapshot(snapshot),
             "unit": _cost_unit_for_runtime(tech),
             "c_overnight": c_overnight,
             "wacc_dict": wacc_dict,
             **runtime_metadata,
             "log_capex_runtime": log_cost,
+            **_serialize_stochastic_snapshot(snapshot),
         }
     return learning_costs
 
@@ -1251,12 +1390,14 @@ def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode):
         dlog = alpha + rho * dlog_prev + eps
         log_cost = log_cost + dlog
         dlog_prev = dlog
+    snapshot = _cgrw_runtime_snapshot(artifact)
     return {
         "final_log_cost": _single_or_median(log_cost, sample_mode),
         "state": {
             "last_log_capex": _single_or_median(log_cost, sample_mode),
             "last_dlog_capex": _single_or_median(dlog_prev, sample_mode),
             "state_type": state.get("state_type", "geometric_random_walk"),
+            "parameter_snapshot": snapshot,
         },
     }
 
@@ -1274,6 +1415,7 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
     n = 1 if sample_mode == "single_draw" else 201
     log_cost = np.full(n, last_log, dtype=float)
     eps_prev = np.full(n, last_eps, dtype=float)
+    snapshot = _way_runtime_snapshot(artifact)
     years = int(elapsed_years)
     if years < 0:
         raise ValueError(f"Elapsed years for Way runtime must be >= 0, got {years}")
@@ -1285,6 +1427,7 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
                 "last_innovation": _single_or_median(eps_prev, sample_mode),
                 "theta_ma1": theta,
                 "state_type": state.get("state_type", "ma1_wright_fixed_rho"),
+                "parameter_snapshot": snapshot,
             },
         }
     x_curr = float(block_dlog_experience) / float(years)
@@ -1300,6 +1443,7 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
             "last_innovation": _single_or_median(eps_prev, sample_mode),
             "theta_ma1": theta,
             "state_type": state.get("state_type", "ma1_wright_fixed_rho"),
+            "parameter_snapshot": snapshot,
         },
     }
 
@@ -1352,18 +1496,28 @@ def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tec
         }
 
     if horizons == 0:
+        regime_scalar = _single_or_median(current_regime, sample_mode)
+        probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
         for tech in techs:
             tech_states[tech] = {
                 "last_log_capex": _single_or_median(log_costs[tech], sample_mode),
+                "parameter_snapshot": _shared_runtime_snapshot(
+                    param_cache[tech],
+                    current_regime,
+                    probs,
+                    p_ss,
+                    p_ff,
+                    sample_mode,
+                ),
             }
-        regime_scalar = _single_or_median(current_regime, sample_mode)
-        probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
         return {
             "final_log_costs": {tech: _single_or_median(log_costs[tech], sample_mode) for tech in techs},
             "technology_states": tech_states,
             "shared_regime_state": {
                 "current_regime": int(round(regime_scalar)),
                 "initial_regime_probs": probs,
+                "p_slow_slow": _single_or_median(p_ss, sample_mode),
+                "p_fast_fast": _single_or_median(p_ff, sample_mode),
             },
         }
 
@@ -1384,18 +1538,28 @@ def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tec
             dlog = alpha + beta * x_curr + pars["sigma"] * rng.standard_normal(n)
             log_costs[tech] = log_costs[tech] + dlog
 
+    regime_scalar = _single_or_median(current_regime, sample_mode)
+    probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
     for tech in techs:
         tech_states[tech] = {
             "last_log_capex": _single_or_median(log_costs[tech], sample_mode),
+            "parameter_snapshot": _shared_runtime_snapshot(
+                param_cache[tech],
+                current_regime,
+                probs,
+                p_ss,
+                p_ff,
+                sample_mode,
+            ),
         }
-    regime_scalar = _single_or_median(current_regime, sample_mode)
-    probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
     return {
         "final_log_costs": {tech: _single_or_median(log_costs[tech], sample_mode) for tech in techs},
         "technology_states": tech_states,
         "shared_regime_state": {
             "current_regime": int(round(regime_scalar)),
             "initial_regime_probs": probs,
+            "p_slow_slow": _single_or_median(p_ss, sample_mode),
+            "p_fast_fast": _single_or_median(p_ff, sample_mode),
         },
     }
 
@@ -1464,6 +1628,10 @@ def update_stochastic_runtime_state(
     runtime_metadata = build_runtime_metadata(
         learning_cfg, "stochastic_forecast", selected_model
     )
+    if state.get("seed") not in (None, ""):
+        runtime_metadata["seed"] = int(state["seed"])
+    if state.get("learning_seed") not in (None, ""):
+        runtime_metadata["learning_seed"] = str(state["learning_seed"])
     passthrough_fields = {}
     for key in ("committed_from_network", "enabled"):
         if key in state:
@@ -1483,7 +1651,11 @@ def update_stochastic_runtime_state(
                     tech: float(state["technology_states"][tech]["last_log_capex"]) for tech in artifacts
                 },
                 "technology_states": {
-                    tech: {"last_log_capex": float(state["technology_states"][tech]["last_log_capex"])} for tech in artifacts
+                    tech: {
+                        "last_log_capex": float(state["technology_states"][tech]["last_log_capex"]),
+                        "parameter_snapshot": (state["technology_states"][tech].get("parameter_snapshot", None)),
+                    }
+                    for tech in artifacts
                 },
                 "shared_regime_state": state.get("shared_regime_state", {}),
             }
@@ -1523,22 +1695,19 @@ def update_stochastic_runtime_state(
             )
             if tech not in solved_capacity_by_tech:
                 raise ValueError(f"Technology {tech} missing in solved capacity map")
+            snapshot = (shared_result["technology_states"].get(tech, {}) or {}).get("parameter_snapshot", None)
+            next_state["technology_states"][tech]["c_overnight"] = c_overnight
+            next_state["technology_states"][tech]["capital_cost"] = capital_cost
             learning_costs[tech] = {
                 "capital_cost": capital_cost,
                 "cumulative_capacity_GW": float(solved_capacity_by_tech[tech]),
-                "A": None,
-                "A_base": None,
-                "A_scenario": None,
-                "beta": None,
-                "beta_base": None,
-                "lr_base": None,
-                "lr_scenario": None,
-                "beta_adjusted": False,
+                **_generic_stochastic_fields_from_snapshot(snapshot),
                 "unit": _cost_unit_for_runtime(tech),
                 "c_overnight": c_overnight,
                 "wacc_dict": wacc_dict,
                 **runtime_metadata,
                 "log_capex_runtime": log_cost,
+                **_serialize_stochastic_snapshot(snapshot),
             }
         return learning_costs, next_state
 
@@ -1570,22 +1739,19 @@ def update_stochastic_runtime_state(
         )
         if tech not in solved_capacity_by_tech:
             raise ValueError(f"Technology {tech} missing in solved capacity map")
+        snapshot = result["state"].get("parameter_snapshot", None)
+        next_state["technology_states"][tech]["c_overnight"] = c_overnight
+        next_state["technology_states"][tech]["capital_cost"] = capital_cost
         learning_costs[tech] = {
             "capital_cost": capital_cost,
             "cumulative_capacity_GW": float(solved_capacity_by_tech[tech]),
-            "A": None,
-            "A_base": None,
-            "A_scenario": None,
-            "beta": None,
-            "beta_base": None,
-            "lr_base": None,
-            "lr_scenario": None,
-            "beta_adjusted": False,
+            **_generic_stochastic_fields_from_snapshot(snapshot),
             "unit": _cost_unit_for_runtime(tech),
             "c_overnight": c_overnight,
             "wacc_dict": wacc_dict,
             **runtime_metadata,
             "log_capex_runtime": log_cost,
+            **_serialize_stochastic_snapshot(snapshot),
         }
     return learning_costs, next_state
 
@@ -1728,7 +1894,7 @@ def calculate_learning_costs(
     - lag_periods=0: NOT handled here (use learning.py for immediate endogenous learning)
     - lag_periods=1: Uses previous period's capacity (exogenous costs calculated here)
       * For 2020: Uses 2015 historical cumulative capacity
-      * For 2025: Uses 2020 historical cumulative capacity
+      * For 2025: Uses 2020 solved capacity
       * For 2030: Uses 2025 solved capacity
       * And so on...
     
@@ -1835,7 +2001,7 @@ def calculate_learning_costs(
         
         # Load cumulative capacity: historical bootstrap horizons or solved lagged horizon.
         if current_year in COST_HISTORICAL_CAPACITY_YEARS:
-            # For 2020/2025: Use historical cumulative capacity data only.
+            # For historical bootstrap horizons: use historical cumulative capacity data only.
             historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
             logger.info(
                 f"    Using {historical_year} historical cumulative capacity "
@@ -2314,6 +2480,13 @@ def save_cost_log(learning_costs, output_file):
         "unit",
         "c_overnight",
         "wacc_dict",
+        "stochastic_family",
+        "stochastic_current_regime",
+        "stochastic_implied_learning_exponent_runtime",
+        "stochastic_implied_learning_rate_runtime",
+        "stochastic_learning_exponent",
+        "stochastic_implied_learning_rate",
+        "stochastic_parameter_snapshot",
     ]
     ordered_columns = [col for col in preferred_columns if col in df.columns]
     remaining_columns = [col for col in df.columns if col not in ordered_columns]
@@ -2363,13 +2536,13 @@ def use_base_learning_for_horizon(planning_horizons, current_year):
     """
     Return True when learning-rate scenarios should be suppressed for this horizon.
 
-    Policy: always use base learning parameters for the first two planning horizons
-    (e.g., 2020 and 2025 in a 5-year myopic setup).
+    Policy: always use base learning parameters for the first planning horizon
+    only (e.g., 2020 in a 5-year myopic setup).
     """
     horizons = sorted(planning_horizons)
-    if len(horizons) < 2:
+    if not horizons:
         return True
-    return current_year in set(horizons[:2])
+    return current_year == horizons[0]
 
 
 def main(snakemake):
@@ -2450,7 +2623,7 @@ def main(snakemake):
     timestep = get_timestep(planning_horizons, year)
     
     # Apply learning costs for all horizons.
-    # 2020 and 2025 are deterministic historical bootstraps; 2030+ uses
+    # 2020 is the deterministic historical bootstrap; 2025+ uses
     # the strictly lagged solved block.
     logger.info(f"Timestep: {timestep} years since previous horizon (or first horizon if {year} == 2020)")
     
@@ -2656,7 +2829,7 @@ def main(snakemake):
     
     logger.info(
         "Calculating learning-based costs "
-        "(2020: historical 2015, 2025: historical 2020, 2030+: realized solved capacity from previous horizon)..."
+        "(2020: historical 2015, 2025+: realized solved capacity from previous horizon)..."
     )
     
     learning_costs = calculate_learning_costs(

@@ -3707,75 +3707,19 @@ def solve_network(n, config, solving, **kwargs):
                 logger.info(f"  {idx}: p_nom_min={gen.p_nom_min}, p_nom_max={gen.p_nom_max} -> setting p_nom_max = p_nom_min * 2")
                 logger.info(f"  {idx}: p_nom_min={gen.p_nom_min} -> p_nom_max={gen.p_nom_min * 2}")
             n.generators.loc[problematic_gens.index, "p_nom_max"] = n.generators.loc[problematic_gens.index, "p_nom_min"] * 2
-        
-        ## Check for generators with zero or negative costs
-        #zero_cost_gens = n.generators.query("marginal_cost <= 0 and p_nom_max > 0")
-        #if len(zero_cost_gens) > 0:
-        #    logger.info(f"Setting minimum marginal cost for {len(zero_cost_gens)} generators with zero/negative costs")
-        #    for idx, gen in zero_cost_gens.iterrows():
-        #        logger.info(f"  {idx}: marginal_cost={gen.marginal_cost} -> 0.001")
-        #    n.generators.loc[zero_cost_gens.index, "marginal_cost"] = 0.001
-        
-        # Ensure all extendable generators have reasonable limits
-        extendable_gens = n.generators.query("p_nom_extendable == True")
-        problematic_extendable = extendable_gens.query("p_nom_max <= p_nom_min or p_nom_max <= 0")
-        if len(problematic_extendable) > 0:
-            logger.info(f"Fixing {len(problematic_extendable)} extendable generators with problematic limits")
-            # Set a reasonable maximum for problematic extendable generators
-            n.generators.loc[problematic_extendable.index, "p_nom_max"] = 1e6  # Large but finite limit
-            for idx, gen in problematic_extendable.iterrows():
-                logger.info(f"  {idx}: p_nom_max set to 1e6 MW")
-        
-        ## Check for NaN values in critical columns
-        #critical_cols = ['marginal_cost', 'p_nom_min', 'p_nom_max']
-        #for col in critical_cols:
-        #    if col in n.generators.columns:
-        #        nan_gens = n.generators[n.generators[col].isna()]
-        #        if len(nan_gens) > 0:
-        #            logger.info(f"Fixing {len(nan_gens)} generators with NaN values in {col}")
-        #            if col == 'marginal_cost':
-        #                n.generators.loc[nan_gens.index, col] = 0.001
-        #            elif col in ['p_nom_min', 'p_nom_max']:
-        #                n.generators.loc[nan_gens.index, col] = 0
-        
 
-        logger.info(f"Removed generators: {len(generators_with_bad_buses) if 'generators_with_bad_buses' in locals() else 0}")
-        logger.info(f"Removed loads: {len(loads_with_bad_buses) if 'loads_with_bad_buses' in locals() else 0}")
-        logger.info(f"Removed stores: {len(stores_with_bad_buses) if 'stores_with_bad_buses' in locals() else 0}")
-        logger.info(f"Removed links: {len(links_with_bad_buses) if 'links_with_bad_buses' in locals() else 0}")
-        logger.info(f"Fixed generator capacity limits: {len(problematic_gens) if 'problematic_gens' in locals() else 0}")
-        logger.info(f"Fixed zero-cost generators: {len(zero_cost_gens) if 'zero_cost_gens' in locals() else 0}")
+        logger.info("Retrying with configured solver options plus NumericFocus=3...")
         
-        logger.info("Retrying solve with cleaned network...")
+        retry_threads = 16
 
-        logger.info("Setting numeric focus parameters for solver...")
-
-        cpu_threads = os.cpu_count() or 1
-        base_solver_opts = kwargs.get("solver_options", {}) or {}
-        configured_threads = (
-            base_solver_opts.get("Threads")
-            if "Threads" in base_solver_opts
-            else base_solver_opts.get("threads", cpu_threads)
-        )
-        try:
-            retry_threads = int(configured_threads)
-        except (TypeError, ValueError):
-            retry_threads = cpu_threads
-        retry_threads = max(1, min(retry_threads, cpu_threads))
-
-        robust_solver_options = {
-                "NumericFocus": 3,
-                "Method": 2,  # barrier
-                "Crossover": 0,
-                "BarHomogeneous": 1,
-                "BarConvTol": 1e-3,
-                "FeasibilityTol": 1e-3,
-                "OptimalityTol": 1e-3,
-                "Presolve": 2,
-                "Aggregate": 1,
-                "Threads": retry_threads,
-                "Seed": 123
-            }
+        robust_solver_options = dict(base_solver_opts)
+        robust_solver_options["NumericFocus"] = 3
+        if "Threads" in robust_solver_options:
+            robust_solver_options["Threads"] = retry_threads
+        elif "threads" in robust_solver_options:
+            robust_solver_options["threads"] = retry_threads
+        else:
+            robust_solver_options["Threads"] = retry_threads
         
         logger.info(f"Using robust solver options: {robust_solver_options}")
         kwargs_robust = kwargs.copy()

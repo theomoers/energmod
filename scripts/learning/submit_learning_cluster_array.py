@@ -7,7 +7,6 @@ import os
 import random
 import shlex
 import subprocess
-import sys
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +16,8 @@ import yaml
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent.parent
+DEFAULT_JOB_ROOT = ROOT_DIR / "cluster_workdirs"
+DEFAULT_CONDA_ENV = "/shared/share_cki25/envs/sh-pypsa-earth-main"
 SUPPORTED_MODELS = [
     "shared_state_bayesian_regime_wright",
     "way_fixed_rho_benchmark_035",
@@ -56,7 +57,9 @@ def build_seed_list(mc_cfg, learning_cfg):
     if seed_mode == "random":
         seed_upper_bound = int(mc_cfg.get("seed_upper_bound", 1000000000) or 1000000000)
         if draws > seed_upper_bound:
-            raise ValueError("learning.monte_carlo.draws cannot exceed learning.monte_carlo.seed_upper_bound")
+            raise ValueError(
+                "learning.monte_carlo.draws cannot exceed learning.monte_carlo.seed_upper_bound"
+            )
         rng = random.Random(random_seed)
         return rng.sample(range(seed_upper_bound), draws)
 
@@ -70,7 +73,9 @@ def build_tasks(configfiles, scenario_name):
     if not mc_cfg.get("enable", False):
         raise ValueError("learning.monte_carlo.enable must be true for array submission")
 
-    learning_rates = [str(x) for x in ((cfg.get("scenario", {}) or {}).get("learning_rate", []) or [])]
+    learning_rates = [
+        str(x) for x in ((cfg.get("scenario", {}) or {}).get("learning_rate", []) or [])
+    ]
     if any(rate != "base" for rate in learning_rates):
         raise ValueError("Cluster stochastic runs require scenario.learning_rate to contain only 'base'")
 
@@ -95,8 +100,27 @@ def build_tasks(configfiles, scenario_name):
     return tasks
 
 
+def build_grid_run_cmd(args, manifest_path, task_count, worker_script):
+    cmd = [
+        "grid_run",
+        f"--grid_mem={args.grid_mem}",
+        f"--grid_ncpus={args.grid_ncpus}",
+        f"--grid_submit={args.grid_submit}",
+        f"--grid_array=1-{task_count}",
+        worker_script,
+        str(manifest_path),
+        f"LEARNING_JOB_ROOT={Path(os.path.expandvars(args.job_root)).resolve()}",
+        f"LEARNING_CONDA_ENV={args.conda_env}",
+        f"LEARNING_RUN_MODE={args.run_mode}",
+    ]
+    return cmd
+
+
 def submit_array(args):
-    configfiles = [str((ROOT_DIR / "config.myopic.yaml").resolve()), str((ROOT_DIR / "config.learning.yaml").resolve())]
+    configfiles = [
+        str((ROOT_DIR / "config.myopic.yaml").resolve()),
+        str((ROOT_DIR / "config.learning.yaml").resolve()),
+    ]
     configfiles.extend(args.configfiles)
     tasks = build_tasks(configfiles, args.scenario_name)
 
@@ -112,40 +136,19 @@ def submit_array(args):
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     worker_script = str((SCRIPT_DIR / "run_learning_cluster_array_task.sh").resolve())
-    env_args = ",".join(
-        [
-            f"LEARNING_ARRAY_MANIFEST={manifest_path}",
-            f"LEARNING_JOB_ROOT={os.path.expandvars(args.job_root)}",
-            f"LEARNING_CONDA_ENV={args.conda_env}",
-        ]
-    )
-
-    qsub_cmd = [
-        "qsub",
-        "-cwd",
-        "-V",
-        "-v",
-        env_args,
-        "-t",
-        f"1-{len(tasks)}",
-        "-N",
-        args.job_name,
-        "-o",
-        str(logs_dir / "array.out"),
-        "-e",
-        str(logs_dir / "array.err"),
-        worker_script,
-    ]
+    grid_run_cmd = build_grid_run_cmd(args, manifest_path, len(tasks), worker_script)
 
     if args.print_only:
         print("TASK_MANIFEST", manifest_path)
         print("ARRAY_SIZE", len(tasks))
-        print("QSUB_CMD", " ".join(qsub_cmd))
+        print("LOG_DIR", logs_dir)
+        print("GRID_RUN_CMD", " ".join(shlex.quote(part) for part in grid_run_cmd))
         return
 
-    subprocess.run(qsub_cmd, check=True)
+    subprocess.run(grid_run_cmd, check=True, cwd=logs_dir)
     print("TASK_MANIFEST", manifest_path)
     print("ARRAY_SIZE", len(tasks))
+    print("LOG_DIR", logs_dir)
 
 
 def run_worker(args):
@@ -167,18 +170,24 @@ def run_worker(args):
         str(task["seed"]),
         str(Path(os.path.expandvars(args.job_root)).resolve()),
     ]
-    subprocess.run(cmd, check=True)
+    env = os.environ.copy()
+    env["LEARNING_SCENARIO_NAME"] = str(task["scenario_name"])
+    subprocess.run(cmd, check=True, env=env)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--manifest")
-    parser.add_argument("--job-root", default="/scratch/$USER")
+    parser.add_argument("--job-root", default=str(DEFAULT_JOB_ROOT))
     parser.add_argument("--submit-root", default="cluster_submissions")
     parser.add_argument("--scenario-name", default="learning_mc")
     parser.add_argument("--job-name", default="learnmc")
-    parser.add_argument("--conda-env", default="pypsa-earth")
+    parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV)
+    parser.add_argument("--run-mode", choices=["branch", "full"], default="branch")
+    parser.add_argument("--grid-mem", default="12G")
+    parser.add_argument("--grid-ncpus", default="36")
+    parser.add_argument("--grid-submit", default="batch")
     parser.add_argument("--print-only", action="store_true")
     parser.add_argument("configfiles", nargs="*")
     args = parser.parse_args()

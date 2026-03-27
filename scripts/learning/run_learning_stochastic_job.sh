@@ -2,9 +2,9 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_stochastic_job.sh <model> <seed> [--dry-run]
+  bash scripts/learning/run_learning_stochastic_job.sh <model> <seed> [--mode full|branch] [--dry-run]
 
 Supported models:
   - shared_state_bayesian_regime_wright
@@ -12,21 +12,49 @@ Supported models:
   - correlated_geometric_random_walk
 
 Environment variables:
-  JOBS   Snakemake parallelism for the solve chain (default: 4)
+  JOBS                 Snakemake parallelism override
+  NSLOTS               Cluster slot count fallback when JOBS is unset
+  LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
 
-This is a local/manual execution helper. For cluster submission, use
-scripts/learning/submit_learning_cluster_array.py instead.
-EOF
+Modes:
+  full    Run the full seeded learning chain
+  branch  Run only the stochastic branch after the shared deterministic bootstrap
+USAGE
 }
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
+if [[ $# -lt 2 ]]; then
   usage >&2
   exit 1
 fi
 
 MODEL="$1"
 SEED="$2"
-DRY_RUN_FLAG="${3:-}"
+shift 2
+
+RUN_MODE="${LEARNING_RUN_MODE:-full}"
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "--mode requires an argument" >&2
+        exit 1
+      fi
+      RUN_MODE="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 case "$MODEL" in
   shared_state_bayesian_regime_wright|way_fixed_rho_benchmark_035|correlated_geometric_random_walk)
@@ -43,18 +71,34 @@ if [[ ! "$SEED" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-if [[ -n "$DRY_RUN_FLAG" && "$DRY_RUN_FLAG" != "--dry-run" ]]; then
-  echo "Only optional flag supported is --dry-run" >&2
-  exit 1
-fi
+case "$RUN_MODE" in
+  full)
+    TARGET_RULE="solve_sector_networks_myopic"
+    ;;
+  branch)
+    TARGET_RULE="solve_sector_networks_myopic_stochastic_branch"
+    ;;
+  *)
+    echo "Unsupported run mode: $RUN_MODE" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_job.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
-JOB_SECTOR_NAME="Global_200_${MODEL}_seed_s$(printf '%04d' "$SEED")"
+JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME:-Global_200}"
+SNAKEMAKE_JOBS="${JOBS:-${NSLOTS:-4}}"
+CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
 
-cat >"$OVERLAY_FILE" <<EOF
+if ! command -v snakemake >/dev/null 2>&1; then
+  source /apps/anaconda3/etc/profile.d/conda.sh
+  conda activate "$CONDA_ENV_NAME"
+fi
+
+cat >"$OVERLAY_FILE" <<EOF2
 run:
   allow_scenario_failure: false
   sector_name: "$JOB_SECTOR_NAME"
@@ -70,17 +114,18 @@ permstore:
 
 learning:
   enabled: true
+  execution_mode: "$RUN_MODE"
   engine: stochastic_forecast
   selected_model: "$MODEL"
   seed: $SEED
   monte_carlo:
     enable: false
-EOF
+EOF2
 
 CMD=(
   snakemake
-  "-j${JOBS:-4}"
-  solve_sector_networks_myopic
+  "-j${SNAKEMAKE_JOBS}"
+  "$TARGET_RULE"
   --configfile
   config.myopic.yaml
   config.learning.yaml
@@ -89,15 +134,22 @@ CMD=(
   mtime
 )
 
-if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
+if [[ "$DRY_RUN" -eq 1 ]]; then
   CMD+=(-n)
 fi
 
 echo "Running stochastic learning job:"
 echo "  model=$MODEL"
 echo "  seed=$SEED"
+echo "  mode=$RUN_MODE"
+echo "  target=$TARGET_RULE"
 echo "  sector_name=$JOB_SECTOR_NAME"
+echo "  jobs=$SNAKEMAKE_JOBS"
 echo "  overlay=$OVERLAY_FILE"
 
 cd "$ROOT_DIR"
-"${CMD[@]}"
+if command -v stdbuf >/dev/null 2>&1; then
+  stdbuf -oL -eL "${CMD[@]}"
+else
+  "${CMD[@]}"
+fi
