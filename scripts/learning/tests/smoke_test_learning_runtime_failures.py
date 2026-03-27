@@ -204,36 +204,22 @@ def test_missing_block_history(root):
         bad_state.setdefault("capacity_history", {})[tech] = tech_history
     bad_state_path = root / "bad_state_committed_2020.json"
     bad_state_path.write_text(json.dumps(bad_state, indent=2, sort_keys=True), encoding="utf-8")
-    learned_2025 = root / "learned_2025.nc"
-    cost_log_2025 = root / "cost_log_2025.csv"
-    state_proposed_2025 = root / "state_proposed_2025.json"
-    solved_2025 = root / "solved_2025.nc"
-    run_apply_learning(
-        network_path=prepared["brownfield_2025"],
-        output_network_path=learned_2025,
-        cost_log_path=cost_log_2025,
-        state_proposed_path=state_proposed_2025,
-        learning_config=prepared["learning_config"],
-        costs_file=prepared["costs_2025"],
-        planning_year=2025,
-        planning_horizons=[2020, 2025],
-        learning_model="way_fixed_rho_benchmark_035",
-        prev_network_path=prepared["solved_2020"],
-        prev_state_path=bad_state_path,
-    )
-    solve_mock_network(learned_2025, solved_2025)
     return expect_failure(
         "missing_block_history",
-        lambda: run_export_postsolve(
-            solved_network_path=solved_2025,
-            base_cost_log_path=cost_log_2025,
-            proposed_state_path=state_proposed_2025,
+        lambda: run_apply_learning(
+            network_path=prepared["brownfield_2025"],
+            output_network_path=root / "learned_2025.nc",
+            cost_log_path=root / "cost_log_2025.csv",
+            state_proposed_path=root / "state_proposed_2025.json",
             learning_config=prepared["learning_config"],
             costs_file=prepared["costs_2025"],
-            output_cost_log_path=root / "cost_log_solved_2025.csv",
-            output_state_committed_path=root / "state_committed_2025.json",
+            planning_year=2025,
+            planning_horizons=[2020, 2025],
+            learning_model="way_fixed_rho_benchmark_035",
+            prev_network_path=prepared["solved_2020"],
+            prev_state_path=bad_state_path,
         ),
-        "Committed cumulative capacity history",
+        "Committed capacity_history",
     )
 
 

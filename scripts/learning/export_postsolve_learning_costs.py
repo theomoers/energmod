@@ -22,8 +22,10 @@ if (SCRIPTS_DIR / "_helpers.py").exists():
 from _helpers import mock_snakemake
 from learning.apply_learning_costs import (
     BOS_multiplier,
+    build_learning_base_capacity_map,
     convert_to_capital_cost,
     extract_capacity_from_network,
+    get_battery_phi_for_block,
     get_learning_engine,
     get_manifest_historical_datafile,
     get_selected_learning_model,
@@ -94,7 +96,19 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
             prev_cumulative = float(tech_cumulative[prev_year_str])
             prev_modeled = float(tech_modeled[prev_year_str])
             additions = max(solved_capacity - prev_modeled, 0.0)
-            cumulative_value = prev_cumulative + additions
+            if tech == "battery_energy":
+                phi_block = get_battery_phi_for_block(learning_cfg, prev_year, current_year)
+                cumulative_value = prev_cumulative + additions * phi_block
+                logger.info(
+                    "Battery mapping %s-%s: modeled additions %.3f GWh × phi %.3f = %.3f GWh global Li-ion additions",
+                    prev_year,
+                    current_year,
+                    additions,
+                    phi_block,
+                    additions * phi_block,
+                )
+            else:
+                cumulative_value = prev_cumulative + additions
 
         tech_cumulative[current_year_str] = cumulative_value
         tech_modeled[current_year_str] = solved_capacity
@@ -307,15 +321,8 @@ def main(snakemake):
         global_scale_factors=global_scale_factors,
     )
 
-    learning_costs = build_postsolve_cost_log(
-        base_cost_log_df=base_df,
-        solved_capacity_by_tech=solved_capacity_by_tech,
-        learning_cfg=learning_cfg,
-        costs_file=costs_file,
-    )
-
-    logger.info("Saving post-solve learning cost log to: %s", output_cost_log)
     current_year = int(base_df["planning_horizon"].iloc[0])
+    logger.info("Saving post-solve learning cost log to: %s", output_cost_log)
     logger.info("Committing learning state to: %s", output_state)
     Path(output_state).parent.mkdir(parents=True, exist_ok=True)
     if not proposed_state:
@@ -327,6 +334,18 @@ def main(snakemake):
         solved_capacity_by_tech,
         learning_cfg,
         current_year,
+    )
+    learning_base_capacity_by_tech = build_learning_base_capacity_map(
+        payload,
+        solved_capacity_by_tech,
+        current_year,
+    )
+
+    learning_costs = build_postsolve_cost_log(
+        base_cost_log_df=base_df,
+        solved_capacity_by_tech=learning_base_capacity_by_tech,
+        learning_cfg=learning_cfg,
+        costs_file=costs_file,
     )
 
     learning_model = getattr(snakemake.wildcards, "learning_model", None)
@@ -351,7 +370,7 @@ def main(snakemake):
             current_year=current_year,
             state=payload,
             costs_file=costs_file,
-            solved_capacity_by_tech=solved_capacity_by_tech,
+            solved_capacity_by_tech=learning_base_capacity_by_tech,
         )
         postsolve_df = build_stochastic_postsolve_cost_log(base_df, learning_costs, current_year)
         postsolve_df.to_csv(output_cost_log, index=False)

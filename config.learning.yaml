@@ -9,6 +9,8 @@
 #   - way_fixed_rho_benchmark_035
 #   - correlated_geometric_random_walk
 # - `battery_power` remains on the default `costs_{year}.csv` path for now.
+# - `battery_energy` learning uses the manifest-bundled phi_t mapping from
+#   modeled grid-battery additions to global Li-ion additions.
 
 learning:
   enabled: true

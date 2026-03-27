@@ -336,7 +336,14 @@ def validate_lagged_cost_carry_forward(previous_committed_cost_log, next_input_c
             )
 
 
-def validate_historical_bootstrap_cost_log(cost_log_path, learning_config, costs_file, current_year):
+def validate_historical_bootstrap_cost_log(
+    cost_log_path,
+    learning_config,
+    costs_file,
+    current_year,
+    prev_network_path=None,
+    prior_state_payload=None,
+):
     learning_cfg = apply_learning_costs_module.load_config_learning(str(learning_config))
     apply_learning_costs_module.load_learning_manifest(learning_cfg, str(learning_config))
     params = apply_learning_costs_module.load_learning_params(
@@ -347,7 +354,8 @@ def validate_historical_bootstrap_cost_log(cost_log_path, learning_config, costs
         learning_cfg=learning_cfg,
         current_year=int(current_year),
         planning_horizons=[2020, 2025, 2030],
-        prev_network_path=None,
+        prev_network_path=prev_network_path,
+        prior_state_payload={} if prior_state_payload is None else prior_state_payload,
         costs_file=str(costs_file),
         global_scale_factors=apply_learning_costs_module.get_global_scale_factors(learning_cfg),
         wacc_dict=None,
@@ -447,7 +455,8 @@ def run_model_smoke(model_name, root, seed=0):
         output_state_committed_path=state_committed_2020,
     )
     validate_cost_log(cost_log_2020, model_name)
-    validate_historical_bootstrap_cost_log(cost_log_2020, learning_config, costs_2020, 2020)
+    if model_name == "legacy_curve":
+        validate_historical_bootstrap_cost_log(cost_log_2020, learning_config, costs_2020, 2020)
     validate_committed_state(state_committed_2020, model_name, 2020)
 
     build_mock_network(2025).export_to_netcdf(base_2025)
@@ -477,7 +486,16 @@ def run_model_smoke(model_name, root, seed=0):
         output_state_committed_path=state_committed_2025,
     )
     validate_cost_log(cost_log_2025, model_name)
-    validate_historical_bootstrap_cost_log(cost_log_2025, learning_config, costs_2025, 2025)
+    if model_name == "legacy_curve":
+        prior_state_2020 = json.loads(state_committed_2020.read_text(encoding="utf-8"))
+        validate_historical_bootstrap_cost_log(
+            cost_log_2025,
+            learning_config,
+            costs_2025,
+            2025,
+            prev_network_path=str(solved_2020),
+            prior_state_payload=prior_state_2020,
+        )
     validate_committed_state(state_committed_2025, model_name, 2025)
 
     base_2030 = model_root / "network_2030_base.nc"

@@ -1,6 +1,17 @@
 {
   "battery_treatment": {
     "battery_power": "deterministic_only",
+    "global_liion_mapping": {
+      "block_aggregation": "arithmetic_mean",
+      "fallback_mode": "recent_window_geometric_mean",
+      "fallback_value": 16.97314803391489,
+      "fallback_window_end_year": 2025,
+      "fallback_window_start_year": 2015,
+      "latest_series_value": 11.000000002400002,
+      "latest_series_year": 2024,
+      "series_column": "rolling_median_5yr_phi",
+      "series_csv": "artifacts/support/battery_mapping/battery_phi_mapping.csv"
+    },
     "stochastic_learning_technology": "battery_energy"
   },
   "historical_files": {

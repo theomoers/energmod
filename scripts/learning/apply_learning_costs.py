@@ -44,14 +44,10 @@ from learning.learning_data_io import load_historical_capacity
 # Calibrated to 2020: 246.7088 EUR/kWh (system) / (137 USD/kWh (cell) / 1.14 USD/EUR) = 2.054
 BOS_multiplier = 246.7088 / (137 / 1.14)
 
-# Global scaling factors for technologies where model covers only a fraction of global deployment
-# Learning happens globally, so we scale modeled capacity to represent global deployment
-# Values can be overridden in config.learning.yaml via:
-# learning.global_scale_factors.<technology>
-DEFAULT_GLOBAL_SCALE_FACTORS = {
-    "battery_energy": 17.76,  # Model covers 66/1173 = 5.63% of global battery storage (2020)
-    "battery_power": 17.76,   # Apply same global scaling to battery inverter learning
-}
+# Global scaling factors for technologies where model covers only a fraction of
+# global deployment. Battery energy is handled separately via the bundled
+# phi_t mapping from modeled grid additions to global Li-ion additions.
+DEFAULT_GLOBAL_SCALE_FACTORS = {}
 
 DEFAULT_TECH_MAPPING = {
     "solar": "solar_power",
@@ -759,6 +755,135 @@ def get_manifest_historical_datafile(learning_cfg, tech_key):
     return str((root / relative).resolve())
 
 
+def get_battery_mapping_config(learning_cfg):
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    battery_treatment = manifest.get("battery_treatment", {}) or {}
+    mapping = battery_treatment.get("global_liion_mapping", {}) or {}
+    if not mapping:
+        raise ValueError(
+            "Manifest is missing battery_treatment.global_liion_mapping for battery learning."
+        )
+
+    relative = mapping.get("series_csv")
+    if not relative:
+        raise ValueError("Battery global Li-ion mapping is missing series_csv in manifest.")
+
+    config = dict(mapping)
+    config["series_csv"] = str((root / relative).resolve())
+    config["series_column"] = str(mapping.get("series_column", "rolling_median_5yr_phi"))
+    config["block_aggregation"] = str(mapping.get("block_aggregation", "arithmetic_mean"))
+    config["fallback_value"] = float(mapping.get("fallback_value"))
+    return config
+
+
+def load_battery_phi_support(learning_cfg):
+    cached = learning_cfg.get("_battery_phi_support", None)
+    if cached is not None:
+        return cached
+
+    mapping = get_battery_mapping_config(learning_cfg)
+    series_path = Path(mapping["series_csv"])
+    if not series_path.exists():
+        raise FileNotFoundError(f"Battery phi mapping series not found: {series_path}")
+
+    df = pd.read_csv(series_path)
+    series_col = mapping["series_column"]
+    if series_col not in df.columns:
+        raise ValueError(
+            f"Battery phi mapping series is missing required column '{series_col}': {series_path}"
+        )
+
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(int)
+    df[series_col] = pd.to_numeric(df[series_col], errors="coerce")
+    df = df.sort_values("year").reset_index(drop=True)
+
+    support = {"config": mapping, "series": df}
+    learning_cfg["_battery_phi_support"] = support
+    return support
+
+
+def get_battery_phi_for_year(learning_cfg, year):
+    support = load_battery_phi_support(learning_cfg)
+    mapping = support["config"]
+    series = support["series"]
+    series_col = mapping["series_column"]
+
+    row = series.loc[series["year"] == int(year)]
+    if not row.empty:
+        value = float(row[series_col].iloc[-1])
+        if np.isfinite(value) and value > 0.0:
+            return value
+
+    fallback = float(mapping["fallback_value"])
+    if not np.isfinite(fallback) or fallback <= 0.0:
+        raise ValueError(
+            f"Invalid battery phi fallback value {fallback!r}; must be finite and > 0."
+        )
+    return fallback
+
+
+def get_battery_phi_for_block(learning_cfg, start_year, end_year):
+    years = list(range(int(start_year) + 1, int(end_year) + 1))
+    if not years:
+        raise ValueError(
+            f"Invalid battery phi block [{start_year}, {end_year}]: no annual support years."
+        )
+
+    values = [float(get_battery_phi_for_year(learning_cfg, year)) for year in years]
+    aggregation = load_battery_phi_support(learning_cfg)["config"]["block_aggregation"]
+    if aggregation != "arithmetic_mean":
+        raise ValueError(
+            f"Unsupported battery phi block aggregation '{aggregation}'."
+        )
+    phi_block = float(np.mean(values))
+    if not np.isfinite(phi_block) or phi_block <= 0.0:
+        raise ValueError(
+            f"Invalid battery phi block value for [{start_year}, {end_year}]: {phi_block}"
+        )
+    return phi_block
+
+
+def get_committed_capacity_history_value(state, tech, year, history_field="capacity_history"):
+    history = (state.get(history_field, {}) or {}).get(tech, {}) or {}
+    key = str(int(year))
+    if key not in history:
+        raise ValueError(
+            f"Committed {history_field} for {tech} is missing year {year}."
+        )
+    value = float(history[key])
+    if value <= 0.0:
+        raise ValueError(
+            f"Committed {history_field} for {tech} at {year} must be > 0, got {value}."
+        )
+    return value
+
+
+def get_learning_base_capacity_for_year(state, tech, year, fallback_capacity=None):
+    if tech == "battery_energy":
+        return get_committed_capacity_history_value(state, tech, year, "capacity_history")
+    if fallback_capacity is None:
+        raise ValueError(
+            f"Missing fallback capacity for {tech} at {year} in learning-base lookup."
+        )
+    value = float(fallback_capacity)
+    if value <= 0.0:
+        raise ValueError(f"Learning-base capacity for {tech} at {year} must be > 0, got {value}.")
+    return value
+
+
+def build_learning_base_capacity_map(state, solved_capacity_by_tech, current_year):
+    learning_base = {}
+    for tech, solved_capacity in solved_capacity_by_tech.items():
+        if tech == "battery_energy":
+            learning_base[tech] = get_learning_base_capacity_for_year(
+                state, tech, current_year
+            )
+        else:
+            learning_base[tech] = float(solved_capacity)
+    return learning_base
+
+
 def get_training_window_config(learning_cfg):
     training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
     origin_year = int(learning_cfg.get("training_window_origin_year", 2020))
@@ -1329,6 +1454,7 @@ def _state_to_runtime_learning_costs(
         current_year,
         prev_network_path,
         learning_cfg,
+        state,
         tech_mapping,
         global_scale_factors,
     )
@@ -1769,10 +1895,11 @@ def _runtime_capacity_for_log(tech, learning_cfg, state, current_year, prev_netw
     realized = extract_capacity_from_network(prev_network_path, tech_mapping, global_scale_factors)
     if tech not in realized:
         raise ValueError(f"Technology {tech} missing in previous solved network")
-    return float(realized[tech])
+    lag_year = int(state.get("last_applied_year", current_year))
+    return float(get_learning_base_capacity_for_year(state, tech, lag_year, fallback_capacity=realized[tech]))
 
 
-def _get_runtime_capacity_map(current_year, prev_network_path, learning_cfg, tech_mapping, global_scale_factors):
+def _get_runtime_capacity_map(current_year, prev_network_path, learning_cfg, state, tech_mapping, global_scale_factors):
     if current_year in COST_HISTORICAL_CAPACITY_YEARS:
         historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
         return {
@@ -1783,7 +1910,21 @@ def _get_runtime_capacity_map(current_year, prev_network_path, learning_cfg, tec
         raise ValueError(
             f"Missing previous solved network for runtime capacity extraction in {current_year}"
         )
-    return extract_capacity_from_network(prev_network_path, tech_mapping, global_scale_factors)
+    realized = extract_capacity_from_network(prev_network_path, tech_mapping, global_scale_factors)
+    lag_year = int(state.get("last_applied_year", current_year))
+    runtime_map = {}
+    for tech in ("solar_power", "onwind_power", "battery_energy"):
+        if tech not in realized and tech != "battery_energy":
+            raise ValueError(f"Technology {tech} missing in previous solved network")
+        runtime_map[tech] = float(
+            get_learning_base_capacity_for_year(
+                state,
+                tech,
+                lag_year,
+                fallback_capacity=realized.get(tech),
+            )
+        )
+    return runtime_map
 
 
 def extract_capacity_from_network(network_path, tech_mapping, global_scale_factors):
@@ -1792,7 +1933,8 @@ def extract_capacity_from_network(network_path, tech_mapping, global_scale_facto
     
     Sums p_nom_opt (for generators, links) or e_nom_opt (for stores) by carrier.
     Converts carrier names to technology keys using tech_mapping.
-    Applies global scaling factors where model covers only a fraction of deployment.
+    Applies optional global scaling factors for non-battery technologies.
+    Battery energy is handled separately through the bundled phi_t mapping.
     
     Args:
         network_path: Path to solved network
@@ -1860,9 +2002,12 @@ def extract_capacity_from_network(network_path, tech_mapping, global_scale_facto
                 # Note: For energy storage, capacity is in GWh not GW
                 realized[tech] = realized.get(tech, 0.0) + capacity
     
-    # Apply global scaling factors for technologies that represent only a fraction of global deployment
+    # Apply optional global scaling factors for non-battery technologies that
+    # represent only a fraction of global deployment. battery_energy is kept in
+    # raw modeled units here and is mapped to global Li-ion experience later via
+    # the committed-state phi_t recursion.
     for tech in list(realized.keys()):
-        if tech in global_scale_factors:
+        if tech in global_scale_factors and tech not in {"battery_energy", "battery_power"}:
             modeled_cap = realized[tech]
             scale_factor = global_scale_factors[tech]
             global_cap = modeled_cap * scale_factor
@@ -1882,6 +2027,7 @@ def calculate_learning_costs(
     current_year,
     planning_horizons,
     prev_network_path,
+    prior_state_payload,
     costs_file,
     global_scale_factors,
     wacc_dict=None,
@@ -1894,8 +2040,8 @@ def calculate_learning_costs(
     - lag_periods=0: NOT handled here (use learning.py for immediate endogenous learning)
     - lag_periods=1: Uses previous period's capacity (exogenous costs calculated here)
       * For 2020: Uses 2015 historical cumulative capacity
-      * For 2025: Uses 2020 solved capacity
-      * For 2030: Uses 2025 solved capacity
+      * For 2025: Uses 2020 solved capacity / committed cumulative experience
+      * For 2030: Uses 2025 solved capacity / committed cumulative experience
       * And so on...
     
     Args:
@@ -1904,6 +2050,7 @@ def calculate_learning_costs(
         current_year: Current planning horizon year
         planning_horizons: List of all planning horizons
         prev_network_path: Path to previous solved network (for extracting capacity)
+        prior_state_payload: Prior committed learning state from the lagged horizon
         costs_file: Path to cost CSV file for this year
         global_scale_factors: Dict of per-technology global scaling multipliers
         wacc_dict: Optional dict of regional WACCs {tech: {country: wacc}}
@@ -2028,8 +2175,15 @@ def calculate_learning_costs(
                     f"Available technologies: {list(realized_capacity.keys())}"
                 )
             
-            # Use the solved capacity from lag_year
-            cumulative_capacity = realized_capacity[tech]
+            # Use the lagged learning base from the previous committed horizon.
+            # For battery_energy this is cumulative global Li-ion experience,
+            # not the raw modeled battery stock in the solved network.
+            cumulative_capacity = get_learning_base_capacity_for_year(
+                prior_state_payload,
+                tech,
+                lag_year,
+                fallback_capacity=realized_capacity[tech],
+            )
             capacity_unit = "GWh" if tech in ENERGY_TECHS else "GW"
             logger.info(f"    Solved capacity from {lag_year}: {cumulative_capacity:.1f} {capacity_unit}")
         
@@ -2662,6 +2816,7 @@ def main(snakemake):
                 year,
                 planning_horizons,
                 prev_network_path=None,
+                prior_state_payload=prior_state_payload,
                 costs_file=costs_file,
                 global_scale_factors=global_scale_factors,
                 wacc_dict=wacc_dict,
@@ -2838,6 +2993,7 @@ def main(snakemake):
         year,
         planning_horizons,
         prev_network_path,
+        prior_state_payload,
         costs_file,
         global_scale_factors,
         wacc_dict,
