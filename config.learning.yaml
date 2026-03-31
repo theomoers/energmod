@@ -21,6 +21,9 @@ learning:
   artifact_manifest: "data/learning-data/manifest.json"
   sample_mode: "single_draw"   # single_draw | median ; median is for debugging/smoke tests only
   seed: 0                      # used only by stochastic_forecast
+  cost_expectations:
+    mode: point_cost           # point_cost | block_average_expected
+    annual_weights: [0.2, 0.2, 0.2, 0.2, 0.2]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false

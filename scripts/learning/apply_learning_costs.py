@@ -82,8 +82,12 @@ SUPPORTED_STOCHASTIC_MODELS = {
 }
 SUPPORTED_SAMPLE_MODES = {"single_draw", "median"}
 SUPPORTED_TRAINING_WINDOWS = {"origin_cutoff", "full_sample"}
+SUPPORTED_COST_EXPECTATION_MODES = {"point_cost", "block_average_expected"}
 BATTERY_POWER_TREATMENT = "deterministic_default_costs"
 LEGACY_LEARNING_SEED = "deterministic"
+DEFAULT_COST_EXPECTATION_MODE = "point_cost"
+BLOCK_EXPECTATION_DRAWS = 1000
+DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS = (0.2, 0.2, 0.2, 0.2, 0.2)
 
 # Mapping of solve horizon to the historical lag-year whose learned cost is treated
 # as known and therefore applied deterministically.
@@ -503,7 +507,75 @@ def get_runtime_conditioning_type(learning_engine, selected_model):
     return "deployment_conditioned"
 
 
-def build_runtime_metadata(learning_cfg, learning_engine, selected_model):
+def get_requested_cost_expectation_mode(learning_cfg):
+    cfg = learning_cfg.get("cost_expectations", {}) or {}
+    mode = str(cfg.get("mode", DEFAULT_COST_EXPECTATION_MODE))
+    if mode not in SUPPORTED_COST_EXPECTATION_MODES:
+        raise ValueError(
+            f"Unsupported learning.cost_expectations.mode='{mode}'. "
+            f"Supported values: {sorted(SUPPORTED_COST_EXPECTATION_MODES)}"
+        )
+    return mode
+
+
+def resolve_cost_expectation_mode(learning_cfg, selected_model):
+    requested_mode = get_requested_cost_expectation_mode(learning_cfg)
+    if str(selected_model) == "legacy_curve" and requested_mode == "block_average_expected":
+        logger.warning(
+            "learning.cost_expectations.mode=block_average_expected is not supported for legacy_curve; "
+            "falling back to point_cost_legacy."
+        )
+        return "point_cost_legacy"
+    return requested_mode
+
+
+def get_cost_expectation_weights(learning_cfg):
+    cfg = learning_cfg.get("cost_expectations", {}) or {}
+    raw_weights = cfg.get("annual_weights", None)
+    if raw_weights is None:
+        weights = np.asarray(DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS, dtype=float)
+    else:
+        if not isinstance(raw_weights, (list, tuple)):
+            raise ValueError(
+                "learning.cost_expectations.annual_weights must be a list of five non-negative numbers."
+            )
+        if len(raw_weights) != len(DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS):
+            raise ValueError(
+                "learning.cost_expectations.annual_weights must have length 5 "
+                f"(got {len(raw_weights)})."
+            )
+        try:
+            weights = np.asarray([float(weight) for weight in raw_weights], dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "learning.cost_expectations.annual_weights must contain only numeric values."
+            ) from exc
+
+    if np.any(~np.isfinite(weights)):
+        raise ValueError(
+            "learning.cost_expectations.annual_weights must contain only finite values."
+        )
+    if np.any(weights < 0.0):
+        raise ValueError(
+            "learning.cost_expectations.annual_weights must be non-negative."
+        )
+
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        raise ValueError(
+            "learning.cost_expectations.annual_weights must sum to a positive value."
+        )
+    return weights / total
+
+
+def get_cost_expectation_weights_json(learning_cfg):
+    weights = get_cost_expectation_weights(learning_cfg)
+    return json.dumps([float(weight) for weight in weights.tolist()])
+
+
+def build_runtime_metadata(learning_cfg, learning_engine, selected_model, cost_expectation_mode=None):
+    if cost_expectation_mode is None:
+        cost_expectation_mode = resolve_cost_expectation_mode(learning_cfg, selected_model)
     return {
         "engine": str(learning_engine),
         "selected_model": str(selected_model),
@@ -518,6 +590,8 @@ def build_runtime_metadata(learning_cfg, learning_engine, selected_model):
         "manifest_schema_version": str(learning_cfg.get("_manifest_schema_version", "unknown")),
         "manifest_sha256": str(learning_cfg.get("_manifest_sha256", "")),
         "battery_power_treatment": BATTERY_POWER_TREATMENT,
+        "cost_expectation_mode": str(cost_expectation_mode),
+        "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg),
     }
 
 
@@ -660,6 +734,9 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
             f"Unsupported learning.engine='{learning_engine}'. "
             f"Supported values: {sorted(SUPPORTED_LEARNING_ENGINES)}"
         )
+
+    get_requested_cost_expectation_mode(learning_cfg)
+    get_cost_expectation_weights(learning_cfg)
 
     sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
     if sample_mode not in SUPPORTED_SAMPLE_MODES:
@@ -1500,6 +1577,7 @@ def _state_to_runtime_learning_costs(
     artifacts,
     state,
     current_year,
+    selected_model,
     learning_cfg,
     costs_file,
     global_scale_factors,
@@ -1516,37 +1594,73 @@ def _state_to_runtime_learning_costs(
         tech_mapping,
         global_scale_factors,
     )
+    return _learning_costs_from_stochastic_state(
+        artifacts=artifacts,
+        state=state,
+        selected_model=selected_model,
+        cumulative_capacity_map=runtime_capacity_map,
+        learning_cfg=learning_cfg,
+        costs_file=costs_file,
+        wacc_dict=wacc_dict,
+        runtime_metadata=runtime_metadata,
+    )
+
+
+def _learning_costs_from_stochastic_state(
+    artifacts,
+    state,
+    selected_model,
+    cumulative_capacity_map,
+    learning_cfg,
+    costs_file,
+    wacc_dict,
+    runtime_metadata,
+):
     learning_costs = {}
+    cost_expectation_mode = str(runtime_metadata.get("cost_expectation_mode", DEFAULT_COST_EXPECTATION_MODE))
+    expectation_diagnostics = None
+    if cost_expectation_mode == "block_average_expected":
+        expectation_diagnostics = _compute_block_average_expected_costs(
+            artifacts=artifacts,
+            state=state,
+            selected_model=selected_model,
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+        )
     for tech, artifact in artifacts.items():
-        if tech not in runtime_capacity_map:
+        if tech not in cumulative_capacity_map:
             raise ValueError(f"Technology {tech} missing in runtime capacity map")
         state_tech = (state.get("technology_states", {}) or {}).get(tech, {}) or {}
         log_cost = float(state_tech["last_log_capex"])
-        c_overnight = float(np.exp(log_cost) / 1000.0)
-        capital_cost = convert_to_capital_cost(
-            c_overnight,
-            tech,
-            _cost_unit_for_runtime(tech),
-            learning_cfg,
-            costs_file,
-        )
+        point_c_overnight = float(np.exp(log_cost) / 1000.0)
         snapshot = state_tech.get("parameter_snapshot", None)
         if not snapshot:
-            if runtime_metadata.get("selected_model") == "way_fixed_rho_benchmark_035":
+            if selected_model == "way_fixed_rho_benchmark_035":
                 snapshot = _way_runtime_snapshot(artifact)
-            elif runtime_metadata.get("selected_model") == "correlated_geometric_random_walk":
+            elif selected_model == "correlated_geometric_random_walk":
                 snapshot = _cgrw_runtime_snapshot(artifact)
-        learning_costs[tech] = {
-            "capital_cost": capital_cost,
-            "cumulative_capacity_GW": float(runtime_capacity_map[tech]),
-            **_generic_stochastic_fields_from_snapshot(snapshot),
-            "unit": _cost_unit_for_runtime(tech),
-            "c_overnight": c_overnight,
-            "wacc_dict": wacc_dict,
-            **runtime_metadata,
-            "log_capex_runtime": log_cost,
-            **_serialize_stochastic_snapshot(snapshot),
-        }
+        if cost_expectation_mode == "block_average_expected":
+            diag = expectation_diagnostics[tech]
+            applied_c_overnight = float(diag["c_overnight"])
+            terminal_c_overnight = float(diag["c_overnight_terminal_point"])
+        else:
+            applied_c_overnight = point_c_overnight
+            terminal_c_overnight = point_c_overnight
+        record = _runtime_cost_record(
+            tech=tech,
+            cumulative_capacity=cumulative_capacity_map[tech],
+            runtime_metadata=runtime_metadata,
+            snapshot=snapshot,
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+            applied_c_overnight=applied_c_overnight,
+            terminal_c_overnight=terminal_c_overnight,
+            wacc_dict=wacc_dict,
+        )
+        if cost_expectation_mode != "block_average_expected":
+            record["log_capex_runtime"] = log_cost
+            record["log_capex_terminal_point"] = log_cost
+        learning_costs[tech] = record
     return learning_costs
 
 
@@ -1559,21 +1673,167 @@ def _single_or_median(values, sample_mode):
     return float(arr[0])
 
 
-def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode):
+def _runtime_sample_count(sample_mode, n_samples=None):
+    if n_samples is not None:
+        return int(n_samples)
+    return 1 if sample_mode == "single_draw" else 201
+
+
+def _empty_annual_log_cost_paths(n, elapsed_years):
+    return np.empty((int(n), int(elapsed_years)), dtype=float)
+
+
+def _cost_statistics_from_levels(
+    applied_c_overnight,
+    terminal_c_overnight,
+    learning_cfg,
+    costs_file,
+    tech,
+):
+    applied_c_overnight = float(applied_c_overnight)
+    terminal_c_overnight = float(terminal_c_overnight)
+    return {
+        "c_overnight": applied_c_overnight,
+        "capital_cost": convert_to_capital_cost(
+            applied_c_overnight,
+            tech,
+            _cost_unit_for_runtime(tech),
+            learning_cfg,
+            costs_file,
+        ),
+        "c_overnight_terminal_point": terminal_c_overnight,
+        "capital_cost_terminal_point": convert_to_capital_cost(
+            terminal_c_overnight,
+            tech,
+            _cost_unit_for_runtime(tech),
+            learning_cfg,
+            costs_file,
+        ),
+        "log_capex_terminal_point": float(np.log(max(terminal_c_overnight, 1.0e-12) * 1000.0)),
+    }
+
+
+def _runtime_cost_record(
+    tech,
+    cumulative_capacity,
+    runtime_metadata,
+    snapshot,
+    learning_cfg,
+    costs_file,
+    applied_c_overnight,
+    terminal_c_overnight,
+    wacc_dict,
+):
+    cost_stats = _cost_statistics_from_levels(
+        applied_c_overnight=applied_c_overnight,
+        terminal_c_overnight=terminal_c_overnight,
+        learning_cfg=learning_cfg,
+        costs_file=costs_file,
+        tech=tech,
+    )
+    return {
+        "cumulative_capacity_GW": float(cumulative_capacity),
+        **_generic_stochastic_fields_from_snapshot(snapshot),
+        "unit": _cost_unit_for_runtime(tech),
+        "wacc_dict": wacc_dict,
+        **runtime_metadata,
+        **cost_stats,
+        "log_capex_runtime": float(cost_stats["log_capex_terminal_point"]),
+        **_serialize_stochastic_snapshot(snapshot),
+    }
+
+
+def _runtime_cost_expectation_rng(seed, state):
+    base_year = int(state.get("last_applied_year", 0))
+    return np.random.default_rng(int(seed) + 1000 * base_year + 17)
+
+
+def _compute_block_average_expected_costs(
+    artifacts,
+    state,
+    selected_model,
+    learning_cfg,
+    costs_file,
+):
+    weights = get_cost_expectation_weights(learning_cfg)
+    expectation_years = int(len(weights))
+    seed = int(learning_cfg.get("seed", 0))
+    rng = _runtime_cost_expectation_rng(seed, state)
+
+    if selected_model == "shared_state_bayesian_regime_wright":
+        annual_result = simulate_shared_state_runtime(
+            artifacts=artifacts,
+            state=state,
+            block_dlog_experience_by_tech={tech: 0.0 for tech in artifacts},
+            elapsed_years=expectation_years,
+            rng=rng,
+            sample_mode="single_draw",
+            n_samples=BLOCK_EXPECTATION_DRAWS,
+        )
+        annual_paths = annual_result["annual_log_cost_paths"]
+    elif selected_model == "correlated_geometric_random_walk":
+        annual_paths = {}
+        for tech, artifact in artifacts.items():
+            annual_paths[tech] = simulate_cgrw_runtime(
+                artifact=artifact,
+                state=state["technology_states"][tech],
+                elapsed_years=expectation_years,
+                rng=rng,
+                sample_mode="single_draw",
+                n_samples=BLOCK_EXPECTATION_DRAWS,
+            )["annual_log_cost_paths"]
+    elif selected_model == "way_fixed_rho_benchmark_035":
+        annual_paths = {}
+        for tech, artifact in artifacts.items():
+            annual_paths[tech] = simulate_way_runtime(
+                artifact=artifact,
+                state=state["technology_states"][tech],
+                block_dlog_experience=0.0,
+                elapsed_years=expectation_years,
+                rng=rng,
+                sample_mode="single_draw",
+                n_samples=BLOCK_EXPECTATION_DRAWS,
+            )["annual_log_cost_paths"]
+    else:
+        raise ValueError(f"Unsupported stochastic model for block-average expectations: {selected_model}")
+
+    diagnostics = {}
+    for tech, path in annual_paths.items():
+        if path.shape[1] != expectation_years:
+            raise ValueError(
+                f"Expected {expectation_years} annual path steps for {selected_model}/{tech}, got {path.shape[1]}"
+            )
+        level_costs = np.exp(path) / 1000.0
+        weighted_costs = level_costs @ weights
+        applied_c_overnight = float(np.mean(weighted_costs))
+        terminal_c_overnight = float(np.mean(level_costs[:, -1]))
+        diagnostics[tech] = _cost_statistics_from_levels(
+            applied_c_overnight=applied_c_overnight,
+            terminal_c_overnight=terminal_c_overnight,
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+            tech=tech,
+        )
+    return diagnostics
+
+
+def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode, n_samples=None):
     params = artifact["parameter_summary"]
     sigma = float(params["sigma"])
     alpha = float(params["alpha"])
     rho = float(params["rho"])
     last_log = float(state["last_log_capex"])
     last_dlog = float(state["last_dlog_capex"])
-    n = 1 if sample_mode == "single_draw" else 201
+    n = _runtime_sample_count(sample_mode, n_samples=n_samples)
     log_cost = np.full(n, last_log, dtype=float)
     dlog_prev = np.full(n, last_dlog, dtype=float)
+    annual_log_cost_paths = _empty_annual_log_cost_paths(n, elapsed_years)
     for _ in range(int(elapsed_years)):
         eps = sigma * rng.standard_normal(n)
         dlog = alpha + rho * dlog_prev + eps
         log_cost = log_cost + dlog
         dlog_prev = dlog
+        annual_log_cost_paths[:, _] = log_cost
     snapshot = _cgrw_runtime_snapshot(artifact)
     return {
         "final_log_cost": _single_or_median(log_cost, sample_mode),
@@ -1583,10 +1843,11 @@ def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode):
             "state_type": state.get("state_type", "geometric_random_walk"),
             "parameter_snapshot": snapshot,
         },
+        "annual_log_cost_paths": annual_log_cost_paths,
     }
 
 
-def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, rng, sample_mode):
+def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, rng, sample_mode, n_samples=None):
     params = artifact["parameter_summary"]
     alpha = float(params["alpha"])
     beta = float(params["slope_dlog_experience"])
@@ -1596,7 +1857,7 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
     if "last_innovation" not in state:
         raise ValueError("Way runtime state is missing last_innovation")
     last_eps = float(state["last_innovation"])
-    n = 1 if sample_mode == "single_draw" else 201
+    n = _runtime_sample_count(sample_mode, n_samples=n_samples)
     log_cost = np.full(n, last_log, dtype=float)
     eps_prev = np.full(n, last_eps, dtype=float)
     snapshot = _way_runtime_snapshot(artifact)
@@ -1613,13 +1874,16 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
                 "state_type": state.get("state_type", "ma1_wright_fixed_rho"),
                 "parameter_snapshot": snapshot,
             },
+            "annual_log_cost_paths": _empty_annual_log_cost_paths(n, years),
         }
     x_curr = float(block_dlog_experience) / float(years)
+    annual_log_cost_paths = _empty_annual_log_cost_paths(n, years)
     for _ in range(years):
         eps = sigma * rng.standard_normal(n)
         dlog = alpha + beta * x_curr + eps + theta * eps_prev
         log_cost = log_cost + dlog
         eps_prev = eps
+        annual_log_cost_paths[:, _] = log_cost
     return {
         "final_log_cost": _single_or_median(log_cost, sample_mode),
         "state": {
@@ -1629,14 +1893,23 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
             "state_type": state.get("state_type", "ma1_wright_fixed_rho"),
             "parameter_snapshot": snapshot,
         },
+        "annual_log_cost_paths": annual_log_cost_paths,
     }
 
 
-def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tech, elapsed_years, rng, sample_mode):
+def simulate_shared_state_runtime(
+    artifacts,
+    state,
+    block_dlog_experience_by_tech,
+    elapsed_years,
+    rng,
+    sample_mode,
+    n_samples=None,
+):
     techs = list(artifacts.keys())
     sample_artifact = next(iter(artifacts.values()))
     horizons = int(elapsed_years)
-    n = 1 if sample_mode == "single_draw" else 201
+    n = _runtime_sample_count(sample_mode, n_samples=n_samples)
     if horizons < 0:
         raise ValueError(f"Elapsed years for shared-state runtime must be >= 0, got {horizons}")
 
@@ -1660,10 +1933,12 @@ def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tec
 
     tech_states = {}
     log_costs = {}
+    annual_log_cost_paths = {}
     param_cache = {}
     for tech, artifact in artifacts.items():
         state_tech = state["technology_states"][tech]
         log_costs[tech] = np.full(n, float(state_tech["last_log_capex"]), dtype=float)
+        annual_log_cost_paths[tech] = _empty_annual_log_cost_paths(n, horizons)
         unc = artifact.get("uncertainty_terms", {}) or {}
         params = artifact["parameter_summary"]
         def _draws(key, mean_key):
@@ -1703,6 +1978,7 @@ def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tec
                 "p_slow_slow": _single_or_median(p_ss, sample_mode),
                 "p_fast_fast": _single_or_median(p_ff, sample_mode),
             },
+            "annual_log_cost_paths": annual_log_cost_paths,
         }
 
     x_step_by_tech = {
@@ -1721,6 +1997,7 @@ def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tec
             beta = np.where(current_regime == 0, pars["beta_slow"], pars["beta_fast"])
             dlog = alpha + beta * x_curr + pars["sigma"] * rng.standard_normal(n)
             log_costs[tech] = log_costs[tech] + dlog
+            annual_log_cost_paths[tech][:, step] = log_costs[tech]
 
     regime_scalar = _single_or_median(current_regime, sample_mode)
     probs = [float(np.mean(current_regime == 0)), float(np.mean(current_regime == 1))]
@@ -1745,6 +2022,7 @@ def simulate_shared_state_runtime(artifacts, state, block_dlog_experience_by_tec
             "p_slow_slow": _single_or_median(p_ss, sample_mode),
             "p_fast_fast": _single_or_median(p_ff, sample_mode),
         },
+        "annual_log_cost_paths": annual_log_cost_paths,
     }
 
 
@@ -1765,10 +2043,12 @@ def calculate_stochastic_learning_costs(
         current_year,
         prev_state_path,
     )
-    sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
-    seed = int(learning_cfg.get("seed", 0))
+    cost_expectation_mode = resolve_cost_expectation_mode(learning_cfg, selected_model)
     runtime_metadata = build_runtime_metadata(
-        learning_cfg, "stochastic_forecast", selected_model
+        learning_cfg,
+        "stochastic_forecast",
+        selected_model,
+        cost_expectation_mode=cost_expectation_mode,
     )
 
     if current_year not in COST_HISTORICAL_CAPACITY_YEARS and prev_network_path is None:
@@ -1782,6 +2062,7 @@ def calculate_stochastic_learning_costs(
         artifacts=artifacts,
         state=state,
         current_year=current_year,
+        selected_model=selected_model,
         learning_cfg=learning_cfg,
         costs_file=costs_file,
         global_scale_factors=global_scale_factors,
@@ -1810,8 +2091,12 @@ def update_stochastic_runtime_state(
     sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
     seed = int(learning_cfg.get("seed", 0))
     rng = np.random.default_rng(seed + 1000 * int(current_year))
+    cost_expectation_mode = resolve_cost_expectation_mode(learning_cfg, selected_model)
     runtime_metadata = build_runtime_metadata(
-        learning_cfg, "stochastic_forecast", selected_model
+        learning_cfg,
+        "stochastic_forecast",
+        selected_model,
+        cost_expectation_mode=cost_expectation_mode,
     )
     if state.get("seed") not in (None, ""):
         runtime_metadata["seed"] = int(state["seed"])
@@ -1867,33 +2152,16 @@ def update_stochastic_runtime_state(
             "capacity_history": state.get("capacity_history", {}),
             "modeled_capacity_history": state.get("modeled_capacity_history", {}),
         }
-        learning_costs = {}
-        for tech in artifacts:
-            log_cost = float(shared_result["final_log_costs"][tech])
-            c_overnight = float(np.exp(log_cost) / 1000.0)
-            capital_cost = convert_to_capital_cost(
-                c_overnight,
-                tech,
-                _cost_unit_for_runtime(tech),
-                learning_cfg,
-                costs_file,
-            )
-            if tech not in solved_capacity_by_tech:
-                raise ValueError(f"Technology {tech} missing in solved capacity map")
-            snapshot = (shared_result["technology_states"].get(tech, {}) or {}).get("parameter_snapshot", None)
-            next_state["technology_states"][tech]["c_overnight"] = c_overnight
-            next_state["technology_states"][tech]["capital_cost"] = capital_cost
-            learning_costs[tech] = {
-                "capital_cost": capital_cost,
-                "cumulative_capacity_GW": float(solved_capacity_by_tech[tech]),
-                **_generic_stochastic_fields_from_snapshot(snapshot),
-                "unit": _cost_unit_for_runtime(tech),
-                "c_overnight": c_overnight,
-                "wacc_dict": wacc_dict,
-                **runtime_metadata,
-                "log_capex_runtime": log_cost,
-                **_serialize_stochastic_snapshot(snapshot),
-            }
+        learning_costs = _learning_costs_from_stochastic_state(
+            artifacts=artifacts,
+            state=next_state,
+            selected_model=selected_model,
+            cumulative_capacity_map=solved_capacity_by_tech,
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+            wacc_dict=wacc_dict,
+            runtime_metadata=runtime_metadata,
+        )
         return learning_costs, next_state
 
     next_state = {
@@ -1904,7 +2172,6 @@ def update_stochastic_runtime_state(
         "capacity_history": state.get("capacity_history", {}),
         "modeled_capacity_history": state.get("modeled_capacity_history", {}),
     }
-    learning_costs = {}
     for tech, artifact in artifacts.items():
         state_tech = state["technology_states"][tech]
         if selected_model == "correlated_geometric_random_walk":
@@ -1912,32 +2179,17 @@ def update_stochastic_runtime_state(
         else:
             block_dlog = compute_realized_block_growth(tech, learning_cfg, state, current_year, elapsed_years)
             result = simulate_way_runtime(artifact, state_tech, block_dlog, elapsed_years, rng, sample_mode)
-        log_cost = float(result["final_log_cost"])
         next_state["technology_states"][tech] = result["state"]
-        c_overnight = float(np.exp(log_cost) / 1000.0)
-        capital_cost = convert_to_capital_cost(
-            c_overnight,
-            tech,
-            _cost_unit_for_runtime(tech),
-            learning_cfg,
-            costs_file,
-        )
-        if tech not in solved_capacity_by_tech:
-            raise ValueError(f"Technology {tech} missing in solved capacity map")
-        snapshot = result["state"].get("parameter_snapshot", None)
-        next_state["technology_states"][tech]["c_overnight"] = c_overnight
-        next_state["technology_states"][tech]["capital_cost"] = capital_cost
-        learning_costs[tech] = {
-            "capital_cost": capital_cost,
-            "cumulative_capacity_GW": float(solved_capacity_by_tech[tech]),
-            **_generic_stochastic_fields_from_snapshot(snapshot),
-            "unit": _cost_unit_for_runtime(tech),
-            "c_overnight": c_overnight,
-            "wacc_dict": wacc_dict,
-            **runtime_metadata,
-            "log_capex_runtime": log_cost,
-            **_serialize_stochastic_snapshot(snapshot),
-        }
+    learning_costs = _learning_costs_from_stochastic_state(
+        artifacts=artifacts,
+        state=next_state,
+        selected_model=selected_model,
+        cumulative_capacity_map=solved_capacity_by_tech,
+        learning_cfg=learning_cfg,
+        costs_file=costs_file,
+        wacc_dict=wacc_dict,
+        runtime_metadata=runtime_metadata,
+    )
     return learning_costs, next_state
 
 
@@ -2277,6 +2529,7 @@ def calculate_learning_costs(
         
         learning_costs[tech] = {
             "capital_cost": capital_cost,
+            "capital_cost_terminal_point": capital_cost,
             "cumulative_capacity_GW": cumulative_capacity,
             "A": A,
             "A_base": A_base,
@@ -2288,6 +2541,9 @@ def calculate_learning_costs(
             "beta_adjusted": beta != beta_base,
             "unit": unit,
             "c_overnight": c_overnight,
+            "c_overnight_terminal_point": c_overnight,
+            "log_capex_runtime": float(np.log(max(c_overnight, 1.0e-12) * 1000.0)),
+            "log_capex_terminal_point": float(np.log(max(c_overnight, 1.0e-12) * 1000.0)),
             "wacc_dict": wacc_dict,  # Store for per-bus calculation
         }
         
@@ -2680,6 +2936,8 @@ def save_cost_log(learning_costs, output_file):
         "manifest_sha256",
         "manifest_path",
         "battery_power_treatment",
+        "cost_expectation_mode",
+        "cost_expectation_weights_json",
         "cumulative_capacity_GW",
         "A_base",
         "A_scenario",
@@ -2690,8 +2948,12 @@ def save_cost_log(learning_costs, output_file):
         "lr_scenario",
         "beta_adjusted",
         "capital_cost",
+        "capital_cost_terminal_point",
         "unit",
         "c_overnight",
+        "c_overnight_terminal_point",
+        "log_capex_runtime",
+        "log_capex_terminal_point",
         "wacc_dict",
         "stochastic_family",
         "stochastic_current_regime",
@@ -2778,12 +3040,13 @@ def main(snakemake):
     runtime_metadata = build_runtime_metadata(learning_cfg, learning_engine, selected_model)
     logger.info("Learning runtime: engine=%s, model=%s", learning_engine, selected_model)
     logger.info(
-        "Runtime contract: sample_mode=%s, seed=%s, learning_seed=%s, battery_power=%s, conditioning=%s",
+        "Runtime contract: sample_mode=%s, seed=%s, learning_seed=%s, battery_power=%s, conditioning=%s, cost_expectations=%s",
         runtime_metadata["sample_mode"],
         runtime_metadata["seed"],
         runtime_metadata["learning_seed"],
         BATTERY_POWER_TREATMENT,
         runtime_metadata["runtime_conditioning"],
+        runtime_metadata["cost_expectation_mode"],
     )
     logger.info(
         "Learning manifest: schema_version=%s, sha256=%s",

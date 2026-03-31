@@ -59,7 +59,15 @@ def make_mock_snakemake(rule, inputs, outputs, wildcards, params):
     )
 
 
-def write_learning_config(output_path, selected_model, manifest_path=None, seed=0, sample_mode="single_draw"):
+def write_learning_config(
+    output_path,
+    selected_model,
+    manifest_path=None,
+    seed=0,
+    sample_mode="single_draw",
+    cost_expectation_mode="point_cost",
+    cost_expectation_weights=None,
+):
     cfg_path = ENERGYMOD_ROOT / "config.learning.yaml"
     payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     payload["learning"]["enabled"] = True
@@ -74,6 +82,12 @@ def write_learning_config(output_path, selected_model, manifest_path=None, seed=
     payload["learning"]["training_window_origin_year"] = 2020
     payload["learning"]["sample_mode"] = sample_mode
     payload["learning"]["seed"] = int(seed)
+    payload["learning"].setdefault("cost_expectations", {})
+    payload["learning"]["cost_expectations"]["mode"] = str(cost_expectation_mode)
+    if cost_expectation_weights is not None:
+        payload["learning"]["cost_expectations"]["annual_weights"] = [
+            float(weight) for weight in cost_expectation_weights
+        ]
     output_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
@@ -81,6 +95,19 @@ def format_learning_seed(model_name, seed):
     if model_name == "legacy_curve":
         return LEGACY_LEARNING_SEED
     return f"s{int(seed):04d}"
+
+
+def resolve_mock_cost_file(year):
+    candidates = [
+        ENERGYMOD_ROOT / "resources" / "Earth_200" / f"costs_{year}.csv",
+        ENERGYMOD_ROOT / "resources" / "Earth_myopic_90cluster" / f"costs_{year}.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"Required cost file missing for {year}. Checked: {[str(path) for path in candidates]}"
+    )
 
 
 def build_mock_network(planning_year):
@@ -277,7 +304,7 @@ def run_export_postsolve(
     export_postsolve_learning_costs_module.main(snakemake)
 
 
-def validate_cost_log(path, expected_model):
+def validate_cost_log(path, expected_model, expected_cost_expectation_mode=None):
     df = pd.read_csv(path)
     required = {"solar_power", "onwind_power", "battery_energy"}
     missing = required - set(df["technology"].tolist())
@@ -292,12 +319,23 @@ def validate_cost_log(path, expected_model):
         "manifest_schema_version",
         "manifest_sha256",
         "battery_power_treatment",
+        "cost_expectation_mode",
+        "cost_expectation_weights_json",
+        "c_overnight_terminal_point",
+        "capital_cost_terminal_point",
+        "log_capex_terminal_point",
     ):
         if col not in df.columns:
             raise RuntimeError(f"Cost log {path} missing metadata column {col}")
     models = set(df["selected_model"].dropna().astype(str).tolist())
     if expected_model not in models:
         raise RuntimeError(f"Cost log {path} missing expected model {expected_model}")
+    if expected_cost_expectation_mode is not None:
+        actual_modes = set(df["cost_expectation_mode"].dropna().astype(str).tolist())
+        if actual_modes != {str(expected_cost_expectation_mode)}:
+            raise RuntimeError(
+                f"Cost log {path} cost_expectation_mode mismatch: expected {expected_cost_expectation_mode}, got {sorted(actual_modes)}"
+            )
 
 
 def validate_committed_state(path, expected_model, expected_year):
@@ -319,6 +357,11 @@ def validate_committed_state(path, expected_model, expected_year):
     for tech in ("solar_power", "onwind_power", "battery_energy"):
         if tech not in tech_states:
             raise RuntimeError(f"Committed state {path} missing technology state for {tech}")
+        forbidden = {"c_overnight", "capital_cost"} & set((tech_states.get(tech, {}) or {}).keys())
+        if forbidden:
+            raise RuntimeError(
+                f"Committed state {path} should keep filtered stochastic state only; {tech} still has {sorted(forbidden)}"
+            )
 
 
 def validate_lagged_cost_carry_forward(previous_committed_cost_log, next_input_cost_log, label):
@@ -334,6 +377,112 @@ def validate_lagged_cost_carry_forward(previous_committed_cost_log, next_input_c
                 f"{label}: c_overnight carry-forward mismatch for {row['technology']}: "
                 f"{row['c_overnight_prev']} vs {row['c_overnight_next']}"
             )
+
+
+def validate_point_cost_diagnostics(cost_log_path):
+    df = pd.read_csv(cost_log_path)
+    for _, row in df.iterrows():
+        tech = row["technology"]
+        if abs(float(row["c_overnight"]) - float(row["c_overnight_terminal_point"])) > 1.0e-9:
+            raise RuntimeError(
+                f"{cost_log_path}: point_cost diagnostic mismatch for {tech}: "
+                f"{row['c_overnight']} vs {row['c_overnight_terminal_point']}"
+            )
+        if abs(float(row["capital_cost"]) - float(row["capital_cost_terminal_point"])) > 1.0e-9:
+            raise RuntimeError(
+                f"{cost_log_path}: point_cost capital_cost mismatch for {tech}: "
+                f"{row['capital_cost']} vs {row['capital_cost_terminal_point']}"
+            )
+
+
+def validate_block_average_expected_log(cost_log_path):
+    df = pd.read_csv(cost_log_path)
+    if df.empty:
+        raise RuntimeError(f"Block-average cost log is empty: {cost_log_path}")
+    meaningful_gap = False
+    for _, row in df.iterrows():
+        tech = row["technology"]
+        applied = float(row["c_overnight"])
+        terminal = float(row["c_overnight_terminal_point"])
+        if applied <= 0.0 or terminal <= 0.0:
+            raise RuntimeError(f"{cost_log_path}: non-positive cost diagnostic for {tech}")
+        if abs(applied - terminal) > 1.0e-6:
+            meaningful_gap = True
+    if not meaningful_gap:
+        raise RuntimeError(
+            f"{cost_log_path}: block_average_expected produced no applied-vs-terminal difference."
+        )
+
+
+def validate_block_average_recomputed_from_state(
+    cost_log_path,
+    committed_state_path,
+    learning_config,
+    costs_file,
+    expected_model,
+):
+    learning_cfg = apply_learning_costs_module.load_config_learning(str(learning_config))
+    apply_learning_costs_module.load_learning_manifest(learning_cfg, str(learning_config))
+    learning_engine = apply_learning_costs_module.get_learning_engine(learning_cfg, expected_model)
+    apply_learning_costs_module.resolve_runtime_seed(learning_cfg, learning_engine, expected_model)
+    runtime_metadata = apply_learning_costs_module.build_runtime_metadata(
+        learning_cfg,
+        learning_engine,
+        expected_model,
+        cost_expectation_mode=apply_learning_costs_module.resolve_cost_expectation_mode(
+            learning_cfg, expected_model
+        ),
+    )
+    state = json.loads(Path(committed_state_path).read_text(encoding="utf-8"))
+    artifacts, _ = apply_learning_costs_module.load_stochastic_model_artifacts(
+        learning_cfg, expected_model
+    )
+    actual_df = pd.read_csv(cost_log_path)
+    capacity_map = {
+        row["technology"]: float(row["cumulative_capacity_GW"])
+        for _, row in actual_df.iterrows()
+    }
+    expected = apply_learning_costs_module._learning_costs_from_stochastic_state(
+        artifacts=artifacts,
+        state=state,
+        selected_model=expected_model,
+        cumulative_capacity_map=capacity_map,
+        learning_cfg=learning_cfg,
+        costs_file=str(costs_file),
+        wacc_dict=None,
+        runtime_metadata=runtime_metadata,
+    )
+    for _, row in actual_df.iterrows():
+        tech = row["technology"]
+        exp_row = expected[tech]
+        for column in ("c_overnight", "c_overnight_terminal_point"):
+            if abs(float(row[column]) - float(exp_row[column])) > 1.0e-9:
+                raise RuntimeError(
+                    f"{cost_log_path}: recomputed {column} mismatch for {tech}: "
+                    f"{row[column]} vs {exp_row[column]}"
+                )
+
+
+def validate_nondegenerate_2030_input_costs(cost_log_paths, technologies=None):
+    technologies = technologies or ("solar_power", "onwind_power", "battery_energy")
+    frames = []
+    for seed_label, path in cost_log_paths.items():
+        frame = pd.read_csv(path)
+        frame = frame.loc[frame["technology"].isin(technologies), ["technology", "c_overnight"]].copy()
+        frame["learning_seed"] = str(seed_label)
+        frames.append(frame)
+    combined = pd.concat(frames, ignore_index=True)
+    if combined["learning_seed"].nunique() < 2:
+        raise RuntimeError("Need at least two seeds to validate non-degenerate 2030 input costs.")
+    grouped = combined.groupby("technology")["c_overnight"].agg(["min", "max", "std"]).reset_index()
+    for _, row in grouped.iterrows():
+        spread = float(row["max"] - row["min"])
+        std = float(0.0 if pd.isna(row["std"]) else row["std"])
+        if spread <= 0.0 or std <= 0.0:
+            raise RuntimeError(
+                f"2030 input costs remain degenerate for {row['technology']}: spread={spread}, std={std}"
+            )
+    return grouped
 
 
 def validate_historical_bootstrap_cost_log(
@@ -400,19 +549,21 @@ def add_mock_brownfield(current_network_path, previous_solved_network_path, outp
     n_current.export_to_netcdf(output_path)
 
 
-def run_model_smoke(model_name, root, seed=0):
+def run_model_smoke(model_name, root, seed=0, cost_expectation_mode="point_cost"):
     model_root = root / model_name
     model_root.mkdir(parents=True, exist_ok=True)
 
     learning_config = model_root / "config.learning.yaml"
-    write_learning_config(learning_config, model_name, seed=seed)
+    write_learning_config(
+        learning_config,
+        model_name,
+        seed=seed,
+        cost_expectation_mode=cost_expectation_mode,
+    )
 
-    costs_2020 = ENERGYMOD_ROOT / "resources" / "Earth_200" / "costs_2020.csv"
-    costs_2025 = ENERGYMOD_ROOT / "resources" / "Earth_200" / "costs_2025.csv"
-    costs_2030 = ENERGYMOD_ROOT / "resources" / "Earth_200" / "costs_2030.csv"
-    for required_path in (costs_2020, costs_2025, costs_2030):
-        if not required_path.exists():
-            raise FileNotFoundError(f"Required cost file missing: {required_path}")
+    costs_2020 = resolve_mock_cost_file(2020)
+    costs_2025 = resolve_mock_cost_file(2025)
+    costs_2030 = resolve_mock_cost_file(2030)
 
     base_2020 = model_root / "network_2020_base.nc"
     learned_2020 = model_root / "network_2020_learned.nc"
@@ -454,9 +605,13 @@ def run_model_smoke(model_name, root, seed=0):
         output_cost_log_path=cost_log_solved_2020,
         output_state_committed_path=state_committed_2020,
     )
-    validate_cost_log(cost_log_2020, model_name)
+    expected_mode = "point_cost_legacy" if (
+        model_name == "legacy_curve" and cost_expectation_mode == "block_average_expected"
+    ) else ("point_cost" if model_name == "legacy_curve" else cost_expectation_mode)
+    validate_cost_log(cost_log_2020, model_name, expected_cost_expectation_mode=expected_mode)
     if model_name == "legacy_curve":
         validate_historical_bootstrap_cost_log(cost_log_2020, learning_config, costs_2020, 2020)
+        validate_point_cost_diagnostics(cost_log_2020)
     validate_committed_state(state_committed_2020, model_name, 2020)
 
     build_mock_network(2025).export_to_netcdf(base_2025)
@@ -485,7 +640,7 @@ def run_model_smoke(model_name, root, seed=0):
         output_cost_log_path=cost_log_solved_2025,
         output_state_committed_path=state_committed_2025,
     )
-    validate_cost_log(cost_log_2025, model_name)
+    validate_cost_log(cost_log_2025, model_name, expected_cost_expectation_mode=expected_mode)
     if model_name == "legacy_curve":
         prior_state_2020 = json.loads(state_committed_2020.read_text(encoding="utf-8"))
         validate_historical_bootstrap_cost_log(
@@ -496,6 +651,7 @@ def run_model_smoke(model_name, root, seed=0):
             prev_network_path=str(solved_2020),
             prior_state_payload=prior_state_2020,
         )
+        validate_point_cost_diagnostics(cost_log_2025)
     validate_committed_state(state_committed_2025, model_name, 2025)
 
     base_2030 = model_root / "network_2030_base.nc"
@@ -533,9 +689,20 @@ def run_model_smoke(model_name, root, seed=0):
         output_cost_log_path=cost_log_solved_2030,
         output_state_committed_path=state_committed_2030,
     )
-    validate_cost_log(cost_log_2030, model_name)
+    validate_cost_log(cost_log_2030, model_name, expected_cost_expectation_mode=expected_mode)
     validate_committed_state(state_committed_2030, model_name, 2030)
     validate_lagged_cost_carry_forward(cost_log_solved_2025, cost_log_2030, f"{model_name} 2030 input")
+    if expected_mode in {"point_cost", "point_cost_legacy"}:
+        validate_point_cost_diagnostics(cost_log_2030)
+    else:
+        validate_block_average_expected_log(cost_log_2030)
+        validate_block_average_recomputed_from_state(
+            cost_log_path=cost_log_2030,
+            committed_state_path=state_committed_2025,
+            learning_config=learning_config,
+            costs_file=costs_2030,
+            expected_model=model_name,
+        )
 
     learned_2025_network = pypsa.Network(learned_2025)
     for carrier in ("solar", "onwind"):
@@ -546,6 +713,7 @@ def run_model_smoke(model_name, root, seed=0):
 
     result = {
         "model_name": model_name,
+        "cost_expectation_mode": expected_mode,
         "solve_2020": solve_2020,
         "solve_2025": solve_2025,
         "solve_2030": solve_2030,

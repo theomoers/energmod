@@ -12,6 +12,7 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -201,6 +202,16 @@ def build_postsolve_cost_log(
         if stochastic_runtime:
             c_overnight = _to_float(row.get("c_overnight"), fallback=0.0)
             capital_cost = _to_float(row.get("capital_cost"), fallback=0.0)
+            c_overnight_terminal_point = _to_float(
+                row.get("c_overnight_terminal_point"), fallback=c_overnight
+            )
+            capital_cost_terminal_point = _to_float(
+                row.get("capital_cost_terminal_point"), fallback=capital_cost
+            )
+            log_capex_terminal_point = _to_float(
+                row.get("log_capex_terminal_point"),
+                fallback=np.log(max(c_overnight_terminal_point, 1.0e-12) * 1000.0),
+            )
         else:
             c_overnight = A * (cumulative_capacity ** (-beta))
             if tech == "battery_energy":
@@ -213,6 +224,9 @@ def build_postsolve_cost_log(
                 learning_cfg=learning_cfg,
                 costs_file=costs_file,
             )
+            c_overnight_terminal_point = c_overnight
+            capital_cost_terminal_point = capital_cost
+            log_capex_terminal_point = float(np.log(max(c_overnight, 1.0e-12) * 1000.0))
 
         A_base = _to_float(row.get("A_base"), fallback=A)
         beta_base = _to_float(row.get("beta_base"), fallback=beta)
@@ -242,8 +256,12 @@ def build_postsolve_cost_log(
                 row.get("beta_adjusted"), fallback=(beta != beta_base)
             ),
             "capital_cost": capital_cost,
+            "capital_cost_terminal_point": capital_cost_terminal_point,
             "unit": unit,
             "c_overnight": c_overnight,
+            "c_overnight_terminal_point": c_overnight_terminal_point,
+            "log_capex_runtime": log_capex_terminal_point,
+            "log_capex_terminal_point": log_capex_terminal_point,
             "wacc_dict": row.get("wacc_dict", None),
             "model_name": model_name,
             "selected_model": selected_model,
@@ -258,6 +276,8 @@ def build_postsolve_cost_log(
             "manifest_schema_version": row.get("manifest_schema_version", ""),
             "manifest_sha256": row.get("manifest_sha256", ""),
             "battery_power_treatment": row.get("battery_power_treatment", ""),
+            "cost_expectation_mode": row.get("cost_expectation_mode", "point_cost"),
+            "cost_expectation_weights_json": row.get("cost_expectation_weights_json", ""),
         }
 
         logger.info(

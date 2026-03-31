@@ -18,6 +18,7 @@ from learning_runtime_smoke_utils import (
     SHORTLIST_MODELS,
     build_mock_network,
     format_learning_seed,
+    resolve_mock_cost_file,
     solve_mock_network,
 )
 
@@ -114,7 +115,7 @@ def populate_workspace_resources(workspace_root):
     resources_root = workspace_root / "resources" / "Earth_200"
     resources_root.mkdir(parents=True, exist_ok=True)
     for year in (2020, 2025):
-        source = ENERGYMOD_ROOT / "resources" / "Earth_200" / f"costs_{year}.csv"
+        source = resolve_mock_cost_file(year)
         target = resources_root / f"costs_{year}.csv"
         shutil.copy2(source, target)
 
@@ -326,18 +327,28 @@ def write_mock_learning_outputs(cost_log_path, state_path, model_name, learning_
             {
                 "technology": "solar_power",
                 "c_overnight": 750.0 - year / 100.0,
+                "c_overnight_terminal_point": 751.0 - year / 100.0,
                 "capital_cost": 120.0 - year / 1000.0,
+                "capital_cost_terminal_point": 121.0 - year / 1000.0,
+                "log_capex_terminal_point": 0.0,
                 "selected_model": model_name,
                 "learning_seed": learning_seed,
                 "training_window": "origin_cutoff",
+                "cost_expectation_mode": "block_average_expected",
+                "cost_expectation_weights_json": "[0.2, 0.2, 0.2, 0.2, 0.2]",
             },
             {
                 "technology": "onwind_power",
                 "c_overnight": 1150.0 - year / 100.0,
+                "c_overnight_terminal_point": 1151.0 - year / 100.0,
                 "capital_cost": 180.0 - year / 1000.0,
+                "capital_cost_terminal_point": 181.0 - year / 1000.0,
+                "log_capex_terminal_point": 0.0,
                 "selected_model": model_name,
                 "learning_seed": learning_seed,
                 "training_window": "origin_cutoff",
+                "cost_expectation_mode": "block_average_expected",
+                "cost_expectation_weights_json": "[0.2, 0.2, 0.2, 0.2, 0.2]",
             },
         ]
     ).to_csv(cost_log_path, index=False)

@@ -10,6 +10,7 @@ from learning_runtime_smoke_utils import (
     ENERGYMOD_ROOT,
     add_mock_brownfield,
     build_mock_network,
+    resolve_mock_cost_file,
     run_apply_learning,
     run_export_postsolve,
     solve_mock_network,
@@ -60,8 +61,8 @@ def copy_model_setup(root, model_name, manifest_path=None):
     root.mkdir(parents=True, exist_ok=True)
     learning_config = root / "config.learning.yaml"
     write_learning_config(learning_config, model_name, manifest_path=manifest_path)
-    costs_2020 = ENERGYMOD_ROOT / "resources" / "Earth_200" / "costs_2020.csv"
-    costs_2025 = ENERGYMOD_ROOT / "resources" / "Earth_200" / "costs_2025.csv"
+    costs_2020 = resolve_mock_cost_file(2020)
+    costs_2025 = resolve_mock_cost_file(2025)
     return {
         "learning_config": learning_config,
         "costs_2020": costs_2020,
