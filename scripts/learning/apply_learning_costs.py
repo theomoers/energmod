@@ -87,10 +87,12 @@ LEGACY_LEARNING_SEED = "deterministic"
 
 # Mapping of solve horizon to the historical lag-year whose learned cost is treated
 # as known and therefore applied deterministically.
-# Only 2020 is a historical bootstrap horizon: 2020 solve uses learned_cost[2015].
-# From 2025 onward, the usual lagged rule applies.
+# 2020 solve uses learned_cost[2015].
+# 2025 solve uses learned_cost[2020].
+# From 2030 onward, the usual lagged rule applies.
 COST_HISTORICAL_CAPACITY_YEARS = {
     2020: 2015,
+    2025: 2020,
 }
 
 
@@ -1344,6 +1346,61 @@ def load_runtime_state(prev_state_path, initial_state):
     return json.loads(json.dumps(initial_state))
 
 
+def _reinitialize_stochastic_runtime_state_for_model(state, initial_state, selected_model):
+    reinitialized = json.loads(json.dumps(initial_state))
+    passthrough_keys = [
+        "capacity_history",
+        "modeled_capacity_history",
+        "last_applied_year",
+        "committed_from_network",
+        "battery_power_treatment",
+        "manifest_path",
+        "manifest_schema_version",
+        "manifest_sha256",
+        "training_window",
+        "training_window_origin_year",
+        "sample_mode",
+        "runtime_conditioning",
+        "engine",
+    ]
+    for key in passthrough_keys:
+        if key in state:
+            reinitialized[key] = state[key]
+    reinitialized["selected_model"] = selected_model
+    reinitialized["model_name"] = selected_model
+    return reinitialized
+
+
+def _backfill_stochastic_runtime_state_fields(state, initial_state, selected_model, artifacts):
+    state_model = str(state.get("selected_model") or state.get("model_name") or "").strip()
+    if state_model and state_model != selected_model:
+        logger.info(
+            "Reinitializing stochastic runtime state for %s from shared/bootstrap state produced by %s",
+            selected_model,
+            state_model,
+        )
+        return _reinitialize_stochastic_runtime_state_for_model(state, initial_state, selected_model)
+
+    technology_states = (state.get("technology_states", {}) or {})
+    initial_technology_states = (initial_state.get("technology_states", {}) or {})
+    merged_states = dict(technology_states)
+    for tech in artifacts:
+        base_state = json.loads(json.dumps(initial_technology_states.get(tech, {})))
+        base_state.update(merged_states.get(tech, {}) or {})
+        merged_states[tech] = base_state
+    state["technology_states"] = merged_states
+
+    if selected_model == "shared_state_bayesian_regime_wright" and "shared_regime_state" not in state:
+        if "shared_regime_state" in initial_state:
+            state["shared_regime_state"] = json.loads(json.dumps(initial_state["shared_regime_state"]))
+
+    if selected_model and not state.get("selected_model"):
+        state["selected_model"] = selected_model
+    if selected_model and not state.get("model_name"):
+        state["model_name"] = selected_model
+    return state
+
+
 def load_stochastic_runtime_state(learning_cfg, selected_model, current_year, prev_state_path):
     artifacts, initial_state = load_stochastic_model_artifacts(learning_cfg, selected_model)
     if int(current_year) > min(COST_HISTORICAL_CAPACITY_YEARS) and prev_state_path is None:
@@ -1351,6 +1408,7 @@ def load_stochastic_runtime_state(learning_cfg, selected_model, current_year, pr
             f"Stochastic runtime for {current_year} requires previous committed learning state"
         )
     state = load_runtime_state(prev_state_path, initial_state)
+    state = _backfill_stochastic_runtime_state_fields(state, initial_state, selected_model, artifacts)
     validate_stochastic_runtime_state(state, selected_model, artifacts)
     return artifacts, state
 
@@ -1746,7 +1804,8 @@ def update_stochastic_runtime_state(
     solved_capacity_by_tech,
     wacc_dict=None,
 ):
-    artifacts, _ = load_stochastic_model_artifacts(learning_cfg, selected_model)
+    artifacts, initial_state = load_stochastic_model_artifacts(learning_cfg, selected_model)
+    state = _backfill_stochastic_runtime_state_fields(state, initial_state, selected_model, artifacts)
     validate_stochastic_runtime_state(state, selected_model, artifacts)
     sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
     seed = int(learning_cfg.get("seed", 0))
@@ -2040,7 +2099,7 @@ def calculate_learning_costs(
     - lag_periods=0: NOT handled here (use learning.py for immediate endogenous learning)
     - lag_periods=1: Uses previous period's capacity (exogenous costs calculated here)
       * For 2020: Uses 2015 historical cumulative capacity
-      * For 2025: Uses 2020 solved capacity / committed cumulative experience
+      * For 2025: Uses 2020 historical cumulative capacity
       * For 2030: Uses 2025 solved capacity / committed cumulative experience
       * And so on...
     
@@ -2777,8 +2836,8 @@ def main(snakemake):
     timestep = get_timestep(planning_horizons, year)
     
     # Apply learning costs for all horizons.
-    # 2020 is the deterministic historical bootstrap; 2025+ uses
-    # the strictly lagged solved block.
+    # 2020 and 2025 are deterministic historical bootstrap horizons;
+    # 2030+ uses the strictly lagged solved block.
     logger.info(f"Timestep: {timestep} years since previous horizon (or first horizon if {year} == 2020)")
     
     # Load learning data
@@ -2984,7 +3043,7 @@ def main(snakemake):
     
     logger.info(
         "Calculating learning-based costs "
-        "(2020: historical 2015, 2025+: realized solved capacity from previous horizon)..."
+        "(2020: historical 2015, 2025: historical 2020, 2030+: realized solved capacity from previous horizon)..."
     )
     
     learning_costs = calculate_learning_costs(

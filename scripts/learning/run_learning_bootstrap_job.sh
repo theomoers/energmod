@@ -11,8 +11,8 @@ Environment variables:
   NSLOTS               Cluster slot count fallback when JOBS is unset
   LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
 
-This runs the shared deterministic learning bootstrap through the first
-planning horizon for the stochastic model list configured in config.learning.yaml.
+This runs the shared deterministic learning bootstrap through the first two
+planning horizons for the stochastic model list configured in config.learning.yaml.
 USAGE
 }
 

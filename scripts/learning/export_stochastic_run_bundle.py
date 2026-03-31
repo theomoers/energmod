@@ -910,8 +910,8 @@ def _price_country_year(n: pypsa.Network) -> pd.DataFrame:
         weighted_hourly = (
             (country_prices * country_loads).sum(axis=1).div(load_sum.replace(0.0, np.nan))
         )
-        flat_prices = country_prices.stack(dropna=True)
-        flat_loads = country_loads.stack(dropna=True).reindex(flat_prices.index).fillna(0.0)
+        flat_prices = country_prices.stack(future_stack=True).dropna()
+        flat_loads = country_loads.stack(future_stack=True).reindex(flat_prices.index).fillna(0.0)
         flat_hour_weights = (
             pd.Series(weights, index=country_prices.index).reindex(flat_prices.index.get_level_values(0)).to_numpy(dtype=float)
         )

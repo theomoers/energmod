@@ -22,15 +22,17 @@ learning:
   sample_mode: "single_draw"   # single_draw | median ; median is for debugging/smoke tests only
   seed: 0                      # used only by stochastic_forecast
   monte_carlo:
-    enable: true
+    enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-    draws: 3
-    seed_mode: random      # random | sequential
+      - correlated_geometric_random_walk
+      - way_fixed_rho_benchmark_035
+    draws: 50
+    seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000
   compact_outputs:
-    enable: false
+    enable: true
     cleanup_heavy_raws: true
     price_shadow_resolution: annual_summary

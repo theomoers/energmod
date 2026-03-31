@@ -623,7 +623,7 @@ solving:
     cbc-default: {} # Used in CI
     glpk-default: {} # Used in CI
 
-  mem: 12000 # MB; lean default for MC runs, still above observed ~7.2 GB peak
+  mem: 100000 # MB; raised for stochastic MC branch solves on cluster
   threads: 36
 
 plotting:  

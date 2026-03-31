@@ -12,7 +12,7 @@ Environment variables:
   LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
   LEARNING_CONDA_ENV   Conda env to activate when snakemake is not already on PATH
 
-This builds the shared 2025+ prenetwork export inputs once before launching the
+This builds the shared 2030+ prenetwork export inputs once before launching the
 seed-specific stochastic branch array.
 USAGE
 }

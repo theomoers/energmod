@@ -2818,7 +2818,8 @@ def H2_export_yearly_constraint(n):
         )
         rhs = (
             h2_export * (1 / elec_efficiency) + load
-        )  # 0.7 is approximation of electrloyzer efficiency # TODO obtain value from network
+        )  # 0.7 is approximation of electrloyzer efficiency 
+        # TODO obtain value from network
     else:
         rhs = h2_export * (1 / 0.7)
 
@@ -3416,6 +3417,7 @@ def solve_network(n, config, solving, **kwargs):
         solving["solver_options"][set_of_options] if set_of_options else {}
     )
     kwargs["solver_options"]["DualReductions"] = 0
+    base_solver_opts = dict(kwargs["solver_options"])
     logger.info("Added DualReductions=0 to force infeasible/unbounded determination")
     kwargs["solver_name"] = solving["solver"]["name"]
     kwargs["extra_functionality"] = extra_functionality
@@ -3708,19 +3710,17 @@ def solve_network(n, config, solving, **kwargs):
                 logger.info(f"  {idx}: p_nom_min={gen.p_nom_min} -> p_nom_max={gen.p_nom_min * 2}")
             n.generators.loc[problematic_gens.index, "p_nom_max"] = n.generators.loc[problematic_gens.index, "p_nom_min"] * 2
 
-        logger.info("Retrying with configured solver options plus NumericFocus=3...")
-        
-        retry_threads = 16
-
+        retry_option_set = set_of_options
         robust_solver_options = dict(base_solver_opts)
-        robust_solver_options["NumericFocus"] = 3
-        if "Threads" in robust_solver_options:
-            robust_solver_options["Threads"] = retry_threads
-        elif "threads" in robust_solver_options:
-            robust_solver_options["threads"] = retry_threads
-        else:
-            robust_solver_options["Threads"] = retry_threads
-        
+        if kwargs.get("solver_name") == "gurobi" and "gurobi-numeric-focus" in solving.get("solver_options", {}):
+            retry_option_set = "gurobi-numeric-focus"
+            robust_solver_options = dict(solving["solver_options"][retry_option_set])
+            robust_solver_options["DualReductions"] = 0
+
+        logger.info(
+            "Retrying with solver options profile '%s' from config.myopic.yaml...",
+            retry_option_set,
+        )
         logger.info(f"Using robust solver options: {robust_solver_options}")
         kwargs_robust = kwargs.copy()
         kwargs_robust["solver_options"] = robust_solver_options
