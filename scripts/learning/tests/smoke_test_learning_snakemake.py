@@ -751,6 +751,8 @@ def run_compact_cleanup_smoke(root, model_name, seed):
         "power_emissions_country_carrier.csv",
         "sector_emissions.csv",
         "sector_demands_country.csv",
+        "sector_total_demands_country.csv",
+        "electricity_demand_country_sector.csv",
         "electricity_price_node_year.csv",
         "electricity_price_country_year.csv",
         "constraint_shadow_system_year.csv",

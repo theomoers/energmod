@@ -31,6 +31,8 @@ OUTPUT_TABLE_SPECS = {
     "system_summary.csv": [
         "year",
         "objective_eur",
+        "exogenous_electricity_demand_mwh",
+        "endogenous_electricity_demand_mwh",
         "total_electricity_demand_mwh",
         "total_electricity_generation_mwh",
         "renewable_electricity_generation_mwh",
@@ -129,6 +131,26 @@ OUTPUT_TABLE_SPECS = {
         "annual_demand_mwh",
         "annual_demand_twh",
     ],
+    "sector_total_demands_country.csv": [
+        "year",
+        "country",
+        "sector",
+        "demand_origin",
+        "component",
+        "carrier",
+        "annual_demand_mwh",
+        "annual_demand_twh",
+    ],
+    "electricity_demand_country_sector.csv": [
+        "year",
+        "country",
+        "sector",
+        "demand_origin",
+        "component",
+        "carrier",
+        "annual_demand_mwh",
+        "annual_demand_twh",
+    ],
     "electricity_price_node_year.csv": [
         "year",
         "bus",
@@ -210,6 +232,61 @@ FOSSIL_CARRIER_MAP = {
     "lignite": "lignite",
     "oil": "oil",
 }
+SECTOR_LOAD_CARRIER_MAP = {
+    "electricity": [
+        "AC",
+        "agriculture electricity",
+        "industry electricity",
+        "other electricity",
+        "rail transport electricity",
+        "services electricity",
+    ],
+    "industry": [
+        "H2",
+        "H2 for industry",
+        "gas for industry",
+        "low-temperature heat for industry",
+        "naphtha for industry",
+        "industry electricity",
+        "solid biomass for industry",
+    ],
+    "transport": [
+        "H2 for shipping",
+        "kerosene for aviation",
+        "land transport oil",
+        "rail transport electricity",
+        "rail transport oil",
+        "shipping oil",
+    ],
+    "agriculture": [
+        "agriculture oil",
+        "agriculture electricity",
+    ],
+    "residential": [
+        "residential biomass",
+        "AC",
+        "residential gas",
+        "residential oil",
+        "residential rural heat",
+        "residential urban decentral heat",
+        "urban central heat",
+    ],
+    "services": [
+        "services biomass",
+        "services electricity",
+        "services gas",
+        "services oil",
+        "services rural heat",
+        "services urban decentral heat",
+    ],
+    "other": [
+        "other electricity",
+    ],
+}
+LOAD_CARRIER_TO_SECTORS = {
+    carrier: [sector for sector, carriers in SECTOR_LOAD_CARRIER_MAP.items() if carrier in carriers]
+    for carrier in sorted({carrier for carriers in SECTOR_LOAD_CARRIER_MAP.values() for carrier in carriers})
+}
 RENEWABLE_HINTS = {
     "solar",
     "onwind",
@@ -280,11 +357,20 @@ def _snapshot_weights(n: pypsa.Network, attr: str = "objective") -> pd.Series:
 
 
 def _bus_country_lookup(n: pypsa.Network) -> pd.Series:
-    if "country" in n.buses.columns:
-        countries = n.buses["country"].fillna("").astype(str)
-        if countries.ne("").any():
-            return countries
-    return pd.Series("", index=n.buses.index, dtype=object)
+    countries = (
+        n.buses["country"].fillna("").astype(str)
+        if "country" in n.buses.columns
+        else pd.Series("", index=n.buses.index, dtype=object)
+    )
+    if countries.eq("").any():
+        index_iso2 = (
+            n.buses.index.astype(str)
+            .to_series(index=n.buses.index)
+            .str.extract(r"^([A-Z]{2})\b")[0]
+            .fillna("")
+        )
+        countries = countries.where(countries.ne(""), index_iso2)
+    return countries.fillna("").astype(str)
 
 
 def _capacity_column(df: pd.DataFrame, preferred: str, fallback: str) -> str | None:
@@ -401,6 +487,62 @@ def _sector_from_emission_carrier(carrier: str) -> str:
     return "Other"
 
 
+def _electricity_sector_from_withdrawal(component: str, carrier: str) -> str:
+    component = str(component)
+    carrier_lower = str(carrier).strip().lower()
+    if component in {"StorageUnit", "Store"} or "battery charger" in carrier_lower or carrier_lower in {"phs", "hydro+PHS".lower()}:
+        return "Storage"
+    if "bev charger" in carrier_lower or "transport" in carrier_lower:
+        return "Transport"
+    if any(
+        token in carrier_lower
+        for token in ("heat pump", "resistive heater", "urban central", "residential", "services rural", "services urban")
+    ):
+        return "Heating"
+    if any(
+        token in carrier_lower
+        for token in ("electrolysis", "fischer-tropsch", "helmeth", "methanol", "methanation", "sabatier", "ammonia")
+    ):
+        return "Hydrogen/Fuels"
+    if "dac" in carrier_lower:
+        return "Carbon Removal"
+    if "industry electricity" in carrier_lower:
+        return "Industry"
+    if "services electricity" in carrier_lower:
+        return "Services"
+    if "agriculture electricity" in carrier_lower:
+        return "Agriculture"
+    if "rail transport electricity" in carrier_lower:
+        return "Transport"
+    if "other electricity" in carrier_lower:
+        return "Other"
+    if carrier_lower == "ac":
+        return "Residential/AC"
+    return "Other"
+
+
+def _exogenous_load_sectors(carrier: str) -> list[str]:
+    return LOAD_CARRIER_TO_SECTORS.get(str(carrier), [])
+
+
+def _sector_from_endogenous_electricity_withdrawal(component: str, carrier: str) -> str:
+    component = str(component)
+    carrier_lower = str(carrier).strip().lower()
+    if component in {"StorageUnit", "Store"} or "battery charger" in carrier_lower or carrier_lower == "phs":
+        return "electricity"
+    if "bev charger" in carrier_lower:
+        return "transport"
+    if carrier_lower.startswith("residential ") or "residential" in carrier_lower:
+        return "residential"
+    if carrier_lower.startswith("services ") or "services" in carrier_lower:
+        return "services"
+    if carrier_lower.startswith("urban central "):
+        return "residential"
+    if any(token in carrier_lower for token in ("electrolysis", "fischer-tropsch", "helmeth", "dac")):
+        return "other"
+    return "other"
+
+
 def _is_renewable_carrier(carrier: str) -> bool:
     carrier_lower = str(carrier).lower()
     if carrier_lower in RENEWABLE_HINTS:
@@ -424,6 +566,95 @@ def _load_bus_profiles(n: pypsa.Network) -> pd.DataFrame:
     load_meta = load_meta.loc[ac_mask]
     profiles = profiles.reindex(columns=load_meta.index, fill_value=0.0)
     return profiles.groupby(load_meta["bus"], axis=1).sum()
+
+
+def _load_country_lookup(n: pypsa.Network) -> pd.Series:
+    bus_country = n.loads["bus"].map(_bus_country_lookup(n)).fillna("").astype(str)
+    if bus_country.eq("").any():
+        load_iso2 = (
+            n.loads.index.astype(str)
+            .to_series(index=n.loads.index)
+            .str.extract(r"^([A-Z]{2})\b")[0]
+            .fillna("")
+        )
+        bus_country = bus_country.where(bus_country.ne(""), load_iso2)
+    return bus_country.fillna("").astype(str)
+
+
+def _ac_energy_balance_frame(
+    n: pypsa.Network,
+    *,
+    groupby=None,
+    nice_names: bool = False,
+) -> pd.DataFrame:
+    try:
+        balance = n.statistics.energy_balance(
+            bus_carrier="AC",
+            aggregate_time="sum",
+            aggregate_groups="sum",
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    if isinstance(balance, pd.Series):
+        frame = balance.rename("energy_balance_mwh").reset_index()
+    else:
+        frame = balance.reset_index()
+        if "energy_balance_mwh" not in frame.columns:
+            value_columns = [
+                col for col in frame.columns if col not in {"component", "carrier", "bus_carrier", "country"}
+            ]
+            if len(value_columns) != 1:
+                return pd.DataFrame()
+            frame = frame.rename(columns={value_columns[0]: "energy_balance_mwh"})
+    if "energy_balance_mwh" not in frame.columns or "component" not in frame.columns:
+        return pd.DataFrame()
+    frame["energy_balance_mwh"] = pd.to_numeric(
+        frame["energy_balance_mwh"], errors="coerce"
+    ).fillna(0.0)
+    return frame
+
+
+def _ac_demand_summary_from_balance(n: pypsa.Network) -> dict[str, float]:
+    frame = _ac_energy_balance_frame(n, nice_names=False)
+    if frame.empty:
+        return {
+            "exogenous_electricity_demand_mwh": 0.0,
+            "endogenous_electricity_demand_mwh": 0.0,
+            "total_electricity_demand_mwh": 0.0,
+        }
+
+    frame = frame.loc[
+        frame["component"].isin(["Generator", "Link", "StorageUnit", "Store", "Load"])
+    ].copy()
+    if frame.empty:
+        return {
+            "exogenous_electricity_demand_mwh": 0.0,
+            "endogenous_electricity_demand_mwh": 0.0,
+            "total_electricity_demand_mwh": 0.0,
+        }
+
+    withdrawals = frame.loc[frame["energy_balance_mwh"].lt(0.0)].copy()
+    if withdrawals.empty:
+        return {
+            "exogenous_electricity_demand_mwh": 0.0,
+            "endogenous_electricity_demand_mwh": 0.0,
+            "total_electricity_demand_mwh": 0.0,
+        }
+
+    withdrawals["demand_mwh"] = -withdrawals["energy_balance_mwh"]
+    exogenous = float(
+        withdrawals.loc[withdrawals["component"].eq("Load"), "demand_mwh"].sum()
+    )
+    total = float(withdrawals["demand_mwh"].sum())
+    endogenous = float(max(total - exogenous, 0.0))
+    return {
+        "exogenous_electricity_demand_mwh": exogenous,
+        "endogenous_electricity_demand_mwh": endogenous,
+        "total_electricity_demand_mwh": total,
+    }
 
 
 def _collect_generation_records(n: pypsa.Network) -> pd.DataFrame:
@@ -515,28 +746,21 @@ def _collect_generation_records(n: pypsa.Network) -> pd.DataFrame:
 
 
 def _ac_energy_balance_country_carrier(n: pypsa.Network) -> pd.DataFrame:
-    try:
-        balance = n.statistics.energy_balance(
-            bus_carrier="AC",
-            aggregate_time="sum",
-            aggregate_groups="sum",
-            groupby=n.statistics.groupers.get_country_and_carrier,
-            nice_names=True,
-        )
-    except Exception:
+    frame = _ac_energy_balance_frame(
+        n,
+        groupby=n.statistics.groupers.get_country_and_carrier,
+        nice_names=True,
+    )
+    if frame.empty:
         return _empty_frame("ac_energy_balance_country_carrier.csv")
-
-    if not isinstance(balance, pd.Series):
-        balance = balance.rename("energy_balance_mwh")
-    frame = balance.rename("energy_balance_mwh").reset_index()
     required_columns = {"component", "country", "carrier", "energy_balance_mwh"}
     if not required_columns.issubset(frame.columns):
         return _empty_frame("ac_energy_balance_country_carrier.csv")
 
     frame = frame.loc[
-        frame["component"].isin(["Generator", "Link", "StorageUnit", "Load"])
+        frame["component"].isin(["Generator", "Link", "StorageUnit", "Store", "Load"])
         & frame["country"].fillna("").astype(str).ne("")
-        & pd.to_numeric(frame["energy_balance_mwh"], errors="coerce").fillna(0.0).gt(0.0)
+        & pd.to_numeric(frame["energy_balance_mwh"], errors="coerce").fillna(0.0).ne(0.0)
     ].copy()
     if frame.empty:
         return _empty_frame("ac_energy_balance_country_carrier.csv")
@@ -850,9 +1074,8 @@ def _sector_demands_country(n: pypsa.Network) -> pd.DataFrame:
     if profiles.empty:
         return _empty_frame("sector_demands_country.csv")
     weights = _snapshot_weights(n, "objective")
-    bus_country = _bus_country_lookup(n)
     load_meta = n.loads.copy()
-    load_meta["country"] = load_meta["bus"].map(bus_country).fillna("").astype(str)
+    load_meta["country"] = _load_country_lookup(n)
     if "carrier" not in load_meta.columns:
         load_meta["carrier"] = "electricity"
     data = (
@@ -872,6 +1095,134 @@ def _sector_demands_country(n: pypsa.Network) -> pd.DataFrame:
         result.groupby(["country", "sector"], as_index=False)["annual_demand_mwh"]
         .sum()
         .sort_values(["country", "sector"], ignore_index=True)
+    )
+    result["annual_demand_twh"] = result["annual_demand_mwh"] / 1e6
+    return result
+
+
+def _electricity_demand_country_sector(n: pypsa.Network) -> pd.DataFrame:
+    frame = _ac_energy_balance_frame(
+        n,
+        groupby=n.statistics.groupers.get_country_and_carrier,
+        nice_names=False,
+    )
+    if frame.empty:
+        return _empty_frame("electricity_demand_country_sector.csv")
+
+    frame = frame.loc[
+        frame["component"].isin(["Load", "Link", "StorageUnit", "Store"])
+        & frame["country"].fillna("").astype(str).ne("")
+        & frame["energy_balance_mwh"].lt(0.0)
+    ].copy()
+    if frame.empty:
+        return _empty_frame("electricity_demand_country_sector.csv")
+
+    frame["country"] = frame["country"].astype(str)
+    frame["component"] = frame["component"].astype(str)
+    frame["carrier"] = frame["carrier"].astype(str)
+    frame["sector"] = [
+        _electricity_sector_from_withdrawal(component, carrier)
+        for component, carrier in zip(frame["component"], frame["carrier"])
+    ]
+    frame["demand_origin"] = np.where(
+        frame["component"].eq("Load"),
+        "exogenous",
+        "endogenous",
+    )
+    frame["annual_demand_mwh"] = -frame["energy_balance_mwh"]
+    result = (
+        frame.groupby(
+            ["country", "sector", "demand_origin", "component", "carrier"],
+            as_index=False,
+        )["annual_demand_mwh"]
+        .sum()
+        .sort_values(
+            ["country", "sector", "demand_origin", "component", "carrier"],
+            ignore_index=True,
+        )
+    )
+    result["annual_demand_twh"] = result["annual_demand_mwh"] / 1e6
+    return result
+
+
+def _sector_total_demands_country(n: pypsa.Network) -> pd.DataFrame:
+    frames = []
+
+    if not n.loads.empty:
+        weights = _snapshot_weights(n, "generators")
+        load_meta = n.loads.copy()
+        load_meta["country"] = _load_country_lookup(n)
+        data = (
+            n.get_switchable_as_dense("Load", "p_set")
+            if "p_set" in n.loads_t and not n.loads_t.p_set.empty
+            else n.loads_t.p.reindex(columns=load_meta.index, fill_value=0.0)
+        )
+        annual = data.reindex(columns=load_meta.index, fill_value=0.0).mul(weights, axis=0).sum(axis=0)
+        rows = []
+        for load_name, demand_mwh in annual.items():
+            if demand_mwh <= 0.0:
+                continue
+            carrier = str(load_meta.at[load_name, "carrier"]) if "carrier" in load_meta.columns else "unknown"
+            sectors = _exogenous_load_sectors(carrier)
+            if not sectors:
+                continue
+            country = str(load_meta.at[load_name, "country"])
+            for sector in sectors:
+                rows.append(
+                    {
+                        "country": country,
+                        "sector": sector,
+                        "demand_origin": "exogenous",
+                        "component": "Load",
+                        "carrier": carrier,
+                        "annual_demand_mwh": float(demand_mwh),
+                    }
+                )
+        if rows:
+            frames.append(pd.DataFrame(rows))
+
+    frame = _ac_energy_balance_frame(
+        n,
+        groupby=n.statistics.groupers.get_country_and_carrier,
+        nice_names=False,
+    )
+    if not frame.empty:
+        endogenous = frame.loc[
+            frame["component"].isin(["Link", "StorageUnit", "Store"])
+            & frame["country"].fillna("").astype(str).ne("")
+            & frame["energy_balance_mwh"].lt(0.0)
+        ].copy()
+        if not endogenous.empty:
+            endogenous["country"] = endogenous["country"].astype(str)
+            endogenous["component"] = endogenous["component"].astype(str)
+            endogenous["carrier"] = endogenous["carrier"].astype(str)
+            endogenous["sector"] = [
+                _sector_from_endogenous_electricity_withdrawal(component, carrier)
+                for component, carrier in zip(endogenous["component"], endogenous["carrier"])
+            ]
+            endogenous["demand_origin"] = "endogenous"
+            endogenous["annual_demand_mwh"] = -endogenous["energy_balance_mwh"]
+            frames.append(
+                endogenous.loc[
+                    :,
+                    ["country", "sector", "demand_origin", "component", "carrier", "annual_demand_mwh"],
+                ]
+            )
+
+    if not frames:
+        return _empty_frame("sector_total_demands_country.csv")
+
+    result = (
+        pd.concat(frames, ignore_index=True)
+        .groupby(
+            ["country", "sector", "demand_origin", "component", "carrier"],
+            as_index=False,
+        )["annual_demand_mwh"]
+        .sum()
+        .sort_values(
+            ["country", "sector", "demand_origin", "component", "carrier"],
+            ignore_index=True,
+        )
     )
     result["annual_demand_twh"] = result["annual_demand_mwh"] / 1e6
     return result
@@ -1135,9 +1486,7 @@ def _curtailment_total_mwh(n: pypsa.Network) -> float:
 
 
 def _system_summary(n: pypsa.Network, generation_df: pd.DataFrame, power_emissions_df: pd.DataFrame, sector_emissions_df: pd.DataFrame, capacity_df: pd.DataFrame) -> pd.DataFrame:
-    load_profiles = _load_bus_profiles(n)
-    weights = _snapshot_weights(n, "objective")
-    total_electricity_demand_mwh = float(load_profiles.mul(weights, axis=0).sum().sum()) if not load_profiles.empty else 0.0
+    demand_summary = _ac_demand_summary_from_balance(n)
     total_generation = float(generation_df["annual_generation_mwh"].sum()) if not generation_df.empty else 0.0
     renewable_generation = float(
         generation_df.loc[generation_df["carrier"].map(_is_renewable_carrier), "annual_generation_mwh"].sum()
@@ -1165,7 +1514,9 @@ def _system_summary(n: pypsa.Network, generation_df: pd.DataFrame, power_emissio
         [
             {
                 "objective_eur": float(n.objective) if getattr(n, "objective", None) is not None else float("nan"),
-                "total_electricity_demand_mwh": total_electricity_demand_mwh,
+                "exogenous_electricity_demand_mwh": demand_summary["exogenous_electricity_demand_mwh"],
+                "endogenous_electricity_demand_mwh": demand_summary["endogenous_electricity_demand_mwh"],
+                "total_electricity_demand_mwh": demand_summary["total_electricity_demand_mwh"],
                 "total_electricity_generation_mwh": total_generation,
                 "renewable_electricity_generation_mwh": renewable_generation,
                 "renewable_share": renewable_generation / total_generation if total_generation > 0.0 else float("nan"),
@@ -1225,6 +1576,8 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
     power_emissions_frames = []
     sector_emissions_frames = []
     sector_demands_frames = []
+    sector_total_demand_frames = []
+    electricity_demand_sector_frames = []
     node_price_frames = []
     country_price_frames = []
     system_shadow_frames = []
@@ -1311,6 +1664,28 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
             else _empty_frame("sector_demands_country.csv")
         )
 
+        sector_total_demands = _sector_total_demands_country(network)
+        if "year" in sector_total_demands.columns:
+            sector_total_demands["year"] = int(year)
+        else:
+            sector_total_demands.insert(0, "year", int(year))
+        sector_total_demand_frames.append(
+            sector_total_demands.loc[:, OUTPUT_TABLE_SPECS["sector_total_demands_country.csv"]]
+            if not sector_total_demands.empty
+            else _empty_frame("sector_total_demands_country.csv")
+        )
+
+        electricity_demand_sector = _electricity_demand_country_sector(network)
+        if "year" in electricity_demand_sector.columns:
+            electricity_demand_sector["year"] = int(year)
+        else:
+            electricity_demand_sector.insert(0, "year", int(year))
+        electricity_demand_sector_frames.append(
+            electricity_demand_sector.loc[:, OUTPUT_TABLE_SPECS["electricity_demand_country_sector.csv"]]
+            if not electricity_demand_sector.empty
+            else _empty_frame("electricity_demand_country_sector.csv")
+        )
+
         node_prices = _price_node_year(network)
         if "year" in node_prices.columns:
             node_prices["year"] = int(year)
@@ -1389,6 +1764,8 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
     tables["power_emissions_country_carrier.csv"] = pd.concat(power_emissions_frames, ignore_index=True)
     tables["sector_emissions.csv"] = pd.concat(sector_emissions_frames, ignore_index=True)
     tables["sector_demands_country.csv"] = pd.concat(sector_demands_frames, ignore_index=True)
+    tables["sector_total_demands_country.csv"] = pd.concat(sector_total_demand_frames, ignore_index=True)
+    tables["electricity_demand_country_sector.csv"] = pd.concat(electricity_demand_sector_frames, ignore_index=True)
     tables["electricity_price_node_year.csv"] = pd.concat(node_price_frames, ignore_index=True)
     tables["electricity_price_country_year.csv"] = pd.concat(country_price_frames, ignore_index=True)
     tables["constraint_shadow_system_year.csv"] = pd.concat(system_shadow_frames, ignore_index=True)
