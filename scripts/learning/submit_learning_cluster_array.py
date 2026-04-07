@@ -18,6 +18,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent.parent
 DEFAULT_JOB_ROOT = ROOT_DIR / "cluster_workdirs"
 DEFAULT_CONDA_ENV = "/shared/share_cki25/envs/sh-pypsa-earth-main"
+DEFAULT_CONFIGFILES = [
+    str((ROOT_DIR / "config.myopic.yaml").resolve()),
+    str((ROOT_DIR / "config.learning.yaml").resolve()),
+]
 SUPPORTED_MODELS = [
     "shared_state_bayesian_regime_wright",
     "way_fixed_rho_benchmark_035",
@@ -41,6 +45,10 @@ def load_merged_config(configfiles):
             payload = yaml.safe_load(f) or {}
         deep_update(merged, payload)
     return merged
+
+
+def default_configfiles():
+    return list(DEFAULT_CONFIGFILES)
 
 
 def build_seed_list(mc_cfg, learning_cfg):
@@ -116,12 +124,39 @@ def build_grid_run_cmd(args, manifest_path, task_count, worker_script):
     return cmd
 
 
+def write_submission_metadata(submit_dir, args, configfiles, tasks, merged_config=None):
+    if merged_config is None:
+        merged_config = load_merged_config(configfiles)
+
+    learning_cfg = merged_config.get("learning", {}) or {}
+    mc_cfg = learning_cfg.get("monte_carlo", {}) or {}
+    metadata = {
+        "scenario_name": args.scenario_name,
+        "run_mode": args.run_mode,
+        "configfiles": [str(Path(cfg).resolve()) for cfg in configfiles],
+        "grid_mem": args.grid_mem,
+        "grid_ncpus": args.grid_ncpus,
+        "grid_submit": args.grid_submit,
+        "job_root": str(Path(os.path.expandvars(args.job_root)).resolve()),
+        "conda_env": args.conda_env,
+        "task_count": len(tasks),
+        "models": sorted({task["model"] for task in tasks}),
+        "monte_carlo": {
+            "seed_mode": mc_cfg.get("seed_mode", "random"),
+            "random_seed": int(mc_cfg.get("random_seed", learning_cfg.get("seed", 0) or 0)),
+            "seed_upper_bound": int(mc_cfg.get("seed_upper_bound", 1000000000) or 1000000000),
+            "draws": int(mc_cfg.get("draws", 0) or 0),
+        },
+    }
+    metadata_path = submit_dir / "submission_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    return metadata_path
+
+
 def submit_array(args):
-    configfiles = [
-        str((ROOT_DIR / "config.myopic.yaml").resolve()),
-        str((ROOT_DIR / "config.learning.yaml").resolve()),
-    ]
+    configfiles = default_configfiles()
     configfiles.extend(args.configfiles)
+    merged_config = load_merged_config(configfiles)
     tasks = build_tasks(configfiles, args.scenario_name)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -131,6 +166,13 @@ def submit_array(args):
 
     manifest_path = submit_dir / "task_manifest.json"
     manifest_path.write_text(json.dumps(tasks, indent=2, sort_keys=True), encoding="utf-8")
+    metadata_path = write_submission_metadata(
+        submit_dir,
+        args,
+        configfiles,
+        tasks,
+        merged_config=merged_config,
+    )
 
     logs_dir = submit_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +182,7 @@ def submit_array(args):
 
     if args.print_only:
         print("TASK_MANIFEST", manifest_path)
+        print("SUBMISSION_METADATA", metadata_path)
         print("ARRAY_SIZE", len(tasks))
         print("LOG_DIR", logs_dir)
         print("GRID_RUN_CMD", " ".join(shlex.quote(part) for part in grid_run_cmd))
@@ -147,6 +190,7 @@ def submit_array(args):
 
     subprocess.run(grid_run_cmd, check=True, cwd=logs_dir)
     print("TASK_MANIFEST", manifest_path)
+    print("SUBMISSION_METADATA", metadata_path)
     print("ARRAY_SIZE", len(tasks))
     print("LOG_DIR", logs_dir)
 
@@ -185,7 +229,7 @@ def main():
     parser.add_argument("--job-name", default="learnmc")
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV)
     parser.add_argument("--run-mode", choices=["branch", "full"], default="branch")
-    parser.add_argument("--grid-mem", default="120G")
+    parser.add_argument("--grid-mem", default="200G")
     parser.add_argument("--grid-ncpus", default="40")
     parser.add_argument("--grid-submit", default="batch")
     parser.add_argument("--print-only", action="store_true")

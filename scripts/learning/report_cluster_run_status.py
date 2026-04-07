@@ -123,6 +123,12 @@ def active_job_tasks() -> set[tuple[int, int]]:
     return active
 
 
+def submission_has_running_tasks(submit_dir: Path) -> bool:
+    logs = collect_logs(submit_dir / "logs")
+    active = active_job_tasks()
+    return any((info.job_id, task_id) in active for task_id, info in logs.items())
+
+
 def read_text(path: Path | None, limit: int = 120_000) -> str:
     if path is None or not path.exists():
         return ""
@@ -133,17 +139,25 @@ def read_text(path: Path | None, limit: int = 120_000) -> str:
 
 
 def classify_failure(text: str) -> str | None:
+    lowered = text.lower()
     checks = [
-        ("Too many sessions", "license"),
-        ("MissingInputException", "missing-input"),
-        ("Out of memory", "memory"),
-        ("Optimization exhausted available memory", "memory"),
-        ("_ArrayMemoryError", "memory"),
-        ("CalledProcessError", "subprocess"),
-        ("KeyboardInterrupt", "interrupted"),
+        ("too many sessions", "license"),
+        ("missinginputexception", "missing-input"),
+        ("condition='time_limit'", "time_limit"),
+        ("termination condition: time_limit", "time_limit"),
+        ("hard wallclock limit", "time_limit"),
+        ("timed out", "time_limit"),
+        ("timeout: sending signal", "time_limit"),
+        ("exit status 124", "time_limit"),
+        ("returned non-zero exit status 124", "time_limit"),
+        ("out of memory", "memory"),
+        ("optimization exhausted available memory", "memory"),
+        ("_arraymemoryerror", "memory"),
+        ("calledprocesserror", "subprocess"),
+        ("keyboardinterrupt", "interrupted"),
     ]
     for needle, label in checks:
-        if needle in text:
+        if needle in lowered:
             return label
     return None
 
@@ -252,13 +266,14 @@ def summarize(submit_dir: Path, tasks: list[dict]) -> str:
         else:
             reason = classify_failure(combined)
             status = "failed"
+            display_status = f"failed:{reason}" if reason else status
             stage = f"failed:{reason}" if reason else infer_stage(combined, progress_horizons)
         counts[status] += 1
         rows.append(
             {
                 "task": idx,
                 "seed": task["seed"],
-                "status": status,
+                "status": display_status if status == "failed" else status,
                 "stage": stage,
                 "job": job,
                 "host": host,

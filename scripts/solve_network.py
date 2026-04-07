@@ -80,6 +80,7 @@ Details (and errors introduced through this heuristic) are discussed in the pape
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -108,6 +109,107 @@ from pypsa.optimization.abstract import optimize_transmission_expansion_iterativ
 
 logger = create_logger(__name__)
 pypsa.pf.logger.setLevel(logging.WARNING)
+
+
+def _acceptable_solve(status, condition):
+    return status == "ok" and str(condition).lower() in {"optimal", "suboptimal"}
+
+
+def _load_task_runtime_budget():
+    raw_max_seconds = os.environ.get("LEARNING_TASK_MAX_SECONDS")
+    if not raw_max_seconds:
+        return None
+
+    max_seconds = int(raw_max_seconds)
+    if max_seconds <= 0:
+        return None
+
+    start_epoch = int(float(os.environ.get("LEARNING_TASK_START_EPOCH", time.time())))
+    reserve_seconds = max(0, int(os.environ.get("LEARNING_TASK_RESERVE_SECONDS", 900)))
+    retry_min_seconds = max(0, int(os.environ.get("LEARNING_RETRY_MIN_SECONDS", 3600)))
+    return {
+        "start_epoch": start_epoch,
+        "max_seconds": max_seconds,
+        "reserve_seconds": reserve_seconds,
+        "retry_min_seconds": retry_min_seconds,
+    }
+
+
+def _runtime_budget_snapshot(runtime_budget):
+    if runtime_budget is None:
+        return None
+    elapsed_seconds = max(0, int(time.time() - runtime_budget["start_epoch"]))
+    remaining_seconds = max(0, runtime_budget["max_seconds"] - elapsed_seconds)
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "remaining_seconds": remaining_seconds,
+    }
+
+
+def _apply_solver_time_limit(solver_name, solver_options, time_limit_seconds):
+    updated = dict(solver_options)
+    if solver_name == "gurobi":
+        updated["TimeLimit"] = max(1, int(time_limit_seconds))
+    return updated
+
+
+def _prepare_initial_solver_options(runtime_budget, solver_name, solver_options):
+    if runtime_budget is None:
+        return dict(solver_options)
+
+    snapshot = _runtime_budget_snapshot(runtime_budget)
+    reserve_seconds = runtime_budget["reserve_seconds"]
+    remaining_seconds = snapshot["remaining_seconds"]
+    if remaining_seconds <= reserve_seconds:
+        raise RuntimeError(
+            "Skipping solve because only "
+            f"{remaining_seconds}s remain and reserve is {reserve_seconds}s"
+        )
+
+    time_limit_seconds = max(1, remaining_seconds - reserve_seconds)
+    logger.info(
+        "Task runtime budget before initial solve: elapsed=%ss remaining=%ss reserve=%ss",
+        snapshot["elapsed_seconds"],
+        remaining_seconds,
+        reserve_seconds,
+    )
+    if solver_name == "gurobi":
+        logger.info("Applying initial Gurobi TimeLimit=%ss", time_limit_seconds)
+    else:
+        logger.info(
+            "Task runtime budget is active but solver '%s' has no explicit injected TimeLimit",
+            solver_name,
+        )
+    return _apply_solver_time_limit(solver_name, solver_options, time_limit_seconds)
+
+
+def _prepare_retry_solver_options(runtime_budget, solver_name, solver_options):
+    if runtime_budget is None:
+        return dict(solver_options)
+
+    snapshot = _runtime_budget_snapshot(runtime_budget)
+    reserve_seconds = runtime_budget["reserve_seconds"]
+    retry_min_seconds = runtime_budget["retry_min_seconds"]
+    remaining_seconds = snapshot["remaining_seconds"]
+    retry_window_seconds = max(0, remaining_seconds - reserve_seconds)
+    logger.info(
+        "Task runtime budget before retry: elapsed=%ss remaining=%ss reserve=%ss retry_min=%ss",
+        snapshot["elapsed_seconds"],
+        remaining_seconds,
+        reserve_seconds,
+        retry_min_seconds,
+    )
+    if retry_window_seconds < retry_min_seconds:
+        return None
+
+    if solver_name == "gurobi":
+        logger.info("Applying retry Gurobi TimeLimit=%ss", retry_window_seconds)
+    else:
+        logger.info(
+            "Retry budget is active but solver '%s' has no explicit injected TimeLimit",
+            solver_name,
+        )
+    return _apply_solver_time_limit(solver_name, solver_options, retry_window_seconds)
 
 
 # Baseyear generation validation helpers moved to scripts/validation.py
@@ -3421,6 +3523,12 @@ def solve_network(n, config, solving, **kwargs):
     logger.info("Added DualReductions=0 to force infeasible/unbounded determination")
     kwargs["solver_name"] = solving["solver"]["name"]
     kwargs["extra_functionality"] = extra_functionality
+    task_runtime_budget = _load_task_runtime_budget()
+    kwargs["solver_options"] = _prepare_initial_solver_options(
+        task_runtime_budget,
+        kwargs["solver_name"],
+        kwargs["solver_options"],
+    )
 
     _ensure_pypsa_nodal_balance_busname_compat()
 
@@ -3628,9 +3736,25 @@ def solve_network(n, config, solving, **kwargs):
         else:
             logger.info("LP file saving is disabled (set solving.save_lpfile: true to enable)")
         
-    if "infeasible" in condition or "unbounded" in condition or status != 'ok':
+    if not _acceptable_solve(status, condition):
         logger.error(f"Solver status: {status}")
         logger.error(f"Termination condition: {condition}")
+        robust_solver_options = _prepare_retry_solver_options(
+            task_runtime_budget,
+            kwargs.get("solver_name"),
+            base_solver_opts,
+        )
+        if task_runtime_budget is not None and robust_solver_options is None:
+            remaining_snapshot = _runtime_budget_snapshot(task_runtime_budget)
+            remaining_seconds = remaining_snapshot["remaining_seconds"]
+            reserve_seconds = task_runtime_budget["reserve_seconds"]
+            retry_min_seconds = task_runtime_budget["retry_min_seconds"]
+            retry_window_seconds = max(0, remaining_seconds - reserve_seconds)
+            raise RuntimeError(
+                "Skipping retry because only "
+                f"{retry_window_seconds}s remain after reserve (minimum required is {retry_min_seconds}s). "
+                f"Initial solve ended with status '{status}' and condition '{condition}'."
+            )
         
         # Remove components with undefined buses first
         buses_to_keep = set(n.buses.index)
@@ -3711,11 +3835,18 @@ def solve_network(n, config, solving, **kwargs):
             n.generators.loc[problematic_gens.index, "p_nom_max"] = n.generators.loc[problematic_gens.index, "p_nom_min"] * 2
 
         retry_option_set = set_of_options
-        robust_solver_options = dict(base_solver_opts)
         if kwargs.get("solver_name") == "gurobi" and "gurobi-numeric-focus" in solving.get("solver_options", {}):
             retry_option_set = "gurobi-numeric-focus"
             robust_solver_options = dict(solving["solver_options"][retry_option_set])
             robust_solver_options["DualReductions"] = 0
+        else:
+            robust_solver_options = dict(robust_solver_options)
+
+        robust_solver_options = _prepare_retry_solver_options(
+            task_runtime_budget,
+            kwargs.get("solver_name"),
+            robust_solver_options,
+        ) or robust_solver_options
 
         logger.info(
             "Retrying with solver options profile '%s' from config.myopic.yaml...",
@@ -3734,7 +3865,7 @@ def solve_network(n, config, solving, **kwargs):
                 
             logger.info(f"Retry result: status='{status}', condition='{condition}'")
             
-            if status != "ok":
+            if not _acceptable_solve(status, condition):
                 logger.error(f"Retry still failed: {status} / {condition}")
                 raise RuntimeError(f"Solving status '{status}' with termination condition '{condition}' after retry")
                 

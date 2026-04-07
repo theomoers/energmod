@@ -7,8 +7,7 @@ Usage:
   bash scripts/learning/run_learning_bootstrap_job.sh [--dry-run]
 
 Environment variables:
-  JOBS                 Snakemake parallelism override
-  NSLOTS               Cluster slot count fallback when JOBS is unset
+  Bootstrap always runs with Snakemake parallelism fixed to 100 jobs
   LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
 
 This runs the shared deterministic learning bootstrap through the first two
@@ -36,7 +35,7 @@ TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_bootstrap.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
 JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME:-Global_200}"
-SNAKEMAKE_JOBS="${JOBS:-${NSLOTS:-4}}"
+SNAKEMAKE_JOBS="100"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
 
 if ! command -v snakemake >/dev/null 2>&1; then
