@@ -381,6 +381,20 @@ def _capacity_column(df: pd.DataFrame, preferred: str, fallback: str) -> str | N
     return None
 
 
+def _resolved_numeric_column(df: pd.DataFrame, preferred: str, fallback: str) -> pd.Series:
+    preferred_series = (
+        pd.to_numeric(df[preferred], errors="coerce")
+        if preferred in df.columns
+        else pd.Series(np.nan, index=df.index, dtype=float)
+    )
+    fallback_series = (
+        pd.to_numeric(df[fallback], errors="coerce")
+        if fallback in df.columns
+        else pd.Series(np.nan, index=df.index, dtype=float)
+    )
+    return preferred_series.where(preferred_series.notna(), fallback_series)
+
+
 def _weighted_quantile(values: pd.Series, weights: pd.Series, quantile: float) -> float:
     series = pd.to_numeric(values, errors="coerce")
     weight_series = pd.to_numeric(weights, errors="coerce").fillna(0.0)
@@ -553,11 +567,16 @@ def _is_renewable_carrier(carrier: str) -> bool:
 def _load_bus_profiles(n: pypsa.Network) -> pd.DataFrame:
     if n.loads.empty:
         return pd.DataFrame(index=n.snapshots)
-    if "p_set" in n.loads_t and not n.loads_t.p_set.empty:
-        profiles = n.loads_t.p_set.copy()
-    elif "p" in n.loads_t and not n.loads_t.p.empty:
-        profiles = n.loads_t.p.copy()
-    else:
+    try:
+        profiles = n.get_switchable_as_dense("Load", "p_set")
+    except Exception:
+        if "p_set" in n.loads_t and not n.loads_t.p_set.empty:
+            profiles = n.loads_t.p_set.copy()
+        elif "p" in n.loads_t and not n.loads_t.p.empty:
+            profiles = n.loads_t.p.copy()
+        else:
+            return pd.DataFrame(index=n.snapshots)
+    if profiles is None or profiles.empty:
         return pd.DataFrame(index=n.snapshots)
     load_meta = n.loads.copy()
     ac_mask = load_meta["bus"].map(n.buses.carrier).eq("AC")
@@ -745,6 +764,19 @@ def _collect_generation_records(n: pypsa.Network) -> pd.DataFrame:
     )
 
 
+def _generation_country_summary(generation_df: pd.DataFrame, year: int) -> pd.DataFrame:
+    if generation_df.empty:
+        return _empty_frame("generation_country_carrier.csv")
+    result = (
+        generation_df.groupby(["component", "country", "carrier"], as_index=False)["annual_generation_mwh"]
+        .sum()
+        .sort_values(["country", "carrier", "component"], ignore_index=True)
+    )
+    result.insert(0, "year", int(year))
+    result["annual_generation_twh"] = result["annual_generation_mwh"] / 1e6
+    return result.loc[:, OUTPUT_TABLE_SPECS["generation_country_carrier.csv"]]
+
+
 def _ac_energy_balance_country_carrier(n: pypsa.Network) -> pd.DataFrame:
     frame = _ac_energy_balance_frame(
         n,
@@ -838,10 +870,7 @@ def _collect_capacity_records(n: pypsa.Network) -> pd.DataFrame:
                 link_df["bus"] = link_df[bus_col].astype(str)
                 link_df["country"] = link_df["bus"].map(bus_country).fillna("").astype(str)
                 link_df["capacity_unit"] = "MW"
-                link_df["capacity_value"] = (
-                    pd.to_numeric(link_df[column], errors="coerce").fillna(0.0)
-                    * pd.to_numeric(link_df[eff_col], errors="coerce").fillna(0.0).abs()
-                )
+                link_df["capacity_value"] = pd.to_numeric(link_df[column], errors="coerce").fillna(0.0)
                 frames.append(link_df.loc[:, ["component", "asset", "bus", "country", "carrier", "capacity_unit", "capacity_value"]])
 
     if not frames:
@@ -937,7 +966,12 @@ def _battery_operations_country_year(n: pypsa.Network) -> pd.DataFrame:
         discharge_to_ac = (
             (-n.links_t.p1.reindex(columns=dischargers.index, fill_value=0.0)).clip(lower=0.0).mul(weights, axis=0).sum(axis=0)
         )
-        discharger_power = pd.to_numeric(dischargers[capacity_col], errors="coerce").fillna(0.0) if capacity_col else pd.Series(0.0, index=dischargers.index)
+        discharger_efficiency = pd.to_numeric(dischargers.get("efficiency", pd.Series(1.0, index=dischargers.index)), errors="coerce").fillna(1.0).abs()
+        discharger_power = (
+            pd.to_numeric(dischargers[capacity_col], errors="coerce").fillna(0.0).mul(discharger_efficiency, fill_value=1.0)
+            if capacity_col
+            else pd.Series(0.0, index=dischargers.index)
+        )
         discharger_rows = pd.DataFrame(
             {
                 "country": dischargers["country"].values,
@@ -1070,27 +1104,38 @@ def _sector_emissions(n: pypsa.Network) -> pd.DataFrame:
 def _sector_demands_country(n: pypsa.Network) -> pd.DataFrame:
     if n.loads.empty:
         return _empty_frame("sector_demands_country.csv")
-    profiles = _load_bus_profiles(n)
-    if profiles.empty:
-        return _empty_frame("sector_demands_country.csv")
-    weights = _snapshot_weights(n, "objective")
+    weights = _snapshot_weights(n, "generators")
     load_meta = n.loads.copy()
     load_meta["country"] = _load_country_lookup(n)
-    if "carrier" not in load_meta.columns:
-        load_meta["carrier"] = "electricity"
-    data = (
-        n.loads_t.p_set.reindex(columns=load_meta.index, fill_value=0.0)
-        if "p_set" in n.loads_t and not n.loads_t.p_set.empty
-        else n.loads_t.p.reindex(columns=load_meta.index, fill_value=0.0)
-    )
+    try:
+        data = n.get_switchable_as_dense("Load", "p_set")
+    except Exception:
+        data = (
+            n.loads_t.p_set.reindex(columns=load_meta.index, fill_value=0.0)
+            if "p_set" in n.loads_t and not n.loads_t.p_set.empty
+            else n.loads_t.p.reindex(columns=load_meta.index, fill_value=0.0)
+        )
     annual = data.mul(weights, axis=0).sum(axis=0)
-    result = pd.DataFrame(
-        {
-            "country": load_meta["country"].values,
-            "sector": load_meta["carrier"].astype(str).values,
-            "annual_demand_mwh": annual.to_numpy(dtype=float),
-        }
-    )
+    rows = []
+    for load_name, demand_mwh in annual.items():
+        if demand_mwh <= 0.0:
+            continue
+        carrier = str(load_meta.at[load_name, "carrier"]) if "carrier" in load_meta.columns else "unknown"
+        sectors = _exogenous_load_sectors(carrier)
+        if not sectors:
+            continue
+        country = str(load_meta.at[load_name, "country"])
+        for sector in sectors:
+            rows.append(
+                {
+                    "country": country,
+                    "sector": sector,
+                    "annual_demand_mwh": float(demand_mwh),
+                }
+            )
+    if not rows:
+        return _empty_frame("sector_demands_country.csv")
+    result = pd.DataFrame(rows)
     result = (
         result.groupby(["country", "sector"], as_index=False)["annual_demand_mwh"]
         .sum()
@@ -1152,11 +1197,14 @@ def _sector_total_demands_country(n: pypsa.Network) -> pd.DataFrame:
         weights = _snapshot_weights(n, "generators")
         load_meta = n.loads.copy()
         load_meta["country"] = _load_country_lookup(n)
-        data = (
-            n.get_switchable_as_dense("Load", "p_set")
-            if "p_set" in n.loads_t and not n.loads_t.p_set.empty
-            else n.loads_t.p.reindex(columns=load_meta.index, fill_value=0.0)
-        )
+        try:
+            data = n.get_switchable_as_dense("Load", "p_set")
+        except Exception:
+            data = (
+                n.loads_t.p_set.reindex(columns=load_meta.index, fill_value=0.0)
+                if "p_set" in n.loads_t and not n.loads_t.p_set.empty
+                else n.loads_t.p.reindex(columns=load_meta.index, fill_value=0.0)
+            )
         annual = data.reindex(columns=load_meta.index, fill_value=0.0).mul(weights, axis=0).sum(axis=0)
         rows = []
         for load_name, demand_mwh in annual.items():
@@ -1266,8 +1314,8 @@ def _price_country_year(n: pypsa.Network) -> pd.DataFrame:
         weighted_hourly = (
             (country_prices * country_loads).sum(axis=1).div(load_sum.replace(0.0, np.nan))
         )
-        flat_prices = country_prices.stack(future_stack=True).dropna()
-        flat_loads = country_loads.stack(future_stack=True).reindex(flat_prices.index).fillna(0.0)
+        flat_prices = country_prices.stack(dropna=True)
+        flat_loads = country_loads.stack(dropna=True).reindex(flat_prices.index).fillna(0.0)
         flat_hour_weights = (
             pd.Series(weights, index=country_prices.index).reindex(flat_prices.index.get_level_values(0)).to_numpy(dtype=float)
         )
@@ -1491,22 +1539,77 @@ def _system_summary(n: pypsa.Network, generation_df: pd.DataFrame, power_emissio
     renewable_generation = float(
         generation_df.loc[generation_df["carrier"].map(_is_renewable_carrier), "annual_generation_mwh"].sum()
     ) if not generation_df.empty else 0.0
-    storage_power_capacity = float(
+    storage_unit_power_capacity = float(
         capacity_df.loc[
-            capacity_df["component"].isin(["StorageUnit", "Link"]) & capacity_df["capacity_unit"].eq("MW"),
+            capacity_df["component"].eq("StorageUnit") & capacity_df["capacity_unit"].eq("MW"),
             "capacity_value",
         ].sum()
     ) if not capacity_df.empty else 0.0
-    storage_energy_capacity = float(
-        capacity_df.loc[
-            capacity_df["component"].eq("Store") & capacity_df["capacity_unit"].eq("MWh"),
-            "capacity_value",
-        ].sum()
-    ) if not capacity_df.empty else 0.0
-    transmission_ac_capacity = float(pd.to_numeric(n.lines.get("s_nom_opt", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not n.lines.empty else 0.0
-    transmission_dc_capacity = float(pd.to_numeric(n.links.loc[n.links.get("carrier", pd.Series(dtype=str)).eq("DC"), "p_nom_opt"], errors="coerce").fillna(0.0).sum()) if not n.links.empty and "carrier" in n.links.columns and "p_nom_opt" in n.links.columns else 0.0
-    transmission_ac_volume = float((pd.to_numeric(n.lines.get("length", pd.Series(dtype=float)), errors="coerce").fillna(0.0) * pd.to_numeric(n.lines.get("s_nom_opt", pd.Series(dtype=float)), errors="coerce").fillna(0.0)).sum()) if not n.lines.empty else 0.0
-    transmission_dc_volume = float((pd.to_numeric(n.links.loc[n.links.get("carrier", pd.Series(dtype=str)).eq("DC"), "length"], errors="coerce").fillna(0.0) * pd.to_numeric(n.links.loc[n.links.get("carrier", pd.Series(dtype=str)).eq("DC"), "p_nom_opt"], errors="coerce").fillna(0.0)).sum()) if not n.links.empty and "carrier" in n.links.columns and "length" in n.links.columns and "p_nom_opt" in n.links.columns else 0.0
+    storage_unit_energy_capacity = 0.0
+    if not n.storage_units.empty:
+        storage_unit_capacity_col = _capacity_column(n.storage_units, "p_nom_opt", "p_nom")
+        if storage_unit_capacity_col and "max_hours" in n.storage_units.columns:
+            storage_unit_energy_capacity = float(
+                (
+                    pd.to_numeric(n.storage_units[storage_unit_capacity_col], errors="coerce").fillna(0.0)
+                    * pd.to_numeric(n.storage_units["max_hours"], errors="coerce").fillna(0.0)
+                ).sum()
+            )
+    storage_link_power_capacity = 0.0
+    if not n.links.empty and "carrier" in n.links.columns:
+        discharger_mask = n.links["carrier"].astype(str).str.lower().eq("battery discharger")
+        discharger_capacity_col = _capacity_column(n.links, "p_nom_opt", "p_nom")
+        if discharger_mask.any() and discharger_capacity_col:
+            discharger_efficiency = pd.to_numeric(
+                n.links.loc[discharger_mask, "efficiency"],
+                errors="coerce",
+            ).fillna(1.0).abs()
+            storage_link_power_capacity = float(
+                pd.to_numeric(
+                    n.links.loc[discharger_mask, discharger_capacity_col],
+                    errors="coerce",
+                ).fillna(0.0).mul(discharger_efficiency, fill_value=1.0).sum()
+            )
+    store_energy_capacity = 0.0
+    if not n.stores.empty:
+        store_capacity_col = _capacity_column(n.stores, "e_nom_opt", "e_nom")
+        if store_capacity_col and "carrier" in n.stores.columns:
+            electricity_store_mask = n.stores["carrier"].astype(str).str.lower().eq("battery")
+            if electricity_store_mask.any():
+                store_energy_capacity = float(
+                    pd.to_numeric(
+                        n.stores.loc[electricity_store_mask, store_capacity_col],
+                        errors="coerce",
+                    ).fillna(0.0).sum()
+                )
+    storage_power_capacity = storage_unit_power_capacity + storage_link_power_capacity
+    storage_energy_capacity = storage_unit_energy_capacity + store_energy_capacity
+    transmission_ac_nom = (
+        _resolved_numeric_column(n.lines, "s_nom_opt", "s_nom").fillna(0.0)
+        if not n.lines.empty
+        else pd.Series(dtype=float)
+    )
+    transmission_ac_capacity = float(transmission_ac_nom.sum()) if not transmission_ac_nom.empty else 0.0
+    transmission_ac_length = (
+        pd.to_numeric(n.lines.get("length", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+        if not n.lines.empty
+        else pd.Series(dtype=float)
+    )
+    transmission_ac_volume = float((transmission_ac_length * transmission_ac_nom).sum()) if not transmission_ac_nom.empty else 0.0
+    dc_mask = n.links.get("carrier", pd.Series(dtype=str)).eq("DC") if not n.links.empty and "carrier" in n.links.columns else pd.Series(dtype=bool)
+    dc_links = n.links.loc[dc_mask].copy() if not n.links.empty and not dc_mask.empty else pd.DataFrame()
+    transmission_dc_nom = (
+        _resolved_numeric_column(dc_links, "p_nom_opt", "p_nom").fillna(0.0)
+        if not dc_links.empty
+        else pd.Series(dtype=float)
+    )
+    transmission_dc_capacity = float(transmission_dc_nom.sum()) if not transmission_dc_nom.empty else 0.0
+    transmission_dc_length = (
+        pd.to_numeric(dc_links.get("length", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+        if not dc_links.empty
+        else pd.Series(dtype=float)
+    )
+    transmission_dc_volume = float((transmission_dc_length * transmission_dc_nom).sum()) if not transmission_dc_nom.empty else 0.0
     total_emissions_mtco2 = float(
         sector_emissions_df.loc[sector_emissions_df["sector"].eq("TOTAL"), "emissions_mtco2"].sum()
     ) if not sector_emissions_df.empty else 0.0
@@ -1588,14 +1691,10 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
     for year in years:
         network = pypsa.Network(str(network_paths[year]))
         generation = _collect_generation_records(network)
-        if "year" in generation.columns:
-            generation["year"] = int(year)
-        else:
-            generation.insert(0, "year", int(year))
-        generation["annual_generation_twh"] = generation["annual_generation_mwh"] / 1e6
+        generation_country = _generation_country_summary(generation, year)
         generation_frames.append(
-            generation.loc[:, OUTPUT_TABLE_SPECS["generation_country_carrier.csv"]]
-            if not generation.empty
+            generation_country
+            if not generation_country.empty
             else _empty_frame("generation_country_carrier.csv")
         )
 
