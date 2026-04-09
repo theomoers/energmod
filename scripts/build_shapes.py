@@ -1399,7 +1399,7 @@ if __name__ == "__main__":
     country_shapes.to_file(snakemake.output.country_shapes)
 
     offshore_shapes = eez(
-        countries_list, geo_crs, country_shapes, EEZ_gpkg, out_logging, simplify_gadm
+        countries_list, geo_crs, country_shapes, EEZ_gpkg, out_logging, simplify_gadm=simplify_gadm,
     )
 
     offshore_shapes.reset_index().to_file(snakemake.output.offshore_shapes)
