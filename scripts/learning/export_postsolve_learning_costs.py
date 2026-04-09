@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pypsa
 
 
 SCRIPTS_DIR = Path.cwd() / "scripts"
@@ -43,6 +44,56 @@ from learning.learning_data_io import load_historical_capacity
 
 
 logger = logging.getLogger(__name__)
+
+
+def _stat_frame(metric, value_name):
+    """Normalize PyPSA statistics outputs to a flat DataFrame."""
+    if isinstance(metric, pd.Series):
+        frame = metric.rename(value_name).to_frame()
+    else:
+        frame = metric.copy()
+        if value_name not in frame.columns:
+            if frame.shape[1] != 1:
+                raise ValueError(
+                    f"Expected a single-column statistics frame for {value_name}, got {list(frame.columns)}"
+                )
+            frame = frame.rename(columns={frame.columns[0]: value_name})
+    return frame.reset_index()
+
+
+def export_system_cost_statistics(network_path, output_system_costs, output_statistics, planning_horizon):
+    """Export grouped capex/opex system costs and the raw PyPSA statistics table."""
+    logger.info("Loading solved network for statistics export: %s", network_path)
+    n = pypsa.Network(network_path)
+
+    groupby = n.statistics.groupers.get_country_and_carrier
+    capex = _stat_frame(
+        n.statistics.capex(groupby=groupby, nice_names=False),
+        "annualized_capital_cost_eur",
+    )
+    opex = _stat_frame(
+        n.statistics.opex(groupby=groupby, nice_names=False),
+        "operating_cost_eur",
+    )
+
+    join_cols = [c for c in ["component", "country", "carrier"] if c in capex.columns or c in opex.columns]
+    system_costs = capex.merge(opex, how="outer", on=join_cols).fillna(0.0)
+    if "carrier" in system_costs.columns and "technology" not in system_costs.columns:
+        system_costs.insert(system_costs.columns.get_loc("carrier") + 1, "technology", system_costs["carrier"])
+    system_costs.insert(0, "planning_horizon", int(planning_horizon))
+    system_costs["total_system_cost_eur"] = (
+        system_costs["annualized_capital_cost_eur"] + system_costs["operating_cost_eur"]
+    )
+    sort_cols = [c for c in ["planning_horizon", "component", "country", "carrier"] if c in system_costs.columns]
+    system_costs = system_costs.sort_values(sort_cols, kind="stable", ignore_index=True)
+
+    Path(output_system_costs).parent.mkdir(parents=True, exist_ok=True)
+    system_costs.to_csv(output_system_costs, index=False)
+    logger.info("Saved grouped system costs to: %s", output_system_costs)
+
+    Path(output_statistics).parent.mkdir(parents=True, exist_ok=True)
+    n.statistics().to_csv(output_statistics)
+    logger.info("Saved raw network statistics to: %s", output_statistics)
 
 
 def _load_historical_cumulative(tech, year, learning_cfg):
@@ -322,6 +373,8 @@ def main(snakemake):
     costs_file = snakemake.input.costs
     output_cost_log = snakemake.output.cost_log
     output_state = snakemake.output.state_committed
+    output_system_costs = getattr(snakemake.output, "system_costs", None)
+    output_statistics = getattr(snakemake.output, "statistics", None)
 
     logger.info("Loading learning config: %s", learning_config_path)
     learning_cfg = load_config_learning(learning_config_path)
@@ -342,6 +395,13 @@ def main(snakemake):
     )
 
     current_year = int(base_df["planning_horizon"].iloc[0])
+    if output_system_costs and output_statistics:
+        export_system_cost_statistics(
+            network_path=solved_network,
+            output_system_costs=output_system_costs,
+            output_statistics=output_statistics,
+            planning_horizon=current_year,
+        )
     logger.info("Saving post-solve learning cost log to: %s", output_cost_log)
     logger.info("Committing learning state to: %s", output_state)
     Path(output_state).parent.mkdir(parents=True, exist_ok=True)
