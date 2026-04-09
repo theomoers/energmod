@@ -564,6 +564,17 @@ def _is_renewable_carrier(carrier: str) -> bool:
     return any(token in carrier_lower for token in ("solar", "wind", "hydro", "geo", "biomass", "ror"))
 
 
+def _exclude_from_total_generation(carrier: str) -> bool:
+    carrier_lower = str(carrier).strip().lower()
+    return carrier_lower in {
+        "battery discharger",
+        "phs",
+        "hydro+phs",
+        "h2 fuel cell",
+        "load shedding",
+    }
+
+
 def _load_bus_profiles(n: pypsa.Network) -> pd.DataFrame:
     if n.loads.empty:
         return pd.DataFrame(index=n.snapshots)
@@ -1535,10 +1546,13 @@ def _curtailment_total_mwh(n: pypsa.Network) -> float:
 
 def _system_summary(n: pypsa.Network, generation_df: pd.DataFrame, power_emissions_df: pd.DataFrame, sector_emissions_df: pd.DataFrame, capacity_df: pd.DataFrame) -> pd.DataFrame:
     demand_summary = _ac_demand_summary_from_balance(n)
-    total_generation = float(generation_df["annual_generation_mwh"].sum()) if not generation_df.empty else 0.0
+    generation_for_share = generation_df.loc[
+        ~generation_df["carrier"].map(_exclude_from_total_generation)
+    ].copy() if not generation_df.empty else generation_df
+    total_generation = float(generation_for_share["annual_generation_mwh"].sum()) if not generation_for_share.empty else 0.0
     renewable_generation = float(
-        generation_df.loc[generation_df["carrier"].map(_is_renewable_carrier), "annual_generation_mwh"].sum()
-    ) if not generation_df.empty else 0.0
+        generation_for_share.loc[generation_for_share["carrier"].map(_is_renewable_carrier), "annual_generation_mwh"].sum()
+    ) if not generation_for_share.empty else 0.0
     storage_unit_power_capacity = float(
         capacity_df.loc[
             capacity_df["component"].eq("StorageUnit") & capacity_df["capacity_unit"].eq("MW"),
