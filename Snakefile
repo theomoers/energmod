@@ -547,6 +547,143 @@ def expand_learning_seed_targets(pattern, stochastic_only=False):
     return outputs
 
 
+def expand_learning_seed_horizon_targets(pattern, horizons, stochastic_only=False):
+    scenario_kwargs = {
+        key: value
+        for key, value in config["scenario"].items()
+        if key not in {"learning_model", "learning_seed", "planning_horizons"}
+    }
+    horizons = [str(h) for h in horizons]
+    if not horizons:
+        return []
+    outputs = []
+    for learning_model, learning_seed in build_learning_run_pairs(stochastic_only=stochastic_only):
+        outputs.extend(
+            expand(
+                pattern,
+                learning_model=[learning_model],
+                learning_seed=[learning_seed],
+                planning_horizons=horizons,
+                **scenario_kwargs,
+                **config["costs"],
+                **config["export"],
+            )
+        )
+    return outputs
+
+
+def _dedupe_preserve_order(paths):
+    deduped = []
+    seen = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return deduped
+
+
+def expand_learning_myopic_network_targets(stochastic_only=False):
+    paths = []
+    paths.extend(
+        expand_learning_bootstrap_targets(
+            RESDIR
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
+            stochastic_only=stochastic_only,
+        )
+    )
+    paths.extend(
+        expand_learning_branch_targets(
+            RESDIR
+            + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
+            stochastic_only=stochastic_only,
+        )
+    )
+    return _dedupe_preserve_order(paths)
+
+
+def expand_learning_myopic_cost_log_targets(stochastic_only=False):
+    bootstrap_horizons = [str(h) for h in get_learning_bootstrap_horizons()]
+    branch_horizons = [str(h) for h in get_learning_branch_horizons()]
+    paths = []
+    if bootstrap_horizons:
+        if branch_horizons and len(bootstrap_horizons) > 0:
+            generic_bootstrap = bootstrap_horizons[:-1]
+            final_bootstrap = bootstrap_horizons[-1:]
+        else:
+            generic_bootstrap = bootstrap_horizons
+            final_bootstrap = []
+        if generic_bootstrap:
+            paths.extend(
+                expand_learning_bootstrap_targets(
+                    RESDIR
+                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+                    stochastic_only=stochastic_only,
+                )
+            )
+            if branch_horizons:
+                generic_set = set(generic_bootstrap)
+                paths = [p for p in paths if any(f"_{year}_" in p for year in generic_set)]
+        if final_bootstrap:
+            paths.extend(
+                expand_learning_seed_horizon_targets(
+                    RESDIR
+                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+                    final_bootstrap,
+                    stochastic_only=stochastic_only,
+                )
+            )
+    paths.extend(
+        expand_learning_branch_targets(
+            RESDIR
+            + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            stochastic_only=stochastic_only,
+        )
+    )
+    return _dedupe_preserve_order(paths)
+
+
+def expand_learning_myopic_state_targets(stochastic_only=False):
+    bootstrap_horizons = [str(h) for h in get_learning_bootstrap_horizons()]
+    branch_horizons = [str(h) for h in get_learning_branch_horizons()]
+    paths = []
+    if bootstrap_horizons:
+        if branch_horizons and len(bootstrap_horizons) > 0:
+            generic_bootstrap = bootstrap_horizons[:-1]
+            final_bootstrap = bootstrap_horizons[-1:]
+        else:
+            generic_bootstrap = bootstrap_horizons
+            final_bootstrap = []
+        if generic_bootstrap:
+            paths.extend(
+                expand_learning_bootstrap_targets(
+                    RESDIR
+                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.json",
+                    stochastic_only=stochastic_only,
+                )
+            )
+            if branch_horizons:
+                generic_set = set(generic_bootstrap)
+                paths = [p for p in paths if any(f"_{year}_" in p for year in generic_set)]
+        if final_bootstrap:
+            paths.extend(
+                expand_learning_seed_horizon_targets(
+                    RESDIR
+                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+                    final_bootstrap,
+                    stochastic_only=stochastic_only,
+                )
+            )
+    paths.extend(
+        expand_learning_branch_targets(
+            RESDIR
+            + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+            stochastic_only=stochastic_only,
+        )
+    )
+    return _dedupe_preserve_order(paths)
+
+
 def compact_learning_bundle_dir(w):
     return (
         RESDIR
@@ -3727,49 +3864,28 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
 
     rule solve_sector_networks_myopic:
         input:
-            networks=lambda wildcards: expand_learning_myopic_targets(
-                RESDIR
-                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
-            ),
+            networks=lambda wildcards: expand_learning_myopic_network_targets(),
             postsolve_learning_cost_logs=(
-                lambda wildcards: expand_learning_myopic_targets(
-                    RESDIR
-                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
-                )
+                lambda wildcards: expand_learning_myopic_cost_log_targets()
                 if get_learning_enabled()
                 else []
             ),
             postsolve_learning_states=(
-                lambda wildcards: expand_learning_myopic_targets(
-                    RESDIR
-                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
-                )
+                lambda wildcards: expand_learning_myopic_state_targets()
                 if get_learning_enabled()
                 else []
             ),
 
     rule solve_sector_networks_myopic_stochastic_mc:
         input:
-            networks=lambda wildcards: expand_learning_myopic_targets(
-                RESDIR
-                + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
-                stochastic_only=True,
-            ),
+            networks=lambda wildcards: expand_learning_myopic_network_targets(stochastic_only=True),
             postsolve_learning_cost_logs=(
-                lambda wildcards: expand_learning_myopic_targets(
-                    RESDIR
-                    + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
-                    stochastic_only=True,
-                )
+                lambda wildcards: expand_learning_myopic_cost_log_targets(stochastic_only=True)
                 if get_learning_enabled()
                 else []
             ),
             postsolve_learning_states=(
-                lambda wildcards: expand_learning_myopic_targets(
-                    RESDIR
-                    + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
-                    stochastic_only=True,
-                )
+                lambda wildcards: expand_learning_myopic_state_targets(stochastic_only=True)
                 if get_learning_enabled()
                 else []
             ),

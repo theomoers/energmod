@@ -27,7 +27,7 @@ SUPPORTED_MODELS = [
     "way_fixed_rho_benchmark_035",
     "correlated_geometric_random_walk",
 ]
-DEFAULT_GRID_ARRAY_CONCURRENCY = 50
+DEFAULT_GRID_ARRAY_CONCURRENCY = 200
 
 
 
