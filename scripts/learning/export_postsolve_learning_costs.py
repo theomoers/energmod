@@ -46,6 +46,17 @@ from learning.learning_data_io import load_historical_capacity
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_superseded_learning_inputs(base_cost_log, proposed_state, current_year):
+    """Drop branch-only intermediates once solved outputs are written."""
+    if int(current_year) <= 2025:
+        return
+    for candidate in [base_cost_log, proposed_state]:
+        path = Path(candidate)
+        if path.exists():
+            path.unlink()
+            logger.info("Removed superseded learning intermediate: %s", path)
+
+
 def _stat_frame(metric, value_name):
     """Normalize PyPSA statistics outputs to a flat DataFrame."""
     if isinstance(metric, pd.Series):
@@ -468,6 +479,7 @@ def main(snakemake):
         }
 
     Path(output_state).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    _cleanup_superseded_learning_inputs(base_cost_log, proposed_state, current_year)
     logger.info("Done")
 
 

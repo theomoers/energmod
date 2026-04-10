@@ -92,6 +92,8 @@ trap 'rm -f "$OVERLAY_FILE"' EXIT
 JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME:-Global_200}"
 SNAKEMAKE_JOBS="${JOBS:-${NSLOTS:-4}}"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
+COST_EXPECTATION_MODE="${LEARNING_COST_EXPECTATION_MODE:-}"
+COST_EXPECTATION_WEIGHTS="${LEARNING_COST_EXPECTATION_WEIGHTS:-}"
 
 if ! command -v snakemake >/dev/null 2>&1; then
   source /apps/anaconda3/etc/profile.d/conda.sh
@@ -121,6 +123,16 @@ learning:
   monte_carlo:
     enable: false
 EOF2
+
+if [[ -n "$COST_EXPECTATION_MODE" || -n "$COST_EXPECTATION_WEIGHTS" ]]; then
+  {
+    echo "  cost_expectations:"
+    echo "    mode: \"${COST_EXPECTATION_MODE:-block_average_expected}\""
+    if [[ -n "$COST_EXPECTATION_WEIGHTS" ]]; then
+      echo "    annual_weights: ${COST_EXPECTATION_WEIGHTS}"
+    fi
+  } >>"$OVERLAY_FILE"
+fi
 
 CMD=(
   snakemake

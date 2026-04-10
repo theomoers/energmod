@@ -3698,6 +3698,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             brownfield=compact_learning_branch_brownfield_inputs,
             learning_prenetworks=compact_learning_branch_prenetwork_inputs,
             postnetworks=compact_learning_branch_postnetwork_inputs,
+            solved_cost_logs=compact_learning_branch_cost_log_inputs,
+            committed_states=compact_learning_branch_state_inputs,
             lpfiles=compact_learning_branch_lpfile_inputs,
         output:
             marker=RESDIR
@@ -3705,7 +3707,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "raw_cleanup_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.txt",
         shell:
             r"""
-            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.lpfiles}
+            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.solved_cost_logs} {input.committed_states} {input.lpfiles}
             mkdir -p "$(dirname {output.marker})"
             printf 'branch raws cleaned\n' > {output.marker}
             """

@@ -24,7 +24,9 @@
 *.nc
 *.xls
 *.xlsx
-*.org
+*.org\
+
+
 *.sh.e*
 *.sh.o*
 *.sh.pe*
@@ -76,8 +78,7 @@ cluster_workdirs/
 tests/
 
 # Specific configuration files
-configs/scenarios/config.*.yaml
-!configs/scenarios/config.NG.yaml
+configs/*
 
 # VS Code-related files
 .vscode
