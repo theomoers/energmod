@@ -74,12 +74,13 @@ DEFAULT_FINANCE = {
     },
 }
 
-SUPPORTED_LEARNING_ENGINES = {"legacy_curve", "stochastic_forecast"}
+SUPPORTED_LEARNING_ENGINES = {"legacy_curve", "stochastic_forecast", "exogenous_path"}
 SUPPORTED_STOCHASTIC_MODELS = {
     "shared_state_bayesian_regime_wright",
     "way_fixed_rho_benchmark_035",
     "correlated_geometric_random_walk",
 }
+SUPPORTED_EXOGENOUS_MODELS = {"iea_weo_exogenous_path"}
 SUPPORTED_SAMPLE_MODES = {"single_draw", "median"}
 SUPPORTED_TRAINING_WINDOWS = {"origin_cutoff", "full_sample"}
 SUPPORTED_COST_EXPECTATION_MODES = {"point_cost", "block_average_expected"}
@@ -488,8 +489,12 @@ def load_learning_manifest(learning_cfg, config_file):
 
 
 def get_learning_engine(learning_cfg, learning_model=None):
-    if learning_model and learning_model != "legacy_curve":
-        return "stochastic_forecast"
+    if learning_model:
+        model = str(learning_model)
+        if model in SUPPORTED_EXOGENOUS_MODELS:
+            return "exogenous_path"
+        if model != "legacy_curve":
+            return "stochastic_forecast"
     return str(learning_cfg.get("engine", "legacy_curve"))
 
 
@@ -502,6 +507,8 @@ def get_selected_learning_model(learning_cfg, learning_model=None):
 def get_runtime_conditioning_type(learning_engine, selected_model):
     if learning_engine == "legacy_curve":
         return "deployment_conditioned"
+    if learning_engine == "exogenous_path":
+        return "time_conditioned"
     if selected_model == "correlated_geometric_random_walk":
         return "time_conditioned"
     return "deployment_conditioned"
@@ -765,6 +772,12 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
                 "learning.selected_model='legacy_curve'. "
                 f"Got selected_model='{selected_model}'."
             )
+    elif learning_engine == "exogenous_path":
+        if selected_model not in SUPPORTED_EXOGENOUS_MODELS:
+            raise ValueError(
+                f"Unsupported exogenous learning model '{selected_model}'. "
+                f"Supported values: {sorted(SUPPORTED_EXOGENOUS_MODELS)}"
+            )
     else:
         if selected_model not in SUPPORTED_STOCHASTIC_MODELS:
             raise ValueError(
@@ -776,11 +789,11 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
 def resolve_runtime_seed(learning_cfg, learning_engine, selected_model, learning_seed=None):
     default_seed = int(learning_cfg.get("seed", 0))
 
-    if learning_engine == "legacy_curve":
+    if learning_engine in {"legacy_curve", "exogenous_path"}:
         token = LEGACY_LEARNING_SEED if learning_seed in (None, "") else str(learning_seed)
         if token != LEGACY_LEARNING_SEED:
             raise ValueError(
-                "legacy_curve requires learning_seed='deterministic'. "
+                f"{learning_engine} requires learning_seed='deterministic'. "
                 f"Got learning_seed={token!r}."
             )
         learning_cfg["seed"] = 0
@@ -832,6 +845,122 @@ def get_manifest_historical_datafile(learning_cfg, tech_key):
     if not relative:
         return None
     return str((root / relative).resolve())
+
+
+def get_manifest_exogenous_cost_path_info(learning_cfg, selected_model):
+    cfg = learning_cfg.get("exogenous_cost_path", {}) or {}
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    model_info = (((manifest.get("exogenous_cost_paths", {}) or {}).get("models", {}) or {}).get(selected_model))
+    if model_info is None and not cfg.get("artifact_csv"):
+        raise ValueError(
+            f"Selected exogenous model '{selected_model}' not found in learning manifest and no override artifact_csv was provided."
+        )
+
+    artifact_relative = str(cfg.get("artifact_csv") or (model_info or {}).get("artifact_csv", "")).strip()
+    if not artifact_relative:
+        raise ValueError(f"No exogenous artifact_csv configured for {selected_model}")
+    artifact_path = Path(artifact_relative)
+    if not artifact_path.is_absolute():
+        artifact_path = root / artifact_path
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"Exogenous cost-path artifact not found: {artifact_path}")
+
+    interpolation = str(cfg.get("interpolation") or (model_info or {}).get("interpolation", "log_linear"))
+    if interpolation != "log_linear":
+        raise ValueError(
+            f"Unsupported exogenous interpolation '{interpolation}'. Supported values: ['log_linear']"
+        )
+
+    return {
+        "artifact_csv": artifact_path,
+        "source": str(cfg.get("source") or (model_info or {}).get("source") or selected_model),
+        "interpolation": interpolation,
+        "start_year": int((model_info or {}).get("start_year", 2030)),
+        "end_year": int((model_info or {}).get("end_year", 2050)),
+        "weighting_method": str((model_info or {}).get("weighting_method", "")),
+    }
+
+
+def load_exogenous_cost_path(learning_cfg, selected_model):
+    info = get_manifest_exogenous_cost_path_info(learning_cfg, selected_model)
+    df = pd.read_csv(info["artifact_csv"])
+    for col in ("year", "c_overnight"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[df["technology"].isin(("solar_power", "onwind_power", "battery_energy"))].copy()
+    if df.empty:
+        raise ValueError(f"Exogenous cost-path artifact {info['artifact_csv']} is empty")
+    return df.sort_values(["technology", "year"]).reset_index(drop=True), info
+
+
+def _lookup_exogenous_point_cost(exogenous_df, technology, year):
+    row = exogenous_df[(exogenous_df["technology"] == technology) & (exogenous_df["year"] == int(year))]
+    if row.empty:
+        raise ValueError(f"Exogenous cost path is missing {technology} at year {year}")
+    return float(row.iloc[0]["c_overnight"])
+
+
+def _lookup_exogenous_future_costs(exogenous_df, technology, start_year, n_years):
+    tech_df = exogenous_df[exogenous_df["technology"] == technology].copy().sort_values("year")
+    if tech_df.empty:
+        raise ValueError(f"Exogenous cost path is missing technology {technology}")
+
+    last_year = int(tech_df["year"].max())
+    last_cost = float(tech_df.loc[tech_df["year"] == last_year, "c_overnight"].iloc[0])
+    lookup = tech_df.set_index("year")["c_overnight"].to_dict()
+    values = []
+    for year in range(int(start_year), int(start_year) + int(n_years)):
+        values.append(float(lookup.get(year, last_cost if year > last_year else np.nan)))
+    arr = np.asarray(values, dtype=float)
+    if np.any(~np.isfinite(arr)):
+        raise ValueError(
+            f"Exogenous cost path for {technology} is missing years in {start_year}-{start_year + n_years - 1}"
+        )
+    return arr
+
+
+def calculate_exogenous_learning_costs(
+    learning_cfg,
+    selected_model,
+    current_year,
+    costs_file,
+    wacc_dict=None,
+    runtime_metadata=None,
+):
+    exogenous_df, info = load_exogenous_cost_path(learning_cfg, selected_model)
+    cost_expectation_mode = str((runtime_metadata or {}).get("cost_expectation_mode", DEFAULT_COST_EXPECTATION_MODE))
+    weights = get_cost_expectation_weights(learning_cfg)
+    horizon_years = len(weights)
+
+    learning_costs = {}
+    for tech in ("solar_power", "onwind_power", "battery_energy"):
+        point_cost = _lookup_exogenous_point_cost(exogenous_df, tech, current_year)
+        if cost_expectation_mode == "block_average_expected":
+            future_costs = _lookup_exogenous_future_costs(exogenous_df, tech, int(current_year) + 1, horizon_years)
+            applied_c_overnight = float(np.dot(future_costs, weights))
+            terminal_c_overnight = float(future_costs[-1])
+        else:
+            applied_c_overnight = float(point_cost)
+            terminal_c_overnight = float(point_cost)
+
+        record = _runtime_cost_record(
+            tech=tech,
+            cumulative_capacity=0.0,
+            runtime_metadata=runtime_metadata or {},
+            snapshot={
+                "family": "iea_weo_exogenous_path",
+                "source": info["source"],
+                "interpolation": info["interpolation"],
+            },
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+            applied_c_overnight=applied_c_overnight,
+            terminal_c_overnight=terminal_c_overnight,
+            wacc_dict=wacc_dict,
+        )
+        record["cumulative_capacity_GW"] = 0.0
+        learning_costs[tech] = record
+    return learning_costs, info
 
 
 def get_battery_mapping_config(learning_cfg):
@@ -1448,6 +1577,14 @@ def _reinitialize_stochastic_runtime_state_for_model(state, initial_state, selec
     return reinitialized
 
 
+def _artifact_train_end_year(artifact, fallback_year):
+    sample_window = artifact.get("sample_window", {}) or {}
+    train_end_year = sample_window.get("train_end_year", None)
+    if train_end_year in (None, ""):
+        return int(fallback_year)
+    return int(train_end_year)
+
+
 def _backfill_stochastic_runtime_state_fields(state, initial_state, selected_model, artifacts):
     state_model = str(state.get("selected_model") or state.get("model_name") or "").strip()
     if state_model and state_model != selected_model:
@@ -1804,7 +1941,20 @@ def _compute_block_average_expected_costs(
                 f"Expected {expectation_years} annual path steps for {selected_model}/{tech}, got {path.shape[1]}"
             )
         level_costs = np.exp(path) / 1000.0
-        weighted_costs = level_costs @ weights
+        endpoint_level = float(np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0)
+        expectation_sequence = np.concatenate(
+            [
+                np.full((level_costs.shape[0], 1), endpoint_level, dtype=float),
+                level_costs[:, : max(expectation_years - 1, 0)],
+            ],
+            axis=1,
+        )
+        if expectation_sequence.shape[1] != expectation_years:
+            raise ValueError(
+                f"Expected {expectation_years} expectation-sequence points for {selected_model}/{tech}, "
+                f"got {expectation_sequence.shape[1]}"
+            )
+        weighted_costs = expectation_sequence @ weights
         applied_c_overnight = float(np.mean(weighted_costs))
         terminal_c_overnight = float(np.mean(level_costs[:, -1]))
         diagnostics[tech] = _cost_statistics_from_levels(
@@ -2076,6 +2226,38 @@ def calculate_stochastic_learning_costs(
     return learning_costs, proposed_state
 
 
+def _stochastic_alignment_years_by_tech(artifacts, learning_cfg, current_year, base_year):
+    training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
+    if training_window != "full_sample":
+        return {tech: 0 for tech in artifacts}
+
+    target_year = min(int(current_year), int(base_year))
+    if target_year < int(current_year):
+        return {tech: 0 for tech in artifacts}
+
+    alignment_years = {}
+    for tech, artifact in artifacts.items():
+        train_end_year = _artifact_train_end_year(artifact, base_year)
+        alignment_years[tech] = max(0, target_year - int(train_end_year))
+    return alignment_years
+
+
+def _shared_result_from_current_state(state, artifacts):
+    return {
+        "final_log_costs": {
+            tech: float(state["technology_states"][tech]["last_log_capex"]) for tech in artifacts
+        },
+        "technology_states": {
+            tech: {
+                "last_log_capex": float(state["technology_states"][tech]["last_log_capex"]),
+                "parameter_snapshot": (state["technology_states"][tech].get("parameter_snapshot", None)),
+            }
+            for tech in artifacts
+        },
+        "shared_regime_state": state.get("shared_regime_state", {}),
+    }
+
+
 def update_stochastic_runtime_state(
     learning_cfg,
     selected_model,
@@ -2113,22 +2295,46 @@ def update_stochastic_runtime_state(
         raise ValueError(
             f"Invalid stochastic runtime state transition: current_year={current_year}, last_applied_year={base_year}"
         )
+    alignment_years_by_tech = _stochastic_alignment_years_by_tech(
+        artifacts,
+        learning_cfg,
+        current_year,
+        base_year,
+    )
+    positive_alignment_years = sorted({years for years in alignment_years_by_tech.values() if years > 0})
+    if len(positive_alignment_years) > 1:
+        raise ValueError(
+            "Stochastic runtime alignment only supports a single positive catch-up horizon per update. "
+            f"Got {alignment_years_by_tech}."
+        )
+    alignment_years = positive_alignment_years[0] if positive_alignment_years else 0
+    next_state_year = int(current_year) if int(current_year) > base_year else int(base_year)
 
     if selected_model == "shared_state_bayesian_regime_wright":
         if int(current_year) <= base_year:
-            shared_result = {
-                "final_log_costs": {
-                    tech: float(state["technology_states"][tech]["last_log_capex"]) for tech in artifacts
-                },
-                "technology_states": {
-                    tech: {
-                        "last_log_capex": float(state["technology_states"][tech]["last_log_capex"]),
-                        "parameter_snapshot": (state["technology_states"][tech].get("parameter_snapshot", None)),
-                    }
-                    for tech in artifacts
-                },
-                "shared_regime_state": state.get("shared_regime_state", {}),
-            }
+            if alignment_years > 0:
+                block_dlog_by_tech = {
+                    tech: (
+                        compute_realized_block_growth(tech, learning_cfg, state, current_year, years)
+                        if years > 0 else 0.0
+                    )
+                    for tech, years in alignment_years_by_tech.items()
+                }
+                shared_result = simulate_shared_state_runtime(
+                    artifacts,
+                    state,
+                    block_dlog_by_tech,
+                    alignment_years,
+                    rng,
+                    sample_mode,
+                )
+                for tech, years in alignment_years_by_tech.items():
+                    if years == 0:
+                        shared_result["technology_states"][tech]["last_log_capex"] = float(
+                            state["technology_states"][tech]["last_log_capex"]
+                        )
+            else:
+                shared_result = _shared_result_from_current_state(state, artifacts)
         else:
             block_dlog_by_tech = {
                 tech: compute_realized_block_growth(tech, learning_cfg, state, current_year, elapsed_years)
@@ -2146,7 +2352,7 @@ def update_stochastic_runtime_state(
         next_state = {
             **passthrough_fields,
             **runtime_metadata,
-            "last_applied_year": int(current_year),
+            "last_applied_year": next_state_year,
             "technology_states": shared_result["technology_states"],
             "shared_regime_state": shared_result["shared_regime_state"],
             "capacity_history": state.get("capacity_history", {}),
@@ -2167,18 +2373,31 @@ def update_stochastic_runtime_state(
     next_state = {
         **passthrough_fields,
         **runtime_metadata,
-        "last_applied_year": int(current_year),
+        "last_applied_year": next_state_year,
         "technology_states": {},
         "capacity_history": state.get("capacity_history", {}),
         "modeled_capacity_history": state.get("modeled_capacity_history", {}),
     }
     for tech, artifact in artifacts.items():
         state_tech = state["technology_states"][tech]
-        if selected_model == "correlated_geometric_random_walk":
-            result = simulate_cgrw_runtime(artifact, state_tech, elapsed_years, rng, sample_mode)
+        if int(current_year) <= base_year:
+            tech_elapsed_years = int(alignment_years_by_tech.get(tech, 0))
         else:
-            block_dlog = compute_realized_block_growth(tech, learning_cfg, state, current_year, elapsed_years)
-            result = simulate_way_runtime(artifact, state_tech, block_dlog, elapsed_years, rng, sample_mode)
+            tech_elapsed_years = elapsed_years
+        if selected_model == "correlated_geometric_random_walk":
+            result = simulate_cgrw_runtime(artifact, state_tech, tech_elapsed_years, rng, sample_mode)
+        else:
+            if tech_elapsed_years > 0:
+                block_dlog = compute_realized_block_growth(
+                    tech,
+                    learning_cfg,
+                    state,
+                    current_year,
+                    tech_elapsed_years,
+                )
+            else:
+                block_dlog = 0.0
+            result = simulate_way_runtime(artifact, state_tech, block_dlog, tech_elapsed_years, rng, sample_mode)
         next_state["technology_states"][tech] = result["state"]
     learning_costs = _learning_costs_from_stochastic_state(
         artifacts=artifacts,
@@ -3124,7 +3343,7 @@ def main(snakemake):
     else:
         logger.info("No regional WACC file provided - using global WACCs from config")
 
-    if learning_engine != "legacy_curve":
+    if learning_engine == "stochastic_forecast":
         if year in COST_HISTORICAL_CAPACITY_YEARS:
             logger.info(
                 "Using deterministic historical bootstrap for stochastic horizon %s based on historical year %s",
@@ -3239,6 +3458,94 @@ def main(snakemake):
 
         logger.info("=" * 70)
         logger.info(f"Stochastic learning cost application completed for {year}")
+        logger.info("=" * 70)
+        return
+
+    if learning_engine == "exogenous_path":
+        if year in COST_HISTORICAL_CAPACITY_YEARS:
+            logger.info(
+                "Using deterministic historical bootstrap for exogenous horizon %s based on historical year %s",
+                year,
+                COST_HISTORICAL_CAPACITY_YEARS[year],
+            )
+            params = load_learning_params(get_legacy_params_path(learning_cfg))
+            learning_costs = calculate_learning_costs(
+                params,
+                learning_cfg,
+                year,
+                planning_horizons,
+                prev_network_path=None,
+                prior_state_payload=prior_state_payload,
+                costs_file=costs_file,
+                global_scale_factors=global_scale_factors,
+                wacc_dict=wacc_dict,
+            )
+            proposed_state = {
+                **runtime_metadata,
+                "last_applied_year": int(year),
+                "technology_states": {},
+                "capacity_history": prior_state_payload.get("capacity_history", {}),
+                "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+            }
+            cost_log_context = {
+                **runtime_metadata,
+                "planning_horizon": int(year),
+                "lag_year": int(get_cost_lag_year(planning_horizons, year)),
+                "anchor_year": int(get_cost_lag_year(planning_horizons, year)),
+                "anchor_source": "historical_deterministic_bootstrap",
+                "anchor_network": "",
+            }
+        else:
+            learning_costs, exogenous_info = calculate_exogenous_learning_costs(
+                learning_cfg=learning_cfg,
+                selected_model=selected_model,
+                current_year=year,
+                costs_file=costs_file,
+                wacc_dict=wacc_dict,
+                runtime_metadata=runtime_metadata,
+            )
+            proposed_state = {
+                **runtime_metadata,
+                "last_applied_year": int(year),
+                "technology_states": {},
+                "capacity_history": prior_state_payload.get("capacity_history", {}),
+                "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+                "exogenous_cost_path_source": exogenous_info["source"],
+                "exogenous_cost_path_interpolation": exogenous_info["interpolation"],
+            }
+            cost_log_context = {
+                **runtime_metadata,
+                "planning_horizon": int(year),
+                "lag_year": int(year),
+                "anchor_year": int(year),
+                "anchor_source": f"exogenous_cost_path:{exogenous_info['source']}",
+                "anchor_network": "",
+            }
+
+        for tech_costs in learning_costs.values():
+            tech_costs.update(cost_log_context)
+
+        logger.info(
+            "battery_power remains on deterministic default costs from costs_%s.csv in exogenous runtime",
+            year,
+        )
+        logger.info("Exogenous runtime ignores realized deployment for 2030+ cost formation")
+
+        tech_mapping = get_tech_mapping(learning_cfg)
+        n, updates_log = update_network_costs(
+            snakemake.input.network,
+            learning_costs,
+            tech_mapping,
+            snakemake.output.network,
+            learning_cfg,
+            costs_file,
+            learning_rates=None,
+        )
+        save_cost_log(learning_costs, snakemake.output.cost_log)
+        save_learning_state(proposed_state, snakemake.output.state_proposed)
+
+        logger.info("=" * 70)
+        logger.info(f"Exogenous learning cost application completed for {year}")
         logger.info("=" * 70)
         return
 

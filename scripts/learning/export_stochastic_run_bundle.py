@@ -27,6 +27,25 @@ OUTPUT_TABLE_SPECS = {
         "training_window",
         "cost_expectation_mode",
         "cost_expectation_weights_json",
+        "postsolve_c_overnight",
+        "postsolve_c_overnight_terminal_point",
+        "postsolve_capital_cost",
+        "postsolve_capital_cost_terminal_point",
+        "postsolve_log_capex_terminal_point",
+        "postsolve_state_year",
+        "capital_cost_network_median",
+        "capital_cost_network_min",
+        "capital_cost_network_max",
+    ],
+    "system_costs.csv": [
+        "year",
+        "component",
+        "country",
+        "carrier",
+        "technology",
+        "annualized_capital_cost_eur",
+        "operating_cost_eur",
+        "total_system_cost_eur",
     ],
     "system_summary.csv": [
         "year",
@@ -1664,6 +1683,25 @@ def _prepare_learning_costs(cost_log_paths: dict[int, Path]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _prepare_system_costs(system_cost_paths: dict[int, Path]) -> pd.DataFrame:
+    frames = []
+    for year, path in sorted(system_cost_paths.items()):
+        frame = pd.read_csv(path)
+        if "planning_horizon" in frame.columns and "year" not in frame.columns:
+            frame = frame.rename(columns={"planning_horizon": "year"})
+        if "year" not in frame.columns:
+            frame.insert(0, "year", int(year))
+        else:
+            frame["year"] = int(year)
+        for column in OUTPUT_TABLE_SPECS["system_costs.csv"]:
+            if column not in frame.columns:
+                frame[column] = np.nan
+        frames.append(frame.loc[:, OUTPUT_TABLE_SPECS["system_costs.csv"]])
+    if not frames:
+        return _empty_frame("system_costs.csv")
+    return pd.concat(frames, ignore_index=True)
+
+
 def _write_csv(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -1677,9 +1715,19 @@ def _sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int, Path], cost_log_paths: dict[int, Path], state_paths: dict[int, Path], metadata: dict):
+def _extract_bundle(
+    bundle_dir: Path,
+    years: list[int],
+    network_paths: dict[int, Path],
+    cost_log_paths: dict[int, Path],
+    state_paths: dict[int, Path],
+    system_cost_paths: dict[int, Path],
+    statistics_paths: dict[int, Path],
+    metadata: dict,
+):
     tables = {name: _empty_frame(name) for name in OUTPUT_TABLE_SPECS}
     learning_costs = _prepare_learning_costs(cost_log_paths)
+    system_costs = _prepare_system_costs(system_cost_paths)
     previous_capacity = pd.DataFrame(
         columns=["component", "asset", "bus", "country", "carrier", "capacity_unit", "capacity_value"]
     )
@@ -1868,6 +1916,7 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
         system_summary_frames.append(system_summary.loc[:, OUTPUT_TABLE_SPECS["system_summary.csv"]])
 
     tables["learning_costs.csv"] = learning_costs
+    tables["system_costs.csv"] = system_costs
     tables["generation_country_carrier.csv"] = pd.concat(generation_frames, ignore_index=True)
     tables["ac_energy_balance_country_carrier.csv"] = pd.concat(ac_balance_frames, ignore_index=True)
     tables["capacity_country_carrier.csv"] = pd.concat(capacity_frames, ignore_index=True)
@@ -1894,6 +1943,8 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
         "network_sources": {str(year): str(path) for year, path in network_paths.items()},
         "cost_log_sources": {str(year): str(path) for year, path in cost_log_paths.items()},
         "state_sources": {str(year): str(path) for year, path in state_paths.items()},
+        "system_cost_sources": {str(year): str(path) for year, path in system_cost_paths.items()},
+        "statistics_sources": {str(year): str(path) for year, path in statistics_paths.items()},
     }
     (bundle_dir / "run_manifest.json").write_text(
         json.dumps(_sanitize_json(run_manifest), indent=2, sort_keys=True),
@@ -1907,6 +1958,13 @@ def _extract_bundle(bundle_dir: Path, years: list[int], network_paths: dict[int,
         _write_csv(df, output_path)
         checksums[filename] = _sha256(output_path)
         row_counts[filename] = int(len(df))
+
+    statistics_dir = bundle_dir / "statistics_raw"
+    statistics_dir.mkdir(parents=True, exist_ok=True)
+    for year, path in sorted(statistics_paths.items()):
+        copied_path = statistics_dir / f"statistics_{year}.csv"
+        shutil.copy2(path, copied_path)
+        checksums[str(copied_path.relative_to(bundle_dir))] = _sha256(copied_path)
 
     if os.environ.get("LEARNING_COMPACT_FORCE_FAIL") == "1":
         raise RuntimeError("Forced compact-output failure for test coverage.")
@@ -1930,6 +1988,8 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
     network_paths = _map_paths_by_year(list(snakemake.input.networks), years)
     cost_log_paths = _map_paths_by_year(list(snakemake.input.cost_logs), years)
     state_paths = _map_paths_by_year(list(snakemake.input.states), years)
+    system_cost_paths = _map_paths_by_year(list(snakemake.input.system_costs), years)
+    statistics_paths = _map_paths_by_year(list(snakemake.input.statistics), years)
 
     bundle_dir = Path(str(snakemake.params.bundle_dir)).resolve()
     temp_dir = bundle_dir.parent / f".{bundle_dir.name}.tmp"
@@ -1944,7 +2004,16 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
     }
 
     try:
-        _extract_bundle(temp_dir, years, network_paths, cost_log_paths, state_paths, metadata)
+        _extract_bundle(
+            temp_dir,
+            years,
+            network_paths,
+            cost_log_paths,
+            state_paths,
+            system_cost_paths,
+            statistics_paths,
+            metadata,
+        )
         if bundle_dir.exists():
             shutil.rmtree(bundle_dir)
         temp_dir.rename(bundle_dir)

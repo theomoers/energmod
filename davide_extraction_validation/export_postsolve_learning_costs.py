@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export same-year applied learning costs plus post-solve diagnostics.
+"""Export learning-implied costs from the solved network of the same horizon.
 
-The compact learning CSVs should reflect the costs that were actually applied
-to the solved network for the current planning horizon. This script therefore
-uses the base/applied cost log as the primary output and appends explicit
-post-solve diagnostic columns that describe the committed next state.
+This script creates a post-solve diagnostic cost log that keeps the same
+column schema as `apply_learning_costs.py` (`cost_log_*`) but recomputes
+`cumulative_capacity_GW`, `c_overnight`, and `capital_cost` from the solved
+network of the current planning horizon.
 """
 
 import json
@@ -36,6 +36,7 @@ from learning.apply_learning_costs import (
     load_config_learning,
     load_learning_manifest,
     resolve_runtime_seed,
+    save_cost_log,
     update_stochastic_runtime_state,
     validate_runtime_contract,
 )
@@ -43,17 +44,6 @@ from learning.learning_data_io import load_historical_capacity
 
 
 logger = logging.getLogger(__name__)
-
-
-def _cleanup_superseded_learning_inputs(base_cost_log, proposed_state, current_year):
-    """Drop branch-only intermediates once solved outputs are written."""
-    if int(current_year) <= 2025:
-        return
-    for candidate in [base_cost_log, proposed_state]:
-        path = Path(candidate)
-        if path.exists():
-            path.unlink()
-            logger.info("Removed superseded learning intermediate: %s", path)
 
 
 def _stat_frame(metric, value_name):
@@ -193,80 +183,6 @@ def _read_cost_log(path):
     return df
 
 
-def _learning_costs_to_frame(learning_costs):
-    rows = []
-    for tech, payload in learning_costs.items():
-        rows.append({"technology": tech, **payload})
-    return pd.DataFrame(rows)
-
-
-def _extract_network_capital_cost_summaries(network_path, tech_mapping):
-    n = pypsa.Network(network_path)
-    carrier_to_tech = dict(tech_mapping)
-    records = []
-
-    def _append(component_name, frame):
-        if frame.empty or "carrier" not in frame.columns or "capital_cost" not in frame.columns:
-            return
-        local = frame.reset_index(drop=True).copy()
-        local["technology"] = local["carrier"].map(carrier_to_tech)
-        local = local.dropna(subset=["technology", "capital_cost"])
-        if local.empty:
-            return
-        local["component"] = component_name
-        records.extend(
-            local.loc[:, ["technology", "component", "capital_cost"]].to_dict(orient="records")
-        )
-
-    _append("Generator", n.generators)
-    _append("StorageUnit", n.storage_units)
-    _append("Link", n.links)
-    _append("Store", n.stores)
-
-    if not records:
-        return pd.DataFrame(
-            columns=[
-                "technology",
-                "capital_cost_network_median",
-                "capital_cost_network_min",
-                "capital_cost_network_max",
-            ]
-        )
-
-    summary = (
-        pd.DataFrame(records)
-        .groupby("technology", as_index=False)["capital_cost"]
-        .agg(
-            capital_cost_network_median="median",
-            capital_cost_network_min="min",
-            capital_cost_network_max="max",
-        )
-    )
-    return summary
-
-
-def _build_export_learning_cost_log(base_df, postsolve_df, postsolve_state_year, network_capital_summary):
-    export_df = base_df.copy()
-    if "planning_horizon" not in export_df.columns:
-        export_df["planning_horizon"] = pd.to_numeric(export_df.get("year"), errors="coerce")
-
-    rename_map = {
-        "c_overnight": "postsolve_c_overnight",
-        "c_overnight_terminal_point": "postsolve_c_overnight_terminal_point",
-        "capital_cost": "postsolve_capital_cost",
-        "capital_cost_terminal_point": "postsolve_capital_cost_terminal_point",
-        "log_capex_terminal_point": "postsolve_log_capex_terminal_point",
-    }
-    keep_cols = ["technology", *rename_map.keys()]
-    available_cols = [col for col in keep_cols if col in postsolve_df.columns]
-    diagnostics_df = postsolve_df.loc[:, available_cols].rename(columns=rename_map)
-    diagnostics_df["postsolve_state_year"] = int(postsolve_state_year)
-
-    export_df = export_df.merge(diagnostics_df, on="technology", how="left")
-    export_df = export_df.merge(network_capital_summary, on="technology", how="left")
-    return export_df
-
-
 def _to_float(value, fallback):
     """Convert scalar to float with fallback for NaN/None."""
     if pd.isna(value):
@@ -326,18 +242,15 @@ def build_postsolve_cost_log(
             raise ValueError(f"Unexpected unit for {tech}: {unit}")
 
         model_name = row.get("model_name", "")
-        selected_model = row.get("selected_model", model_name)
-        runtime_model = str(selected_model or model_name)
-        stochastic_runtime = runtime_model in {
+        stochastic_runtime = str(model_name) in {
             "shared_state_bayesian_regime_wright",
             "correlated_geometric_random_walk",
             "way_fixed_rho_benchmark_035",
         }
-        exogenous_runtime = runtime_model == "iea_weo_exogenous_path"
 
         A = _to_float(row.get("A"), fallback=0.0)
         beta = _to_float(row.get("beta"), fallback=0.0)
-        if stochastic_runtime or exogenous_runtime:
+        if stochastic_runtime:
             c_overnight = _to_float(row.get("c_overnight"), fallback=0.0)
             capital_cost = _to_float(row.get("capital_cost"), fallback=0.0)
             c_overnight_terminal_point = _to_float(
@@ -373,6 +286,8 @@ def build_postsolve_cost_log(
             row.get("lr_scenario"), fallback=(1.0 - (2.0 ** (-beta)))
         )
         planning_horizon = _to_int(row.get("planning_horizon"), fallback=row.get("year"))
+        selected_model = row.get("selected_model", model_name)
+
         # Keep anchor metadata from original log; lag_year reflects solved-capacity source.
         learning_costs[tech] = {
             "planning_horizon": planning_horizon,
@@ -399,8 +314,8 @@ def build_postsolve_cost_log(
             "log_capex_runtime": log_capex_terminal_point,
             "log_capex_terminal_point": log_capex_terminal_point,
             "wacc_dict": row.get("wacc_dict", None),
-            "model_name": runtime_model,
-            "selected_model": runtime_model,
+            "model_name": model_name,
+            "selected_model": selected_model,
             "training_window": row.get("training_window", ""),
             "training_window_origin_year": _to_int(row.get("training_window_origin_year"), fallback=2020),
             "engine": row.get("engine", ""),
@@ -505,12 +420,8 @@ def main(snakemake):
         solved_capacity_by_tech,
         current_year,
     )
-    network_capital_summary = _extract_network_capital_cost_summaries(
-        solved_network,
-        tech_mapping=tech_mapping,
-    )
 
-    postsolve_learning_costs = build_postsolve_cost_log(
+    learning_costs = build_postsolve_cost_log(
         base_cost_log_df=base_df,
         solved_capacity_by_tech=learning_base_capacity_by_tech,
         learning_cfg=learning_cfg,
@@ -532,8 +443,8 @@ def main(snakemake):
     resolve_runtime_seed(learning_cfg, learning_engine, learning_model, learning_seed)
     validate_runtime_contract(learning_cfg, learning_engine, learning_model)
 
-    if learning_engine == "stochastic_forecast":
-        postsolve_learning_costs, payload = update_stochastic_runtime_state(
+    if learning_engine != "legacy_curve":
+        learning_costs, payload = update_stochastic_runtime_state(
             learning_cfg=learning_cfg,
             selected_model=learning_model,
             current_year=current_year,
@@ -541,11 +452,10 @@ def main(snakemake):
             costs_file=costs_file,
             solved_capacity_by_tech=learning_base_capacity_by_tech,
         )
-        postsolve_df = build_stochastic_postsolve_cost_log(base_df, postsolve_learning_costs, current_year)
-        postsolve_state_year = int(payload.get("last_applied_year", current_year))
+        postsolve_df = build_stochastic_postsolve_cost_log(base_df, learning_costs, current_year)
+        postsolve_df.to_csv(output_cost_log, index=False)
     else:
-        postsolve_df = _learning_costs_to_frame(postsolve_learning_costs)
-        postsolve_state_year = int(current_year)
+        save_cost_log(learning_costs, output_cost_log)
         payload["last_applied_year"] = int(current_year)
         payload["technology_states"] = {
             tech: {
@@ -554,20 +464,10 @@ def main(snakemake):
                 "cumulative_capacity_GW": float(values["cumulative_capacity_GW"]),
                 "unit": values["unit"],
             }
-            for tech, values in postsolve_learning_costs.items()
+            for tech, values in learning_costs.items()
         }
 
-    export_df = _build_export_learning_cost_log(
-        base_df=base_df,
-        postsolve_df=postsolve_df,
-        postsolve_state_year=postsolve_state_year,
-        network_capital_summary=network_capital_summary,
-    )
-    Path(output_cost_log).parent.mkdir(parents=True, exist_ok=True)
-    export_df.to_csv(output_cost_log, index=False)
-
     Path(output_state).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    _cleanup_superseded_learning_inputs(base_cost_log, proposed_state, current_year)
     logger.info("Done")
 
 

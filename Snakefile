@@ -182,7 +182,7 @@ SUPPORTED_STOCHASTIC_LEARNING_MODELS = [
     "way_fixed_rho_benchmark_035",
     "correlated_geometric_random_walk",
 ]
-SUPPORTED_RUNTIME_LEARNING_MODELS = ["legacy_curve", *SUPPORTED_STOCHASTIC_LEARNING_MODELS]
+SUPPORTED_RUNTIME_LEARNING_MODELS = ["legacy_curve", "iea_weo_exogenous_path", *SUPPORTED_STOCHASTIC_LEARNING_MODELS]
 LEGACY_LEARNING_SEED = "deterministic"
 
 
@@ -291,7 +291,7 @@ def build_learning_run_pairs(stochastic_only=False):
     else:
         default_seed_token = get_default_learning_seed_token()
         for model in scenario_models:
-            if model == "legacy_curve":
+            if model in {"legacy_curve", "iea_weo_exogenous_path"}:
                 if not stochastic_only:
                     pairs.append((model, LEGACY_LEARNING_SEED))
             else:
@@ -789,6 +789,72 @@ def compact_learning_branch_state_inputs(w):
 
 def compact_learning_state_inputs(w):
     return compact_learning_bootstrap_state_inputs(w) + compact_learning_branch_state_inputs(w)
+
+
+def compact_learning_bootstrap_system_cost_inputs(w):
+    bootstrap_horizons = get_learning_bootstrap_horizons()
+    if not bootstrap_horizons:
+        return []
+    last_bootstrap = bootstrap_horizons[-1]
+    branch_enabled = bool(get_learning_branch_horizons())
+    paths = []
+    for year in bootstrap_horizons:
+        if branch_enabled and year == last_bootstrap:
+            paths.append(
+                RESDIR
+                + f"learning/system_costs_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+            )
+        else:
+            paths.append(
+                RESDIR
+                + f"learning/system_costs_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
+            )
+    return paths
+
+
+def compact_learning_branch_system_cost_inputs(w):
+    return [
+        RESDIR
+        + f"learning/system_costs_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_system_cost_inputs(w):
+    return compact_learning_bootstrap_system_cost_inputs(w) + compact_learning_branch_system_cost_inputs(w)
+
+
+def compact_learning_bootstrap_statistics_inputs(w):
+    bootstrap_horizons = get_learning_bootstrap_horizons()
+    if not bootstrap_horizons:
+        return []
+    last_bootstrap = bootstrap_horizons[-1]
+    branch_enabled = bool(get_learning_branch_horizons())
+    paths = []
+    for year in bootstrap_horizons:
+        if branch_enabled and year == last_bootstrap:
+            paths.append(
+                RESDIR
+                + f"learning/statistics_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+            )
+        else:
+            paths.append(
+                RESDIR
+                + f"learning/statistics_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
+            )
+    return paths
+
+
+def compact_learning_branch_statistics_inputs(w):
+    return [
+        RESDIR
+        + f"learning/statistics_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_statistics_inputs(w):
+    return compact_learning_bootstrap_statistics_inputs(w) + compact_learning_branch_statistics_inputs(w)
 
 
 def compact_learning_branch_brownfield_inputs(w):
@@ -3581,6 +3647,10 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
                 state_committed=RESDIR
                 + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.json",
+                system_costs=RESDIR
+                + "learning/system_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+                statistics=RESDIR
+                + "learning/statistics_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
             wildcard_constraints:
                 planning_horizons=LEARNING_BOOTSTRAP_HORIZON_PATTERN,
             threads: 1
@@ -3621,6 +3691,10 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
                 state_committed=RESDIR
                 + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+                system_costs=RESDIR
+                + "learning/system_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+                statistics=RESDIR
+                + "learning/statistics_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
             wildcard_constraints:
                 planning_horizons=str(LEARNING_BOOTSTRAP_HORIZONS[-1]),
             threads: 1
@@ -3790,6 +3864,10 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "learning/cost_log_solved_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
             state_committed=RESDIR
             + "learning/state_committed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
+            system_costs=RESDIR
+            + "learning/system_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            statistics=RESDIR
+            + "learning/statistics_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
         threads: 1
         resources:
             mem_mb=5000,
@@ -3809,6 +3887,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             networks=compact_learning_network_inputs,
             cost_logs=compact_learning_cost_log_inputs,
             states=compact_learning_state_inputs,
+            system_costs=compact_learning_system_cost_inputs,
+            statistics=compact_learning_statistics_inputs,
             learning_config="config.learning.yaml",
         output:
             complete=RESDIR
@@ -3837,6 +3917,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             postnetworks=compact_learning_branch_postnetwork_inputs,
             solved_cost_logs=compact_learning_branch_cost_log_inputs,
             committed_states=compact_learning_branch_state_inputs,
+            system_costs=compact_learning_branch_system_cost_inputs,
+            statistics=compact_learning_branch_statistics_inputs,
             lpfiles=compact_learning_branch_lpfile_inputs,
         output:
             marker=RESDIR
