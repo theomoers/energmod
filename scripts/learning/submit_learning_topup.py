@@ -62,7 +62,7 @@ def apply_submission_defaults(args, submit_dir: Path):
     if args.run_mode is None:
         args.run_mode = metadata.get("run_mode", "branch")
     if args.grid_mem is None:
-        args.grid_mem = metadata.get("grid_mem", "200G")
+        args.grid_mem = metadata.get("grid_mem", "90G")
     if args.grid_ncpus is None:
         args.grid_ncpus = metadata.get("grid_ncpus", "40")
     if args.grid_submit is None:

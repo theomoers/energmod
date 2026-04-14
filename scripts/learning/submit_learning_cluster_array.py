@@ -343,7 +343,7 @@ def main():
     parser.add_argument("--job-name", default="learnmc")
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV)
     parser.add_argument("--run-mode", choices=["branch", "full"], default="branch")
-    parser.add_argument("--grid-mem", default="200G")
+    parser.add_argument("--grid-mem", default="90G")
     parser.add_argument("--grid-ncpus", default="16")
     parser.add_argument("--grid-submit", default="batch")
     parser.add_argument("--print-only", action="store_true")

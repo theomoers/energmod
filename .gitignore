@@ -76,6 +76,7 @@ validation/data/.DS_Store
 cluster_submissions/
 cluster_workdirs/
 tests/
+permstorage/bootstrap_snapshots/*
 
 # Specific configuration files
 configs/*

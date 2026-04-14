@@ -4,13 +4,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import math
+from pathlib import Path
 
 import country_converter as coco
 import numpy as np
 import pandas as pd
 import pycountry
 import requests
-from _helpers import content_retrieve
+from _helpers import BASE_DIR, content_retrieve
 from geopy.geocoders import Nominatim
 
 
@@ -221,11 +222,9 @@ def create_cement_db():
     # The following excel file was downloaded from the following webpage https://www.cgfi.ac.uk/spatial-finance-initiative/geoasset-project/cement/.
     # The dataset contains 3117 cement plants globally.
     fn = "https://www.cgfi.ac.uk/wp-content/uploads/2021/08/SFI-Global-Cement-Database-July-2021.xlsx"
-    storage_options = {"User-Agent": "Mozilla/5.0"}
     cement_orig = pd.read_excel(
-        fn,
+        content_retrieve(fn),
         index_col=0,
-        storage_options=storage_options,
         sheet_name="SFI_ALD_Cement_Database",
         header=0,
     )
@@ -391,11 +390,12 @@ def create_paper_df():
 
     fn = "https://www.cgfi.ac.uk/wp-content/uploads/2023/03/SFI_ALD_Pulp_Paper_Sample_LatAm_Jan_2023.xlsx"
 
-    storage_options = {"User-Agent": "Mozilla/5.0"}
+    local_fn = Path(BASE_DIR) / "data" / "SFI_ALD_Pulp_Paper_Sample_LatAm_Jan_2023.xlsx"
+    paper_source = local_fn if local_fn.exists() else content_retrieve(fn)
+    print(f"Using paper dataset from: {paper_source}")
     paper_orig = pd.read_excel(
-        fn,
+        paper_source,
         index_col=0,
-        storage_options=storage_options,
         sheet_name="SFI_ALD_PPM_LatAm",
         header=0,
     )

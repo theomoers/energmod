@@ -1278,5 +1278,6 @@ if __name__ == "__main__":
     n.meta.update(dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards))))
 
     # sanitize_carriers(n, snakemake.config)
+    os.makedirs(os.path.dirname(snakemake.output[0]), exist_ok=True)
 
     n.export_to_netcdf(snakemake.output[0])
