@@ -36,13 +36,14 @@ if (SCRIPTS_DIR / "_helpers.py").exists():
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from _helpers import configure_logging, create_logger
-from learning.learning_data_io import load_historical_capacity
+from learning.learning_data_io import load_historical_capacity, load_historical_cost
 
-# Battery Balance of System (BOS) multiplier
-# Learning happens at cell/pack level (USD historical data), but model uses system costs (EUR)
-# BOS_multiplier converts cell costs to full system costs including inverters, installation, etc.
-# Calibrated to 2020: 246.7088 EUR/kWh (system) / (137 USD/kWh (cell) / 1.14 USD/EUR) = 2.054
-BOS_multiplier = 246.7088 / (137 / 1.14)
+# Battery energy-side BOS multiplier reference year.
+# We derive the multiplier from data as:
+# (battery storage investment cost in costs_2020.csv) /
+# (historical Li-ion pack cost in 2020 EUR/kWh),
+# then apply that multiplier to learning-based battery_energy costs.
+BATTERY_ENERGY_BOS_REFERENCE_YEAR = 2020
 
 # Global scaling factors for technologies where model covers only a fraction of
 # global deployment. Battery energy is handled separately via the bundled
@@ -139,6 +140,90 @@ def get_global_scale_factors(learning_cfg):
 
     logger.info(f"Using global scale factors: {factors}")
     return factors
+
+
+def _resolve_reference_costs_file(costs_file, reference_year):
+    path = Path(costs_file)
+    match = re.search(r"costs_(\d{4})\.csv$", path.name)
+    if not match:
+        raise ValueError(
+            f"Cannot infer reference costs file from path: {costs_file}. "
+            "Expected filename pattern costs_<year>.csv."
+        )
+    candidate = path.with_name(f"costs_{int(reference_year)}.csv")
+    if not candidate.exists():
+        raise FileNotFoundError(
+            f"Reference costs file not found for battery BOS derivation: {candidate}"
+        )
+    return str(candidate)
+
+
+def load_battery_storage_investment_cost(costs_file):
+    """
+    Load battery storage energy investment cost as EUR/kWh from a costs CSV.
+    """
+    df = pd.read_csv(costs_file)
+    rows = df[
+        df["technology"].astype(str).str.strip().eq("battery storage")
+        & df["parameter"].astype(str).str.strip().eq("investment")
+    ]
+    if rows.empty:
+        raise ValueError(
+            f"No battery storage investment row found in costs file: {costs_file}"
+        )
+    value = float(rows.iloc[0]["value"])
+    unit = str(rows.iloc[0]["unit"]).strip().lower()
+    if unit == "eur/kwh":
+        return value
+    if unit == "eur/mwh":
+        return value / 1000.0
+    raise ValueError(
+        f"Unsupported battery storage investment unit '{rows.iloc[0]['unit']}' in {costs_file}. "
+        "Expected EUR/kWh or EUR/MWh."
+    )
+
+
+def get_battery_energy_bos_multiplier(learning_cfg, costs_file):
+    """
+    Return data-derived energy-side multiplier applied to battery_energy costs.
+
+    This multiplier is intended for energy-side adders only and should exclude
+    battery_power components (inverter/power electronics), which are modeled
+    separately on links.
+    """
+    cache = learning_cfg.setdefault("_battery_energy_bos_cache", {})
+    cache_key = f"{Path(costs_file).resolve()}::{BATTERY_ENERGY_BOS_REFERENCE_YEAR}"
+    if cache_key in cache:
+        return float(cache[cache_key])
+
+    reference_costs_file = _resolve_reference_costs_file(
+        costs_file,
+        BATTERY_ENERGY_BOS_REFERENCE_YEAR,
+    )
+    energy_side_system_cost = load_battery_storage_investment_cost(reference_costs_file)
+    liion_pack_cost = float(
+        load_cost_from_historical_csv(
+            "battery_energy",
+            BATTERY_ENERGY_BOS_REFERENCE_YEAR,
+            learning_cfg,
+        )
+    )
+    value = energy_side_system_cost / liion_pack_cost
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"Invalid derived battery energy-side multiplier={value!r}; must be finite and > 0."
+        )
+    logger.info(
+        "Derived battery energy-side multiplier %.4f from %s: "
+        "battery storage investment %.3f EUR/kWh / Li-ion pack %.3f EUR/kWh (year %s)",
+        value,
+        reference_costs_file,
+        energy_side_system_cost,
+        liion_pack_cost,
+        BATTERY_ENERGY_BOS_REFERENCE_YEAR,
+    )
+    cache[cache_key] = float(value)
+    return value
 
 
 def normalize_optional_input(value):
@@ -1512,6 +1597,36 @@ def load_capacity_from_historical_csv(tech, year, learning_cfg):
     return capacity
 
 
+def load_cost_from_historical_csv(tech, year, learning_cfg):
+    """
+    Load cost-per-unit from bundled historical support CSVs for a specific year.
+
+    Returns:
+        Historical overnight cost in EUR/kW or EUR/kWh.
+    """
+    hist_file = get_manifest_historical_datafile(learning_cfg, tech)
+    if hist_file is None:
+        raise ValueError(
+            f"No historical data file configured for {tech}. "
+            "Check the learning artifact manifest."
+        )
+
+    logger.info(f"  Loading {year} cost for {tech} from historical data")
+    hist_data = load_historical_cost(hist_file, tech)
+
+    year_data = hist_data[hist_data["year"] == year]
+    if year_data.empty:
+        raise ValueError(
+            f"Year {year} not found in historical cost data for {tech}. "
+            f"Available years: {hist_data['year'].min():.0f}-{hist_data['year'].max():.0f}"
+        )
+
+    cost_per_unit = float(year_data["cost_per_unit"].iloc[0])
+    unit = "EUR/kWh" if tech in ENERGY_TECHS else "EUR/kW"
+    logger.info(f"    Found {year} cost: {cost_per_unit:.3f} {unit}")
+    return cost_per_unit
+
+
 def load_stochastic_model_artifacts(learning_cfg, selected_model):
     manifest = learning_cfg.get("_manifest", {}) or {}
     root = Path(learning_cfg.get("_manifest_root", "."))
@@ -2656,6 +2771,7 @@ def calculate_learning_costs(
         )
     
     learning_costs = {}
+    battery_energy_bos_multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
     
     for tech in params.index:
         logger.info(f"  Processing {tech}...")
@@ -2724,15 +2840,44 @@ def calculate_learning_costs(
             logger.error(f"    Numerical validation failed: {e}")
             raise
         
-        # Calculate overnight cost using learning curve: c = A * L^(-β)
-        c_overnight_cell = A * (cumulative_capacity ** (-beta))
-        
-        # For batteries, apply BOS multiplier (learning at cell level, costs at system level)
-        if tech == 'battery_energy':
-            c_overnight = c_overnight_cell * BOS_multiplier
-            logger.info(f"    Battery cell cost: {c_overnight_cell:.2f} EUR/{unit}, system cost (×{BOS_multiplier:.4f}): {c_overnight:.2f} EUR/{unit}")
+        if current_year in COST_HISTORICAL_CAPACITY_YEARS:
+            historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
+            try:
+                c_overnight = load_cost_from_historical_csv(tech, historical_year, learning_cfg)
+            except Exception as e:
+                logger.error(f"    Failed to load historical cost for {tech}: {e}")
+                raise ValueError(
+                    f"Failed to load {historical_year} cost for {tech}: {e}"
+                ) from e
+            if tech == 'battery_energy':
+                c_overnight_cell = c_overnight
+                c_overnight = c_overnight_cell * battery_energy_bos_multiplier
+                logger.info(
+                    "    Battery historical Li-ion cost: %.3f EUR/%s, energy-side cost (×%.4f): %.3f EUR/%s",
+                    c_overnight_cell,
+                    unit,
+                    battery_energy_bos_multiplier,
+                    c_overnight,
+                    unit,
+                )
+            logger.info(
+                f"    Using historical lag-year cost for bootstrap: "
+                f"{current_year} <- {historical_year}, c_overnight={c_overnight:.3f} EUR/{unit}"
+            )
         else:
-            c_overnight = c_overnight_cell
+            # Calculate overnight cost using learning curve: c = A * L^(-β)
+            c_overnight_cell = A * (cumulative_capacity ** (-beta))
+
+            # For batteries, apply data-derived energy-side multiplier
+            # (learning at Li-ion pack level, converted to model battery-energy cost object).
+            if tech == 'battery_energy':
+                c_overnight = c_overnight_cell * battery_energy_bos_multiplier
+                logger.info(
+                    f"    Battery cell cost: {c_overnight_cell:.2f} EUR/{unit}, "
+                    f"energy-side cost (×{battery_energy_bos_multiplier:.4f}): {c_overnight:.2f} EUR/{unit}"
+                )
+            else:
+                c_overnight = c_overnight_cell
         
         # Convert to capital_cost (EUR/MW-yr or EUR/MWh-yr)
         # NOTE: For renewable technologies, we calculate a global average capital cost here

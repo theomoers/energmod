@@ -47,7 +47,7 @@
     "regime_intercept": 1,
     "regime_slope": 1,
     "regime_variance": 0,
-    "runtime_seconds": 14.101102749998972,
+    "runtime_seconds": 32.214129792002495,
     "sampler": "metropolis",
     "sigma_mean": 0.060852789472747464,
     "sigma_sd": 0.005151540164105061,
@@ -929,5 +929,5 @@
       0.06040585352457526
     ]
   },
-  "version_hash": "4cbf047a6e5f980e003eaeda406eb6a65bab828c4254671694f7d8264c3cb80e"
+  "version_hash": "e3ceab30123342a0d105d5439b6b9cc501869ebb2c04640c9537d49a87286968"
 }

@@ -1,36 +1,35 @@
-Year,"Cumulative production, GWh"
-1991,0.0
-1992,0.002
-1993,0.013
-1994,0.039
-1995,0.123
-1996,0.498
-1997,0.717
-1998,1.009
-1999,1.511
-2000,2.029
-2001,2.452
-2002,3.441
-2003,5.081
-2004,6.916
-2005,8.627
-2006,11.343
-2007,13.707
-2008,16.813
-2009,19.093
-2010,24.264
-2011,29.68
-2012,34.841
-2013,42.496
-2014,49.649
-2015,62.906
-2016,78.058
-2017,211.058
-2018,392.058
-2019,604.058
-2020,874.058
-2021,1344.058
-2022,2054.058
-2023,3044.058
-2024,4304.058
-2025,5904.058
+Year,"Cumulative production, GWh","Historical cost, 2020 EUR/kWh (Li-ion pack cost)",Cost proxy,Cost scope,Applied network cost treatment
+1992,0.002,5451.4270607,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1993,0.013,4339.94368988,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1994,0.039,4954.3378749700005,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1995,0.123,4649.92093418,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1996,0.498,3916.4497468,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1997,0.717,3353.7992633000003,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1998,1.009,2698.26088765,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+1999,1.511,2043.7839698300002,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2000,2.029,1985.31179944,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2001,2.452,1385.72663448,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2002,3.441,992.815287492,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2003,5.081,767.648051593,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2004,6.916,686.878760942,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2005,8.627,592.161597603,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2006,11.343,507.129578352,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2007,13.707,483.916546485,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2008,16.813,507.395999866,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2009,19.093,451.996788512,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2010,24.264,406.355892941,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2011,29.68,387.080967252,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2012,34.841,398.218629992,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2013,42.496,362.211716485,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2014,49.649,320.43129447399997,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2015,62.906,244.927968025,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2016,78.058,219.988605625,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2017,211.058,171.94781523,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2018,392.058,164.13739866100002,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2019,604.058,137.598597721,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2020,874.058,120.070113935,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2021,1344.058,112.19117953199999,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2022,2054.058,119.952833462,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2023,3044.058,104.429525602,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2024,4304.058,83.26137852080001,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)
+2025,5904.058,76.2053294936,global_liion_pack_cost,global_all_applications,multiply by data-derived battery_energy energy-side multiplier (from battery storage investment / Li-ion pack cost)

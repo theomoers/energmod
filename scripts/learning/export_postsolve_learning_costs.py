@@ -23,11 +23,11 @@ if (SCRIPTS_DIR / "_helpers.py").exists():
 
 from _helpers import mock_snakemake
 from learning.apply_learning_costs import (
-    BOS_multiplier,
     build_learning_base_capacity_map,
     convert_to_capital_cost,
     extract_capacity_from_network,
     get_battery_phi_for_block,
+    get_battery_energy_bos_multiplier,
     get_learning_engine,
     get_manifest_historical_datafile,
     get_selected_learning_model,
@@ -147,7 +147,18 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
 
         prior_years = sorted(int(y) for y in tech_modeled.keys() if int(y) < int(current_year))
         if not prior_years:
-            cumulative_value = _load_historical_cumulative(tech, current_year, learning_cfg)
+            try:
+                cumulative_value = _load_historical_cumulative(tech, current_year, learning_cfg)
+            except ValueError:
+                if tech == "battery_energy":
+                    raise
+                cumulative_value = solved_capacity
+                logger.info(
+                    "No historical cumulative %s value at %s; seeding committed history from solved network: %.3f GW",
+                    tech,
+                    current_year,
+                    solved_capacity,
+                )
         else:
             prev_year = prior_years[-1]
             prev_year_str = str(prev_year)
@@ -305,6 +316,7 @@ def build_postsolve_cost_log(
 ):
     """Recalculate learning costs using solved capacity from current horizon."""
     learning_costs = {}
+    battery_energy_bos_multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
 
     for _, row in base_cost_log_df.iterrows():
         tech = row["technology"]
@@ -353,7 +365,7 @@ def build_postsolve_cost_log(
         else:
             c_overnight = A * (cumulative_capacity ** (-beta))
             if tech == "battery_energy":
-                c_overnight *= BOS_multiplier
+                c_overnight *= battery_energy_bos_multiplier
 
             capital_cost = convert_to_capital_cost(
                 c_overnight=c_overnight,
