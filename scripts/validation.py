@@ -3937,7 +3937,7 @@ def add_year2025_global_capacity_band(n, planning_year, config):
         ext_gen = all_ext_gen.loc[positive_headroom_ext].copy()
 
     fixed_capacity = (
-        fixed_gen.groupby(["constraint_carrier"])["p_nom"].sum()
+        fixed_gen.groupby("constraint_carrier")["p_nom"].sum()
         if not fixed_gen.empty
         else pd.Series(dtype=float)
     )
@@ -3949,7 +3949,7 @@ def add_year2025_global_capacity_band(n, planning_year, config):
                 axis=1,
             )
             .max(axis=1)
-            .groupby([degenerate_ext_gen["constraint_carrier"]])
+            .groupby(degenerate_ext_gen["constraint_carrier"])
             .sum()
         )
         if fixed_capacity.empty:
@@ -3959,8 +3959,8 @@ def add_year2025_global_capacity_band(n, planning_year, config):
 
     ext_groups = {}
     if not ext_gen.empty:
-        for carrier, d in ext_gen.groupby(["constraint_carrier"]):
-            ext_groups[carrier] = pd.Index(d.index)
+        for carrier, d in ext_gen.groupby("constraint_carrier"):
+            ext_groups[str(carrier)] = pd.Index(d.index)
 
     added = 0
     skipped_no_variable_but_satisfied = 0
