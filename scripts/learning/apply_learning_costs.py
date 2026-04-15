@@ -632,7 +632,7 @@ def load_fossil_price_bundle(learning_cfg, config_file):
     historical_path = resolve_manifest_artifact(manifest, bundle_root, "historical_market_prices_csv")
 
     params_df = pd.read_csv(params_path)
-    country_map_df = pd.read_csv(country_map_path)
+    country_map_df = pd.read_csv(country_map_path, keep_default_na=False)
     historical_df = pd.read_csv(historical_path)
     params_df["fuel_type"] = params_df["fuel_type"].astype(str).str.lower()
     params_df["market"] = params_df.apply(
@@ -3318,6 +3318,74 @@ def _resolve_fossil_state(
     }
 
 
+def _is_missing_historical_fossil_price_error(exc):
+    return "Historical market price missing for " in str(exc)
+
+
+def _compute_fossil_block_average_expected_price(
+    *,
+    params_row,
+    start_state,
+    current_year,
+    seed,
+    historical_by_key,
+    expectation_weights,
+):
+    expectation_years = int(len(expectation_weights))
+    first_weight_year = int(current_year) - expectation_years
+    expectation_sequence = []
+    available_weights = []
+    effective_weights = np.zeros(expectation_years, dtype=float)
+    skipped_years = []
+
+    for offset, expectation_year in enumerate(range(first_weight_year, int(current_year))):
+        slot_weight = float(expectation_weights[offset])
+        if slot_weight <= 0.0:
+            continue
+        try:
+            expectation_state = _resolve_fossil_state(
+                params_row=params_row,
+                existing_state=start_state,
+                target_year=expectation_year,
+                seed=seed,
+                historical_by_key=historical_by_key,
+            )
+        except ValueError as exc:
+            if not _is_missing_historical_fossil_price_error(exc):
+                raise
+            skipped_years.append(int(expectation_year))
+            continue
+        expectation_sequence.append(float(expectation_state["realized_price_eur_mwh"]))
+        available_weights.append(slot_weight)
+        effective_weights[offset] = slot_weight
+
+    if not available_weights:
+        fuel_type = str(params_row["fuel_type"])
+        market = str(params_row["market"])
+        raise ValueError(
+            "No historical/realized fossil price points available for "
+            f"{fuel_type}/{market} in expectation window "
+            f"{first_weight_year}-{int(current_year) - 1}."
+        )
+
+    available_weights = np.asarray(available_weights, dtype=float)
+    normalized_weights = available_weights / float(available_weights.sum())
+    effective_weights /= float(available_weights.sum())
+    applied_price = float(np.dot(np.asarray(expectation_sequence, dtype=float), normalized_weights))
+
+    if skipped_years:
+        logger.warning(
+            "Fossil bootstrap expectation window for %s/%s at %s is missing historical years %s; "
+            "renormalizing weights over available years.",
+            str(params_row["fuel_type"]),
+            str(params_row["market"]),
+            int(current_year),
+            skipped_years,
+        )
+
+    return applied_price, json.dumps([float(weight) for weight in effective_weights.tolist()])
+
+
 def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, state_payload):
     cfg = get_fossil_price_cfg(learning_cfg)
     expectation_mode = str(
@@ -3391,27 +3459,18 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
                 )
             terminal_price = float(state["realized_price_eur_mwh"])
             applied_price = terminal_price
+            row_expectation_weights_json = expectation_weights_json
             if expectation_mode == "block_average_expected":
-                expectation_years = int(len(expectation_weights))
-                first_weight_year = int(current_year) - expectation_years
-                expectation_sequence = []
                 start_state = (input_states.get(fuel_type, {}) or {}).get(market)
                 params_row = bundle["params_by_key"][(fuel_type, market)]
-                for expectation_year in range(first_weight_year, int(current_year)):
-                    expectation_state = _resolve_fossil_state(
-                        params_row=params_row,
-                        existing_state=start_state,
-                        target_year=expectation_year,
-                        seed=seed,
-                        historical_by_key=bundle["historical_by_key"],
-                    )
-                    expectation_sequence.append(float(expectation_state["realized_price_eur_mwh"]))
-                if len(expectation_sequence) != expectation_years:
-                    raise ValueError(
-                        f"Expected {expectation_years} fossil expectation points for {fuel_type}/{market}, "
-                        f"got {len(expectation_sequence)}"
-                    )
-                applied_price = float(np.dot(np.asarray(expectation_sequence, dtype=float), expectation_weights))
+                applied_price, row_expectation_weights_json = _compute_fossil_block_average_expected_price(
+                    params_row=params_row,
+                    start_state=start_state,
+                    current_year=current_year,
+                    seed=seed,
+                    historical_by_key=bundle["historical_by_key"],
+                    expectation_weights=expectation_weights,
+                )
             country_rows.append(
                 {
                     "learning_seed": runtime_metadata.get("learning_seed", ""),
@@ -3422,7 +3481,7 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
                     "applied_price_eur_mwh": applied_price,
                     "price_terminal_point_eur_mwh": terminal_price,
                     "fossil_price_expectation_mode": expectation_mode,
-                    "fossil_price_expectation_weights_json": expectation_weights_json,
+                    "fossil_price_expectation_weights_json": row_expectation_weights_json,
                     "last_state_year": int(state["last_state_year"]),
                     "source_state_year": int(state["source_state_year"]),
                 }
