@@ -95,13 +95,23 @@ SUPPORTED_SAMPLE_MODES = {"single_draw", "median"}
 SUPPORTED_TRAINING_WINDOWS = {"origin_cutoff", "full_sample"}
 SUPPORTED_COST_EXPECTATION_MODES = {"point_cost", "block_average_expected"}
 SUPPORTED_FOSSIL_PRICE_EXPECTATION_MODES = {"point_cost", "block_average_expected"}
+SUPPORTED_COST_EXPECTATION_KERNEL_MODES = {
+    "global_current_window",
+    "technology_specific_lagged_window",
+}
 BATTERY_POWER_TREATMENT = "deterministic_default_costs"
 LEGACY_LEARNING_SEED = "deterministic"
 DEFAULT_COST_EXPECTATION_MODE = "point_cost"
+DEFAULT_COST_EXPECTATION_KERNEL_MODE = "global_current_window"
 DEFAULT_FOSSIL_PRICE_EXPECTATION_MODE = "point_cost"
 BLOCK_EXPECTATION_DRAWS = 1000
 DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS = (0.2, 0.2, 0.2, 0.2, 0.2)
 DEFAULT_FOSSIL_PRICE_ANNUAL_STEP = 1
+DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH = {
+    "solar_power": 3,
+    "onwind_power": 4,
+    "battery_energy": 2,
+}
 
 # Mapping of solve horizon to the historical lag-year used for bootstrap
 # cumulative capacity (experience) before switching to solved lagged blocks.
@@ -795,6 +805,81 @@ def get_cost_expectation_weights_json(learning_cfg):
     return json.dumps([float(weight) for weight in weights.tolist()])
 
 
+def get_requested_cost_expectation_kernel_mode(learning_cfg):
+    cfg = learning_cfg.get("cost_expectations", {}) or {}
+    mode = str(cfg.get("kernel_mode", DEFAULT_COST_EXPECTATION_KERNEL_MODE))
+    if mode not in SUPPORTED_COST_EXPECTATION_KERNEL_MODES:
+        raise ValueError(
+            f"Unsupported learning.cost_expectations.kernel_mode='{mode}'. "
+            f"Supported values: {sorted(SUPPORTED_COST_EXPECTATION_KERNEL_MODES)}"
+        )
+    return mode
+
+
+def get_cost_expectation_lag_years_by_tech(learning_cfg):
+    cfg = learning_cfg.get("cost_expectations", {}) or {}
+    raw = cfg.get("lag_years_by_tech", None)
+    values = DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH.copy()
+    if raw is None:
+        return values
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "learning.cost_expectations.lag_years_by_tech must be a mapping of "
+            "technology -> non-negative integer lag."
+        )
+
+    missing = sorted(set(DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH) - set(raw))
+    extra = sorted(set(raw) - set(DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH))
+    if missing or extra:
+        raise ValueError(
+            "learning.cost_expectations.lag_years_by_tech must contain exactly "
+            f"{sorted(DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH)} "
+            f"(missing={missing}, extra={extra})."
+        )
+
+    for tech in DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH:
+        value = raw[tech]
+        if not isinstance(value, (int, np.integer)):
+            raise ValueError(
+                "learning.cost_expectations.lag_years_by_tech values must be non-negative integers."
+            )
+        if int(value) < 0:
+            raise ValueError(
+                "learning.cost_expectations.lag_years_by_tech values must be non-negative."
+            )
+        values[tech] = int(value)
+    return values
+
+
+def get_cost_expectation_lag_years_json(learning_cfg):
+    return json.dumps(get_cost_expectation_lag_years_by_tech(learning_cfg), sort_keys=True)
+
+
+def build_lagged_kernel_years(network_year, lag_year, kernel_length=5):
+    network_year = int(network_year)
+    lag_year = int(lag_year)
+    kernel_length = int(kernel_length)
+    if kernel_length <= 0:
+        raise ValueError(f"Kernel length must be positive (got {kernel_length}).")
+    start_year = network_year - lag_year - kernel_length + 1
+    return [int(start_year + offset) for offset in range(kernel_length)]
+
+
+def split_kernel_years(kernel_years, committed_year):
+    committed_year = int(committed_year)
+    known_years = [int(year) for year in kernel_years if int(year) <= committed_year]
+    expected_years = [int(year) for year in kernel_years if int(year) > committed_year]
+    return known_years, expected_years
+
+
+def _serialize_year_list(years):
+    return json.dumps([int(year) for year in years])
+
+
+def _serialize_float_list(values):
+    return json.dumps([float(value) for value in values])
+
+
 def get_requested_fossil_price_expectation_mode(learning_cfg):
     cfg = get_fossil_price_cfg(learning_cfg)
     mode = str(cfg.get("expectation_mode", DEFAULT_FOSSIL_PRICE_EXPECTATION_MODE))
@@ -870,7 +955,9 @@ def build_runtime_metadata(learning_cfg, learning_engine, selected_model, cost_e
         "manifest_sha256": str(learning_cfg.get("_manifest_sha256", "")),
         "battery_power_treatment": BATTERY_POWER_TREATMENT,
         "cost_expectation_mode": str(cost_expectation_mode),
+        "cost_expectation_kernel_mode": get_requested_cost_expectation_kernel_mode(learning_cfg),
         "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg),
+        "cost_expectation_lag_years_json": get_cost_expectation_lag_years_json(learning_cfg),
         "fossil_price_uncertainty_enabled": bool(fossil_cfg["enabled"]),
         "fossil_price_bundle_path": str(fossil_bundle.get("manifest_path", "")),
         "fossil_price_bundle_schema_version": str(fossil_bundle.get("schema_version", "")),
@@ -1021,7 +1108,9 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
         )
 
     get_requested_cost_expectation_mode(learning_cfg)
+    get_requested_cost_expectation_kernel_mode(learning_cfg)
     get_cost_expectation_weights(learning_cfg)
+    get_cost_expectation_lag_years_by_tech(learning_cfg)
     get_fossil_price_cfg(learning_cfg)
     get_requested_fossil_price_expectation_mode(learning_cfg)
     get_fossil_price_expectation_weights(learning_cfg)
@@ -1181,6 +1270,20 @@ def _lookup_exogenous_point_cost(exogenous_df, technology, year):
     return float(row.iloc[0]["c_overnight"])
 
 
+def _lookup_exogenous_annual_cost(exogenous_df, technology, year):
+    tech_df = exogenous_df[exogenous_df["technology"] == technology].copy().sort_values("year")
+    if tech_df.empty:
+        raise ValueError(f"Exogenous cost path is missing technology {technology}")
+    lookup = tech_df.set_index("year")["c_overnight"].to_dict()
+    year = int(year)
+    if year in lookup:
+        return float(lookup[year])
+    last_year = int(tech_df["year"].max())
+    if year > last_year:
+        return float(lookup[last_year])
+    raise ValueError(f"Exogenous cost path is missing {technology} at year {year}")
+
+
 def _lookup_exogenous_future_costs(exogenous_df, technology, start_year, n_years):
     tech_df = exogenous_df[exogenous_df["technology"] == technology].copy().sort_values("year")
     if tech_df.empty:
@@ -1210,19 +1313,53 @@ def calculate_exogenous_learning_costs(
 ):
     exogenous_df, info = load_exogenous_cost_path(learning_cfg, selected_model)
     cost_expectation_mode = str((runtime_metadata or {}).get("cost_expectation_mode", DEFAULT_COST_EXPECTATION_MODE))
+    kernel_mode = str(
+        (runtime_metadata or {}).get(
+            "cost_expectation_kernel_mode",
+            get_requested_cost_expectation_kernel_mode(learning_cfg),
+        )
+    )
     weights = get_cost_expectation_weights(learning_cfg)
     horizon_years = len(weights)
+    lag_years_by_tech = get_cost_expectation_lag_years_by_tech(learning_cfg)
 
     learning_costs = {}
     for tech in ("solar_power", "onwind_power", "battery_energy"):
         point_cost = _lookup_exogenous_point_cost(exogenous_df, tech, current_year)
         if cost_expectation_mode == "block_average_expected":
-            future_costs = _lookup_exogenous_future_costs(exogenous_df, tech, int(current_year) + 1, horizon_years)
-            applied_c_overnight = float(np.dot(future_costs, weights))
-            terminal_c_overnight = float(future_costs[-1])
+            if kernel_mode == "technology_specific_lagged_window":
+                kernel_years = build_lagged_kernel_years(
+                    current_year,
+                    lag_years_by_tech[tech],
+                    kernel_length=horizon_years,
+                )
+                kernel_costs = [
+                    _lookup_exogenous_annual_cost(exogenous_df, tech, year) for year in kernel_years
+                ]
+                applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+                terminal_c_overnight = float(point_cost)
+                kernel_diag = {
+                    "kernel_year_start": int(kernel_years[0]),
+                    "kernel_year_end": int(kernel_years[-1]),
+                    "kernel_years_json": _serialize_year_list(kernel_years),
+                    "known_kernel_years_json": _serialize_year_list([]),
+                    "expected_kernel_years_json": _serialize_year_list(kernel_years),
+                    "applied_kernel_costs_json": _serialize_float_list(kernel_costs),
+                }
+            else:
+                future_costs = _lookup_exogenous_future_costs(
+                    exogenous_df,
+                    tech,
+                    int(current_year) + 1,
+                    horizon_years,
+                )
+                applied_c_overnight = float(np.dot(future_costs, weights))
+                terminal_c_overnight = float(future_costs[-1])
+                kernel_diag = {}
         else:
             applied_c_overnight = float(point_cost)
             terminal_c_overnight = float(point_cost)
+            kernel_diag = {}
 
         record = _runtime_cost_record(
             tech=tech,
@@ -1240,6 +1377,7 @@ def calculate_exogenous_learning_costs(
             wacc_dict=wacc_dict,
         )
         record["cumulative_capacity_GW"] = 0.0
+        record.update(kernel_diag)
         learning_costs[tech] = record
     return learning_costs, info
 
@@ -1881,6 +2019,73 @@ def load_average_cost_from_historical_csv(tech, start_year, end_year, learning_c
     return average_cost
 
 
+def _normalize_annual_cost_history(state):
+    raw_history = (state.get("annual_cost_history", {}) or {})
+    normalized = {}
+    for tech, year_map in raw_history.items():
+        cleaned = {}
+        for year_key, value in (year_map or {}).items():
+            cleaned[str(int(year_key))] = float(value)
+        normalized[str(tech)] = cleaned
+    state["annual_cost_history"] = normalized
+    return normalized
+
+
+def get_known_annual_cost_for_year(tech, year, state, learning_cfg):
+    year = int(year)
+    current_year = int(state.get("last_applied_year", year))
+    if year > current_year:
+        raise ValueError(
+            f"Cannot load known annual cost for {tech} in future year {year} "
+            f"when committed state year is {current_year}."
+        )
+
+    if year == current_year:
+        return float(np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0)
+
+    annual_cost_history = _normalize_annual_cost_history(state)
+    tech_history = (annual_cost_history.get(str(tech), {}) or {})
+    history_key = str(year)
+    if history_key in tech_history:
+        return float(tech_history[history_key])
+
+    return float(load_cost_from_historical_csv(tech, year, learning_cfg))
+
+
+def _record_annual_cost_history_from_paths(
+    annual_log_cost_paths_by_tech,
+    base_year,
+    sample_mode,
+):
+    history = {}
+    base_year = int(base_year)
+    for tech, path in annual_log_cost_paths_by_tech.items():
+        arr = np.asarray(path, dtype=float)
+        tech_history = {}
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        for idx in range(arr.shape[1]):
+            levels = np.exp(arr[:, idx]) / 1000.0
+            tech_history[str(base_year + idx + 1)] = float(_single_or_median(levels, sample_mode))
+        history[tech] = tech_history
+    return history
+
+
+def _merge_annual_cost_history(base_history, updates):
+    merged = {}
+    for tech, year_map in (base_history or {}).items():
+        merged[str(tech)] = {
+            str(int(year_key)): float(value) for year_key, value in (year_map or {}).items()
+        }
+    for tech, year_map in (updates or {}).items():
+        tech_key = str(tech)
+        if tech_key not in merged:
+            merged[tech_key] = {}
+        for year_key, value in (year_map or {}).items():
+            merged[tech_key][str(int(year_key))] = float(value)
+    return merged
+
+
 def load_stochastic_model_artifacts(learning_cfg, selected_model):
     manifest = learning_cfg.get("_manifest", {}) or {}
     root = Path(learning_cfg.get("_manifest_root", "."))
@@ -1925,6 +2130,7 @@ def _reinitialize_stochastic_runtime_state_for_model(state, initial_state, selec
     reinitialized = json.loads(json.dumps(initial_state))
     passthrough_keys = [
         "capacity_history",
+        "annual_cost_history",
         "modeled_capacity_history",
         "last_applied_year",
         "committed_from_network",
@@ -1972,6 +2178,7 @@ def _backfill_stochastic_runtime_state_fields(state, initial_state, selected_mod
         base_state.update(merged_states.get(tech, {}) or {})
         merged_states[tech] = base_state
     state["technology_states"] = merged_states
+    _normalize_annual_cost_history(state)
 
     if selected_model == "shared_state_bayesian_regime_wright" and "shared_regime_state" not in state:
         if "shared_regime_state" in initial_state:
@@ -2103,6 +2310,7 @@ def _state_to_runtime_learning_costs(
     return _learning_costs_from_stochastic_state(
         artifacts=artifacts,
         state=state,
+        current_year=current_year,
         selected_model=selected_model,
         cumulative_capacity_map=runtime_capacity_map,
         learning_cfg=learning_cfg,
@@ -2115,6 +2323,7 @@ def _state_to_runtime_learning_costs(
 def _learning_costs_from_stochastic_state(
     artifacts,
     state,
+    current_year,
     selected_model,
     cumulative_capacity_map,
     learning_cfg,
@@ -2129,6 +2338,7 @@ def _learning_costs_from_stochastic_state(
         expectation_diagnostics = _compute_block_average_expected_costs(
             artifacts=artifacts,
             state=state,
+            current_year=current_year,
             selected_model=selected_model,
             learning_cfg=learning_cfg,
             costs_file=costs_file,
@@ -2136,6 +2346,7 @@ def _learning_costs_from_stochastic_state(
     for tech, artifact in artifacts.items():
         if tech not in cumulative_capacity_map:
             raise ValueError(f"Technology {tech} missing in runtime capacity map")
+        diag = None
         state_tech = (state.get("technology_states", {}) or {}).get(tech, {}) or {}
         log_cost = float(state_tech["last_log_capex"])
         point_c_overnight = float(np.exp(log_cost) / 1000.0)
@@ -2166,6 +2377,8 @@ def _learning_costs_from_stochastic_state(
         if cost_expectation_mode != "block_average_expected":
             record["log_capex_runtime"] = log_cost
             record["log_capex_terminal_point"] = log_cost
+        elif diag:
+            record.update(diag)
         learning_costs[tech] = record
     return learning_costs
 
@@ -2254,60 +2467,88 @@ def _runtime_cost_expectation_rng(seed, state):
     return np.random.default_rng(int(seed) + 1000 * base_year + 17)
 
 
-def _compute_block_average_expected_costs(
+def _simulate_frozen_block_expectation_annual_paths(
     artifacts,
     state,
     selected_model,
-    learning_cfg,
-    costs_file,
+    elapsed_years,
+    rng,
 ):
-    weights = get_cost_expectation_weights(learning_cfg)
-    expectation_years = int(len(weights))
-    seed = int(learning_cfg.get("seed", 0))
-    rng = _runtime_cost_expectation_rng(seed, state)
+    elapsed_years = int(elapsed_years)
+    if elapsed_years <= 0:
+        return {tech: _empty_annual_log_cost_paths(BLOCK_EXPECTATION_DRAWS, 0) for tech in artifacts}
 
     if selected_model == "shared_state_bayesian_regime_wright":
         annual_result = simulate_shared_state_runtime(
             artifacts=artifacts,
             state=state,
             block_dlog_experience_by_tech={tech: 0.0 for tech in artifacts},
-            elapsed_years=expectation_years,
+            elapsed_years=elapsed_years,
             rng=rng,
             sample_mode="single_draw",
             n_samples=BLOCK_EXPECTATION_DRAWS,
         )
-        annual_paths = annual_result["annual_log_cost_paths"]
-    elif selected_model == "correlated_geometric_random_walk":
-        annual_paths = {}
-        for tech, artifact in artifacts.items():
+        return annual_result["annual_log_cost_paths"]
+
+    annual_paths = {}
+    for tech, artifact in artifacts.items():
+        if selected_model == "correlated_geometric_random_walk":
             annual_paths[tech] = simulate_cgrw_runtime(
                 artifact=artifact,
                 state=state["technology_states"][tech],
-                elapsed_years=expectation_years,
+                elapsed_years=elapsed_years,
                 rng=rng,
                 sample_mode="single_draw",
                 n_samples=BLOCK_EXPECTATION_DRAWS,
             )["annual_log_cost_paths"]
-    elif selected_model == "way_fixed_rho_benchmark_035":
-        annual_paths = {}
-        for tech, artifact in artifacts.items():
+        elif selected_model == "way_fixed_rho_benchmark_035":
             annual_paths[tech] = simulate_way_runtime(
                 artifact=artifact,
                 state=state["technology_states"][tech],
                 block_dlog_experience=0.0,
-                elapsed_years=expectation_years,
+                elapsed_years=elapsed_years,
                 rng=rng,
                 sample_mode="single_draw",
                 n_samples=BLOCK_EXPECTATION_DRAWS,
             )["annual_log_cost_paths"]
-    else:
-        raise ValueError(f"Unsupported stochastic model for block-average expectations: {selected_model}")
+        else:
+            raise ValueError(
+                f"Unsupported stochastic model for block-average expectations: {selected_model}"
+            )
+    return annual_paths
 
+
+def _expected_annual_level_costs_from_paths(annual_paths, base_year):
+    expected = {}
+    base_year = int(base_year)
+    for tech, path in annual_paths.items():
+        arr = np.asarray(path, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        tech_expected = {}
+        for idx in range(arr.shape[1]):
+            tech_expected[int(base_year) + idx + 1] = float(np.mean(np.exp(arr[:, idx]) / 1000.0))
+        expected[tech] = tech_expected
+    return expected
+
+
+def _legacy_global_current_window_diagnostics(
+    artifacts,
+    state,
+    annual_paths,
+    weights,
+    learning_cfg,
+    costs_file,
+):
+    expectation_years = int(len(weights))
     diagnostics = {}
+    base_year = int(state.get("last_applied_year", 0))
+    kernel_years = [int(base_year + offset) for offset in range(expectation_years)]
     for tech, path in annual_paths.items():
         if path.shape[1] != expectation_years:
             raise ValueError(
-                f"Expected {expectation_years} annual path steps for {selected_model}/{tech}, got {path.shape[1]}"
+                f"Expected {expectation_years} annual path steps for legacy block expectations "
+                f"for {tech}, got {path.shape[1]}"
             )
         level_costs = np.exp(path) / 1000.0
         endpoint_level = float(np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0)
@@ -2318,21 +2559,120 @@ def _compute_block_average_expected_costs(
             ],
             axis=1,
         )
-        if expectation_sequence.shape[1] != expectation_years:
-            raise ValueError(
-                f"Expected {expectation_years} expectation-sequence points for {selected_model}/{tech}, "
-                f"got {expectation_sequence.shape[1]}"
-            )
         weighted_costs = expectation_sequence @ weights
         applied_c_overnight = float(np.mean(weighted_costs))
         terminal_c_overnight = float(np.mean(level_costs[:, -1]))
-        diagnostics[tech] = _cost_statistics_from_levels(
-            applied_c_overnight=applied_c_overnight,
-            terminal_c_overnight=terminal_c_overnight,
+        diagnostics[tech] = {
+            **_cost_statistics_from_levels(
+                applied_c_overnight=applied_c_overnight,
+                terminal_c_overnight=terminal_c_overnight,
+                learning_cfg=learning_cfg,
+                costs_file=costs_file,
+                tech=tech,
+            ),
+            "kernel_year_start": int(kernel_years[0]),
+            "kernel_year_end": int(kernel_years[-1]),
+            "kernel_years_json": _serialize_year_list(kernel_years),
+            "known_kernel_years_json": _serialize_year_list(kernel_years[:1]),
+            "expected_kernel_years_json": _serialize_year_list(kernel_years[1:]),
+            "applied_kernel_costs_json": _serialize_float_list(
+                [endpoint_level] + [float(np.mean(level_costs[:, idx])) for idx in range(level_costs.shape[1] - 1)]
+            ),
+        }
+    return diagnostics
+
+
+def _compute_block_average_expected_costs(
+    artifacts,
+    state,
+    current_year,
+    selected_model,
+    learning_cfg,
+    costs_file,
+):
+    weights = get_cost_expectation_weights(learning_cfg)
+    kernel_length = int(len(weights))
+    kernel_mode = get_requested_cost_expectation_kernel_mode(learning_cfg)
+    lag_years_by_tech = get_cost_expectation_lag_years_by_tech(learning_cfg)
+    committed_year = int(state.get("last_applied_year", current_year))
+    seed = int(learning_cfg.get("seed", 0))
+    rng = _runtime_cost_expectation_rng(seed, state)
+
+    if kernel_mode == "global_current_window":
+        annual_paths = _simulate_frozen_block_expectation_annual_paths(
+            artifacts=artifacts,
+            state=state,
+            selected_model=selected_model,
+            elapsed_years=kernel_length,
+            rng=rng,
+        )
+        return _legacy_global_current_window_diagnostics(
+            artifacts=artifacts,
+            state=state,
+            annual_paths=annual_paths,
+            weights=weights,
             learning_cfg=learning_cfg,
             costs_file=costs_file,
-            tech=tech,
         )
+
+    kernel_years_by_tech = {
+        tech: build_lagged_kernel_years(current_year, lag_years_by_tech[tech], kernel_length=kernel_length)
+        for tech in artifacts
+    }
+    max_expected_year = max(
+        [
+            max(split_kernel_years(kernel_years, committed_year)[1])
+            for kernel_years in kernel_years_by_tech.values()
+            if split_kernel_years(kernel_years, committed_year)[1]
+        ]
+        or [int(current_year)]
+    )
+    max_expected_year = max(int(current_year), int(max_expected_year))
+    annual_paths = _simulate_frozen_block_expectation_annual_paths(
+        artifacts=artifacts,
+        state=state,
+        selected_model=selected_model,
+        elapsed_years=max(0, max_expected_year - committed_year),
+        rng=rng,
+    )
+    expected_costs_by_tech = _expected_annual_level_costs_from_paths(annual_paths, committed_year)
+
+    diagnostics = {}
+    for tech in artifacts:
+        kernel_years = kernel_years_by_tech[tech]
+        known_years, expected_years = split_kernel_years(kernel_years, committed_year)
+        kernel_costs = []
+        for year in kernel_years:
+            if int(year) <= committed_year:
+                kernel_costs.append(get_known_annual_cost_for_year(tech, year, state, learning_cfg))
+            else:
+                tech_expected = expected_costs_by_tech.get(tech, {})
+                if int(year) not in tech_expected:
+                    raise ValueError(
+                        f"Missing expected annual cost for {tech} in {year} "
+                        f"(committed_year={committed_year}, priced_year={current_year})."
+                    )
+                kernel_costs.append(float(tech_expected[int(year)]))
+        terminal_c_overnight = expected_costs_by_tech.get(tech, {}).get(
+            int(current_year),
+            float(np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0),
+        )
+        applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+        diagnostics[tech] = {
+            **_cost_statistics_from_levels(
+                applied_c_overnight=applied_c_overnight,
+                terminal_c_overnight=terminal_c_overnight,
+                learning_cfg=learning_cfg,
+                costs_file=costs_file,
+                tech=tech,
+            ),
+            "kernel_year_start": int(kernel_years[0]),
+            "kernel_year_end": int(kernel_years[-1]),
+            "kernel_years_json": _serialize_year_list(kernel_years),
+            "known_kernel_years_json": _serialize_year_list(known_years),
+            "expected_kernel_years_json": _serialize_year_list(expected_years),
+            "applied_kernel_costs_json": _serialize_float_list(kernel_costs),
+        }
     return diagnostics
 
 
@@ -2657,6 +2997,7 @@ def update_stochastic_runtime_state(
     for key in ("committed_from_network", "enabled", "fossil_price_states"):
         if key in state:
             passthrough_fields[key] = state[key]
+    existing_annual_cost_history = _normalize_annual_cost_history(state)
 
     base_year = int(state.get("last_applied_year", current_year))
     elapsed_years = max(0, int(current_year) - base_year)
@@ -2725,11 +3066,22 @@ def update_stochastic_runtime_state(
             "technology_states": shared_result["technology_states"],
             "shared_regime_state": shared_result["shared_regime_state"],
             "capacity_history": state.get("capacity_history", {}),
+            "annual_cost_history": existing_annual_cost_history,
             "modeled_capacity_history": state.get("modeled_capacity_history", {}),
         }
+        if int(current_year) > base_year and "annual_log_cost_paths" in shared_result:
+            next_state["annual_cost_history"] = _merge_annual_cost_history(
+                existing_annual_cost_history,
+                _record_annual_cost_history_from_paths(
+                    shared_result["annual_log_cost_paths"],
+                    base_year=base_year,
+                    sample_mode=sample_mode,
+                ),
+            )
         learning_costs = _learning_costs_from_stochastic_state(
             artifacts=artifacts,
             state=next_state,
+            current_year=current_year,
             selected_model=selected_model,
             cumulative_capacity_map=solved_capacity_by_tech,
             learning_cfg=learning_cfg,
@@ -2745,8 +3097,10 @@ def update_stochastic_runtime_state(
         "last_applied_year": next_state_year,
         "technology_states": {},
         "capacity_history": state.get("capacity_history", {}),
+        "annual_cost_history": existing_annual_cost_history,
         "modeled_capacity_history": state.get("modeled_capacity_history", {}),
     }
+    annual_log_cost_paths_by_tech = {}
     for tech, artifact in artifacts.items():
         state_tech = state["technology_states"][tech]
         if int(current_year) <= base_year:
@@ -2768,9 +3122,21 @@ def update_stochastic_runtime_state(
                 block_dlog = 0.0
             result = simulate_way_runtime(artifact, state_tech, block_dlog, tech_elapsed_years, rng, sample_mode)
         next_state["technology_states"][tech] = result["state"]
+        if int(current_year) > base_year:
+            annual_log_cost_paths_by_tech[tech] = result["annual_log_cost_paths"]
+    if annual_log_cost_paths_by_tech:
+        next_state["annual_cost_history"] = _merge_annual_cost_history(
+            existing_annual_cost_history,
+            _record_annual_cost_history_from_paths(
+                annual_log_cost_paths_by_tech,
+                base_year=base_year,
+                sample_mode=sample_mode,
+            ),
+        )
     learning_costs = _learning_costs_from_stochastic_state(
         artifacts=artifacts,
         state=next_state,
+        current_year=current_year,
         selected_model=selected_model,
         cumulative_capacity_map=solved_capacity_by_tech,
         learning_cfg=learning_cfg,
@@ -3961,7 +4327,9 @@ def save_cost_log(learning_costs, output_file):
         "manifest_path",
         "battery_power_treatment",
         "cost_expectation_mode",
+        "cost_expectation_kernel_mode",
         "cost_expectation_weights_json",
+        "cost_expectation_lag_years_json",
         "fossil_price_uncertainty_enabled",
         "fossil_price_bundle_path",
         "fossil_price_bundle_schema_version",
@@ -3997,6 +4365,12 @@ def save_cost_log(learning_costs, output_file):
         "unit",
         "c_overnight",
         "c_overnight_terminal_point",
+        "kernel_year_start",
+        "kernel_year_end",
+        "kernel_years_json",
+        "known_kernel_years_json",
+        "expected_kernel_years_json",
+        "applied_kernel_costs_json",
         "log_capex_runtime",
         "log_capex_terminal_point",
         "wacc_dict",

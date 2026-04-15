@@ -24,7 +24,12 @@ learning:
   seed: 0                      # used only by stochastic_forecast
   cost_expectations:
     mode: block_average_expected         # point_cost | block_average_expected
+    kernel_mode: technology_specific_lagged_window   # global_current_window | technology_specific_lagged_window
     annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
+    lag_years_by_tech:
+      solar_power: 3
+      onwind_power: 4
+      battery_energy: 2
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false
@@ -41,10 +46,10 @@ learning:
     cleanup_heavy_raws: true
     price_shadow_resolution: annual_summary
   fossil_price_uncertainty:
-    enabled: false
+    enabled: true
     bundle_root: "data/fuel-price-data"
     fallback_to_static_prices: false
     annual_step: 1
     fuels: ["oil", "gas", "coal"]
-    expectation_mode: point_cost   # point_cost | block_average_expected
+    expectation_mode: block_average_expected   # point_cost | block_average_expected
     annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # when block_average_expected, first weight is previous-horizon year (e.g. 2025 for 2030 pricing)

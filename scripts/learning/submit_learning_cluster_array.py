@@ -33,6 +33,11 @@ SUPPORTED_MODELS = [
     "way_fixed_rho_benchmark_035",
     "correlated_geometric_random_walk",
 ]
+SUPPORTED_COST_EXPECTATION_KERNEL_MODES = {
+    "global_current_window",
+    "technology_specific_lagged_window",
+}
+SUPPORTED_COST_EXPECTATION_LAG_TECHS = ("solar_power", "onwind_power", "battery_energy")
 DEFAULT_GRID_ARRAY_CONCURRENCY = 200
 
 
@@ -80,6 +85,34 @@ def _validate_cost_expectation_weights(weights):
     return values
 
 
+def _validate_cost_expectation_kernel_mode(mode):
+    mode = str(mode).strip()
+    if mode not in SUPPORTED_COST_EXPECTATION_KERNEL_MODES:
+        raise ValueError(
+            f"cost expectation kernel_mode must be one of {sorted(SUPPORTED_COST_EXPECTATION_KERNEL_MODES)}"
+        )
+    return mode
+
+
+def _validate_cost_expectation_lag_years_by_tech(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("lag_years_by_tech must be a mapping of technology -> non-negative integer")
+    missing = sorted(set(SUPPORTED_COST_EXPECTATION_LAG_TECHS) - set(payload))
+    extra = sorted(set(payload) - set(SUPPORTED_COST_EXPECTATION_LAG_TECHS))
+    if missing or extra:
+        raise ValueError(
+            f"lag_years_by_tech must contain exactly {list(SUPPORTED_COST_EXPECTATION_LAG_TECHS)} "
+            f"(missing={missing}, extra={extra})"
+        )
+    validated = {}
+    for tech in SUPPORTED_COST_EXPECTATION_LAG_TECHS:
+        value = payload[tech]
+        if not isinstance(value, int) or value < 0:
+            raise ValueError("lag_years_by_tech values must be non-negative integers")
+        validated[tech] = int(value)
+    return validated
+
+
 def load_cost_expectation_scenarios(path):
     if not path:
         return None
@@ -103,17 +136,27 @@ def load_cost_expectation_scenarios(path):
             raise ValueError(
                 f"scenario '{name}' has unsupported mode '{mode}' (use block_average_expected or point_cost)"
             )
+        kernel_mode = scenario.get('kernel_mode', None)
+        lag_years_by_tech = scenario.get('lag_years_by_tech', None)
         weights = scenario.get('annual_weights', None)
         if mode == 'point_cost':
             weights = None
+            kernel_mode = None
+            lag_years_by_tech = None
         elif weights is None:
             raise ValueError(f"scenario '{name}' requires annual_weights for block_average_expected")
         else:
             weights = _validate_cost_expectation_weights(weights)
+            if kernel_mode is not None:
+                kernel_mode = _validate_cost_expectation_kernel_mode(kernel_mode)
+            if lag_years_by_tech is not None:
+                lag_years_by_tech = _validate_cost_expectation_lag_years_by_tech(lag_years_by_tech)
         normalized.append({
             'name': name,
             'mode': mode,
             'annual_weights': weights,
+            'kernel_mode': kernel_mode,
+            'lag_years_by_tech': lag_years_by_tech,
         })
     return normalized
 
@@ -204,6 +247,8 @@ def build_tasks(configfiles, scenario_name, override_models=None, override_draws
                             "seed": int(seed),
                             "cost_expectation_mode": variant["mode"],
                             "cost_expectation_weights": variant.get("annual_weights"),
+                            "cost_expectation_kernel_mode": variant.get("kernel_mode"),
+                            "cost_expectation_lag_years_by_tech": variant.get("lag_years_by_tech"),
                         }
                     )
         return tasks
@@ -395,6 +440,15 @@ def run_worker(args):
         env["LEARNING_COST_EXPECTATION_MODE"] = str(task["cost_expectation_mode"])
     if "cost_expectation_weights" in task and task["cost_expectation_weights"] is not None:
         env["LEARNING_COST_EXPECTATION_WEIGHTS"] = json.dumps(task["cost_expectation_weights"])
+    if "cost_expectation_kernel_mode" in task and task["cost_expectation_kernel_mode"] is not None:
+        env["LEARNING_COST_EXPECTATION_KERNEL_MODE"] = str(task["cost_expectation_kernel_mode"])
+    if (
+        "cost_expectation_lag_years_by_tech" in task
+        and task["cost_expectation_lag_years_by_tech"] is not None
+    ):
+        env["LEARNING_COST_EXPECTATION_LAG_YEARS_BY_TECH"] = json.dumps(
+            task["cost_expectation_lag_years_by_tech"]
+        )
     subprocess.run(cmd, check=True, env=env)
 
 

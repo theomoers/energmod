@@ -1,0 +1,196 @@
+import importlib.util
+import json
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+MODULE_PATH = ROOT / "scripts" / "learning" / "apply_learning_costs.py"
+SPEC = importlib.util.spec_from_file_location("apply_learning_costs_module", MODULE_PATH)
+alc = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(alc)
+
+
+def _make_state(committed_year, level_by_tech):
+    return {
+        "last_applied_year": int(committed_year),
+        "technology_states": {
+            tech: {"last_log_capex": math.log(float(level) * 1000.0)}
+            for tech, level in level_by_tech.items()
+        },
+        "annual_cost_history": {},
+    }
+
+
+def test_build_lagged_kernel_years_and_split():
+    assert alc.build_lagged_kernel_years(2030, 3) == [2023, 2024, 2025, 2026, 2027]
+    assert alc.build_lagged_kernel_years(2030, 4) == [2022, 2023, 2024, 2025, 2026]
+    assert alc.build_lagged_kernel_years(2030, 2) == [2024, 2025, 2026, 2027, 2028]
+
+    known, expected = alc.split_kernel_years([2023, 2024, 2025, 2026, 2027], 2025)
+    assert known == [2023, 2024, 2025]
+    assert expected == [2026, 2027]
+
+
+def test_get_known_annual_cost_prefers_runtime_state_and_history(monkeypatch):
+    state = _make_state(
+        2030,
+        {"solar_power": 30.0, "onwind_power": 1.0, "battery_energy": 1.0},
+    )
+    state["annual_cost_history"] = {"solar_power": {"2028": 12.0, "2029": 18.0}}
+
+    monkeypatch.setattr(alc, "load_cost_from_historical_csv", lambda tech, year, cfg: float(year))
+
+    assert alc.get_known_annual_cost_for_year("solar_power", 2030, state, {}) == pytest.approx(30.0)
+    assert alc.get_known_annual_cost_for_year("solar_power", 2028, state, {}) == pytest.approx(12.0)
+    assert alc.get_known_annual_cost_for_year("solar_power", 2024, state, {}) == pytest.approx(2024.0)
+
+
+def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeypatch):
+    learning_cfg = {
+        "seed": 0,
+        "cost_expectations": {
+            "mode": "block_average_expected",
+            "kernel_mode": "technology_specific_lagged_window",
+            "annual_weights": [0.1, 0.2, 0.3, 0.2, 0.2],
+            "lag_years_by_tech": {
+                "solar_power": 3,
+                "onwind_power": 4,
+                "battery_energy": 2,
+            },
+        },
+    }
+    state = _make_state(
+        2025,
+        {"solar_power": 30.0, "onwind_power": 40.0, "battery_energy": 25.0},
+    )
+    artifacts = {
+        "solar_power": {},
+        "onwind_power": {},
+        "battery_energy": {},
+    }
+
+    monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    expected_levels = np.log(
+        np.array([[40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]], dtype=float) * 1000.0
+    )
+    monkeypatch.setattr(
+        alc,
+        "_simulate_frozen_block_expectation_annual_paths",
+        lambda artifacts, state, selected_model, elapsed_years, rng: {
+            tech: expected_levels[:, :elapsed_years] for tech in artifacts
+        },
+    )
+
+    known_map = {
+        "solar_power": {2023: 10.0, 2024: 20.0, 2025: 30.0},
+        "onwind_power": {2022: 11.0, 2023: 21.0, 2024: 31.0, 2025: 41.0},
+        "battery_energy": {2024: 15.0, 2025: 25.0},
+    }
+    monkeypatch.setattr(
+        alc,
+        "get_known_annual_cost_for_year",
+        lambda tech, year, state, cfg: known_map[tech][int(year)],
+    )
+
+    diagnostics = alc._compute_block_average_expected_costs(
+        artifacts=artifacts,
+        state=state,
+        current_year=2030,
+        selected_model="shared_state_bayesian_regime_wright",
+        learning_cfg=learning_cfg,
+        costs_file="costs.csv",
+    )
+
+    assert diagnostics["solar_power"]["c_overnight"] == pytest.approx(32.0)
+    assert diagnostics["solar_power"]["c_overnight_terminal_point"] == pytest.approx(80.0)
+    assert json.loads(diagnostics["solar_power"]["known_kernel_years_json"]) == [2023, 2024, 2025]
+    assert json.loads(diagnostics["solar_power"]["expected_kernel_years_json"]) == [2026, 2027]
+
+    assert diagnostics["onwind_power"]["c_overnight"] == pytest.approx(30.8)
+    assert diagnostics["battery_energy"]["c_overnight"] == pytest.approx(40.5)
+
+
+def test_legacy_global_current_window_behavior_is_preserved(monkeypatch):
+    learning_cfg = {
+        "seed": 0,
+        "cost_expectations": {
+            "mode": "block_average_expected",
+            "annual_weights": [1, 1, 1, 1, 1],
+        },
+    }
+    state = _make_state(
+        2025,
+        {"solar_power": 10.0, "onwind_power": 10.0, "battery_energy": 10.0},
+    )
+    monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    path = np.log(np.array([[20.0, 30.0, 40.0, 50.0, 60.0]], dtype=float) * 1000.0)
+    monkeypatch.setattr(
+        alc,
+        "_simulate_frozen_block_expectation_annual_paths",
+        lambda artifacts, state, selected_model, elapsed_years, rng: {
+            tech: path[:, :elapsed_years] for tech in artifacts
+        },
+    )
+
+    diagnostics = alc._compute_block_average_expected_costs(
+        artifacts={"solar_power": {}},
+        state=state,
+        current_year=2030,
+        selected_model="shared_state_bayesian_regime_wright",
+        learning_cfg=learning_cfg,
+        costs_file="costs.csv",
+    )
+
+    assert diagnostics["solar_power"]["c_overnight"] == pytest.approx(30.0)
+    assert diagnostics["solar_power"]["c_overnight_terminal_point"] == pytest.approx(60.0)
+    assert json.loads(diagnostics["solar_power"]["kernel_years_json"]) == [2025, 2026, 2027, 2028, 2029]
+
+
+def test_exogenous_lagged_kernel_uses_priced_year_kernel(monkeypatch):
+    learning_cfg = {
+        "cost_expectations": {
+            "mode": "block_average_expected",
+            "kernel_mode": "technology_specific_lagged_window",
+            "annual_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
+            "lag_years_by_tech": {
+                "solar_power": 3,
+                "onwind_power": 4,
+                "battery_energy": 2,
+            },
+        }
+    }
+    monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    exogenous_df = pd.DataFrame(
+        [
+            {"technology": tech, "year": year, "c_overnight": float(year - 2000)}
+            for tech in ("solar_power", "onwind_power", "battery_energy")
+            for year in range(2022, 2031)
+        ]
+    )
+    monkeypatch.setattr(
+        alc,
+        "load_exogenous_cost_path",
+        lambda learning_cfg, selected_model: (exogenous_df, {"source": "stub", "interpolation": "linear"}),
+    )
+
+    costs, _ = alc.calculate_exogenous_learning_costs(
+        learning_cfg=learning_cfg,
+        selected_model="iea_weo_exogenous_path",
+        current_year=2030,
+        costs_file="costs.csv",
+        runtime_metadata={
+            "cost_expectation_mode": "block_average_expected",
+            "cost_expectation_kernel_mode": "technology_specific_lagged_window",
+        },
+    )
+
+    assert costs["solar_power"]["c_overnight"] == pytest.approx(25.0)
+    assert json.loads(costs["solar_power"]["kernel_years_json"]) == [2023, 2024, 2025, 2026, 2027]
+    assert costs["solar_power"]["c_overnight_terminal_point"] == pytest.approx(30.0)

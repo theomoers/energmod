@@ -123,6 +123,8 @@ SNAKEMAKE_JOBS="${JOBS:-${NSLOTS:-4}}"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
 COST_EXPECTATION_MODE="${LEARNING_COST_EXPECTATION_MODE:-}"
 COST_EXPECTATION_WEIGHTS="${LEARNING_COST_EXPECTATION_WEIGHTS:-}"
+COST_EXPECTATION_KERNEL_MODE="${LEARNING_COST_EXPECTATION_KERNEL_MODE:-}"
+COST_EXPECTATION_LAG_YEARS_BY_TECH="${LEARNING_COST_EXPECTATION_LAG_YEARS_BY_TECH:-}"
 
 if ! command -v snakemake >/dev/null 2>&1; then
   source /apps/anaconda3/etc/profile.d/conda.sh
@@ -153,12 +155,18 @@ learning:
     enable: false
 EOF2
 
-if [[ -n "$COST_EXPECTATION_MODE" || -n "$COST_EXPECTATION_WEIGHTS" ]]; then
+if [[ -n "$COST_EXPECTATION_MODE" || -n "$COST_EXPECTATION_WEIGHTS" || -n "$COST_EXPECTATION_KERNEL_MODE" || -n "$COST_EXPECTATION_LAG_YEARS_BY_TECH" ]]; then
   {
     echo "  cost_expectations:"
     echo "    mode: \"${COST_EXPECTATION_MODE:-block_average_expected}\""
+    if [[ -n "$COST_EXPECTATION_KERNEL_MODE" ]]; then
+      echo "    kernel_mode: \"${COST_EXPECTATION_KERNEL_MODE}\""
+    fi
     if [[ -n "$COST_EXPECTATION_WEIGHTS" ]]; then
       echo "    annual_weights: ${COST_EXPECTATION_WEIGHTS}"
+    fi
+    if [[ -n "$COST_EXPECTATION_LAG_YEARS_BY_TECH" ]]; then
+      echo "    lag_years_by_tech: ${COST_EXPECTATION_LAG_YEARS_BY_TECH}"
     fi
   } >>"$OVERLAY_FILE"
 fi

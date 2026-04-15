@@ -425,7 +425,15 @@ def build_postsolve_cost_log(
             "manifest_sha256": row.get("manifest_sha256", ""),
             "battery_power_treatment": row.get("battery_power_treatment", ""),
             "cost_expectation_mode": row.get("cost_expectation_mode", "point_cost"),
+            "cost_expectation_kernel_mode": row.get("cost_expectation_kernel_mode", "global_current_window"),
             "cost_expectation_weights_json": row.get("cost_expectation_weights_json", ""),
+            "cost_expectation_lag_years_json": row.get("cost_expectation_lag_years_json", ""),
+            "kernel_year_start": _to_int(row.get("kernel_year_start"), fallback=current_year),
+            "kernel_year_end": _to_int(row.get("kernel_year_end"), fallback=current_year),
+            "kernel_years_json": row.get("kernel_years_json", ""),
+            "known_kernel_years_json": row.get("known_kernel_years_json", ""),
+            "expected_kernel_years_json": row.get("expected_kernel_years_json", ""),
+            "applied_kernel_costs_json": row.get("applied_kernel_costs_json", ""),
         }
 
         logger.info(
