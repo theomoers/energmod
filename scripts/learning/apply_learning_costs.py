@@ -36,6 +36,15 @@ if (SCRIPTS_DIR / "_helpers.py").exists():
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from _helpers import configure_logging, create_logger
+from learning.fuel_price_io import (
+    FOSSIL_FUELS,
+    build_country_fuel_price_dict,
+    ensure_unique_mapping_rows,
+    extract_country_code_from_bus,
+    load_fuel_price_bundle_manifest,
+    normalize_market_name,
+    resolve_manifest_artifact,
+)
 from learning.learning_data_io import load_historical_capacity, load_historical_cost
 
 # Battery energy-side BOS multiplier reference year.
@@ -85,11 +94,14 @@ SUPPORTED_EXOGENOUS_MODELS = {"iea_weo_exogenous_path"}
 SUPPORTED_SAMPLE_MODES = {"single_draw", "median"}
 SUPPORTED_TRAINING_WINDOWS = {"origin_cutoff", "full_sample"}
 SUPPORTED_COST_EXPECTATION_MODES = {"point_cost", "block_average_expected"}
+SUPPORTED_FOSSIL_PRICE_EXPECTATION_MODES = {"point_cost", "block_average_expected"}
 BATTERY_POWER_TREATMENT = "deterministic_default_costs"
 LEGACY_LEARNING_SEED = "deterministic"
 DEFAULT_COST_EXPECTATION_MODE = "point_cost"
+DEFAULT_FOSSIL_PRICE_EXPECTATION_MODE = "point_cost"
 BLOCK_EXPECTATION_DRAWS = 1000
 DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS = (0.2, 0.2, 0.2, 0.2, 0.2)
+DEFAULT_FOSSIL_PRICE_ANNUAL_STEP = 1
 
 # Mapping of solve horizon to the historical lag-year used for bootstrap
 # cumulative capacity (experience) before switching to solved lagged blocks.
@@ -581,6 +593,116 @@ def load_learning_manifest(learning_cfg, config_file):
     return manifest
 
 
+def get_fossil_price_cfg(learning_cfg):
+    cfg = learning_cfg.get("fossil_price_uncertainty", {}) or {}
+    fuels = cfg.get("fuels", list(FOSSIL_FUELS))
+    fuels = [str(fuel).strip().lower() for fuel in fuels]
+    invalid = sorted(set(fuels) - set(FOSSIL_FUELS))
+    if invalid:
+        raise ValueError(
+            f"Unsupported fossil_price_uncertainty.fuels entries: {invalid}. "
+            f"Supported values: {list(FOSSIL_FUELS)}"
+        )
+    annual_step = int(cfg.get("annual_step", DEFAULT_FOSSIL_PRICE_ANNUAL_STEP))
+    if annual_step != 1:
+        raise ValueError(
+            "Only annual fossil price evolution is currently supported "
+            f"(got fossil_price_uncertainty.annual_step={annual_step})."
+        )
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "bundle_root": str(cfg.get("bundle_root", "")),
+        "fallback_to_static_prices": bool(cfg.get("fallback_to_static_prices", False)),
+        "annual_step": annual_step,
+        "fuels": fuels,
+        "expectation_mode": str(cfg.get("expectation_mode", DEFAULT_FOSSIL_PRICE_EXPECTATION_MODE)),
+        "annual_weights": cfg.get("annual_weights", None),
+    }
+
+
+def load_fossil_price_bundle(learning_cfg, config_file):
+    cfg = get_fossil_price_cfg(learning_cfg)
+    if not cfg["enabled"]:
+        learning_cfg["_fossil_price_bundle"] = None
+        return None
+
+    manifest, bundle_root = load_fuel_price_bundle_manifest(cfg["bundle_root"], config_file)
+    params_path = resolve_manifest_artifact(manifest, bundle_root, "ar1_parameters_csv")
+    country_map_path = resolve_manifest_artifact(manifest, bundle_root, "country_market_map_csv")
+    historical_path = resolve_manifest_artifact(manifest, bundle_root, "historical_market_prices_csv")
+
+    params_df = pd.read_csv(params_path)
+    country_map_df = pd.read_csv(country_map_path)
+    historical_df = pd.read_csv(historical_path)
+    params_df["fuel_type"] = params_df["fuel_type"].astype(str).str.lower()
+    params_df["market"] = params_df.apply(
+        lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+        axis=1,
+    )
+    country_map_df["fuel_type"] = country_map_df["fuel_type"].astype(str).str.lower()
+    country_map_df["market"] = country_map_df.apply(
+        lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+        axis=1,
+    )
+    historical_df["fuel_type"] = historical_df["fuel_type"].astype(str).str.lower()
+    historical_df["market"] = historical_df.apply(
+        lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+        axis=1,
+    )
+    ensure_unique_mapping_rows(params_df, ["fuel_type", "market"], "fuel AR(1) parameter")
+    ensure_unique_mapping_rows(country_map_df, ["fuel_type", "country"], "fuel country-market")
+    ensure_unique_mapping_rows(
+        historical_df,
+        ["fuel_type", "market", "year"],
+        "historical market price",
+    )
+    missing_param_keys = sorted(
+        {
+            (str(row["fuel_type"]), str(row["market"]))
+            for row in country_map_df.to_dict(orient="records")
+        }
+        - {
+            (str(row["fuel_type"]), str(row["market"]))
+            for row in params_df.to_dict(orient="records")
+        }
+    )
+    if missing_param_keys:
+        raise ValueError(
+            "Fuel price bundle country mappings reference markets without AR(1) parameters: "
+            f"{missing_param_keys[:10]}"
+        )
+
+    params_by_key = {
+        (str(row["fuel_type"]), str(row["market"])): {
+            key: value for key, value in row.items()
+        }
+        for row in params_df.to_dict(orient="records")
+    }
+    historical_by_key = {
+        (str(row["fuel_type"]), str(row["market"]), int(row["year"])): float(row["price_eur_mwh"])
+        for row in historical_df.to_dict(orient="records")
+    }
+    country_market_map = {
+        (str(row["fuel_type"]), str(row["country"])): str(row["market"])
+        for row in country_map_df.to_dict(orient="records")
+    }
+    bundle = {
+        "manifest": manifest,
+        "root": bundle_root,
+        "params_df": params_df,
+        "country_map_df": country_map_df,
+        "historical_df": historical_df,
+        "params_by_key": params_by_key,
+        "historical_by_key": historical_by_key,
+        "country_market_map": country_market_map,
+        "schema_version": str(manifest.get("schema_version", "unknown")),
+        "manifest_path": str((bundle_root / "manifest.json").resolve()),
+        "manifest_sha256": str(manifest.get("_sha256", "")),
+    }
+    learning_cfg["_fossil_price_bundle"] = bundle
+    return bundle
+
+
 def get_learning_engine(learning_cfg, learning_model=None):
     if learning_model:
         model = str(learning_model)
@@ -673,9 +795,66 @@ def get_cost_expectation_weights_json(learning_cfg):
     return json.dumps([float(weight) for weight in weights.tolist()])
 
 
+def get_requested_fossil_price_expectation_mode(learning_cfg):
+    cfg = get_fossil_price_cfg(learning_cfg)
+    mode = str(cfg.get("expectation_mode", DEFAULT_FOSSIL_PRICE_EXPECTATION_MODE))
+    if mode not in SUPPORTED_FOSSIL_PRICE_EXPECTATION_MODES:
+        raise ValueError(
+            f"Unsupported learning.fossil_price_uncertainty.expectation_mode='{mode}'. "
+            f"Supported values: {sorted(SUPPORTED_FOSSIL_PRICE_EXPECTATION_MODES)}"
+        )
+    return mode
+
+
+def get_fossil_price_expectation_weights(learning_cfg):
+    cfg = get_fossil_price_cfg(learning_cfg)
+    raw_weights = cfg.get("annual_weights", None)
+    if raw_weights is None:
+        weights = np.asarray(DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS, dtype=float)
+    else:
+        if not isinstance(raw_weights, (list, tuple)):
+            raise ValueError(
+                "learning.fossil_price_uncertainty.annual_weights must be a list of five non-negative numbers."
+            )
+        if len(raw_weights) != len(DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS):
+            raise ValueError(
+                "learning.fossil_price_uncertainty.annual_weights must have length 5 "
+                f"(got {len(raw_weights)})."
+            )
+        try:
+            weights = np.asarray([float(weight) for weight in raw_weights], dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "learning.fossil_price_uncertainty.annual_weights must contain only numeric values."
+            ) from exc
+
+    if np.any(~np.isfinite(weights)):
+        raise ValueError(
+            "learning.fossil_price_uncertainty.annual_weights must contain only finite values."
+        )
+    if np.any(weights < 0.0):
+        raise ValueError(
+            "learning.fossil_price_uncertainty.annual_weights must be non-negative."
+        )
+
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        raise ValueError(
+            "learning.fossil_price_uncertainty.annual_weights must sum to a positive value."
+        )
+    return weights / total
+
+
+def get_fossil_price_expectation_weights_json(learning_cfg):
+    weights = get_fossil_price_expectation_weights(learning_cfg)
+    return json.dumps([float(weight) for weight in weights.tolist()])
+
+
 def build_runtime_metadata(learning_cfg, learning_engine, selected_model, cost_expectation_mode=None):
     if cost_expectation_mode is None:
         cost_expectation_mode = resolve_cost_expectation_mode(learning_cfg, selected_model)
+    fossil_cfg = get_fossil_price_cfg(learning_cfg)
+    fossil_bundle = learning_cfg.get("_fossil_price_bundle") or {}
     return {
         "engine": str(learning_engine),
         "selected_model": str(selected_model),
@@ -692,6 +871,12 @@ def build_runtime_metadata(learning_cfg, learning_engine, selected_model, cost_e
         "battery_power_treatment": BATTERY_POWER_TREATMENT,
         "cost_expectation_mode": str(cost_expectation_mode),
         "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg),
+        "fossil_price_uncertainty_enabled": bool(fossil_cfg["enabled"]),
+        "fossil_price_bundle_path": str(fossil_bundle.get("manifest_path", "")),
+        "fossil_price_bundle_schema_version": str(fossil_bundle.get("schema_version", "")),
+        "fossil_price_bundle_sha256": str(fossil_bundle.get("manifest_sha256", "")),
+        "fossil_price_expectation_mode": get_requested_fossil_price_expectation_mode(learning_cfg),
+        "fossil_price_expectation_weights_json": get_fossil_price_expectation_weights_json(learning_cfg),
     }
 
 
@@ -837,6 +1022,9 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
 
     get_requested_cost_expectation_mode(learning_cfg)
     get_cost_expectation_weights(learning_cfg)
+    get_fossil_price_cfg(learning_cfg)
+    get_requested_fossil_price_expectation_mode(learning_cfg)
+    get_fossil_price_expectation_weights(learning_cfg)
 
     sample_mode = str(learning_cfg.get("sample_mode", "single_draw"))
     if sample_mode not in SUPPORTED_SAMPLE_MODES:
@@ -2466,7 +2654,7 @@ def update_stochastic_runtime_state(
     if state.get("learning_seed") not in (None, ""):
         runtime_metadata["learning_seed"] = str(state["learning_seed"])
     passthrough_fields = {}
-    for key in ("committed_from_network", "enabled"):
+    for key in ("committed_from_network", "enabled", "fossil_price_states"):
         if key in state:
             passthrough_fields[key] = state[key]
 
@@ -3054,7 +3242,333 @@ def convert_to_capital_cost(c_overnight, tech, unit, learning_cfg, costs_file, w
     return capital_cost
 
 
-def update_network_costs(network_path, learning_costs, tech_mapping, output_path, learning_cfg, costs_file, learning_rates=None):
+def _stable_uint64_from_key(*parts):
+    key = "::".join(str(part) for part in parts).encode("utf-8")
+    digest = __import__("hashlib").sha256(key).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def _fossil_standard_normal(seed, fuel_type, market, year):
+    rng = np.random.default_rng(_stable_uint64_from_key(seed, fuel_type, market, int(year)))
+    return float(rng.standard_normal())
+
+
+def _resolve_fossil_state(
+    params_row,
+    existing_state,
+    target_year,
+    seed,
+    historical_by_key,
+):
+    fuel_type = str(params_row["fuel_type"])
+    market = str(params_row["market"])
+    target_year = int(target_year)
+
+    if existing_state:
+        start_year = int(existing_state.get("last_state_year", existing_state.get("source_state_year", target_year)))
+        log_price = float(existing_state["realized_log_price"])
+        price = float(existing_state["realized_price_eur_mwh"])
+        source_state_year = int(existing_state.get("source_state_year", start_year))
+        if start_year > target_year:
+            existing_state = None
+        elif start_year == target_year:
+            return {
+                "realized_log_price": log_price,
+                "realized_price_eur_mwh": price,
+                "last_state_year": start_year,
+                "source_state_year": source_state_year,
+            }
+    if not existing_state:
+        last_observed_year = int(params_row["last_observed_year"])
+        if target_year <= last_observed_year:
+            historical_key = (fuel_type, market, target_year)
+            if historical_key not in historical_by_key:
+                raise ValueError(
+                    f"Historical market price missing for {fuel_type}/{market}/{target_year} "
+                    "in fossil price bundle."
+                )
+            price = float(historical_by_key[historical_key])
+            return {
+                "realized_log_price": float(np.log(price)),
+                "realized_price_eur_mwh": price,
+                "last_state_year": target_year,
+                "source_state_year": target_year,
+            }
+        start_year = last_observed_year
+        log_price = float(params_row["last_observed_log_price"])
+        price = float(params_row["last_observed_price_eur_mwh"])
+        source_state_year = last_observed_year
+
+    for year in range(int(start_year) + 1, target_year + 1):
+        epsilon = float(params_row["sigma_epsilon"]) * _fossil_standard_normal(
+            seed,
+            fuel_type,
+            market,
+            year,
+        )
+        log_price = float(params_row["kappa"]) + float(params_row["phi"]) * float(log_price) + epsilon
+        price = float(np.exp(log_price))
+        start_year = year
+
+    return {
+        "realized_log_price": float(log_price),
+        "realized_price_eur_mwh": float(price),
+        "last_state_year": int(start_year),
+        "source_state_year": int(source_state_year),
+    }
+
+
+def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, state_payload):
+    cfg = get_fossil_price_cfg(learning_cfg)
+    expectation_mode = str(
+        runtime_metadata.get(
+            "fossil_price_expectation_mode",
+            get_requested_fossil_price_expectation_mode(learning_cfg),
+        )
+    )
+    if not cfg["enabled"]:
+        return {
+            "enabled": False,
+            "log_df": pd.DataFrame(
+                columns=[
+                    "learning_seed",
+                    "planning_horizon",
+                    "fuel_type",
+                    "market",
+                    "country",
+                    "applied_price_eur_mwh",
+                    "price_terminal_point_eur_mwh",
+                    "fossil_price_expectation_mode",
+                    "fossil_price_expectation_weights_json",
+                    "last_state_year",
+                    "source_state_year",
+                ]
+            ),
+            "price_dict": {},
+            "states": state_payload.get("fossil_price_states", {}) or {},
+            "summary": {"fossil_price_uncertainty_enabled": False},
+        }
+
+    bundle = learning_cfg.get("_fossil_price_bundle")
+    if not bundle:
+        raise ValueError("Fossil price uncertainty is enabled but no bundle is loaded.")
+
+    seed = int(learning_cfg.get("seed", 0))
+    input_states = (state_payload.get("fossil_price_states", {}) or {})
+    next_states = {fuel: dict(input_states.get(fuel, {}) or {}) for fuel in cfg["fuels"]}
+    expectation_weights = get_fossil_price_expectation_weights(learning_cfg)
+    expectation_weights_json = get_fossil_price_expectation_weights_json(learning_cfg)
+    for fuel_type in cfg["fuels"]:
+        fuel_params = bundle["params_df"].loc[
+            bundle["params_df"]["fuel_type"].astype(str).str.lower() == fuel_type
+        ]
+        for params_row in fuel_params.to_dict(orient="records"):
+            market = str(params_row["market"])
+            existing_state = (input_states.get(fuel_type, {}) or {}).get(market)
+            resolved = _resolve_fossil_state(
+                params_row=params_row,
+                existing_state=existing_state,
+                target_year=current_year,
+                seed=seed,
+                historical_by_key=bundle["historical_by_key"],
+            )
+            next_states.setdefault(fuel_type, {})[market] = resolved
+
+    country_rows = []
+    for fuel_type in cfg["fuels"]:
+        mapping_rows = bundle["country_map_df"].loc[
+            bundle["country_map_df"]["fuel_type"].astype(str).str.lower() == fuel_type
+        ]
+        for row in mapping_rows.to_dict(orient="records"):
+            country = str(row["country"])
+            market = str(row["market"])
+            state = (next_states.get(fuel_type, {}) or {}).get(market)
+            if state is None:
+                if cfg["fallback_to_static_prices"]:
+                    continue
+                raise ValueError(
+                    f"Missing realized fossil state for {fuel_type}/{market} while pricing country {country}."
+                )
+            terminal_price = float(state["realized_price_eur_mwh"])
+            applied_price = terminal_price
+            if expectation_mode == "block_average_expected":
+                expectation_years = int(len(expectation_weights))
+                first_weight_year = int(current_year) - expectation_years
+                expectation_sequence = []
+                start_state = (input_states.get(fuel_type, {}) or {}).get(market)
+                params_row = bundle["params_by_key"][(fuel_type, market)]
+                for expectation_year in range(first_weight_year, int(current_year)):
+                    expectation_state = _resolve_fossil_state(
+                        params_row=params_row,
+                        existing_state=start_state,
+                        target_year=expectation_year,
+                        seed=seed,
+                        historical_by_key=bundle["historical_by_key"],
+                    )
+                    expectation_sequence.append(float(expectation_state["realized_price_eur_mwh"]))
+                if len(expectation_sequence) != expectation_years:
+                    raise ValueError(
+                        f"Expected {expectation_years} fossil expectation points for {fuel_type}/{market}, "
+                        f"got {len(expectation_sequence)}"
+                    )
+                applied_price = float(np.dot(np.asarray(expectation_sequence, dtype=float), expectation_weights))
+            country_rows.append(
+                {
+                    "learning_seed": runtime_metadata.get("learning_seed", ""),
+                    "planning_horizon": int(current_year),
+                    "fuel_type": fuel_type,
+                    "market": market,
+                    "country": country,
+                    "applied_price_eur_mwh": applied_price,
+                    "price_terminal_point_eur_mwh": terminal_price,
+                    "fossil_price_expectation_mode": expectation_mode,
+                    "fossil_price_expectation_weights_json": expectation_weights_json,
+                    "last_state_year": int(state["last_state_year"]),
+                    "source_state_year": int(state["source_state_year"]),
+                }
+            )
+
+    log_df = pd.DataFrame(
+        country_rows,
+        columns=[
+            "learning_seed",
+            "planning_horizon",
+            "fuel_type",
+            "market",
+            "country",
+            "applied_price_eur_mwh",
+            "price_terminal_point_eur_mwh",
+            "fossil_price_expectation_mode",
+            "fossil_price_expectation_weights_json",
+            "last_state_year",
+            "source_state_year",
+        ],
+    )
+    if not log_df.empty:
+        log_df = log_df.sort_values(["fuel_type", "country"]).reset_index(drop=True)
+    price_dict = build_country_fuel_price_dict(
+        log_df.rename(columns={"applied_price_eur_mwh": "price_eur_mwh"})
+    ) if not log_df.empty else {}
+    summary = {
+        "fossil_price_uncertainty_enabled": True,
+        "fossil_price_seed": int(seed),
+        "fossil_price_learning_seed": runtime_metadata.get("learning_seed", ""),
+        "fossil_price_bundle_path": runtime_metadata.get("fossil_price_bundle_path", ""),
+        "fossil_price_bundle_schema_version": runtime_metadata.get("fossil_price_bundle_schema_version", ""),
+        "fossil_price_bundle_sha256": runtime_metadata.get("fossil_price_bundle_sha256", ""),
+        "fossil_price_expectation_mode": expectation_mode,
+        "fossil_price_expectation_weights_json": expectation_weights_json,
+    }
+    if not log_df.empty:
+        summary["fossil_price_summary_json"] = json.dumps(
+            {
+                fuel: {
+                    "applied_min": float(group["applied_price_eur_mwh"].min()),
+                    "applied_median": float(group["applied_price_eur_mwh"].median()),
+                    "applied_max": float(group["applied_price_eur_mwh"].max()),
+                    "terminal_min": float(group["price_terminal_point_eur_mwh"].min()),
+                    "terminal_median": float(group["price_terminal_point_eur_mwh"].median()),
+                    "terminal_max": float(group["price_terminal_point_eur_mwh"].max()),
+                    "markets": {
+                        str(market): {
+                            "applied_price_eur_mwh": float(applied),
+                            "price_terminal_point_eur_mwh": float(terminal),
+                        }
+                        for market, applied, terminal in (
+                            log_df.loc[log_df["fuel_type"] == fuel]
+                            .drop_duplicates(subset=["market"], keep="last")
+                            .loc[:, ["market", "applied_price_eur_mwh", "price_terminal_point_eur_mwh"]]
+                            .itertuples(index=False, name=None)
+                        )
+                    },
+                }
+                for fuel, group in log_df.groupby("fuel_type")
+            },
+            sort_keys=True,
+        )
+        for fuel, group in log_df.groupby("fuel_type"):
+            summary[f"fossil_{fuel}_price_min_eur_mwh"] = float(group["applied_price_eur_mwh"].min())
+            summary[f"fossil_{fuel}_price_median_eur_mwh"] = float(group["applied_price_eur_mwh"].median())
+            summary[f"fossil_{fuel}_price_max_eur_mwh"] = float(group["applied_price_eur_mwh"].max())
+            summary[f"fossil_{fuel}_price_terminal_point_median_eur_mwh"] = float(
+                group["price_terminal_point_eur_mwh"].median()
+            )
+    else:
+        summary["fossil_price_summary_json"] = json.dumps({}, sort_keys=True)
+    return {
+        "enabled": True,
+        "log_df": log_df,
+        "price_dict": price_dict,
+        "states": next_states,
+        "summary": summary,
+        "fallback_to_static_prices": cfg["fallback_to_static_prices"],
+    }
+
+
+def save_fossil_price_log(fossil_payload, output_file):
+    logger.info("Saving fossil price log to %s", output_file)
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    log_df = pd.DataFrame()
+    if fossil_payload:
+        candidate = fossil_payload.get("log_df")
+        if candidate is not None:
+            log_df = candidate
+    log_df.to_csv(output_file, index=False)
+
+
+def _apply_fossil_price_updates_to_network(n, fossil_payload):
+    if not fossil_payload or not fossil_payload.get("enabled"):
+        return []
+
+    price_dict = fossil_payload.get("price_dict", {}) or {}
+    fallback = bool(fossil_payload.get("fallback_to_static_prices", False))
+    updates_log = []
+    if n.generators.empty:
+        return updates_log
+
+    for idx, row in n.generators.iterrows():
+        carrier = str(row["carrier"])
+        if carrier not in FOSSIL_FUELS:
+            continue
+        country = extract_country_code_from_bus(row["bus"])
+        carrier_prices = price_dict.get(carrier, {}) or {}
+        if country not in carrier_prices:
+            if fallback:
+                logger.warning(
+                    "Fossil price mapping missing for %s/%s; retaining existing generator marginal_cost.",
+                    carrier,
+                    country,
+                )
+                continue
+            raise ValueError(
+                f"Missing stochastic fossil price for generator {idx} carrier={carrier} country={country}."
+            )
+        old_cost = float(row["marginal_cost"])
+        new_cost = float(carrier_prices[country])
+        n.generators.at[idx, "marginal_cost"] = new_cost
+        updates_log.append(
+            {
+                "component": "generators",
+                "index": str(idx),
+                "carrier": carrier,
+                "country": country,
+                "old_marginal_cost": old_cost,
+                "new_marginal_cost": new_cost,
+            }
+        )
+    return updates_log
+
+
+def update_network_costs(
+    network_path,
+    learning_costs,
+    tech_mapping,
+    output_path,
+    learning_cfg,
+    costs_file,
+    learning_rates=None,
+    fossil_payload=None,
+):
     """
     Update network component costs in-memory and save.
     
@@ -3076,6 +3590,7 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
         learning_cfg: Learning configuration dict
         costs_file: Path to cost CSV file
         learning_rates: Optional dict of learning rates to store in metadata
+        fossil_payload: Optional stochastic fossil fuel price payload
     
     Returns:
         Tuple of (network, updates_log)
@@ -3317,6 +3832,8 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
             logger.info(f"  Updated stores[{carrier}]: {old_cost:.2f} → {new_cost:.2f} EUR/MWh-yr")
             updates_count += 1
     
+    fossil_updates_log = _apply_fossil_price_updates_to_network(n, fossil_payload)
+
     # Convert numpy types to native Python types for JSON serialization
     def convert_to_native(obj):
         """Convert numpy types to native Python types."""
@@ -3338,6 +3855,11 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
     n.meta["learning_costs_applied"] = True
     n.meta["learning_costs"] = convert_to_native(learning_costs)
     n.meta["learning_updates_log"] = convert_to_native(updates_log)
+    n.meta["fossil_prices_applied"] = bool(fossil_payload and fossil_payload.get("enabled"))
+    if fossil_payload:
+        n.meta["fossil_price_states"] = convert_to_native(fossil_payload.get("states", {}))
+        n.meta["fossil_price_updates_log"] = convert_to_native(fossil_updates_log)
+        n.meta["fossil_price_summary"] = convert_to_native(fossil_payload.get("summary", {}))
     
     # Store learning rates in metadata if provided
     if learning_rates is not None:
@@ -3346,6 +3868,8 @@ def update_network_costs(network_path, learning_costs, tech_mapping, output_path
     
     logger.info(f"Saving updated network to {output_path}")
     logger.info(f"  Updated {updates_count} carrier types across components")
+    if fossil_updates_log:
+        logger.info("  Updated %s fossil fuel supply generator marginal costs", len(fossil_updates_log))
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     n.export_to_netcdf(output_path)
     
@@ -3379,6 +3903,27 @@ def save_cost_log(learning_costs, output_file):
         "battery_power_treatment",
         "cost_expectation_mode",
         "cost_expectation_weights_json",
+        "fossil_price_uncertainty_enabled",
+        "fossil_price_bundle_path",
+        "fossil_price_bundle_schema_version",
+        "fossil_price_bundle_sha256",
+        "fossil_price_expectation_mode",
+        "fossil_price_expectation_weights_json",
+        "fossil_price_seed",
+        "fossil_price_learning_seed",
+        "fossil_oil_price_min_eur_mwh",
+        "fossil_oil_price_median_eur_mwh",
+        "fossil_oil_price_max_eur_mwh",
+        "fossil_oil_price_terminal_point_median_eur_mwh",
+        "fossil_gas_price_min_eur_mwh",
+        "fossil_gas_price_median_eur_mwh",
+        "fossil_gas_price_max_eur_mwh",
+        "fossil_gas_price_terminal_point_median_eur_mwh",
+        "fossil_coal_price_min_eur_mwh",
+        "fossil_coal_price_median_eur_mwh",
+        "fossil_coal_price_max_eur_mwh",
+        "fossil_coal_price_terminal_point_median_eur_mwh",
+        "fossil_price_summary_json",
         "cumulative_capacity_GW",
         "A_base",
         "A_scenario",
@@ -3415,6 +3960,19 @@ def save_learning_state(state_payload, output_file):
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(state_payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def prepare_fossil_payload_for_horizon(learning_cfg, runtime_metadata, year, state_payload, learning_costs):
+    fossil_payload = _build_fossil_price_payload(
+        learning_cfg=learning_cfg,
+        runtime_metadata=runtime_metadata,
+        current_year=year,
+        state_payload=state_payload,
+    )
+    summary = fossil_payload.get("summary", {}) or {}
+    for tech_costs in learning_costs.values():
+        tech_costs.update(summary)
+    return fossil_payload
 
 
 def get_timestep(planning_horizons, current_year):
@@ -3472,6 +4030,7 @@ def main(snakemake):
     
     learning_cfg = load_config_learning(snakemake.input.learning_config)
     load_learning_manifest(learning_cfg, snakemake.input.learning_config)
+    load_fossil_price_bundle(learning_cfg, snakemake.input.learning_config)
     learning_model = getattr(snakemake.wildcards, "learning_model", None)
     learning_seed = getattr(snakemake.wildcards, "learning_seed", None)
     learning_engine = get_learning_engine(learning_cfg, learning_model)
@@ -3517,11 +4076,15 @@ def main(snakemake):
         # Just copy network without modifications
         n = pypsa.Network(snakemake.input.network)
         n.meta["learning_costs_applied"] = False
+        n.meta["fossil_prices_applied"] = False
         n.export_to_netcdf(snakemake.output.network)
         
         # Create empty log file
         Path(snakemake.output.cost_log).parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame().to_csv(snakemake.output.cost_log)
+        if hasattr(snakemake.output, "fossil_price_log"):
+            Path(snakemake.output.fossil_price_log).parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame().to_csv(snakemake.output.fossil_price_log, index=False)
         save_learning_state(
             {
                 **runtime_metadata,
@@ -3602,6 +4165,14 @@ def main(snakemake):
             }
             for tech_costs in learning_costs.values():
                 tech_costs.update(cost_log_context)
+            fossil_payload = prepare_fossil_payload_for_horizon(
+                learning_cfg,
+                runtime_metadata,
+                year,
+                proposed_state,
+                learning_costs,
+            )
+            proposed_state["fossil_price_states"] = fossil_payload.get("states", {})
 
             logger.info(
                 "battery_power remains on deterministic default costs from costs_%s.csv in stochastic runtime",
@@ -3621,8 +4192,11 @@ def main(snakemake):
                 learning_cfg,
                 costs_file,
                 learning_rates=None,
+                fossil_payload=fossil_payload,
             )
             save_cost_log(learning_costs, snakemake.output.cost_log)
+            if hasattr(snakemake.output, "fossil_price_log"):
+                save_fossil_price_log(fossil_payload, snakemake.output.fossil_price_log)
             save_learning_state(proposed_state, snakemake.output.state_proposed)
 
             logger.info("=" * 70)
@@ -3655,6 +4229,14 @@ def main(snakemake):
         }
         for tech_costs in learning_costs.values():
             tech_costs.update(cost_log_context)
+        fossil_payload = prepare_fossil_payload_for_horizon(
+            learning_cfg,
+            runtime_metadata,
+            year,
+            proposed_state,
+            learning_costs,
+        )
+        proposed_state["fossil_price_states"] = fossil_payload.get("states", {})
 
         logger.info(
             "battery_power remains on deterministic default costs from costs_%s.csv in stochastic runtime",
@@ -3674,8 +4256,11 @@ def main(snakemake):
             learning_cfg,
             costs_file,
             learning_rates=None,
+            fossil_payload=fossil_payload,
         )
         save_cost_log(learning_costs, snakemake.output.cost_log)
+        if hasattr(snakemake.output, "fossil_price_log"):
+            save_fossil_price_log(fossil_payload, snakemake.output.fossil_price_log)
         save_learning_state(proposed_state, snakemake.output.state_proposed)
 
         logger.info("=" * 70)
@@ -3708,6 +4293,7 @@ def main(snakemake):
                 "technology_states": {},
                 "capacity_history": prior_state_payload.get("capacity_history", {}),
                 "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+                "fossil_price_states": prior_state_payload.get("fossil_price_states", {}),
             }
             cost_log_context = {
                 **runtime_metadata,
@@ -3734,6 +4320,7 @@ def main(snakemake):
                 "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
                 "exogenous_cost_path_source": exogenous_info["source"],
                 "exogenous_cost_path_interpolation": exogenous_info["interpolation"],
+                "fossil_price_states": prior_state_payload.get("fossil_price_states", {}),
             }
             cost_log_context = {
                 **runtime_metadata,
@@ -3746,6 +4333,14 @@ def main(snakemake):
 
         for tech_costs in learning_costs.values():
             tech_costs.update(cost_log_context)
+        fossil_payload = prepare_fossil_payload_for_horizon(
+            learning_cfg,
+            runtime_metadata,
+            year,
+            proposed_state,
+            learning_costs,
+        )
+        proposed_state["fossil_price_states"] = fossil_payload.get("states", {})
 
         logger.info(
             "battery_power remains on deterministic default costs from costs_%s.csv in exogenous runtime",
@@ -3762,8 +4357,11 @@ def main(snakemake):
             learning_cfg,
             costs_file,
             learning_rates=None,
+            fossil_payload=fossil_payload,
         )
         save_cost_log(learning_costs, snakemake.output.cost_log)
+        if hasattr(snakemake.output, "fossil_price_log"):
+            save_fossil_price_log(fossil_payload, snakemake.output.fossil_price_log)
         save_learning_state(proposed_state, snakemake.output.state_proposed)
 
         logger.info("=" * 70)
@@ -3868,6 +4466,30 @@ def main(snakemake):
     }
     for tech_costs in learning_costs.values():
         tech_costs.update(cost_log_context)
+    proposed_state = {
+        **runtime_metadata,
+        "last_applied_year": int(year),
+        "capacity_history": prior_state_payload.get("capacity_history", {}),
+        "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+        "fossil_price_states": prior_state_payload.get("fossil_price_states", {}),
+        "technology_states": {
+            tech: {
+                "capital_cost": float(values["capital_cost"]),
+                "c_overnight": float(values["c_overnight"]),
+                "cumulative_capacity_GW": float(values["cumulative_capacity_GW"]),
+                "unit": values["unit"],
+            }
+            for tech, values in learning_costs.items()
+        },
+    }
+    fossil_payload = prepare_fossil_payload_for_horizon(
+        learning_cfg,
+        runtime_metadata,
+        year,
+        proposed_state,
+        learning_costs,
+    )
+    proposed_state["fossil_price_states"] = fossil_payload.get("states", {})
 
     logger.info(
         "battery_power remains on deterministic default costs from costs_%s.csv in legacy_curve runtime",
@@ -3892,32 +4514,21 @@ def main(snakemake):
         snakemake.output.network,
         learning_cfg,
         costs_file,
-        learning_rates=learning_rates
+        learning_rates=learning_rates,
+        fossil_payload=fossil_payload,
     )
     
     # Save cost log (includes costs, capacities, and all learning parameters)
     save_cost_log(learning_costs, snakemake.output.cost_log)
+    if hasattr(snakemake.output, "fossil_price_log"):
+        save_fossil_price_log(fossil_payload, snakemake.output.fossil_price_log)
     save_learning_state(
-        {
-            **runtime_metadata,
-            "last_applied_year": int(year),
-            "capacity_history": prior_state_payload.get("capacity_history", {}),
-            "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
-            "technology_states": {
-                tech: {
-                    "capital_cost": float(values["capital_cost"]),
-                    "c_overnight": float(values["c_overnight"]),
-                    "cumulative_capacity_GW": float(values["cumulative_capacity_GW"]),
-                    "unit": values["unit"],
-                }
-                for tech, values in learning_costs.items()
-            },
-        },
+        proposed_state,
         snakemake.output.state_proposed,
     )
     
     logger.info("=" * 70)
-    logger.info(f"Exogenous learning cost application completed for {year}")
+    logger.info(f"Learning cost application completed for {year}")
     logger.info("=" * 70)
 
 

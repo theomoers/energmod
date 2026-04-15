@@ -1,0 +1,15 @@
+{
+  "artifacts": {
+    "ar1_parameters_csv": "ar1_parameters.csv",
+    "country_market_map_csv": "country_market_map.csv",
+    "historical_market_prices_csv": "historical_market_prices.csv",
+    "metadata_json": "metadata.json"
+  },
+  "fuels": [
+    "coal",
+    "gas",
+    "oil"
+  ],
+  "generated_at": "2026-04-15T15:59:53.432469+00:00",
+  "schema_version": "fuel-price-bundle-v1"
+}

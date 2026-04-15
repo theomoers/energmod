@@ -37,6 +37,19 @@ OUTPUT_TABLE_SPECS = {
         "capital_cost_network_min",
         "capital_cost_network_max",
     ],
+    "fossil_fuel_prices_country.csv": [
+        "year",
+        "learning_seed",
+        "fuel_type",
+        "market",
+        "country",
+        "applied_price_eur_mwh",
+        "price_terminal_point_eur_mwh",
+        "fossil_price_expectation_mode",
+        "fossil_price_expectation_weights_json",
+        "last_state_year",
+        "source_state_year",
+    ],
     "system_costs.csv": [
         "year",
         "component",
@@ -1702,6 +1715,25 @@ def _prepare_system_costs(system_cost_paths: dict[int, Path]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _prepare_fossil_prices(fossil_price_log_paths: dict[int, Path]) -> pd.DataFrame:
+    frames = []
+    for year, path in sorted(fossil_price_log_paths.items()):
+        frame = pd.read_csv(path)
+        if "planning_horizon" in frame.columns and "year" not in frame.columns:
+            frame = frame.rename(columns={"planning_horizon": "year"})
+        if "year" not in frame.columns:
+            frame.insert(0, "year", int(year))
+        else:
+            frame["year"] = int(year)
+        for column in OUTPUT_TABLE_SPECS["fossil_fuel_prices_country.csv"]:
+            if column not in frame.columns:
+                frame[column] = np.nan
+        frames.append(frame.loc[:, OUTPUT_TABLE_SPECS["fossil_fuel_prices_country.csv"]])
+    if not frames:
+        return _empty_frame("fossil_fuel_prices_country.csv")
+    return pd.concat(frames, ignore_index=True)
+
+
 def _write_csv(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -1720,6 +1752,7 @@ def _extract_bundle(
     years: list[int],
     network_paths: dict[int, Path],
     cost_log_paths: dict[int, Path],
+    fossil_price_log_paths: dict[int, Path],
     state_paths: dict[int, Path],
     system_cost_paths: dict[int, Path],
     statistics_paths: dict[int, Path],
@@ -1727,6 +1760,7 @@ def _extract_bundle(
 ):
     tables = {name: _empty_frame(name) for name in OUTPUT_TABLE_SPECS}
     learning_costs = _prepare_learning_costs(cost_log_paths)
+    fossil_prices = _prepare_fossil_prices(fossil_price_log_paths)
     system_costs = _prepare_system_costs(system_cost_paths)
     previous_capacity = pd.DataFrame(
         columns=["component", "asset", "bus", "country", "carrier", "capacity_unit", "capacity_value"]
@@ -1916,6 +1950,7 @@ def _extract_bundle(
         system_summary_frames.append(system_summary.loc[:, OUTPUT_TABLE_SPECS["system_summary.csv"]])
 
     tables["learning_costs.csv"] = learning_costs
+    tables["fossil_fuel_prices_country.csv"] = fossil_prices
     tables["system_costs.csv"] = system_costs
     tables["generation_country_carrier.csv"] = pd.concat(generation_frames, ignore_index=True)
     tables["ac_energy_balance_country_carrier.csv"] = pd.concat(ac_balance_frames, ignore_index=True)
@@ -1942,6 +1977,7 @@ def _extract_bundle(
         "planning_horizons": years,
         "network_sources": {str(year): str(path) for year, path in network_paths.items()},
         "cost_log_sources": {str(year): str(path) for year, path in cost_log_paths.items()},
+        "fossil_price_log_sources": {str(year): str(path) for year, path in fossil_price_log_paths.items()},
         "state_sources": {str(year): str(path) for year, path in state_paths.items()},
         "system_cost_sources": {str(year): str(path) for year, path in system_cost_paths.items()},
         "statistics_sources": {str(year): str(path) for year, path in statistics_paths.items()},
@@ -1987,6 +2023,7 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
     years = [int(year) for year in snakemake.params.planning_horizons]
     network_paths = _map_paths_by_year(list(snakemake.input.networks), years)
     cost_log_paths = _map_paths_by_year(list(snakemake.input.cost_logs), years)
+    fossil_price_log_paths = _map_paths_by_year(list(snakemake.input.fossil_price_logs), years)
     state_paths = _map_paths_by_year(list(snakemake.input.states), years)
     system_cost_paths = _map_paths_by_year(list(snakemake.input.system_costs), years)
     statistics_paths = _map_paths_by_year(list(snakemake.input.statistics), years)
@@ -2009,6 +2046,7 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
             years,
             network_paths,
             cost_log_paths,
+            fossil_price_log_paths,
             state_paths,
             system_cost_paths,
             statistics_paths,

@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from bootstrap_state_store import resolve_scenario_sector_name
+
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
-RESULTS_DIR = ROOT_DIR / "results" / "Global_200"
+LEGACY_RESULTS_DIR = ROOT_DIR / "results" / "Global_200"
 LOG_PATTERN = re.compile(r"run_learning_cluster_array_task\.sh\.(?P<stream>[oe])(?P<jobid>\d+)\.(?P<taskid>\d+)$")
 RULE_BLOCK_RE = re.compile(
     r"rule (?P<rule>[A-Za-z0-9_]+):(?P<body>.*?)(?=\n\[|\nrule |\Z)",
@@ -43,6 +45,56 @@ def load_manifest(submission_path: Path) -> tuple[Path, list[dict]]:
     return submit_dir, tasks
 
 
+def load_submission_metadata(submit_dir: Path) -> dict:
+    metadata_path = submit_dir / "submission_metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path.resolve())
+    return unique
+
+
+def results_dirs_for_submission(submit_dir: Path, tasks: list[dict] | None = None) -> list[Path]:
+    metadata = load_submission_metadata(submit_dir)
+    candidates: list[Path] = []
+
+    for sector_name in metadata.get("resolved_sector_names", []) or []:
+        candidates.append((ROOT_DIR / "results" / Path(str(sector_name))).resolve())
+
+    resolved_sector_name = metadata.get("resolved_sector_name")
+    if resolved_sector_name:
+        candidates.append((ROOT_DIR / "results" / Path(str(resolved_sector_name))).resolve())
+
+    scenario_name = metadata.get("scenario_name")
+    if scenario_name:
+        candidates.append((ROOT_DIR / "results" / Path(resolve_scenario_sector_name(str(scenario_name)))).resolve())
+
+    if tasks:
+        for task in tasks:
+            task_scenario = str(task.get("scenario_name", "")).strip()
+            if not task_scenario:
+                continue
+            candidates.append(
+                (ROOT_DIR / "results" / Path(resolve_scenario_sector_name(task_scenario))).resolve()
+            )
+
+    candidates.append(LEGACY_RESULTS_DIR.resolve())
+    return _dedupe_paths(candidates)
+
+
 def load_planning_horizons() -> list[int]:
     text = (ROOT_DIR / "config.myopic.yaml").read_text(encoding="utf-8", errors="replace")
     marker = "planning_horizons:"
@@ -60,15 +112,26 @@ def token_for_seed(model: str, seed: int) -> str:
     return f"s{int(seed):04d}"
 
 
-def compact_complete(task: dict) -> bool:
+def _task_results_dirs(task: dict, base_results_dirs: list[Path] | None) -> list[Path]:
+    candidates = list(base_results_dirs or [])
+    scenario = str(task.get("scenario_name", "")).strip()
+    if scenario:
+        candidates.insert(0, (ROOT_DIR / "results" / Path(resolve_scenario_sector_name(scenario))).resolve())
+    if not candidates:
+        candidates.append(LEGACY_RESULTS_DIR.resolve())
+    return _dedupe_paths(candidates)
+
+
+def compact_complete(task: dict, results_dirs: list[Path] | None = None) -> bool:
     scenario = str(task["scenario_name"])
     model = str(task["model"])
     token = token_for_seed(model, int(task["seed"]))
-    compact_dir = RESULTS_DIR / "learning-compact" / scenario / model / f"seed_{token}"
-    if list(compact_dir.glob("raw_cleanup_complete*.txt")):
-        return True
-    if list(compact_dir.glob("compact_complete*.json")):
-        return True
+    for results_dir in _task_results_dirs(task, results_dirs):
+        compact_dir = results_dir / "learning-compact" / scenario / model / f"seed_{token}"
+        if list(compact_dir.glob("raw_cleanup_complete*.txt")):
+            return True
+        if list(compact_dir.glob("compact_complete*.json")):
+            return True
     return False
 
 
@@ -244,6 +307,7 @@ def summarize(submit_dir: Path, tasks: list[dict]) -> str:
 
     logs = collect_logs(submit_dir / "logs")
     active = active_job_tasks()
+    submission_results_dirs = results_dirs_for_submission(submit_dir, tasks)
     rows = []
     counts = {"completed": 0, "running": 0, "failed": 0, "not_started": 0}
 
@@ -254,7 +318,7 @@ def summarize(submit_dir: Path, tasks: list[dict]) -> str:
         combined = stdout_text + "\n" + stderr_text
         job = str(info.job_id) if info else ""
         host = extract_host(stdout_text)
-        if compact_complete(task):
+        if compact_complete(task, results_dirs=submission_results_dirs):
             status = "completed"
             stage = "complete"
         elif info is None:

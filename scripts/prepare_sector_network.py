@@ -31,6 +31,10 @@ from _helpers import (
     two_2_three_digits_country,
     annuity
 )
+from learning.fuel_price_io import (
+    get_fuel_price_by_node,
+    load_country_fuel_prices_dict,
+)
 from prepare_transport_data import prepare_transport_data
 from temporal_clustering import aggregate_snapshots
 
@@ -58,50 +62,16 @@ if hasattr(_validation_hooks, "apply_country_fuel_price_overrides"):
 
 
 def load_country_fuel_prices(fuelprices_path, investment_year, costs):
-    """
-    Load country-specific fuel prices from CSV for a given investment year.
-    
-    Parameters
-    ----------
-    fuelprices_path : str
-        Path to the fuel prices CSV file
-    investment_year : int
-        Investment year to filter prices for
-    costs : pd.DataFrame
-        Default costs DataFrame for fallback values
-    
-    Returns
-    -------
-    dict
-        Nested dictionary: {fuel_type: {country_code: price_eur_mwh}}
-    """
-    try:
-        fuel_prices_df = pd.read_csv(fuelprices_path)
-    except FileNotFoundError:
-        logger.warning(f"Fuel prices file not found at {fuelprices_path}. Using global defaults.")
-        return {}
-    
-    # Filter for the investment year
-    year_data = fuel_prices_df[fuel_prices_df['year'] == int(investment_year)]
-    
-    if year_data.empty:
-        logger.warning(f"No fuel price data for year {investment_year}. Using global defaults.")
-        return {}
-    
-    # Build nested dictionary: {fuel: {country: price}}
-    fuel_price_dict = {}
-    for fuel_type in ['oil', 'gas', 'coal']:
-        fuel_data = year_data[year_data['fuel_type'] == fuel_type]
-        fuel_price_dict[fuel_type] = dict(zip(
-            fuel_data['country'],
-            fuel_data['price_eur_mwh']
-        ))
-    
+    """Load country-specific fuel prices from CSV for a given investment year."""
+    fuel_price_dict = load_country_fuel_prices_dict(
+        fuelprices_path=fuelprices_path,
+        investment_year=investment_year,
+        costs=costs,
+    )
     logger.info(f"Loaded country-specific fuel prices for year {investment_year}")
     logger.info(f"  Oil prices: {len(fuel_price_dict.get('oil', {}))} countries")
     logger.info(f"  Gas prices: {len(fuel_price_dict.get('gas', {}))} countries")
     logger.info(f"  Coal prices: {len(fuel_price_dict.get('coal', {}))} countries")
-    
     return fuel_price_dict
 
 
@@ -228,58 +198,6 @@ def apply_regional_waccs(n, costs, wacc_dict, Nyears):
     logger.info(f"Applied regional WACCs to {updated_generators} renewable generators")
     logger.info(f"  Updated carriers: {', '.join(carrier_to_wacc_tech.keys())}")
 
-
-def get_fuel_price_by_node(nodes, carrier, costs, fuel_price_dict):
-    """
-    Get fuel prices for each node based on country-specific data.
-    
-    Parameters
-    ----------
-    nodes : pd.Index
-        Node names (e.g., ['NG 0 oil', 'KE 1 oil', ...])
-    carrier : str
-        Fuel carrier type ('oil', 'gas', or 'coal')
-    costs : pd.DataFrame
-        Default costs DataFrame for fallback values
-    fuel_price_dict : dict
-        Nested dictionary from load_country_fuel_prices()
-    
-    Returns
-    -------
-    pd.Series or float
-        Fuel prices indexed by nodes, or single default price if no data
-    """
-    # Default global price
-    default_price = costs.at[carrier, "fuel"]
-    
-    # If no country-specific data, return default for all nodes
-    if not fuel_price_dict or carrier not in fuel_price_dict:
-        return default_price
-    
-    country_prices = fuel_price_dict[carrier]
-    
-    # Extract country codes from node names (format: "XX 0 oil" -> "XX")
-    prices = []
-    missing_countries = set()
-    
-    for node in nodes:
-        # Extract 2-letter country code from node name
-        country_code = str(node).split(" ")[0][:2]
-        
-        if country_code in country_prices:
-            prices.append(country_prices[country_code])
-        else:
-            prices.append(default_price)
-            missing_countries.add(country_code)
-    
-    # Log warning for missing countries
-    if missing_countries:
-        logger.warning(
-            f"Fuel '{carrier}': No country-specific prices found for {sorted(missing_countries)}. "
-            f"Using default price {default_price:.2f} EUR/MWh"
-        )
-    
-    return pd.Series(prices, index=nodes)
 
 import psutil, os
 def print_memory(note=""):

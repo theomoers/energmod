@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_stochastic_job.sh <model> <seed> [--mode full|branch] [--dry-run]
+  bash scripts/learning/run_learning_stochastic_job.sh <model> <seed> [--mode full|branch] [--scenario-name NAME] [--dry-run]
 
 Supported models:
   - shared_state_bayesian_regime_wright
@@ -33,6 +33,7 @@ shift 2
 
 RUN_MODE="${LEARNING_RUN_MODE:-full}"
 DRY_RUN=0
+SCENARIO_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +48,14 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       DRY_RUN=1
       shift
+      ;;
+    --scenario-name)
+      if [[ $# -lt 2 ]]; then
+        echo "--scenario-name requires an argument" >&2
+        exit 1
+      fi
+      SCENARIO_NAME="$2"
+      shift 2
       ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -89,7 +98,27 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_job.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
-JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME:-Global_200}"
+
+sanitize_token() {
+  local raw="$1"
+  local token
+  token="$(printf '%s' "$raw" | tr -cs '[:alnum:]_.-' '_')"
+  token="$(printf '%s' "$token" | sed -e 's/^[._-]\+//' -e 's/[._-]\+$//')"
+  if [[ -z "$token" ]]; then
+    token="default"
+  fi
+  printf '%s' "$token"
+}
+
+if [[ -n "${LEARNING_SECTOR_NAME:-}" ]]; then
+  JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME}"
+elif [[ -n "$SCENARIO_NAME" ]]; then
+  JOB_SECTOR_NAME="Global_200/$(sanitize_token "$SCENARIO_NAME")"
+elif [[ -n "${LEARNING_SCENARIO_NAME:-}" ]]; then
+  JOB_SECTOR_NAME="Global_200/$(sanitize_token "$LEARNING_SCENARIO_NAME")"
+else
+  JOB_SECTOR_NAME="Global_200"
+fi
 SNAKEMAKE_JOBS="${JOBS:-${NSLOTS:-4}}"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
 COST_EXPECTATION_MODE="${LEARNING_COST_EXPECTATION_MODE:-}"

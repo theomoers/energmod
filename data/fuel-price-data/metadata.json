@@ -1,0 +1,31 @@
+{
+  "dummy_years": [
+    2021,
+    2022
+  ],
+  "export_years": [
+    2020,
+    2025,
+    2030,
+    2035,
+    2040,
+    2045,
+    2050
+  ],
+  "forecast_end_year": 2050,
+  "forecast_seed": 42,
+  "forecast_simulations": 10000,
+  "fuel_calibration_years": {
+    "coal": 1980,
+    "gas": 1985,
+    "oil": 1973
+  },
+  "generated_at": "2026-04-15T15:59:53.432469+00:00",
+  "n_country_mappings": 522,
+  "n_market_rows": 484,
+  "n_parameter_rows": 17,
+  "prices_inputs": "/Users/tlm2160/Library/Mobile Documents/com~apple~CloudDocs/Documents/Research/CKI/cost_customization/prices_inputs",
+  "reference_cpi_year": 2020,
+  "schema_version": "fuel-price-bundle-v1",
+  "usd_to_eur_2020": 0.8771929824561404
+}

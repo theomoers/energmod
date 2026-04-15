@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from bootstrap_state_store import resolve_scenario_sector_name
 import report_cluster_run_status as status_report
 from submit_learning_cluster_array import (
     DEFAULT_CONDA_ENV,
@@ -98,8 +99,9 @@ def completed_seeds_by_model(submission_dirs: list[Path]) -> dict[str, set[int]]
     completed: dict[str, set[int]] = defaultdict(set)
     for submit_dir in submission_dirs:
         _, tasks = status_report.load_manifest(submit_dir)
+        results_dirs = status_report.results_dirs_for_submission(submit_dir, tasks)
         for task in tasks:
-            if status_report.compact_complete(task):
+            if status_report.compact_complete(task, results_dirs=results_dirs):
                 completed[str(task["model"])].add(int(task["seed"]))
     return completed
 
@@ -203,6 +205,8 @@ def write_topup_submission(
 
     metadata_payload = {
         "scenario_name": scenario_name,
+        "resolved_sector_name": resolve_scenario_sector_name(scenario_name),
+        "resolved_sector_names": [resolve_scenario_sector_name(scenario_name)],
         "run_mode": args.run_mode,
         "source_submission": str(original_submit_dir.resolve()),
         "configfiles": [str(Path(cfg).resolve()) for cfg in configfiles],

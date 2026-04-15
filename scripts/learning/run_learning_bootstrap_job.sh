@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_bootstrap_job.sh [--dry-run]
+  bash scripts/learning/run_learning_bootstrap_job.sh [--scenario-name NAME] [--save-bootstrap-state PATH] [--dry-run]
 
 Environment variables:
   Bootstrap always runs with Snakemake parallelism fixed to 100 jobs
@@ -16,8 +16,30 @@ USAGE
 }
 
 DRY_RUN=0
+SCENARIO_NAME=""
+SAVE_BOOTSTRAP_STATE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --scenario-name)
+      if [[ $# -lt 2 ]]; then
+        echo "--scenario-name requires an argument" >&2
+        exit 1
+      fi
+      SCENARIO_NAME="$2"
+      shift 2
+      ;;
+    --save-bootstrap-state)
+      if [[ $# -lt 2 ]]; then
+        echo "--save-bootstrap-state requires an argument" >&2
+        exit 1
+      fi
+      SAVE_BOOTSTRAP_STATE="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -34,7 +56,26 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_bootstrap.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
-JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME:-Global_200}"
+
+sanitize_token() {
+  local raw="$1"
+  local token
+  token="$(printf '%s' "$raw" | tr -cs '[:alnum:]_.-' '_')"
+  token="$(printf '%s' "$token" | sed -e 's/^[._-]\+//' -e 's/[._-]\+$//')"
+  if [[ -z "$token" ]]; then
+    token="default"
+  fi
+  printf '%s' "$token"
+}
+
+if [[ -n "${LEARNING_SECTOR_NAME:-}" ]]; then
+  JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME}"
+elif [[ -n "$SCENARIO_NAME" ]]; then
+  JOB_SECTOR_NAME="Global_200/$(sanitize_token "$SCENARIO_NAME")"
+else
+  JOB_SECTOR_NAME="Global_200"
+fi
+
 SNAKEMAKE_JOBS="100"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
 
@@ -80,10 +121,19 @@ echo "Running shared learning bootstrap:"
 echo "  sector_name=$JOB_SECTOR_NAME"
 echo "  jobs=$SNAKEMAKE_JOBS"
 echo "  overlay=$OVERLAY_FILE"
+if [[ -n "$SAVE_BOOTSTRAP_STATE" ]]; then
+  echo "  save_bootstrap_state=$SAVE_BOOTSTRAP_STATE"
+fi
 
 cd "$ROOT_DIR"
 if command -v stdbuf >/dev/null 2>&1; then
   stdbuf -oL -eL "${CMD[@]}"
 else
   "${CMD[@]}"
+fi
+
+if [[ "$DRY_RUN" -eq 0 && -n "$SAVE_BOOTSTRAP_STATE" ]]; then
+  python scripts/learning/bootstrap_state_store.py save \
+    --source-sector-dir "$ROOT_DIR/results/$JOB_SECTOR_NAME" \
+    --target-dir "$SAVE_BOOTSTRAP_STATE"
 fi

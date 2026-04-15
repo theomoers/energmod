@@ -40,3 +40,11 @@ learning:
     enable: true
     cleanup_heavy_raws: true
     price_shadow_resolution: annual_summary
+  fossil_price_uncertainty:
+    enabled: false
+    bundle_root: "data/fuel-price-data"
+    fallback_to_static_prices: false
+    annual_step: 1
+    fuels: ["oil", "gas", "coal"]
+    expectation_mode: point_cost   # point_cost | block_average_expected
+    annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # when block_average_expected, first weight is previous-horizon year (e.g. 2025 for 2030 pricing)

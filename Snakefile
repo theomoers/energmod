@@ -758,6 +758,39 @@ def compact_learning_cost_log_inputs(w):
     return compact_learning_bootstrap_cost_log_inputs(w) + compact_learning_branch_cost_log_inputs(w)
 
 
+def compact_learning_bootstrap_fossil_price_log_inputs(w):
+    bootstrap_horizons = get_learning_bootstrap_horizons()
+    if not bootstrap_horizons:
+        return []
+    last_bootstrap = bootstrap_horizons[-1]
+    branch_enabled = bool(get_learning_branch_horizons())
+    paths = []
+    for year in bootstrap_horizons:
+        if branch_enabled and year == last_bootstrap:
+            paths.append(
+                RESDIR
+                + f"learning/fossil_price_log_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+            )
+        else:
+            paths.append(
+                RESDIR
+                + f"learning/fossil_price_log_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
+            )
+    return paths
+
+
+def compact_learning_branch_fossil_price_log_inputs(w):
+    return [
+        RESDIR
+        + f"learning/fossil_price_log_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_fossil_price_log_inputs(w):
+    return compact_learning_bootstrap_fossil_price_log_inputs(w) + compact_learning_branch_fossil_price_log_inputs(w)
+
+
 def compact_learning_bootstrap_state_inputs(w):
     bootstrap_horizons = get_learning_bootstrap_horizons()
     if not bootstrap_horizons:
@@ -3567,6 +3600,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.nc",
                 cost_log=RESDIR
                 + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+                fossil_price_log=RESDIR
+                + "learning/fossil_price_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
                 state_proposed=RESDIR
                 + "learning/state_proposed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.json",
             wildcard_constraints:
@@ -3778,6 +3813,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "prenetworks-learning/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.nc",
             cost_log=RESDIR
             + "learning/cost_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            fossil_price_log=RESDIR
+            + "learning/fossil_price_log_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
             state_proposed=RESDIR
             + "learning/state_proposed_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.json",
         threads: 1
@@ -3886,6 +3923,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
         input:
             networks=compact_learning_network_inputs,
             cost_logs=compact_learning_cost_log_inputs,
+            fossil_price_logs=compact_learning_fossil_price_log_inputs,
             states=compact_learning_state_inputs,
             system_costs=compact_learning_system_cost_inputs,
             statistics=compact_learning_statistics_inputs,
@@ -3916,6 +3954,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             learning_prenetworks=compact_learning_branch_prenetwork_inputs,
             postnetworks=compact_learning_branch_postnetwork_inputs,
             solved_cost_logs=compact_learning_branch_cost_log_inputs,
+            fossil_price_logs=compact_learning_branch_fossil_price_log_inputs,
             committed_states=compact_learning_branch_state_inputs,
             system_costs=compact_learning_branch_system_cost_inputs,
             statistics=compact_learning_branch_statistics_inputs,
@@ -3926,7 +3965,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "raw_cleanup_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.txt",
         shell:
             r"""
-            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.solved_cost_logs} {input.committed_states} {input.lpfiles}
+            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.solved_cost_logs} {input.fossil_price_logs} {input.committed_states} {input.lpfiles}
             mkdir -p "$(dirname {output.marker})"
             printf 'branch raws cleaned\n' > {output.marker}
             """

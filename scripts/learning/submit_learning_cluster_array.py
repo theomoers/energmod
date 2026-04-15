@@ -12,6 +12,12 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+from bootstrap_state_store import (
+    resolve_results_sector_dir,
+    resolve_scenario_sector_name,
+    restore_bootstrap_state,
+    validate_state_source,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -28,6 +34,19 @@ SUPPORTED_MODELS = [
     "correlated_geometric_random_walk",
 ]
 DEFAULT_GRID_ARRAY_CONCURRENCY = 200
+
+
+def expand_and_resolve(pathlike):
+    return Path(os.path.expandvars(str(pathlike))).resolve()
+
+
+def resolve_task_sector_names(tasks):
+    return sorted(
+        {
+            resolve_scenario_sector_name(str(task["scenario_name"]))
+            for task in tasks
+        }
+    )
 
 
 
@@ -220,7 +239,19 @@ def build_grid_run_cmd(args, manifest_path, task_count, worker_script):
     return cmd
 
 
-def write_submission_metadata(submit_dir, args, configfiles, tasks, merged_config=None, scenario_variants=None, override_draws=None, override_models=None):
+def write_submission_metadata(
+    submit_dir,
+    args,
+    configfiles,
+    tasks,
+    merged_config=None,
+    scenario_variants=None,
+    override_draws=None,
+    override_models=None,
+    resolved_sector_name=None,
+    resolved_sector_names=None,
+    bootstrap_state_source=None,
+):
     if merged_config is None:
         merged_config = load_merged_config(configfiles)
 
@@ -245,6 +276,9 @@ def write_submission_metadata(submit_dir, args, configfiles, tasks, merged_confi
         },
         "scenario_variants": scenario_variants or [],
         "models_override": override_models or None,
+        "resolved_sector_name": resolved_sector_name,
+        "resolved_sector_names": resolved_sector_names or ([] if resolved_sector_name is None else [resolved_sector_name]),
+        "bootstrap_state_source": bootstrap_state_source,
     }
     metadata_path = submit_dir / "submission_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
@@ -265,6 +299,13 @@ def submit_array(args):
         override_draws=args.draws,
         scenario_variants=scenario_variants,
     )
+    resolved_sector_name = resolve_scenario_sector_name(args.scenario_name)
+    resolved_sector_names = resolve_task_sector_names(tasks)
+    bootstrap_state_source = (
+        str(expand_and_resolve(args.bootstrap_state_source))
+        if args.bootstrap_state_source
+        else None
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     submit_root = Path(args.submit_root).resolve()
@@ -282,6 +323,9 @@ def submit_array(args):
         scenario_variants=scenario_variants,
         override_draws=args.draws,
         override_models=override_models,
+        resolved_sector_name=resolved_sector_name,
+        resolved_sector_names=resolved_sector_names,
+        bootstrap_state_source=bootstrap_state_source,
     )
 
     logs_dir = submit_dir / "logs"
@@ -290,10 +334,28 @@ def submit_array(args):
     worker_script = str((SCRIPT_DIR / "run_learning_cluster_array_task.sh").resolve())
     grid_run_cmd = build_grid_run_cmd(args, manifest_path, len(tasks), worker_script)
 
+    if bootstrap_state_source:
+        required_counts = validate_state_source(Path(bootstrap_state_source))
+        if args.print_only:
+            print("BOOTSTRAP_STATE_SOURCE", bootstrap_state_source)
+            print("BOOTSTRAP_STATE_VALIDATED", json.dumps(required_counts, sort_keys=True))
+            for sector_name in resolved_sector_names:
+                target_dir = resolve_results_sector_dir(ROOT_DIR, sector_name)
+                print("BOOTSTRAP_STATE_TARGET", target_dir)
+        else:
+            print("BOOTSTRAP_STATE_SOURCE", bootstrap_state_source)
+            print("BOOTSTRAP_STATE_VALIDATED", json.dumps(required_counts, sort_keys=True))
+            for sector_name in resolved_sector_names:
+                target_dir = resolve_results_sector_dir(ROOT_DIR, sector_name)
+                restore_summary = restore_bootstrap_state(Path(bootstrap_state_source), target_dir)
+                print("BOOTSTRAP_STATE_RESTORED", json.dumps(restore_summary, sort_keys=True))
+
     if args.print_only:
         print("TASK_MANIFEST", manifest_path)
         print("SUBMISSION_METADATA", metadata_path)
         print("ARRAY_SIZE", len(tasks))
+        print("RESOLVED_SECTOR_NAME", resolved_sector_name)
+        print("RESOLVED_SECTOR_NAMES", json.dumps(resolved_sector_names, sort_keys=True))
         print("LOG_DIR", logs_dir)
         print("GRID_RUN_CMD", " ".join(shlex.quote(part) for part in grid_run_cmd))
         return
@@ -302,6 +364,8 @@ def submit_array(args):
     print("TASK_MANIFEST", manifest_path)
     print("SUBMISSION_METADATA", metadata_path)
     print("ARRAY_SIZE", len(tasks))
+    print("RESOLVED_SECTOR_NAME", resolved_sector_name)
+    print("RESOLVED_SECTOR_NAMES", json.dumps(resolved_sector_names, sort_keys=True))
     print("LOG_DIR", logs_dir)
 
 
@@ -326,6 +390,7 @@ def run_worker(args):
     ]
     env = os.environ.copy()
     env["LEARNING_SCENARIO_NAME"] = str(task["scenario_name"])
+    env["LEARNING_SECTOR_NAME"] = resolve_scenario_sector_name(str(task["scenario_name"]))
     if "cost_expectation_mode" in task:
         env["LEARNING_COST_EXPECTATION_MODE"] = str(task["cost_expectation_mode"])
     if "cost_expectation_weights" in task and task["cost_expectation_weights"] is not None:
@@ -350,6 +415,10 @@ def main():
     parser.add_argument("--models", action="append", help="Override stochastic models (comma-separated or repeatable)")
     parser.add_argument("--draws", type=int, help="Override learning.monte_carlo.draws")
     parser.add_argument("--cost-expectation-scenarios", help="YAML/JSON file with cost expectation scenario definitions")
+    parser.add_argument(
+        "--bootstrap-state-source",
+        help="Path to saved bootstrap/prerequisite state to stage before stochastic array submission",
+    )
     parser.add_argument("configfiles", nargs="*")
     args = parser.parse_args()
 
