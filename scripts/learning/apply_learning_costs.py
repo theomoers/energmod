@@ -91,14 +91,22 @@ DEFAULT_COST_EXPECTATION_MODE = "point_cost"
 BLOCK_EXPECTATION_DRAWS = 1000
 DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS = (0.2, 0.2, 0.2, 0.2, 0.2)
 
-# Mapping of solve horizon to the historical lag-year whose learned cost is treated
-# as known and therefore applied deterministically.
-# 2020 solve uses learned_cost[2015].
-# 2025 solve uses learned_cost[2020].
-# From 2030 onward, the usual lagged rule applies.
+# Mapping of solve horizon to the historical lag-year used for bootstrap
+# cumulative capacity (experience) before switching to solved lagged blocks.
+# 2020 solve uses cumulative_capacity[2015].
+# 2025 solve uses cumulative_capacity[2020].
+# From 2030 onward, the usual lagged solved rule applies.
 COST_HISTORICAL_CAPACITY_YEARS = {
     2020: 2015,
     2025: 2020,
+}
+
+# Bootstrap cost windows (inclusive) for deterministic historical pricing.
+# 2020 solve uses average historical cost over 2015-2019.
+# 2025 solve uses average historical cost over 2020-2024.
+COST_HISTORICAL_COST_WINDOWS = {
+    2020: (2015, 2019),
+    2025: (2020, 2024),
 }
 
 
@@ -1627,6 +1635,64 @@ def load_cost_from_historical_csv(tech, year, learning_cfg):
     return cost_per_unit
 
 
+def load_average_cost_from_historical_csv(tech, start_year, end_year, learning_cfg):
+    """
+    Load average historical cost-per-unit over an inclusive year window.
+
+    Returns:
+        Average historical overnight cost in EUR/kW or EUR/kWh.
+    """
+    if int(end_year) < int(start_year):
+        raise ValueError(
+            f"Invalid historical cost window for {tech}: {start_year}-{end_year}"
+        )
+
+    hist_file = get_manifest_historical_datafile(learning_cfg, tech)
+    if hist_file is None:
+        raise ValueError(
+            f"No historical data file configured for {tech}. "
+            "Check the learning artifact manifest."
+        )
+
+    logger.info(
+        "  Loading average %s-%s cost for %s from historical data",
+        int(start_year),
+        int(end_year),
+        tech,
+    )
+    hist_data = load_historical_cost(hist_file, tech).copy()
+    hist_data["year"] = pd.to_numeric(hist_data["year"], errors="coerce")
+    hist_data = hist_data.dropna(subset=["year", "cost_per_unit"])
+    hist_data["year"] = hist_data["year"].astype(int)
+
+    expected_years = set(range(int(start_year), int(end_year) + 1))
+    available_years = set(hist_data["year"].tolist())
+    missing_years = sorted(expected_years - available_years)
+    if missing_years:
+        raise ValueError(
+            f"Historical cost data for {tech} is missing required years for window "
+            f"{start_year}-{end_year}: {missing_years}"
+        )
+
+    window = hist_data[hist_data["year"].isin(expected_years)]
+    if window.empty:
+        raise ValueError(
+            f"No historical cost data found for {tech} in window {start_year}-{end_year}."
+        )
+
+    average_cost = float(window["cost_per_unit"].mean())
+    unit = "EUR/kWh" if tech in ENERGY_TECHS else "EUR/kW"
+    logger.info(
+        "    Averaged %s-%s cost: %.3f %s (%s years)",
+        int(start_year),
+        int(end_year),
+        average_cost,
+        unit,
+        len(window),
+    )
+    return average_cost
+
+
 def load_stochastic_model_artifacts(learning_cfg, selected_model):
     manifest = learning_cfg.get("_manifest", {}) or {}
     root = Path(learning_cfg.get("_manifest_root", "."))
@@ -2842,12 +2908,22 @@ def calculate_learning_costs(
         
         if current_year in COST_HISTORICAL_CAPACITY_YEARS:
             historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
+            cost_window = COST_HISTORICAL_COST_WINDOWS.get(
+                current_year,
+                (historical_year, historical_year),
+            )
             try:
-                c_overnight = load_cost_from_historical_csv(tech, historical_year, learning_cfg)
+                c_overnight = load_average_cost_from_historical_csv(
+                    tech,
+                    cost_window[0],
+                    cost_window[1],
+                    learning_cfg,
+                )
             except Exception as e:
                 logger.error(f"    Failed to load historical cost for {tech}: {e}")
                 raise ValueError(
-                    f"Failed to load {historical_year} cost for {tech}: {e}"
+                    f"Failed to load average historical cost {cost_window[0]}-{cost_window[1]} "
+                    f"for {tech}: {e}"
                 ) from e
             if tech == 'battery_energy':
                 c_overnight_cell = c_overnight
@@ -2861,8 +2937,9 @@ def calculate_learning_costs(
                     unit,
                 )
             logger.info(
-                f"    Using historical lag-year cost for bootstrap: "
-                f"{current_year} <- {historical_year}, c_overnight={c_overnight:.3f} EUR/{unit}"
+                f"    Using historical average cost window for bootstrap: "
+                f"{current_year} <- {cost_window[0]}-{cost_window[1]}, "
+                f"c_overnight={c_overnight:.3f} EUR/{unit}"
             )
         else:
             # Calculate overnight cost using learning curve: c = A * L^(-β)

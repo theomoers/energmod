@@ -3840,6 +3840,190 @@ def add_year2025_irena_country_capacity_band(n, planning_year, config):
     )
 
 
+def add_year2025_global_capacity_band(n, planning_year, config):
+    """
+    Add 2025 global installed-capacity band constraints for selected technologies.
+
+    This is intended to complement (not replace) the country-level IRENA capacity
+    band. Total global installed capacity is constrained around configured targets
+    (e.g. solar, onwind) with a symmetric tolerance.
+    """
+    global_cfg = config.get("global_specific", {})
+    parent_cfg = global_cfg.get("year2025_capacity", {})
+    if not parent_cfg or not parent_cfg.get("year2025_capacity_constraint", False):
+        return
+
+    cfg = (parent_cfg.get("global_capacity_band", {}) or {})
+    if not cfg or not bool(cfg.get("enable", False)):
+        return
+
+    target_year = int(cfg.get("year", parent_cfg.get("year", 2025)))
+    try:
+        current_year = int(float(planning_year))
+    except Exception:
+        logger.warning(
+            "Could not parse planning year '%s' for 2025 global capacity constraints",
+            planning_year,
+        )
+        return
+
+    if current_year != target_year:
+        logger.info(
+            "Skipping 2025 global capacity constraints for %s (configured for %s)",
+            planning_year,
+            target_year,
+        )
+        return
+
+    tolerance = float(cfg.get("tolerance", 0.05))
+    if tolerance < 0.0:
+        raise ValueError(
+            f"global_specific.year2025_capacity.global_capacity_band.tolerance must be >= 0, got {tolerance}"
+        )
+
+    units = str(cfg.get("units", "GW")).lower()
+    unit_scale = {"mw": 1.0, "gw": 1e3, "tw": 1e6}.get(units, 1e3)
+
+    targets = cfg.get("targets", {}) or {}
+    if not targets:
+        logger.warning("2025 global capacity constraints enabled but no targets configured.")
+        return
+
+    model_carriers_by_constraint = parent_cfg.get(
+        "model_carriers_by_constraint",
+        {key: [key] for key in targets.keys()},
+    )
+
+    if n.generators.empty:
+        logger.warning("2025 global capacity constraints skipped: network has no generators")
+        return
+
+    gen = n.generators.copy()
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen["p_nom"] = pd.to_numeric(gen.get("p_nom", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_min"] = pd.to_numeric(gen.get("p_nom_min", 0.0), errors="coerce").fillna(0.0)
+    if "p_nom_max" in gen.columns:
+        gen["p_nom_max"] = pd.to_numeric(gen["p_nom_max"], errors="coerce")
+    else:
+        gen["p_nom_max"] = np.nan
+    gen["p_nom_extendable"] = gen.get("p_nom_extendable", False).fillna(False).astype(bool)
+
+    model_carrier_to_constraint = {}
+    for constraint_name, carriers in (model_carriers_by_constraint or {}).items():
+        if isinstance(carriers, str):
+            carriers = [carriers]
+        for c in carriers or []:
+            model_carrier_to_constraint[str(c)] = str(constraint_name)
+
+    gen["constraint_carrier"] = gen["carrier"].map(model_carrier_to_constraint)
+    gen = gen.loc[gen["constraint_carrier"].notna()].copy()
+    if gen.empty:
+        logger.warning("2025 global capacity constraints skipped: no generators matched configured carrier mapping")
+        return
+
+    p_nom_var = n.model["Generator-p_nom"]
+
+    all_ext_gen = gen.loc[gen["p_nom_extendable"]].copy()
+    fixed_gen = gen.loc[~gen["p_nom_extendable"]].copy()
+
+    degenerate_ext_gen = pd.DataFrame(columns=gen.columns)
+    ext_gen = all_ext_gen
+    if not all_ext_gen.empty:
+        positive_headroom_ext = (
+            all_ext_gen["p_nom_max"].isna()
+            | all_ext_gen["p_nom_max"].gt(all_ext_gen["p_nom_min"] + 1e-9)
+        )
+        degenerate_ext_gen = all_ext_gen.loc[~positive_headroom_ext].copy()
+        ext_gen = all_ext_gen.loc[positive_headroom_ext].copy()
+
+    fixed_capacity = (
+        fixed_gen.groupby(["constraint_carrier"])["p_nom"].sum()
+        if not fixed_gen.empty
+        else pd.Series(dtype=float)
+    )
+
+    if not degenerate_ext_gen.empty:
+        fixed_like_capacity = (
+            pd.concat(
+                [degenerate_ext_gen["p_nom"], degenerate_ext_gen["p_nom_min"]],
+                axis=1,
+            )
+            .max(axis=1)
+            .groupby([degenerate_ext_gen["constraint_carrier"]])
+            .sum()
+        )
+        if fixed_capacity.empty:
+            fixed_capacity = fixed_like_capacity.astype(float)
+        else:
+            fixed_capacity = fixed_capacity.add(fixed_like_capacity, fill_value=0.0)
+
+    ext_groups = {}
+    if not ext_gen.empty:
+        for carrier, d in ext_gen.groupby(["constraint_carrier"]):
+            ext_groups[carrier] = pd.Index(d.index)
+
+    added = 0
+    skipped_no_variable_but_satisfied = 0
+
+    for carrier, target in targets.items():
+        if isinstance(target, str) and target.upper().startswith("X"):
+            logger.info("Skipping %s global-capacity target (placeholder target '%s')", carrier, target)
+            continue
+
+        carrier = str(carrier)
+        target_mw = float(target) * unit_scale
+        lower_total = target_mw * (1.0 - tolerance)
+        upper_total = target_mw * (1.0 + tolerance)
+
+        existing_capacity_mw = float(fixed_capacity.get(carrier, 0.0))
+        ext_idx = ext_groups.get(carrier, pd.Index([]))
+
+        if len(ext_idx) == 0:
+            total_fixed = existing_capacity_mw
+            if total_fixed + 1e-6 < lower_total or total_fixed - 1e-6 > upper_total:
+                raise ValueError(
+                    "Cannot enforce 2025 global capacity band for "
+                    f"{carrier}: no extendable generators and fixed capacity "
+                    f"{total_fixed / unit_scale:.2f} {units.upper()} is outside "
+                    f"[{lower_total / unit_scale:.2f}, {upper_total / unit_scale:.2f}] {units.upper()}."
+                )
+            skipped_no_variable_but_satisfied += 1
+            continue
+
+        lhs = p_nom_var.loc[ext_idx].sum() + existing_capacity_mw
+        carrier_token = _sanitize_constraint_token(carrier)
+
+        n.model.add_constraints(
+            lhs >= lower_total,
+            name=f"year2025_global_capacity_min__{carrier_token}",
+        )
+        n.model.add_constraints(
+            lhs <= upper_total,
+            name=f"year2025_global_capacity_max__{carrier_token}",
+        )
+        added += 1
+
+        logger.info(
+            "Global %s capacity band for %s: %.2f ≤ total installed capacity ≤ %.2f %s "
+            "(fixed-equivalent: %.2f %s)",
+            carrier,
+            planning_year,
+            lower_total / unit_scale,
+            upper_total / unit_scale,
+            units.upper(),
+            existing_capacity_mw / unit_scale,
+            units.upper(),
+        )
+
+    logger.info(
+        "Added %d global 2025 capacity bands for planning year %s (tolerance=%.2f%%, skipped_fixed_only_satisfied=%d)",
+        added,
+        planning_year,
+        100.0 * tolerance,
+        skipped_no_variable_but_satisfied,
+    )
+
+
 def add_year2025_irena_nodal_distribution_constraints(n, planning_year, config):
     """
     Limit 2025 renewable build concentration by adding linear nodal share constraints.

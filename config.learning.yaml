@@ -24,15 +24,15 @@ learning:
   seed: 0                      # used only by stochastic_forecast
   cost_expectations:
     mode: block_average_expected         # point_cost | block_average_expected
-    annual_weights: [1.0, 1.0, 0.0, 0.0, 0.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
+    annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-      - correlated_geometric_random_walk
-      - way_fixed_rho_benchmark_035
-    draws: 500
+      #- correlated_geometric_random_walk
+      #- way_fixed_rho_benchmark_035
+    draws: 20
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000

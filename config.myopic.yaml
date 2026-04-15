@@ -183,6 +183,14 @@ global_specific:
       max_baseyear_share_multiplier: 1.5
       new_bus_share_multiplier: 0.5
       new_bus_flattening_exponent: 0.5
+    global_capacity_band:
+      enable: true
+      year: 2025
+      tolerance: 0.05
+      units: GW
+      targets:
+        solar: 2383.0
+        onwind: 1999.0
 
 permstore:
   enable: true

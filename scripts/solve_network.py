@@ -3498,6 +3498,13 @@ def extra_functionality(n, snapshots):
                 config=config,
             )
 
+        if hasattr(_validation_hooks, "add_year2025_global_capacity_band"):
+            _validation_hooks.add_year2025_global_capacity_band(
+                n,
+                planning_year=planning_year,
+                config=config,
+            )
+
         if hasattr(_validation_hooks, "add_year2025_irena_nodal_distribution_constraints"):
             _validation_hooks.add_year2025_irena_nodal_distribution_constraints(
                 n,
