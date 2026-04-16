@@ -98,6 +98,13 @@ crs:
 
 global_specific:
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
+  post2020_structural_biomass:
+    enable: false
+    start_year: 2025
+    owid_csv: validation/data/owid-energy-data.csv
+    history_metric: biofuel_electricity
+    freeze_last_historical_value: true
+    strict_physical_balance: true
   baseyear_generation:
     baseyear_generation_constraint: true # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
     # Optional solved baseyear network used to estimate non-Load electric end-use

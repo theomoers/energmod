@@ -469,30 +469,20 @@ if __name__ == "__main__":
 
     add_brownfield(n, n_p, year)
 
-    # Reset capacity of current year assets to 0 and make them extendable
-    # The brownfield constraint will be enforced via imported assets from previous year
-    # Biomass/biogas assets: reset capacity to 0 but keep them non-extendable (resource-limited)
+    # Reset capacity of current year assets to 0 and make them extendable.
+    # The brownfield constraint will be enforced via imported assets from previous year.
     for c in n.iterate_components(["Link", "Generator", "Store"]):
         attr = "e" if c.name == "Store" else "p"
         current_year_assets = c.df.index[c.df.build_year == year]
         
         if not current_year_assets.empty:
-            # Identify biomass/biogas assets
-            biomass_biogas_mask = c.df.carrier.str.contains("biomass|biogas", case=False, na=False)
-            biomass_biogas_current = current_year_assets[biomass_biogas_mask[current_year_assets]]
-            
             # Identify battery assets (Stores with carrier "battery" or Links with "battery charger"/"battery discharger")
             battery_mask = c.df.carrier.str.contains("battery", case=False, na=False)
             battery_current = current_year_assets[battery_mask[current_year_assets]]
             
-            # Other assets (excluding biomass/biogas and batteries)
-            other_current = current_year_assets[~biomass_biogas_mask[current_year_assets] & ~battery_mask[current_year_assets]]
-            
-            # Reset biomass/biogas to 0 but keep non-extendable
-            if not biomass_biogas_current.empty:
-                c.df.loc[biomass_biogas_current, f"{attr}_nom"] = 0
-                c.df.loc[biomass_biogas_current, f"{attr}_nom_min"] = 0
-                logger.info(f"Reset {len(biomass_biogas_current)} {c.name} biomass/biogas assets with build_year={year} to {attr}_nom=0, {attr}_nom_min=0")
+            # Other assets (including biomass and biogas) are reset to zero and re-opened
+            # for endogenous replacement in the current horizon.
+            other_current = current_year_assets[~battery_mask[current_year_assets]]
             
             # Reset battery stores to 0 and make extendable
             if not battery_current.empty:

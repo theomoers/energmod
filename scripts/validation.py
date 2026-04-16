@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 
 BASEYEAR_BLOCKED_EXTENDABLE_LINK_CARRIERS = ("H2 Fuel Cell",)
+STRUCTURAL_BIOMASS_POWER_CARRIERS = (
+    "biomass",
+    "biomass EOP",
+    "urban central solid biomass CHP",
+    "urban central solid biomass CHP CC",
+)
+_STRUCTURAL_BIOMASS_EFFICIENCY_CACHE = {}
 
 
 def _get_bus_country_for_clustering(n):
@@ -282,6 +289,243 @@ def _safe_iso3_to_iso2(code):
 def _repo_path(path_like):
     path_str = str(path_like)
     return path_str if os.path.isabs(path_str) else os.path.join(BASE_DIR, path_str)
+
+
+def _structural_biomass_cfg(config):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("post2020_structural_biomass", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _modeled_countries_from_config(config):
+    countries = config.get("countries", []) if isinstance(config, dict) else []
+    return {str(country).strip().upper() for country in countries if str(country).strip()}
+
+
+def _load_global_historical_biofuel_electricity_twh(config):
+    cfg = _structural_biomass_cfg(config)
+    owid_csv = _repo_path(cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
+    if not os.path.exists(owid_csv):
+        raise FileNotFoundError(
+            f"Structural biomass allocation requires OWID data at {owid_csv}"
+        )
+
+    owid = pd.read_csv(
+        owid_csv,
+        usecols=lambda c: c in {"year", "iso_code", "biofuel_electricity"},
+    )
+    if "biofuel_electricity" not in owid.columns:
+        raise ValueError(
+            f"Column 'biofuel_electricity' not found in structural biomass OWID file {owid_csv}"
+        )
+
+    owid["country"] = owid["iso_code"].apply(_safe_iso3_to_iso2)
+    modeled_countries = _modeled_countries_from_config(config)
+    if modeled_countries:
+        owid = owid.loc[owid["country"].isin(modeled_countries)].copy()
+
+    owid["year"] = pd.to_numeric(owid["year"], errors="coerce")
+    owid["biofuel_electricity"] = pd.to_numeric(
+        owid["biofuel_electricity"], errors="coerce"
+    ).fillna(0.0)
+    owid = owid.dropna(subset=["year"])
+
+    return (
+        owid.groupby(owid["year"].astype(int))["biofuel_electricity"]
+        .sum(min_count=1)
+        .sort_index()
+        .astype(float)
+    )
+
+
+def _representative_biomass_electric_efficiency(config):
+    cfg = _structural_biomass_cfg(config)
+    base_cfg = config.get("global_specific", {}).get("baseyear_generation", {})
+    baseline_network = cfg.get(
+        "baseline_network",
+        base_cfg.get("electricity_demand_baseline_network"),
+    )
+    if not baseline_network:
+        raise ValueError(
+            "Structural biomass allocation requires a baseline solved network path."
+        )
+
+    baseline_path = _repo_path(baseline_network)
+    cache_key = os.path.abspath(baseline_path)
+    if cache_key in _STRUCTURAL_BIOMASS_EFFICIENCY_CACHE:
+        return _STRUCTURAL_BIOMASS_EFFICIENCY_CACHE[cache_key]
+
+    if not os.path.exists(baseline_path):
+        raise FileNotFoundError(
+            f"Structural biomass allocation baseline network not found at {baseline_path}"
+        )
+
+    n = pypsa.Network(baseline_path)
+    weights = _snapshot_generator_weights(n)
+    total_electricity_mwh = 0.0
+    total_biomass_input_mwh = 0.0
+
+    if not n.generators.empty and not n.generators_t.p.empty:
+        generators = n.generators.loc[
+            n.generators.carrier.astype(str).isin(STRUCTURAL_BIOMASS_POWER_CARRIERS)
+        ].copy()
+        if not generators.empty:
+            generators = generators.loc[
+                generators.bus.map(n.buses.carrier).fillna("").eq("AC")
+            ].copy()
+            if not generators.empty:
+                dispatch = (
+                    n.generators_t.p.reindex(columns=generators.index)
+                    .fillna(0.0)
+                    .mul(weights, axis=0)
+                    .sum(axis=0)
+                )
+                efficiency = pd.to_numeric(
+                    generators["efficiency"], errors="coerce"
+                ).replace(0.0, np.nan)
+                total_electricity_mwh += float(dispatch.sum())
+                total_biomass_input_mwh += float(
+                    dispatch.div(efficiency).replace([np.inf, -np.inf], np.nan).fillna(0.0).sum()
+                )
+
+    if not n.links.empty and not n.links_t.p0.empty:
+        links = n.links.loc[
+            n.links.carrier.astype(str).isin(STRUCTURAL_BIOMASS_POWER_CARRIERS)
+        ].copy()
+        if not links.empty:
+            links = links.loc[
+                links.bus1.map(n.buses.carrier).fillna("").eq("AC")
+            ].copy()
+            if not links.empty:
+                p0 = (
+                    n.links_t.p0.reindex(columns=links.index)
+                    .fillna(0.0)
+                    .clip(lower=0.0)
+                    .mul(weights, axis=0)
+                    .sum(axis=0)
+                )
+                efficiency = pd.to_numeric(
+                    links["efficiency"], errors="coerce"
+                ).fillna(0.0).abs()
+                total_biomass_input_mwh += float(p0.sum())
+                total_electricity_mwh += float(p0.mul(efficiency).sum())
+
+    if total_biomass_input_mwh <= 0.0 or total_electricity_mwh <= 0.0:
+        raise ValueError(
+            "Could not derive representative biomass-electric efficiency from baseline network."
+        )
+
+    efficiency = total_electricity_mwh / total_biomass_input_mwh
+    _STRUCTURAL_BIOMASS_EFFICIENCY_CACHE[cache_key] = efficiency
+    logger.info(
+        "Derived representative biomass-electric efficiency %.4f from %s",
+        efficiency,
+        baseline_path,
+    )
+    return efficiency
+
+
+def derive_post2020_structural_biomass_allocation(
+    investment_year,
+    config,
+    physical_total_twh,
+    energy_totals=None,
+    industrial_demand=None,
+):
+    cfg = _structural_biomass_cfg(config)
+    if not cfg.get("enable", False):
+        return None
+
+    year = int(investment_year)
+    start_year = int(cfg.get("start_year", 2025))
+    if year < start_year:
+        return None
+
+    physical_total_twh = float(physical_total_twh)
+    historical = _load_global_historical_biofuel_electricity_twh(config)
+    if historical.empty:
+        raise ValueError("No historical global biofuel_electricity values available.")
+
+    if year in historical.index:
+        history_year = int(year)
+        bioelectricity_twh = float(historical.loc[year])
+    else:
+        earlier = historical.loc[historical.index <= year]
+        if bool(cfg.get("freeze_last_historical_value", True)) and not earlier.empty:
+            history_year = int(earlier.index.max())
+            bioelectricity_twh = float(earlier.loc[history_year])
+        else:
+            raise ValueError(
+                f"No historical biofuel_electricity value available for structural biomass year {year}."
+            )
+
+    representative_efficiency = _representative_biomass_electric_efficiency(config)
+    power_required_twh = bioelectricity_twh / representative_efficiency
+
+    industry_required_twh = 0.0
+    if industrial_demand is not None and "solid biomass" in industrial_demand.columns:
+        industry_required_twh = float(
+            pd.to_numeric(industrial_demand["solid biomass"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+            / 1e6
+        )
+
+    buildings_required_twh = 0.0
+    if energy_totals is not None:
+        for col in ["services biomass", "residential biomass", "residential heat biomass"]:
+            if col in energy_totals.columns:
+                buildings_required_twh += float(
+                    pd.to_numeric(energy_totals[col], errors="coerce").fillna(0.0).sum()
+                )
+
+    total_required_twh = power_required_twh + industry_required_twh + buildings_required_twh
+    feasible = total_required_twh <= physical_total_twh + 1e-9
+    residual_twh = max(physical_total_twh - total_required_twh, 0.0)
+
+    if not feasible:
+        message = (
+            "Structural biomass allocation exceeds physical annual biomass potential for "
+            f"{year}: power={power_required_twh:.3f} TWh, industry={industry_required_twh:.3f} TWh, "
+            f"buildings={buildings_required_twh:.3f} TWh, total={total_required_twh:.3f} TWh, "
+            f"physical={physical_total_twh:.3f} TWh."
+        )
+        if bool(cfg.get("strict_physical_balance", True)):
+            raise ValueError(message)
+        logger.warning(message)
+        power_required_twh = max(
+            physical_total_twh - industry_required_twh - buildings_required_twh, 0.0
+        )
+        total_required_twh = power_required_twh + industry_required_twh + buildings_required_twh
+        residual_twh = max(physical_total_twh - total_required_twh, 0.0)
+
+    allocation = pd.Series(
+        {
+            "year": year,
+            "history_year": history_year,
+            "physical_total_twh": physical_total_twh,
+            "power_required_twh": power_required_twh,
+            "industry_required_twh": industry_required_twh,
+            "buildings_required_twh": buildings_required_twh,
+            "unallocated_residual_twh": residual_twh,
+            "bioelectricity_reference_twh": bioelectricity_twh,
+            "representative_efficiency": representative_efficiency,
+            "physical_feasible": bool(feasible),
+        }
+    )
+    logger.info(
+        "Structural biomass allocation for %s: physical=%.3f TWh, power=%.3f TWh, industry=%.3f TWh, buildings=%.3f TWh, residual=%.3f TWh (history_year=%s, bioelectricity=%.3f TWh, eta=%.4f)",
+        year,
+        physical_total_twh,
+        power_required_twh,
+        industry_required_twh,
+        buildings_required_twh,
+        residual_twh,
+        history_year,
+        bioelectricity_twh,
+        representative_efficiency,
+    )
+    return allocation
 
 
 def _bus_country_lookup(n):

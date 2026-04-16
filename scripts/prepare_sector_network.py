@@ -41,6 +41,7 @@ from temporal_clustering import aggregate_snapshots
 logger = logging.getLogger(__name__)
 
 spatial = SimpleNamespace()
+biomass_allocation = None
 
 
 # Centralized validation/tuning hooks (kept outside this core script for easier reversion).
@@ -59,6 +60,10 @@ if hasattr(_validation_hooks, "align_country_electricity_demand_to_owid"):
     logger.info("Using centralized validation/tuning hooks from scripts/validation.py")
 if hasattr(_validation_hooks, "apply_country_fuel_price_overrides"):
     apply_country_fuel_price_overrides = _validation_hooks.apply_country_fuel_price_overrides
+if hasattr(_validation_hooks, "derive_post2020_structural_biomass_allocation"):
+    derive_post2020_structural_biomass_allocation = (
+        _validation_hooks.derive_post2020_structural_biomass_allocation
+    )
 
 
 def load_country_fuel_prices(fuelprices_path, investment_year, costs):
@@ -1293,11 +1298,17 @@ def define_spatial(nodes, options):
     if options["biomass_transport"]:
         spatial.biomass.nodes = nodes + " solid biomass"
         spatial.biomass.locations = nodes
+        spatial.biomass.power = nodes + " solid biomass power"
+        spatial.biomass.buildings = nodes + " solid biomass buildings"
+        spatial.biomass.industry_resource = nodes + " solid biomass industry resource"
         spatial.biomass.industry = nodes + " solid biomass for industry"
         spatial.biomass.industry_cc = nodes + " solid biomass for industry CC"
     else:
         spatial.biomass.nodes = ["Earth solid biomass"]
         spatial.biomass.locations = ["Earth"]
+        spatial.biomass.power = ["Earth solid biomass power"]
+        spatial.biomass.buildings = ["Earth solid biomass buildings"]
+        spatial.biomass.industry_resource = ["Earth solid biomass industry resource"]
         spatial.biomass.industry = ["solid biomass for industry"]
         spatial.biomass.industry_cc = ["solid biomass for industry CC"]
 
@@ -1400,7 +1411,6 @@ def add_biomass(n, costs):
     logger.info("Biomass and Biogas potential fetched from config")
 
     # Convert from total to nodal potentials,
-    biomass_pot_spatial = biomass_pot / len(spatial.biomass.nodes)
     biogas_pot_spatial = biogas_pot / len(spatial.gas.biogas)
     logger.info("Biomass potentials spatially resolved equally across all nodes")
 
@@ -1408,6 +1418,14 @@ def add_biomass(n, costs):
         n.add("Carrier", "biogas")
     if "solid biomass" not in n.carriers.index:
         n.add("Carrier", "solid biomass")
+    if biomass_allocation is not None:
+        for carrier_name in [
+            "solid biomass power",
+            "solid biomass buildings",
+            "solid biomass industry resource",
+        ]:
+            if carrier_name not in n.carriers.index:
+                n.add("Carrier", carrier_name)
 
     biogas_buses = pd.Index(spatial.gas.biogas)
     biogas_buses_new = biogas_buses.difference(n.buses.index)
@@ -1417,16 +1435,6 @@ def add_biomass(n, costs):
             biogas_buses_new,
             location=biogas_buses_new.to_series().map(dict(zip(spatial.gas.biogas, spatial.biomass.locations))),
             carrier="biogas",
-        )
-
-    biomass_buses = pd.Index(spatial.biomass.nodes)
-    biomass_buses_new = biomass_buses.difference(n.buses.index)
-    if len(biomass_buses_new):
-        n.madd(
-            "Bus",
-            biomass_buses_new,
-            location=biomass_buses_new.to_series().map(dict(zip(spatial.biomass.nodes, spatial.biomass.locations))),
-            carrier="solid biomass",
         )
 
     n.madd(
@@ -1439,22 +1447,63 @@ def add_biomass(n, costs):
         e_initial=biogas_pot_spatial,
     )
 
-    n.madd(
-        "Store",
-        spatial.biomass.nodes,
-        bus=spatial.biomass.nodes,
-        carrier="solid biomass",
-        e_nom=biomass_pot_spatial,
-        marginal_cost=costs.at["solid biomass", "fuel"],
-        e_initial=biomass_pot_spatial,
-    )
+    if biomass_allocation is not None:
+        biomass_bus_specs = [
+            (
+                pd.Index(spatial.biomass.power),
+                "solid biomass power",
+                float(biomass_allocation["power_required_twh"]) * 1e6,
+            ),
+            (
+                pd.Index(spatial.biomass.buildings),
+                "solid biomass buildings",
+                float(biomass_allocation["buildings_required_twh"]) * 1e6,
+            ),
+            (
+                pd.Index(spatial.biomass.industry_resource),
+                "solid biomass industry resource",
+                float(biomass_allocation["industry_required_twh"]) * 1e6,
+            ),
+        ]
+    else:
+        biomass_bus_specs = [
+            (
+                pd.Index(spatial.biomass.nodes),
+                "solid biomass",
+                biomass_pot,
+            )
+        ]
+
+    for buses, carrier_name, total_nom_mwh in biomass_bus_specs:
+        buses_new = buses.difference(n.buses.index)
+        if len(buses_new):
+            n.madd(
+                "Bus",
+                buses_new,
+                location=buses_new.to_series().map(dict(zip(buses, spatial.biomass.locations))),
+                carrier=carrier_name,
+            )
+
+        if len(buses) == 0 or total_nom_mwh <= 0.0:
+            continue
+
+        e_nom_spatial = total_nom_mwh / len(buses)
+        n.madd(
+            "Store",
+            buses,
+            bus=buses,
+            carrier=carrier_name,
+            e_nom=e_nom_spatial,
+            marginal_cost=costs.at["solid biomass", "fuel"],
+            e_initial=e_nom_spatial,
+        )
 
     biomass_gen = "biomass EOP"
     n.madd(
         "Link",
         spatial.nodes + " biomass EOP",
         bus0=broadcast_madd_value(
-            spatial.biomass.nodes,
+            spatial.biomass.power if biomass_allocation is not None else spatial.biomass.nodes,
             spatial.nodes,
             "biomass EOP bus0",
         ),
@@ -1560,7 +1609,11 @@ def add_biomass(n, costs):
         n.madd(
             "Link",
             urban_central + " urban central solid biomass CHP",
-            bus0=spatial.biomass.df.loc[urban_central, "nodes"].values,
+            bus0=(
+                spatial.biomass.df.loc[urban_central, "power"].values
+                if biomass_allocation is not None
+                else spatial.biomass.df.loc[urban_central, "nodes"].values
+            ),
             bus1=urban_central,
             bus2=urban_central + " urban central heat",
             carrier="urban central solid biomass CHP",
@@ -1576,7 +1629,11 @@ def add_biomass(n, costs):
             n.madd(
                 "Link",
                 urban_central + " urban central solid biomass CHP CC",
-                bus0=spatial.biomass.df.loc[urban_central, "nodes"].values,
+                bus0=(
+                    spatial.biomass.df.loc[urban_central, "power"].values
+                    if biomass_allocation is not None
+                    else spatial.biomass.df.loc[urban_central, "nodes"].values
+                ),
                 bus1=urban_central,
                 bus2=urban_central + " urban central heat",
                 bus3="co2 atmosphere",
@@ -2146,7 +2203,11 @@ def add_industry(n, costs):
         "Link",
         spatial.biomass.industry,
         bus0=broadcast_madd_value(
-            spatial.biomass.nodes,
+            (
+                spatial.biomass.industry_resource
+                if biomass_allocation is not None
+                else spatial.biomass.nodes
+            ),
             spatial.biomass.industry,
             "solid biomass for industry bus0",
         ),
@@ -2166,7 +2227,11 @@ def add_industry(n, costs):
             "Link",
             spatial.biomass.industry_cc,
             bus0=broadcast_madd_value(
-                spatial.biomass.nodes,
+                (
+                    spatial.biomass.industry_resource
+                    if biomass_allocation is not None
+                    else spatial.biomass.nodes
+                ),
                 spatial.biomass.industry_cc,
                 "solid biomass for industry CC bus0",
             ),
@@ -3046,7 +3111,11 @@ def add_services(n, costs):
         spatial.nodes,
         suffix=" services biomass",
         bus=broadcast_madd_value(
-            spatial.biomass.nodes,
+            (
+                spatial.biomass.buildings
+                if biomass_allocation is not None
+                else spatial.biomass.nodes
+            ),
             spatial.nodes,
             "services biomass bus",
         ),
@@ -3490,7 +3559,11 @@ def add_residential(n, costs):
         spatial.nodes,
         suffix=" residential biomass",
         bus=broadcast_madd_value(
-            spatial.biomass.nodes,
+            (
+                spatial.biomass.buildings
+                if biomass_allocation is not None
+                else spatial.biomass.nodes
+            ),
             spatial.nodes,
             "residential biomass bus",
         ),
@@ -4031,6 +4104,14 @@ if __name__ == "__main__":
         snakemake.input.industrial_demand, index_col=0, header=0
     )  # * 1e6
 
+    biomass_allocation = derive_post2020_structural_biomass_allocation(
+        investment_year=investment_year,
+        config=snakemake.config,
+        physical_total_twh=float(snakemake.params.sector_options["solid_biomass_potential"]),
+        energy_totals=energy_totals,
+        industrial_demand=industrial_demand,
+    )
+
     ##########################################################################
     ############## Functions adding different carrires and sectors ###########
     ##########################################################################
@@ -4270,5 +4351,10 @@ if __name__ == "__main__":
     # Apply country-specific WACCs to ALL renewable generators (must be last to catch all generators)
     logger.info("Applying regional WACCs to all renewable generators...")
     apply_regional_waccs(n, costs, wacc_dict, Nyears)
+
+    if biomass_allocation is not None:
+        if not isinstance(getattr(n, "meta", None), dict):
+            n.meta = {}
+        n.meta["post2020_structural_biomass"] = biomass_allocation.to_dict()
 
     n.export_to_netcdf(snakemake.output.network)
