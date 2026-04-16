@@ -762,21 +762,11 @@ def compact_learning_bootstrap_fossil_price_log_inputs(w):
     bootstrap_horizons = get_learning_bootstrap_horizons()
     if not bootstrap_horizons:
         return []
-    last_bootstrap = bootstrap_horizons[-1]
-    branch_enabled = bool(get_learning_branch_horizons())
-    paths = []
-    for year in bootstrap_horizons:
-        if branch_enabled and year == last_bootstrap:
-            paths.append(
-                RESDIR
-                + f"learning/fossil_price_log_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
-            )
-        else:
-            paths.append(
-                RESDIR
-                + f"learning/fossil_price_log_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
-            )
-    return paths
+    return [
+        RESDIR
+        + f"learning/fossil_price_log_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
+        for year in bootstrap_horizons
+    ]
 
 
 def compact_learning_branch_fossil_price_log_inputs(w):

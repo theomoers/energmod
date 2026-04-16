@@ -46,6 +46,10 @@ def resolve_results_sector_dir(root_dir: Path, sector_name: str) -> Path:
     return (root_dir / "results" / Path(sector_name)).resolve()
 
 
+def resolve_resources_sector_dir(root_dir: Path, sector_name: str) -> Path:
+    return (root_dir / "resources" / Path(sector_name)).resolve()
+
+
 def _require_directory(path: Path, label: str) -> Path:
     resolved = path.resolve()
     if not resolved.exists():
@@ -88,7 +92,7 @@ def _try_hardlink(src: Path, dst: Path) -> bool:
 
 
 def _mirror_file(src: Path, dst: Path, hardlink_first: bool, summary: MirrorSummary) -> None:
-    if dst.exists():
+    if os.path.lexists(dst):
         summary.skipped_existing += 1
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -122,16 +126,45 @@ def mirror_tree(
     return summary
 
 
+def _merge_summary(parts: list[MirrorSummary]) -> MirrorSummary:
+    merged = MirrorSummary()
+    for part in parts:
+        merged.copied += part.copied
+        merged.linked += part.linked
+        merged.skipped_existing += part.skipped_existing
+        merged.symlinked += part.symlinked
+    return merged
+
+
+def _infer_sector_name_from_results_dir(sector_dir: Path) -> str:
+    sector_dir = sector_dir.resolve()
+    try:
+        rel = sector_dir.relative_to((ROOT_DIR / "results").resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"Expected a results sector directory under {ROOT_DIR / 'results'}; got {sector_dir}"
+        ) from exc
+    return str(rel)
+
+
+def _companion_resources_dir_for_results_dir(sector_dir: Path) -> Path:
+    sector_name = _infer_sector_name_from_results_dir(sector_dir)
+    return resolve_resources_sector_dir(ROOT_DIR, sector_name)
+
+
 def write_state_manifest(
     target_dir: Path,
     source_dir: Path,
     required_counts: dict[str, int],
+    resources_source_dir: Path | None = None,
 ) -> Path:
     payload = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_dir": str(source_dir.resolve()),
         "required_artifact_counts": required_counts,
     }
+    if resources_source_dir is not None:
+        payload["resources_source_dir"] = str(resources_source_dir.resolve())
     manifest_path = target_dir / "bootstrap_state_manifest.json"
     manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return manifest_path
@@ -143,8 +176,19 @@ def save_bootstrap_state(
 ) -> dict[str, object]:
     source_sector_dir = _require_directory(source_sector_dir, "Bootstrap source sector directory")
     required_counts = validate_state_source(source_sector_dir)
-    summary = mirror_tree(source_sector_dir, target_dir, hardlink_first=False)
-    manifest_path = write_state_manifest(target_dir.resolve(), source_sector_dir, required_counts)
+    summaries = [mirror_tree(source_sector_dir, target_dir, hardlink_first=False)]
+    resources_source_dir = _companion_resources_dir_for_results_dir(source_sector_dir)
+    resources_target_dir = target_dir.resolve() / "__resources_sector__"
+    resources_source_exists = resources_source_dir.exists() and resources_source_dir.is_dir()
+    if resources_source_exists:
+        summaries.append(mirror_tree(resources_source_dir, resources_target_dir, hardlink_first=False))
+    summary = _merge_summary(summaries)
+    manifest_path = write_state_manifest(
+        target_dir.resolve(),
+        source_sector_dir,
+        required_counts,
+        resources_source_dir=resources_source_dir if resources_source_exists else None,
+    )
     return {
         "source_dir": str(source_sector_dir.resolve()),
         "target_dir": str(target_dir.resolve()),
@@ -154,6 +198,7 @@ def save_bootstrap_state(
         "symlinked": summary.symlinked,
         "skipped_existing": summary.skipped_existing,
         "manifest_path": str(manifest_path),
+        "resources_source_dir": str(resources_source_dir.resolve()) if resources_source_exists else None,
     }
 
 
@@ -163,7 +208,24 @@ def restore_bootstrap_state(
 ) -> dict[str, object]:
     source_dir = _require_directory(source_dir, "Bootstrap state source")
     required_counts = validate_state_source(source_dir)
-    summary = mirror_tree(source_dir, target_sector_dir, hardlink_first=True)
+    summaries = [mirror_tree(source_dir, target_sector_dir, hardlink_first=True)]
+    target_resources_dir = _companion_resources_dir_for_results_dir(target_sector_dir)
+    restored_resources = False
+
+    resources_snapshot_dir = source_dir / "__resources_sector__"
+    if resources_snapshot_dir.exists():
+        summaries.append(mirror_tree(resources_snapshot_dir, target_resources_dir, hardlink_first=True))
+        restored_resources = True
+    else:
+        try:
+            companion_resources_source = _companion_resources_dir_for_results_dir(source_dir)
+        except ValueError:
+            companion_resources_source = None
+        if companion_resources_source is not None and companion_resources_source.exists() and companion_resources_source.is_dir():
+            summaries.append(mirror_tree(companion_resources_source, target_resources_dir, hardlink_first=True))
+            restored_resources = True
+
+    summary = _merge_summary(summaries)
     return {
         "source_dir": str(source_dir.resolve()),
         "target_dir": str(target_sector_dir.resolve()),
@@ -172,6 +234,7 @@ def restore_bootstrap_state(
         "linked": summary.linked,
         "symlinked": summary.symlinked,
         "skipped_existing": summary.skipped_existing,
+        "resources_target_dir": str(target_resources_dir.resolve()) if restored_resources else None,
     }
 
 
