@@ -166,8 +166,8 @@ global_specific:
     year2025_capacity_constraint: true
     year: 2025
     units: GW
-    irena_csv: validation/data/IRENA_2024CAPA.csv
-    reference_year: 2024
+    irena_csv: validation/data/IRENA_2025_capacity.csv
+    reference_year: 2025
     fallback_to_latest_available: false
     geothermal_extendable_fallback: true
     lower_multiplier: 1.0 # 2025 must be at least 2024 installed capacity

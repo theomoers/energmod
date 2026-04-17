@@ -3133,6 +3133,12 @@ def _owid_country_metric_reference(owid_csv, year, metrics):
 
 def _irena_country_capacity_reference(irena_csv, year, carrier_technology_map, fallback_to_latest=True):
     irena = pd.read_csv(irena_csv)
+    irena = irena.rename(
+        columns={
+            col: str(col).replace("\ufeff", "").strip()
+            for col in irena.columns
+        }
+    )
 
     tech_to_carrier = {}
     for carrier, techs in (carrier_technology_map or {}).items():
@@ -3181,6 +3187,76 @@ def _irena_country_capacity_reference(irena_csv, year, carrier_technology_map, f
             .sum(min_count=1)
             .fillna({"reference_mw": 0.0})
         )
+        ref["reference_mw"] = pd.to_numeric(ref["reference_mw"], errors="coerce").fillna(0.0).astype(float)
+        return ref, chosen_year
+
+    # New IRENA Renewable Capacity Statistics long format.
+    new_long_cols = {
+        "Region/area (ISO 3)",
+        "Year",
+        "Data Type",
+        "Product Name",
+        "Grid Type",
+        "Unit",
+        "Value",
+    }
+    if new_long_cols.issubset(irena.columns):
+        irena["Year"] = pd.to_numeric(irena["Year"], errors="coerce")
+        available_years = sorted(int(y) for y in irena["Year"].dropna().unique())
+        if not available_years:
+            raise ValueError(f"No valid `Year` rows found in IRENA capacity file: {irena_csv}")
+
+        chosen_year = requested_year
+        if chosen_year not in available_years:
+            if not fallback_to_latest:
+                raise ValueError(
+                    f"Year row '{requested_year}' not found in {irena_csv}. "
+                    f"Available years: {available_years[0]}-{available_years[-1]}"
+                )
+            earlier_or_equal = [y for y in available_years if y <= requested_year]
+            chosen_year = max(earlier_or_equal) if earlier_or_equal else available_years[-1]
+            logger.warning(
+                "IRENA capacity reference year %s not found in %s; using %s instead.",
+                requested_year,
+                irena_csv,
+                chosen_year,
+            )
+
+        ref = irena.loc[irena["Year"].eq(chosen_year)].copy()
+        ref["Data Type"] = ref["Data Type"].astype(str).str.strip()
+        ref["Product Name"] = ref["Product Name"].astype(str).str.strip()
+        ref["Grid Type"] = ref["Grid Type"].astype(str).str.strip()
+        ref["Unit"] = ref["Unit"].astype(str).str.strip()
+        ref = ref.loc[
+            ref["Data Type"].eq("Electrical Capacity")
+            & ref["Grid Type"].eq("OnGrid")
+            & ref["Unit"].eq("Megawatt")
+        ].copy()
+        ref["carrier"] = ref["Product Name"].map(tech_to_carrier)
+        ref = ref.loc[ref["carrier"].notna()].copy()
+        iso3_codes = ref["Region/area (ISO 3)"].astype(str).str.strip().unique()
+        iso3_map = {code: _safe_iso3_to_iso2(code) for code in iso3_codes}
+        ref["country"] = ref["Region/area (ISO 3)"].astype(str).str.strip().map(iso3_map)
+        ref["reference_mw"] = pd.to_numeric(
+            ref["Value"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace({"-": np.nan, "": np.nan}),
+            errors="coerce",
+        ).fillna(0.0)
+        ref = ref.loc[
+            ref["carrier"].notna() & ref["country"].notna()
+        ].copy()
+        if ref.empty:
+            return pd.DataFrame(columns=["country", "carrier", "reference_mw"]), chosen_year
+        ref["country"] = ref["country"].astype(str).str.upper()
+        ref = (
+            ref.groupby(["country", "carrier"], as_index=False)["reference_mw"]
+            .sum(min_count=1)
+            .fillna({"reference_mw": 0.0})
+        )
+        ref["reference_mw"] = pd.to_numeric(ref["reference_mw"], errors="coerce").fillna(0.0).astype(float)
         return ref, chosen_year
 
     # Long row-wise format: one `Year` column + installed capacity values
@@ -3212,8 +3288,11 @@ def _irena_country_capacity_reference(irena_csv, year, carrier_technology_map, f
         ref = irena.loc[irena["Year"].eq(chosen_year)].copy()
         ref["Technology"] = ref["Technology"].astype(str).str.strip()
         ref["carrier"] = ref["Technology"].map(tech_to_carrier)
+        ref = ref.loc[ref["carrier"].notna()].copy()
         if "ISO3 code" in ref.columns:
-            ref["country"] = ref["ISO3 code"].apply(_safe_iso3_to_iso2)
+            iso3_codes = ref["ISO3 code"].astype(str).str.strip().unique()
+            iso3_map = {code: _safe_iso3_to_iso2(code) for code in iso3_codes}
+            ref["country"] = ref["ISO3 code"].astype(str).str.strip().map(iso3_map)
         else:
             ref["country"] = ref["Country"].astype(str).str.strip().str.upper()
             ref["country"] = ref["country"].where(
@@ -3234,6 +3313,7 @@ def _irena_country_capacity_reference(irena_csv, year, carrier_technology_map, f
             .sum(min_count=1)
             .fillna({"reference_mw": 0.0})
         )
+        ref["reference_mw"] = pd.to_numeric(ref["reference_mw"], errors="coerce").fillna(0.0).astype(float)
         return ref, chosen_year
 
     raise ValueError(
