@@ -2132,6 +2132,26 @@ if not config["custom_data"]["gas_network"]:
                 "scripts/prepare_gas_network.py"
 
 
+def structural_biomass_baseline_network_input(w):
+    cfg = config.get("biomass", {}).get("structural_allocation", {}) or {}
+    if not bool(cfg.get("enable", False)):
+        return []
+    try:
+        year = int(w.planning_horizons)
+    except Exception:
+        return []
+    start_year = int(cfg.get("start_year", 2025))
+    if year < start_year:
+        return []
+    baseline_path = cfg.get(
+        "baseline_network",
+        config.get("global_specific", {})
+        .get("baseyear_generation", {})
+        .get("electricity_demand_baseline_network"),
+    )
+    return [baseline_path] if baseline_path else []
+
+
 rule prepare_sector_network:
     params:
         costs=config["costs"],
@@ -2210,6 +2230,7 @@ rule prepare_sector_network:
         fuelprices="data/fuels/all_fuels_prices_by_country.csv",
         waccs="data/waccs/wacc_by_country.csv",
         battery_capacities="data/energy_storage/battery_storage_capa_bycountry.csv",
+        structural_biomass_baseline=structural_biomass_baseline_network_input,
         tsam_clustering=get_tsam_clustering_path,
     output:
         network=RESDIR

@@ -2086,6 +2086,19 @@ def _merge_annual_cost_history(base_history, updates):
     return merged
 
 
+def _record_current_state_annual_costs(state, state_year):
+    state_year = int(state_year)
+    technology_states = (state.get("technology_states", {}) or {})
+    history = {}
+    for tech, tech_state in technology_states.items():
+        if "last_log_capex" not in (tech_state or {}):
+            continue
+        history[str(tech)] = {
+            str(state_year): float(np.exp(float(tech_state["last_log_capex"])) / 1000.0)
+        }
+    return history
+
+
 def load_stochastic_model_artifacts(learning_cfg, selected_model):
     manifest = learning_cfg.get("_manifest", {}) or {}
     root = Path(learning_cfg.get("_manifest_root", "."))
@@ -3078,6 +3091,13 @@ def update_stochastic_runtime_state(
                     sample_mode=sample_mode,
                 ),
             )
+        next_state["annual_cost_history"] = _merge_annual_cost_history(
+            next_state.get("annual_cost_history", {}),
+            _record_current_state_annual_costs(
+                next_state,
+                next_state_year,
+            ),
+        )
         learning_costs = _learning_costs_from_stochastic_state(
             artifacts=artifacts,
             state=next_state,
@@ -3133,6 +3153,13 @@ def update_stochastic_runtime_state(
                 sample_mode=sample_mode,
             ),
         )
+    next_state["annual_cost_history"] = _merge_annual_cost_history(
+        next_state.get("annual_cost_history", {}),
+        _record_current_state_annual_costs(
+            next_state,
+            next_state_year,
+        ),
+    )
     learning_costs = _learning_costs_from_stochastic_state(
         artifacts=artifacts,
         state=next_state,

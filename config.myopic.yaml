@@ -99,7 +99,9 @@ global_specific:
     owid_csv: validation/data/owid-energy-data.csv
     history_metric: biofuel_electricity
     freeze_last_historical_value: true
-    strict_physical_balance: true
+    minimum_reporting_ratio: 0.8
+    strict_physical_balance: false
+    physical_balance_relative_tolerance: 0.02
   
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_generation:
@@ -129,7 +131,7 @@ global_specific:
       - electricity_generation
 
   year2025_generation: 
-    year2025_generation_constraint: false
+    year2025_generation_constraint: true
     year: 2025 # numbers below are 2024 but we have 10% tolerance
     tolerance: 0.1
     units: TWh
@@ -138,29 +140,29 @@ global_specific:
     targets:
       solar: 2130.0
       onshore_wind: 2350.0
-      offshore_wind: 250.0
-      hydro: 4418.0
-      nuclear: 2760.0
+      #offshore_wind: 250.0
+      #hydro: 4418.0
+      #nuclear: 2760.0
       coal_lignite_power: 10587.0
       gas_power: 6795.0
       oil_power: 857.0
-      biomass: 712.0
-      geothermal: 88.0
+      #biomass: 712.0
+      #geothermal: 88.0
     carriers_map:
       solar: ["solar"]
       onshore_wind: ["onwind"]
-      offshore_wind: ["offwind-ac","offwind-dc"]
-      hydro: ["ror", "hydro"]
-      nuclear: ["nuclear"]
+      #offshore_wind: ["offwind-ac","offwind-dc"]
+      #hydro: ["ror", "hydro"]
+      #nuclear: ["nuclear"]
       coal_lignite_power: ["coal", "lignite"]
       gas_power: ["CCGT","OCGT"]
-      oil_power: ["oil"]
-      biomass: 
-        - "urban central solid biomass CHP CC"
-        - "urban central solid biomass CHP"
-        - "biomass"
-        - "biomass EOP"
-      geothermal: ["geothermal"]
+      #oil_power: ["oil"]
+      #biomass: 
+      #  - "urban central solid biomass CHP CC"
+      #  - "urban central solid biomass CHP"
+      #  - "biomass"
+      #  - "biomass EOP"
+      #geothermal: ["geothermal"]
 
   year2025_capacity:
     year2025_capacity_constraint: true

@@ -27,18 +27,18 @@ learning:
     kernel_mode: technology_specific_lagged_window   # global_current_window | technology_specific_lagged_window
     annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
     lag_years_by_tech:
-      solar_power: 3
+      solar_power: 2
       onwind_power: 4
       battery_energy: 2
-  deployment_constraints:
-    enabled: false
+  deployment_constraints: # testing
+    enabled: true
     mode: first_order   # first_order | second_order | both
     apply_from_year: 2030
     technologies: [solar_power, onwind_power, battery_energy]
     calibration:
       window_start_year: 2015
       window_end_year: 2024
-      quantile: 0.90
+      quantile: 0.95
       difference_space: log_annual_additions
     battery_basis: phi_mapped_global_liion
     uncertainty:
@@ -55,13 +55,13 @@ learning:
       - shared_state_bayesian_regime_wright
       #- correlated_geometric_random_walk
       #- way_fixed_rho_benchmark_035
-    draws: 20
+    draws: 3
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000
   compact_outputs:
     enable: true
-    cleanup_heavy_raws: true
+    cleanup_heavy_raws: false
     price_shadow_resolution: annual_summary
   fossil_price_uncertainty:
     enabled: true

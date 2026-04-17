@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from typing import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,46 @@ DEFAULT_REQUIRED_PATTERNS = (
     "learning/bootstrap_complete_elec_s*.txt",
     "prenetworks/elec_s*export.nc",
 )
+DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS = {
+    "benchmarks",
+    "configs",
+    "learning",
+    "logs",
+    "postnetworks",
+    "prenetworks",
+    "prenetworks-brownfield",
+    "prenetworks-learning",
+    "tsam_clustering",
+}
+DEFAULT_RESULTS_SCENARIO_MARKERS = {
+    "benchmarks",
+    "configs",
+    "learning",
+    "postnetworks",
+    "prenetworks",
+    "prenetworks-brownfield",
+    "prenetworks-learning",
+}
+DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS = {
+    "cops",
+    "demand",
+    "gas_networks",
+    "gdp_shares",
+    "heating",
+    "pattern_profiles",
+    "population_shares",
+    "temperatures",
+}
+DEFAULT_RESOURCES_SCENARIO_MARKERS = {
+    "cops",
+    "demand",
+    "gas_networks",
+    "gdp_shares",
+    "heating",
+    "pattern_profiles",
+    "population_shares",
+    "temperatures",
+}
 
 
 @dataclass
@@ -112,18 +153,49 @@ def mirror_tree(
     target_dir: Path,
     *,
     hardlink_first: bool,
+    exclude_path: Callable[[Path], bool] | None = None,
 ) -> MirrorSummary:
     source_dir = _require_directory(source_dir, "Mirror source")
     target_dir = target_dir.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     summary = MirrorSummary()
     for src in sorted(source_dir.rglob("*")):
+        if exclude_path is not None and exclude_path(src):
+            continue
         if src.is_dir():
             continue
         rel = src.relative_to(source_dir)
         dst = target_dir / rel
         _mirror_file(src, dst, hardlink_first=hardlink_first, summary=summary)
     return summary
+
+
+def _build_nested_scenario_excluder(
+    source_root: Path,
+    *,
+    shared_dir_names: set[str],
+    scenario_markers: set[str],
+):
+    source_root = source_root.resolve()
+
+    def _exclude(path: Path) -> bool:
+        try:
+            rel = path.resolve().relative_to(source_root)
+        except Exception:
+            return False
+        if len(rel.parts) == 0:
+            return False
+        top = rel.parts[0]
+        if top in shared_dir_names:
+            return False
+        top_path = source_root / top
+        if not top_path.is_dir():
+            return False
+        if not any((top_path / marker).exists() for marker in scenario_markers):
+            return False
+        return rel.parts[0] == top
+
+    return _exclude
 
 
 def _merge_summary(parts: list[MirrorSummary]) -> MirrorSummary:
@@ -176,12 +248,36 @@ def save_bootstrap_state(
 ) -> dict[str, object]:
     source_sector_dir = _require_directory(source_sector_dir, "Bootstrap source sector directory")
     required_counts = validate_state_source(source_sector_dir)
-    summaries = [mirror_tree(source_sector_dir, target_dir, hardlink_first=False)]
+    results_excluder = _build_nested_scenario_excluder(
+        source_sector_dir,
+        shared_dir_names=DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS,
+        scenario_markers=DEFAULT_RESULTS_SCENARIO_MARKERS,
+    )
+    summaries = [
+        mirror_tree(
+            source_sector_dir,
+            target_dir,
+            hardlink_first=False,
+            exclude_path=results_excluder,
+        )
+    ]
     resources_source_dir = _companion_resources_dir_for_results_dir(source_sector_dir)
     resources_target_dir = target_dir.resolve() / "__resources_sector__"
     resources_source_exists = resources_source_dir.exists() and resources_source_dir.is_dir()
     if resources_source_exists:
-        summaries.append(mirror_tree(resources_source_dir, resources_target_dir, hardlink_first=False))
+        resources_excluder = _build_nested_scenario_excluder(
+            resources_source_dir,
+            shared_dir_names=DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS,
+            scenario_markers=DEFAULT_RESOURCES_SCENARIO_MARKERS,
+        )
+        summaries.append(
+            mirror_tree(
+                resources_source_dir,
+                resources_target_dir,
+                hardlink_first=False,
+                exclude_path=resources_excluder,
+            )
+        )
     summary = _merge_summary(summaries)
     manifest_path = write_state_manifest(
         target_dir.resolve(),
@@ -208,7 +304,25 @@ def restore_bootstrap_state(
 ) -> dict[str, object]:
     source_dir = _require_directory(source_dir, "Bootstrap state source")
     required_counts = validate_state_source(source_dir)
-    summaries = [mirror_tree(source_dir, target_sector_dir, hardlink_first=True)]
+    results_excluder = None
+    try:
+        _infer_sector_name_from_results_dir(source_dir)
+        results_excluder = _build_nested_scenario_excluder(
+            source_dir,
+            shared_dir_names=DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS,
+            scenario_markers=DEFAULT_RESULTS_SCENARIO_MARKERS,
+        )
+    except ValueError:
+        results_excluder = None
+
+    summaries = [
+        mirror_tree(
+            source_dir,
+            target_sector_dir,
+            hardlink_first=True,
+            exclude_path=results_excluder,
+        )
+    ]
     target_resources_dir = _companion_resources_dir_for_results_dir(target_sector_dir)
     restored_resources = False
 
@@ -222,7 +336,19 @@ def restore_bootstrap_state(
         except ValueError:
             companion_resources_source = None
         if companion_resources_source is not None and companion_resources_source.exists() and companion_resources_source.is_dir():
-            summaries.append(mirror_tree(companion_resources_source, target_resources_dir, hardlink_first=True))
+            resources_excluder = _build_nested_scenario_excluder(
+                companion_resources_source,
+                shared_dir_names=DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS,
+                scenario_markers=DEFAULT_RESOURCES_SCENARIO_MARKERS,
+            )
+            summaries.append(
+                mirror_tree(
+                    companion_resources_source,
+                    target_resources_dir,
+                    hardlink_first=True,
+                    exclude_path=resources_excluder,
+                )
+            )
             restored_resources = True
 
     summary = _merge_summary(summaries)

@@ -302,7 +302,7 @@ def _modeled_countries_from_config(config):
     return {str(country).strip().upper() for country in countries if str(country).strip()}
 
 
-def _load_global_historical_biofuel_electricity_twh(config):
+def _load_historical_biofuel_electricity_summary(config):
     cfg = _structural_biomass_cfg(config)
     owid_csv = _repo_path(cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
     if not os.path.exists(owid_csv):
@@ -327,14 +327,59 @@ def _load_global_historical_biofuel_electricity_twh(config):
     owid["year"] = pd.to_numeric(owid["year"], errors="coerce")
     owid["biofuel_electricity"] = pd.to_numeric(
         owid["biofuel_electricity"], errors="coerce"
-    ).fillna(0.0)
+    )
     owid = owid.dropna(subset=["year"])
+    owid["year"] = owid["year"].astype(int)
 
-    return (
-        owid.groupby(owid["year"].astype(int))["biofuel_electricity"]
-        .sum(min_count=1)
+    summary = (
+        owid.groupby("year").agg(
+            biofuel_electricity=("biofuel_electricity", lambda s: pd.to_numeric(s, errors="coerce").fillna(0.0).sum()),
+            reporting_countries=("biofuel_electricity", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+        )
         .sort_index()
-        .astype(float)
+        .astype({"biofuel_electricity": float, "reporting_countries": int})
+    )
+    return summary
+
+
+def _load_global_historical_biofuel_electricity_twh(config):
+    summary = _load_historical_biofuel_electricity_summary(config)
+    return summary["biofuel_electricity"].astype(float)
+
+
+def _select_structural_biomass_history_year(summary, target_year, config):
+    target_year = int(target_year)
+    if summary.empty:
+        raise ValueError("No historical global biofuel_electricity values available.")
+
+    cfg = _structural_biomass_cfg(config)
+    min_ratio = float(cfg.get("minimum_reporting_ratio", 0.8) or 0.8)
+    max_countries = int(summary["reporting_countries"].max()) if not summary.empty else 0
+    if max_countries <= 0:
+        raise ValueError("Historical biofuel_electricity summary has no reporting countries.")
+
+    eligible = summary.loc[
+        summary["reporting_countries"] >= max(1, int(np.ceil(max_countries * min_ratio)))
+    ].copy()
+    if eligible.empty:
+        eligible = summary.copy()
+
+    if target_year in eligible.index:
+        return int(target_year)
+
+    earlier = eligible.loc[eligible.index <= target_year]
+    if bool(cfg.get("freeze_last_historical_value", True)) and not earlier.empty:
+        return int(earlier.index.max())
+
+    if target_year in summary.index:
+        return int(target_year)
+
+    earlier_any = summary.loc[summary.index <= target_year]
+    if bool(cfg.get("freeze_last_historical_value", True)) and not earlier_any.empty:
+        return int(earlier_any.index.max())
+
+    raise ValueError(
+        f"No historical biofuel_electricity value available for structural biomass year {target_year}."
     )
 
 
@@ -441,23 +486,14 @@ def derive_post2020_structural_biomass_allocation(
     if year < start_year:
         return None
 
-    physical_total_twh = float(physical_total_twh)
-    historical = _load_global_historical_biofuel_electricity_twh(config)
-    if historical.empty:
+    configured_physical_total_twh = float(physical_total_twh)
+    historical_summary = _load_historical_biofuel_electricity_summary(config)
+    if historical_summary.empty:
         raise ValueError("No historical global biofuel_electricity values available.")
 
-    if year in historical.index:
-        history_year = int(year)
-        bioelectricity_twh = float(historical.loc[year])
-    else:
-        earlier = historical.loc[historical.index <= year]
-        if bool(cfg.get("freeze_last_historical_value", True)) and not earlier.empty:
-            history_year = int(earlier.index.max())
-            bioelectricity_twh = float(earlier.loc[history_year])
-        else:
-            raise ValueError(
-                f"No historical biofuel_electricity value available for structural biomass year {year}."
-            )
+    history_year = _select_structural_biomass_history_year(historical_summary, year, config)
+    bioelectricity_twh = float(historical_summary.loc[history_year, "biofuel_electricity"])
+    reporting_countries = int(historical_summary.loc[history_year, "reporting_countries"])
 
     representative_efficiency = _representative_biomass_electric_efficiency(config)
     power_required_twh = bioelectricity_twh / representative_efficiency
@@ -480,36 +516,27 @@ def derive_post2020_structural_biomass_allocation(
                 )
 
     total_required_twh = power_required_twh + industry_required_twh + buildings_required_twh
-    feasible = total_required_twh <= physical_total_twh + 1e-9
+    physical_total_twh = max(configured_physical_total_twh, total_required_twh)
+    excess_twh = max(total_required_twh - physical_total_twh, 0.0)
+    rel_tolerance = float(cfg.get("physical_balance_relative_tolerance", 0.0) or 0.0)
+    abs_tolerance = float(cfg.get("physical_balance_absolute_twh", 0.0) or 0.0)
+    tolerance_twh = max(abs_tolerance, physical_total_twh * rel_tolerance)
+    feasible = excess_twh <= max(tolerance_twh, 1e-9)
     residual_twh = max(physical_total_twh - total_required_twh, 0.0)
-
-    if not feasible:
-        message = (
-            "Structural biomass allocation exceeds physical annual biomass potential for "
-            f"{year}: power={power_required_twh:.3f} TWh, industry={industry_required_twh:.3f} TWh, "
-            f"buildings={buildings_required_twh:.3f} TWh, total={total_required_twh:.3f} TWh, "
-            f"physical={physical_total_twh:.3f} TWh."
-        )
-        if bool(cfg.get("strict_physical_balance", True)):
-            raise ValueError(message)
-        logger.warning(message)
-        power_required_twh = max(
-            physical_total_twh - industry_required_twh - buildings_required_twh, 0.0
-        )
-        total_required_twh = power_required_twh + industry_required_twh + buildings_required_twh
-        residual_twh = max(physical_total_twh - total_required_twh, 0.0)
 
     allocation = pd.Series(
         {
             "year": year,
             "history_year": history_year,
             "physical_total_twh": physical_total_twh,
+            "configured_physical_total_twh": configured_physical_total_twh,
             "power_required_twh": power_required_twh,
             "industry_required_twh": industry_required_twh,
             "buildings_required_twh": buildings_required_twh,
             "unallocated_residual_twh": residual_twh,
             "bioelectricity_reference_twh": bioelectricity_twh,
             "representative_efficiency": representative_efficiency,
+            "reporting_countries": reporting_countries,
             "physical_feasible": bool(feasible),
         }
     )

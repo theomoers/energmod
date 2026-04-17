@@ -3213,6 +3213,13 @@ if hasattr(_validation_hooks, "add_baseyear_generation_band"):
     add_baseyear_generation_band = _validation_hooks.add_baseyear_generation_band
     logger.info("Using centralized baseyear generation constraint hook from scripts/validation.py")
 
+if hasattr(_validation_hooks, "_generator_output_energy_by_buscarrier"):
+    _generator_output_energy_by_buscarrier = _validation_hooks._generator_output_energy_by_buscarrier
+if hasattr(_validation_hooks, "_link_output_energy_by_buscarrier"):
+    _link_output_energy_by_buscarrier = _validation_hooks._link_output_energy_by_buscarrier
+if hasattr(_validation_hooks, "_storageunit_output_energy_by_buscarrier"):
+    _storageunit_output_energy_by_buscarrier = _validation_hooks._storageunit_output_energy_by_buscarrier
+
 
 def add_year2025_generation_band(n, planning_year, config):
     """
