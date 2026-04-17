@@ -68,6 +68,20 @@ OUTPUT_TABLE_SPECS = {
         "operating_cost_eur",
         "total_system_cost_eur",
     ],
+    "deployment_constraints.csv": [
+        "year",
+        "technology",
+        "constraint_enabled",
+        "mode",
+        "uncertainty_enabled",
+        "persistent_shock",
+        "annual_shock",
+        "allowed_block_addition",
+        "realized_block_addition_modeled",
+        "realized_block_addition_constrained_basis",
+        "binding_slack",
+        "battery_phi_block",
+    ],
     "system_summary.csv": [
         "year",
         "objective_eur",
@@ -1723,6 +1737,25 @@ def _prepare_system_costs(system_cost_paths: dict[int, Path]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _prepare_deployment_constraints(paths: dict[int, Path]) -> pd.DataFrame:
+    frames = []
+    for year, path in sorted(paths.items()):
+        frame = pd.read_csv(path)
+        if frame.empty:
+            continue
+        for column in OUTPUT_TABLE_SPECS["deployment_constraints.csv"]:
+            if column not in frame.columns:
+                frame[column] = np.nan
+        if "year" in frame.columns:
+            frame["year"] = pd.to_numeric(frame["year"], errors="coerce").fillna(int(year)).astype(int)
+        else:
+            frame.insert(0, "year", int(year))
+        frames.append(frame.loc[:, OUTPUT_TABLE_SPECS["deployment_constraints.csv"]])
+    if not frames:
+        return _empty_frame("deployment_constraints.csv")
+    return pd.concat(frames, ignore_index=True)
+
+
 def _prepare_fossil_prices(fossil_price_log_paths: dict[int, Path]) -> pd.DataFrame:
     frames = []
     for year, path in sorted(fossil_price_log_paths.items()):
@@ -1763,6 +1796,7 @@ def _extract_bundle(
     fossil_price_log_paths: dict[int, Path],
     state_paths: dict[int, Path],
     system_cost_paths: dict[int, Path],
+    deployment_constraint_paths: dict[int, Path],
     statistics_paths: dict[int, Path],
     metadata: dict,
 ):
@@ -1770,6 +1804,7 @@ def _extract_bundle(
     learning_costs = _prepare_learning_costs(cost_log_paths)
     fossil_prices = _prepare_fossil_prices(fossil_price_log_paths)
     system_costs = _prepare_system_costs(system_cost_paths)
+    deployment_constraints = _prepare_deployment_constraints(deployment_constraint_paths)
     previous_capacity = pd.DataFrame(
         columns=["component", "asset", "bus", "country", "carrier", "capacity_unit", "capacity_value"]
     )
@@ -1960,6 +1995,7 @@ def _extract_bundle(
     tables["learning_costs.csv"] = learning_costs
     tables["fossil_fuel_prices_country.csv"] = fossil_prices
     tables["system_costs.csv"] = system_costs
+    tables["deployment_constraints.csv"] = deployment_constraints
     tables["generation_country_carrier.csv"] = pd.concat(generation_frames, ignore_index=True)
     tables["ac_energy_balance_country_carrier.csv"] = pd.concat(ac_balance_frames, ignore_index=True)
     tables["capacity_country_carrier.csv"] = pd.concat(capacity_frames, ignore_index=True)
@@ -1988,6 +2024,7 @@ def _extract_bundle(
         "fossil_price_log_sources": {str(year): str(path) for year, path in fossil_price_log_paths.items()},
         "state_sources": {str(year): str(path) for year, path in state_paths.items()},
         "system_cost_sources": {str(year): str(path) for year, path in system_cost_paths.items()},
+        "deployment_constraint_sources": {str(year): str(path) for year, path in deployment_constraint_paths.items()},
         "statistics_sources": {str(year): str(path) for year, path in statistics_paths.items()},
     }
     (bundle_dir / "run_manifest.json").write_text(
@@ -2034,6 +2071,7 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
     fossil_price_log_paths = _map_paths_by_year(list(snakemake.input.fossil_price_logs), years)
     state_paths = _map_paths_by_year(list(snakemake.input.states), years)
     system_cost_paths = _map_paths_by_year(list(snakemake.input.system_costs), years)
+    deployment_constraint_paths = _map_paths_by_year(list(snakemake.input.deployment_constraints), years)
     statistics_paths = _map_paths_by_year(list(snakemake.input.statistics), years)
 
     bundle_dir = Path(str(snakemake.params.bundle_dir)).resolve()
@@ -2057,6 +2095,7 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
             fossil_price_log_paths,
             state_paths,
             system_cost_paths,
+            deployment_constraint_paths,
             statistics_paths,
             metadata,
         )

@@ -30,6 +30,24 @@ learning:
       solar_power: 3
       onwind_power: 4
       battery_energy: 2
+  deployment_constraints:
+    enabled: false
+    mode: first_order   # first_order | second_order | both
+    apply_from_year: 2030
+    technologies: [solar_power, onwind_power, battery_energy]
+    calibration:
+      window_start_year: 2015
+      window_end_year: 2024
+      quantile: 0.90
+      difference_space: log_annual_additions
+    battery_basis: phi_mapped_global_liion
+    uncertainty:
+      enabled: true
+      mode: stochastic_draw   # stochastic_draw | deterministic
+      shock_structure: persistent_level_plus_annual
+      persistent_scale_source: historical_residual_std
+      annual_scale_fraction: 0.25
+      random_seed_source: learning_seed
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false

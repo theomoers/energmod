@@ -39,6 +39,11 @@ from learning.apply_learning_costs import (
     update_stochastic_runtime_state,
     validate_runtime_contract,
 )
+from learning.deployment_constraints import (
+    build_deployment_constraint_block_paths,
+    get_deployment_constraint_cfg,
+    summarize_realized_block_additions,
+)
 from learning.learning_data_io import load_historical_capacity
 
 
@@ -254,6 +259,57 @@ def _extract_network_capital_cost_summaries(network_path, tech_mapping):
         )
     )
     return summary
+
+
+def export_deployment_constraint_diagnostics(
+    output_path,
+    learning_cfg,
+    current_year,
+    learning_seed,
+    committed_payload,
+    solved_capacity_by_tech,
+):
+    rows = []
+    cfg = get_deployment_constraint_cfg(learning_cfg)
+    if cfg is not None:
+        cap_payload = build_deployment_constraint_block_paths(
+            learning_cfg,
+            current_year=current_year,
+            learning_seed=learning_seed,
+            config_file="config.learning.yaml",
+        )
+        realized = summarize_realized_block_additions(
+            current_year=current_year,
+            solved_capacity_by_tech=solved_capacity_by_tech,
+            committed_state_payload=committed_payload,
+            learning_cfg=learning_cfg,
+        )
+        technologies = list(cfg.get("technologies", [])) or sorted(set(cap_payload) | set(realized))
+        for technology in technologies:
+            cap_info = cap_payload.get(technology, {})
+            realized_info = realized.get(technology, {})
+            rows.append(
+                {
+                    "year": int(current_year),
+                    "technology": technology,
+                    "constraint_enabled": True,
+                    "mode": str(cfg.get("mode", "")),
+                    "uncertainty_enabled": bool(((cfg.get("uncertainty", {}) or {}).get("enabled", False))),
+                    "persistent_shock": float(cap_info.get("persistent_shock", 0.0)),
+                    "annual_shock": json.dumps(cap_info.get("annual_shocks", {}), sort_keys=True),
+                    "allowed_block_addition": float(cap_info.get("allowed_block_addition", np.nan)),
+                    "realized_block_addition_modeled": float(realized_info.get("modeled_block_addition", np.nan)),
+                    "realized_block_addition_constrained_basis": float(realized_info.get("constrained_basis_addition", np.nan)),
+                    "binding_slack": float(cap_info.get("allowed_block_addition", np.nan) - realized_info.get("constrained_basis_addition", np.nan)),
+                    "battery_phi_block": float(realized_info.get("battery_phi_block", np.nan))
+                    if pd.notna(realized_info.get("battery_phi_block", np.nan))
+                    else np.nan,
+                }
+            )
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output_path, index=False)
+    logger.info("Saved deployment constraint diagnostics to: %s", output_path)
 
 
 def _build_export_learning_cost_log(base_df, postsolve_df, postsolve_state_year, network_capital_summary):
@@ -480,6 +536,7 @@ def main(snakemake):
     output_state = snakemake.output.state_committed
     output_system_costs = getattr(snakemake.output, "system_costs", None)
     output_statistics = getattr(snakemake.output, "statistics", None)
+    output_deployment_constraints = getattr(snakemake.output, "deployment_constraints", None)
 
     logger.info("Loading learning config: %s", learning_config_path)
     learning_cfg = load_config_learning(learning_config_path)
@@ -551,6 +608,16 @@ def main(snakemake):
     learning_engine = get_learning_engine(learning_cfg, learning_model)
     resolve_runtime_seed(learning_cfg, learning_engine, learning_model, learning_seed)
     validate_runtime_contract(learning_cfg, learning_engine, learning_model)
+
+    if output_deployment_constraints:
+        export_deployment_constraint_diagnostics(
+            output_path=output_deployment_constraints,
+            learning_cfg=learning_cfg,
+            current_year=current_year,
+            learning_seed=learning_seed,
+            committed_payload=payload,
+            solved_capacity_by_tech=solved_capacity_by_tech,
+        )
 
     if learning_engine == "stochastic_forecast":
         postsolve_learning_costs, payload = update_stochastic_runtime_state(

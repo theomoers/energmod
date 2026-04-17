@@ -880,6 +880,39 @@ def compact_learning_statistics_inputs(w):
     return compact_learning_bootstrap_statistics_inputs(w) + compact_learning_branch_statistics_inputs(w)
 
 
+def compact_learning_bootstrap_deployment_constraint_inputs(w):
+    bootstrap_horizons = get_learning_bootstrap_horizons()
+    if not bootstrap_horizons:
+        return []
+    last_bootstrap = bootstrap_horizons[-1]
+    branch_enabled = bool(get_learning_branch_horizons())
+    paths = []
+    for year in bootstrap_horizons:
+        if branch_enabled and year == last_bootstrap:
+            paths.append(
+                RESDIR
+                + f"learning/deployment_constraints_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+            )
+        else:
+            paths.append(
+                RESDIR
+                + f"learning/deployment_constraints_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}.csv"
+            )
+    return paths
+
+
+def compact_learning_branch_deployment_constraint_inputs(w):
+    return [
+        RESDIR
+        + f"learning/deployment_constraints_elec_s{w.simpl}_{w.clusters}_l{w.ll}_{w.opts}_{w.sopts}_{year}_{w.discountrate}_{w.demand}_{w.h2export}export_{w.learning_rate}_model_{w.learning_model}_seed_{w.learning_seed}.csv"
+        for year in get_learning_branch_horizons()
+    ]
+
+
+def compact_learning_deployment_constraint_inputs(w):
+    return compact_learning_bootstrap_deployment_constraint_inputs(w) + compact_learning_branch_deployment_constraint_inputs(w)
+
+
 def compact_learning_branch_brownfield_inputs(w):
     return [
         RESDIR
@@ -3676,6 +3709,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 + "learning/system_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
                 statistics=RESDIR
                 + "learning/statistics_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
+                deployment_constraints=RESDIR
+                + "learning/deployment_constraints_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}.csv",
             wildcard_constraints:
                 planning_horizons=LEARNING_BOOTSTRAP_HORIZON_PATTERN,
             threads: 1
@@ -3720,6 +3755,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                 + "learning/system_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
                 statistics=RESDIR
                 + "learning/statistics_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+                deployment_constraints=RESDIR
+                + "learning/deployment_constraints_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
             wildcard_constraints:
                 planning_horizons=str(LEARNING_BOOTSTRAP_HORIZONS[-1]),
             threads: 1
@@ -3895,6 +3932,8 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "learning/system_costs_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
             statistics=RESDIR
             + "learning/statistics_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
+            deployment_constraints=RESDIR
+            + "learning/deployment_constraints_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export_{learning_rate}_model_{learning_model}_seed_{learning_seed}.csv",
         threads: 1
         resources:
             mem_mb=5000,
@@ -3917,6 +3956,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             states=compact_learning_state_inputs,
             system_costs=compact_learning_system_cost_inputs,
             statistics=compact_learning_statistics_inputs,
+            deployment_constraints=compact_learning_deployment_constraint_inputs,
             learning_config="config.learning.yaml",
         output:
             complete=RESDIR
@@ -3948,6 +3988,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             committed_states=compact_learning_branch_state_inputs,
             system_costs=compact_learning_branch_system_cost_inputs,
             statistics=compact_learning_branch_statistics_inputs,
+            deployment_constraints=compact_learning_branch_deployment_constraint_inputs,
             lpfiles=compact_learning_branch_lpfile_inputs,
         output:
             marker=RESDIR
@@ -3955,7 +3996,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             + "raw_cleanup_complete_elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{discountrate}_{demand}_{h2export}export_{learning_rate}.txt",
         shell:
             r"""
-            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.solved_cost_logs} {input.fossil_price_logs} {input.committed_states} {input.lpfiles}
+            rm -f {input.brownfield} {input.learning_prenetworks} {input.postnetworks} {input.solved_cost_logs} {input.fossil_price_logs} {input.committed_states} {input.deployment_constraints} {input.lpfiles}
             mkdir -p "$(dirname {output.marker})"
             printf 'branch raws cleaned\n' > {output.marker}
             """

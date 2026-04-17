@@ -104,6 +104,8 @@ from pypsa.clustering.spatial import (
 from temporal_clustering import add_kotzur_storage_constraints
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
+from learning.apply_learning_costs import load_learning_manifest
+from learning.deployment_constraints import build_deployment_constraint_block_paths
 #from apply_build_constraints import add_build_rate_constraints
 #from pypsa.optimization.optimize import optimize
 
@@ -3357,6 +3359,78 @@ def add_year2025_capacity_targets(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
 
 
+def add_learning_deployment_constraints(n, planning_year, config):
+    learning_cfg = (config or {}).get("learning", {}) or {}
+    deployment_cfg = (learning_cfg.get("deployment_constraints", {}) or {})
+    if not bool(deployment_cfg.get("enabled", False)):
+        return
+
+    planning_year = int(planning_year)
+    if planning_year < int(deployment_cfg.get("apply_from_year", 2030)):
+        return
+
+    try:
+        load_learning_manifest(learning_cfg, "config.learning.yaml")
+    except Exception as exc:
+        logger.warning("Skipping learning deployment constraints: could not load manifest (%s)", exc)
+        return
+
+    learning_seed = getattr(snakemake.wildcards, "learning_seed", None)
+    constraint_payload = build_deployment_constraint_block_paths(
+        learning_cfg,
+        current_year=planning_year,
+        learning_seed=learning_seed,
+        config_file="config.learning.yaml",
+    )
+    if not constraint_payload:
+        return
+
+    n.deployment_constraint_payload = constraint_payload
+
+    def _select_current_vintage(df, extendable_col, carrier, build_year_col="build_year"):
+        subset = df.copy()
+        if extendable_col in subset.columns:
+            subset = subset[subset[extendable_col].fillna(False)]
+        subset = subset[subset["carrier"].astype(str).eq(carrier)]
+        if build_year_col in subset.columns:
+            build_year = pd.to_numeric(subset[build_year_col], errors="coerce")
+            subset = subset[build_year.fillna(planning_year).astype(int).eq(planning_year)]
+        return subset.index
+
+    for technology, payload in constraint_payload.items():
+        allowed = float(payload["allowed_block_addition"])
+        if technology == "solar_power":
+            idx = _select_current_vintage(n.generators, "p_nom_extendable", "solar")
+            if len(idx) == 0:
+                continue
+            lhs = n.model["Generator-p_nom"].loc[idx].sum() / 1e3
+        elif technology == "onwind_power":
+            idx = _select_current_vintage(n.generators, "p_nom_extendable", "onwind")
+            if len(idx) == 0:
+                continue
+            lhs = n.model["Generator-p_nom"].loc[idx].sum() / 1e3
+        elif technology == "battery_energy":
+            idx = _select_current_vintage(n.stores, "e_nom_extendable", "battery")
+            if len(idx) == 0:
+                continue
+            lhs = n.model["Store-e_nom"].loc[idx].sum() / 1e3
+            from learning.apply_learning_costs import get_battery_phi_for_block
+
+            phi_block = float(get_battery_phi_for_block(learning_cfg, planning_year - 5, planning_year))
+            payload["battery_phi_block"] = phi_block
+            lhs = lhs * phi_block
+        else:
+            continue
+
+        n.model.add_constraints(lhs <= allowed, name=f"learning_deployment_cap__{technology}__{planning_year}")
+        logger.info(
+            "Added learning deployment constraint for %s at %s: allowed_block_addition=%.6f",
+            technology,
+            planning_year,
+            allowed,
+        )
+
+
 def extra_functionality(n, snapshots):
     """
     Collects supplementary constraints which will be passed to
@@ -3513,6 +3587,8 @@ def extra_functionality(n, snapshots):
             )
 
     add_co2_sequestration_limit(n, snapshots)
+    if planning_year is not None:
+        add_learning_deployment_constraints(n, planning_year=planning_year, config=config)
     
     # Add build rate constraints (if build_rate_limits attached to network)
     #add_build_rate_constraints(n, snapshots)
