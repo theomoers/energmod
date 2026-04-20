@@ -105,7 +105,11 @@ from temporal_clustering import add_kotzur_storage_constraints
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
 from learning.apply_learning_costs import load_learning_manifest
-from learning.deployment_constraints import build_deployment_constraint_block_paths
+from learning.deployment_constraints import (
+    build_deployment_constraint_block_paths,
+    build_deployment_constraint_lhs,
+    get_current_vintage_constraint_basis_upper_bound,
+)
 #from apply_build_constraints import add_build_rate_constraints
 #from pypsa.optimization.optimize import optimize
 
@@ -258,6 +262,37 @@ def _repo_path(path_like):
     if not p.is_absolute():
         p = Path(__file__).resolve().parents[1] / p
     return p.resolve()
+
+
+def _json_safe_meta(value):
+    """Recursively coerce metadata values into JSON-serializable primitives."""
+    if isinstance(value, pd.DataFrame):
+        return _json_safe_meta(value.to_dict(orient="split"))
+    if isinstance(value, pd.Series):
+        return _json_safe_meta(value.to_dict())
+    if isinstance(value, pd.Index):
+        return _json_safe_meta(value.tolist())
+    if isinstance(value, dict):
+        return {str(k): _json_safe_meta(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_meta(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe_meta(v) for v in sorted(value, key=str)]
+    if isinstance(value, np.ndarray):
+        return _json_safe_meta(value.tolist())
+    if isinstance(value, xr.DataArray):
+        return _json_safe_meta(value.to_dict())
+    if isinstance(value, xr.Dataset):
+        return _json_safe_meta(value.to_dict())
+    if isinstance(value, os.PathLike):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _zscore_columns(df):
@@ -3393,48 +3428,70 @@ def add_learning_deployment_constraints(n, planning_year, config):
         return
 
     n.deployment_constraint_payload = constraint_payload
-
-    def _select_current_vintage(df, extendable_col, carrier, build_year_col="build_year"):
-        subset = df.copy()
-        if extendable_col in subset.columns:
-            subset = subset[subset[extendable_col].fillna(False)]
-        subset = subset[subset["carrier"].astype(str).eq(carrier)]
-        if build_year_col in subset.columns:
-            build_year = pd.to_numeric(subset[build_year_col], errors="coerce")
-            subset = subset[build_year.fillna(planning_year).astype(int).eq(planning_year)]
-        return subset.index
+    large_rhs_skip_threshold = float(
+        deployment_cfg.get("large_rhs_skip_threshold", 1.0e9)
+    )
 
     for technology, payload in constraint_payload.items():
         allowed = float(payload["allowed_block_addition"])
-        if technology == "solar_power":
-            idx = _select_current_vintage(n.generators, "p_nom_extendable", "solar")
-            if len(idx) == 0:
-                continue
-            lhs = n.model["Generator-p_nom"].loc[idx].sum() / 1e3
-        elif technology == "onwind_power":
-            idx = _select_current_vintage(n.generators, "p_nom_extendable", "onwind")
-            if len(idx) == 0:
-                continue
-            lhs = n.model["Generator-p_nom"].loc[idx].sum() / 1e3
-        elif technology == "battery_energy":
-            idx = _select_current_vintage(n.stores, "e_nom_extendable", "battery")
-            if len(idx) == 0:
-                continue
-            lhs = n.model["Store-e_nom"].loc[idx].sum() / 1e3
-            from learning.apply_learning_costs import get_battery_phi_for_block
+        try:
+            lhs, basis_metadata = build_deployment_constraint_lhs(
+                n,
+                technology,
+                planning_year,
+                learning_cfg,
+            )
+        except ValueError:
+            continue
+        if lhs is None:
+            continue
+        payload.update(basis_metadata)
+        upper_info = get_current_vintage_constraint_basis_upper_bound(
+            n,
+            technology,
+            planning_year,
+            learning_cfg,
+        )
+        payload.update(upper_info)
 
-            phi_block = float(get_battery_phi_for_block(learning_cfg, planning_year - 5, planning_year))
-            payload["battery_phi_block"] = phi_block
-            lhs = lhs * phi_block
-        else:
+        upper = float(upper_info.get("upper_bound_basis_value", np.nan))
+        if bool(upper_info.get("upper_bound_is_finite", False)):
+            tolerance = max(1.0e-9, abs(upper) * 1.0e-9)
+            if allowed >= upper - tolerance:
+                payload["constraint_skipped_reason"] = "allowed_exceeds_current_vintage_upper_bound"
+                logger.info(
+                    "Skipping redundant learning deployment constraint for %s at %s: "
+                    "allowed_block_addition=%.6f %s >= finite current-vintage upper bound=%.6f %s",
+                    technology,
+                    planning_year,
+                    allowed,
+                    payload.get("constraint_basis_unit", ""),
+                    upper,
+                    payload.get("constraint_basis_unit", ""),
+                )
+                continue
+        elif large_rhs_skip_threshold > 0.0 and allowed >= large_rhs_skip_threshold:
+            payload["constraint_skipped_reason"] = "allowed_exceeds_large_rhs_skip_threshold"
+            logger.warning(
+                "Skipping numerically risky learning deployment constraint for %s at %s: "
+                "allowed_block_addition=%.6g %s exceeds large_rhs_skip_threshold=%.6g "
+                "and no finite current-vintage upper bound is available (%s nonfinite assets).",
+                technology,
+                planning_year,
+                allowed,
+                payload.get("constraint_basis_unit", ""),
+                large_rhs_skip_threshold,
+                int(upper_info.get("upper_bound_nonfinite_assets", 0)),
+            )
             continue
 
         n.model.add_constraints(lhs <= allowed, name=f"learning_deployment_cap__{technology}__{planning_year}")
         logger.info(
-            "Added learning deployment constraint for %s at %s: allowed_block_addition=%.6f",
+            "Added learning deployment constraint for %s at %s: allowed_block_addition=%.6f %s",
             technology,
             planning_year,
             allowed,
+            payload.get("constraint_basis_unit", ""),
         )
 
 
@@ -4036,6 +4093,8 @@ if __name__ == "__main__":
         solving=snakemake.params.solving,
         log_fn=_safe_solver_log(snakemake),
     )
-    n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    n.meta = _json_safe_meta(
+        dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    )
     n.export_to_netcdf(snakemake.output[0])
     logger.info(f"Objective constant: {n.objective_constant}")

@@ -463,7 +463,7 @@ def main():
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV)
     parser.add_argument("--run-mode", choices=["branch", "full"], default="branch")
     parser.add_argument("--grid-mem", default="90G")
-    parser.add_argument("--grid-ncpus", default="16")
+    parser.add_argument("--grid-ncpus", default="12")
     parser.add_argument("--grid-submit", default="batch")
     parser.add_argument("--print-only", action="store_true")
     parser.add_argument("--models", action="append", help="Override stochastic models (comma-separated or repeatable)")

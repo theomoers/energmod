@@ -42,6 +42,7 @@ from learning.apply_learning_costs import (
 from learning.deployment_constraints import (
     build_deployment_constraint_block_paths,
     get_deployment_constraint_cfg,
+    get_constraint_basis_unit,
     summarize_realized_block_additions,
 )
 from learning.learning_data_io import load_historical_capacity
@@ -268,6 +269,7 @@ def export_deployment_constraint_diagnostics(
     learning_seed,
     committed_payload,
     solved_capacity_by_tech,
+    solved_network,
 ):
     rows = []
     cfg = get_deployment_constraint_cfg(learning_cfg)
@@ -278,11 +280,16 @@ def export_deployment_constraint_diagnostics(
             learning_seed=learning_seed,
             config_file="config.learning.yaml",
         )
+        if isinstance(solved_network, (str, Path)):
+            solved_network_obj = pypsa.Network(solved_network)
+        else:
+            solved_network_obj = solved_network
         realized = summarize_realized_block_additions(
             current_year=current_year,
             solved_capacity_by_tech=solved_capacity_by_tech,
             committed_state_payload=committed_payload,
             learning_cfg=learning_cfg,
+            network=solved_network_obj,
         )
         technologies = list(cfg.get("technologies", [])) or sorted(set(cap_payload) | set(realized))
         for technology in technologies:
@@ -295,6 +302,12 @@ def export_deployment_constraint_diagnostics(
                     "constraint_enabled": True,
                     "mode": str(cfg.get("mode", "")),
                     "uncertainty_enabled": bool(((cfg.get("uncertainty", {}) or {}).get("enabled", False))),
+                    "constraint_basis_unit": str(
+                        cap_info.get(
+                            "constraint_basis_unit",
+                            realized_info.get("constraint_basis_unit", get_constraint_basis_unit(technology)),
+                        )
+                    ),
                     "persistent_shock": float(cap_info.get("persistent_shock", 0.0)),
                     "annual_shock": json.dumps(cap_info.get("annual_shocks", {}), sort_keys=True),
                     "allowed_block_addition": float(cap_info.get("allowed_block_addition", np.nan)),
@@ -617,6 +630,7 @@ def main(snakemake):
             learning_seed=learning_seed,
             committed_payload=payload,
             solved_capacity_by_tech=solved_capacity_by_tech,
+            solved_network=solved_network,
         )
 
     if learning_engine == "stochastic_forecast":

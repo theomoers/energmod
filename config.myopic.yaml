@@ -531,7 +531,7 @@ solving:
       parallel: "on"
       random_seed: 123
     gurobi-default:
-      threads: 16
+      threads: 12
       method: 2 # barrier
       crossover: 0
       BarConvTol: 1.e-5
@@ -641,7 +641,7 @@ solving:
     glpk-default: {} # Used in CI
 
   mem: 100000 # MB; raised for stochastic MC branch solves on cluster
-  threads: 16
+  threads: 12
 
 plotting:  
   tech_colors:

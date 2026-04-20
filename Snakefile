@@ -2133,7 +2133,7 @@ if not config["custom_data"]["gas_network"]:
 
 
 def structural_biomass_baseline_network_input(w):
-    cfg = config.get("biomass", {}).get("structural_allocation", {}) or {}
+    cfg = config.get("global_specific", {}).get("post2020_structural_biomass", {}) or {}
     if not bool(cfg.get("enable", False)):
         return []
     try:
