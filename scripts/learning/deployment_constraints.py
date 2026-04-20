@@ -241,6 +241,7 @@ def _deployment_calibration_request(learning_cfg):
     return {
         "window_start_year": int(calibration_cfg.get("window_start_year", 2015)),
         "window_end_year": int(calibration_cfg.get("window_end_year", 2024)),
+        "anchor_smoothing_years": int(calibration_cfg.get("anchor_smoothing_years", 1)),
         "quantile": float(calibration_cfg["quantile"]),
         "difference_space": str(
             calibration_cfg.get("difference_space", "log_annual_additions")
@@ -249,6 +250,10 @@ def _deployment_calibration_request(learning_cfg):
 
 
 def _matching_calibration_rows(calibration, request):
+    if int(request.get("anchor_smoothing_years", 1)) != 1:
+        # Existing support artifacts store a single endpoint anchor. Smoothed
+        # anchors are derived from annual history at load time.
+        return calibration.iloc[0:0].copy()
     if calibration.empty:
         return calibration
     mask = np.isclose(
@@ -275,6 +280,8 @@ def _derive_requested_calibration_from_history(history, calibration, request):
 
     start_year = int(request["window_start_year"])
     end_year = int(request["window_end_year"])
+    anchor_smoothing_years = max(int(request.get("anchor_smoothing_years", 1)), 1)
+    anchor_start_year = end_year - anchor_smoothing_years + 1
     quantile = float(request["quantile"])
     technologies = list(calibration["technology"].dropna().unique())
     if not technologies:
@@ -291,11 +298,24 @@ def _derive_requested_calibration_from_history(history, calibration, request):
                 f"Cannot derive deployment calibration for {technology}: "
                 f"no history in {start_year}-{end_year}."
             )
-        anchor = window.loc[window["year"].eq(end_year)]
-        if anchor.empty:
+        anchor_window = window.loc[
+            window["year"].between(anchor_start_year, end_year, inclusive="both")
+        ].copy()
+        if anchor_window.empty:
             raise ValueError(
                 f"Cannot derive deployment calibration for {technology}: "
-                f"missing anchor year {end_year} in history."
+                f"missing anchor history in {anchor_start_year}-{end_year}."
+            )
+        anchor_additions = pd.to_numeric(
+            anchor_window["annual_addition"], errors="coerce"
+        ).dropna()
+        anchor_growth = pd.to_numeric(
+            anchor_window["first_diff"], errors="coerce"
+        ).dropna()
+        if anchor_additions.empty or anchor_growth.empty:
+            raise ValueError(
+                f"Cannot derive deployment calibration for {technology}: "
+                f"missing smoothed anchor additions/growth in {anchor_start_year}-{end_year}."
             )
         first_diff = pd.to_numeric(window["first_diff"], errors="coerce").dropna()
         second_diff = pd.to_numeric(window["second_diff"], errors="coerce").dropna()
@@ -307,7 +327,6 @@ def _derive_requested_calibration_from_history(history, calibration, request):
 
         first_q = float(first_diff.quantile(quantile))
         second_q = float(second_diff.quantile(quantile))
-        anchor = anchor.iloc[-1]
         first_residuals = first_diff - first_q
         second_residuals = second_diff - second_q
         rows.append(
@@ -316,12 +335,12 @@ def _derive_requested_calibration_from_history(history, calibration, request):
                 "window_start_year": start_year,
                 "window_end_year": end_year,
                 "quantile": quantile,
-                "annual_addition_anchor_2024": float(anchor["annual_addition"]),
+                "annual_addition_anchor_2024": float(anchor_additions.mean()),
                 # Keep the historical column names for compatibility; values are
                 # resolved from the configured quantile at load time.
                 "first_diff_q90": first_q,
                 "second_diff_q90": second_q,
-                "anchor_first_diff_2024": float(anchor["first_diff"]),
+                "anchor_first_diff_2024": float(anchor_growth.mean()),
                 "first_order_residual_std": float(first_residuals.std()),
                 "second_order_residual_std": float(second_residuals.std()),
             }
@@ -471,6 +490,63 @@ def _build_mode_mean_path(row, mode, years):
     return {year: min(first[year], second[year]) for year in requested_years}
 
 
+def _sigma_persistent_for_mode(row, mode):
+    if mode == "first_order":
+        return float(row["first_order_residual_std"])
+    if mode == "second_order":
+        return float(row["second_order_residual_std"])
+    return max(
+        float(row["first_order_residual_std"]),
+        float(row["second_order_residual_std"]),
+    )
+
+
+def _historical_residual_series(history, technology, row, mode):
+    tech_history = history.loc[history["technology"].eq(technology)].sort_values("year")
+    if mode == "first_order":
+        return pd.to_numeric(tech_history["first_diff"], errors="coerce") - float(row["first_diff_q90"])
+    if mode == "second_order":
+        return pd.to_numeric(tech_history["second_diff"], errors="coerce") - float(row["second_diff_q90"])
+    raise ValueError(f"Unsupported residual mode for annual scale: {mode!r}")
+
+
+def _annual_innovation_sigma(history, technology, row, mode):
+    residuals = _historical_residual_series(history, technology, row, mode).dropna()
+    if len(residuals) < 3:
+        return np.nan
+    return float(residuals.diff().dropna().std() / np.sqrt(2.0))
+
+
+def _sigma_annual_for_mode(row, mode, technology, history, uncertainty_cfg):
+    source = str(uncertainty_cfg.get("annual_scale_source", "configured_fraction")).strip()
+    sigma_persistent = _sigma_persistent_for_mode(row, mode)
+
+    if source in {"configured_fraction", "fraction_of_persistent"}:
+        annual_fraction = float(uncertainty_cfg.get("annual_scale_fraction", 0.25))
+        return float(max(annual_fraction, 0.0) * sigma_persistent), source, np.nan
+
+    if source == "calibrated_residual_innovation":
+        shrinkage = float(uncertainty_cfg.get("annual_scale_shrinkage", 1.0))
+        if mode == "both":
+            raw_sigma = max(
+                _annual_innovation_sigma(history, technology, row, "first_order"),
+                _annual_innovation_sigma(history, technology, row, "second_order"),
+            )
+        else:
+            raw_sigma = _annual_innovation_sigma(history, technology, row, mode)
+        if not np.isfinite(raw_sigma):
+            annual_fraction = float(uncertainty_cfg.get("annual_scale_fraction", 0.25))
+            fallback = float(max(annual_fraction, 0.0) * sigma_persistent)
+            return fallback, "configured_fraction_fallback", np.nan
+        return float(max(shrinkage, 0.0) * raw_sigma), source, float(raw_sigma)
+
+    raise ValueError(
+        "Unsupported learning.deployment_constraints.uncertainty."
+        f"annual_scale_source={source!r}. Supported values are "
+        "'configured_fraction' and 'calibrated_residual_innovation'."
+    )
+
+
 def build_deployment_constraint_block_paths(
     learning_cfg,
     current_year,
@@ -486,7 +562,7 @@ def build_deployment_constraint_block_paths(
     if current_year < apply_from_year:
         return {}
 
-    calibration, _, _ = load_deployment_constraint_support(learning_cfg, config_file=config_file)
+    calibration, history, _ = load_deployment_constraint_support(learning_cfg, config_file=config_file)
     techs = list(cfg.get("technologies", [])) or list(calibration["technology"].unique())
     mode = str(cfg.get("mode", "first_order")).strip()
     annual_years = _annual_years_for_block(current_year)
@@ -494,7 +570,6 @@ def build_deployment_constraint_block_paths(
     uncertainty_enabled = bool(uncertainty_cfg.get("enabled", False)) and str(
         uncertainty_cfg.get("mode", "stochastic_draw")
     ).strip() == "stochastic_draw"
-    annual_fraction = float(uncertainty_cfg.get("annual_scale_fraction", 0.25))
 
     payload = {}
     for technology in techs:
@@ -512,14 +587,14 @@ def build_deployment_constraint_block_paths(
             for year in annual_years
             if year in mean_annual_full
         }
-        sigma_key = "first_order_residual_std" if mode == "first_order" else "second_order_residual_std"
-        if mode == "both":
-            sigma_persistent = max(
-                float(row["first_order_residual_std"]),
-                float(row["second_order_residual_std"]),
-            )
-        else:
-            sigma_persistent = float(row[sigma_key])
+        sigma_persistent = _sigma_persistent_for_mode(row, mode)
+        sigma_annual, annual_scale_source, annual_innovation_sigma = _sigma_annual_for_mode(
+            row,
+            mode,
+            technology,
+            history,
+            uncertainty_cfg,
+        )
         persistent_shock = 0.0
         annual_shocks = {year: 0.0 for year in annual_years}
         if uncertainty_enabled and sigma_persistent > 0.0:
@@ -531,7 +606,6 @@ def build_deployment_constraint_block_paths(
                     "persistent",
                 ).normal(0.0, sigma_persistent)
             )
-            sigma_annual = float(max(annual_fraction, 0.0) * sigma_persistent)
             if sigma_annual > 0.0:
                 annual_shocks = {
                     year: float(
@@ -561,7 +635,11 @@ def build_deployment_constraint_block_paths(
             "technology": technology,
             "mode": mode,
             "uncertainty_enabled": uncertainty_enabled,
+            "persistent_shock_sigma": sigma_persistent,
             "persistent_shock": persistent_shock,
+            "annual_scale_source": annual_scale_source,
+            "annual_innovation_sigma": annual_innovation_sigma,
+            "annual_shock_sigma": sigma_annual,
             "annual_shocks": annual_shocks,
             "annual_mean_caps": mean_annual_basis,
             "annual_capped_additions": annual_capped_basis,

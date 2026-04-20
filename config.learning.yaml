@@ -32,12 +32,13 @@ learning:
       battery_energy: 2
   deployment_constraints: # testing
     enabled: true
-    mode: both   # first_order | second_order | both
+    mode: first_order   # first_order | second_order | both
     apply_from_year: 2030
     technologies: [solar_power, onwind_power, battery_energy]
     calibration:
       window_start_year: 2014
       window_end_year: 2024
+      anchor_smoothing_years: 3
       quantile: 0.9
       difference_space: log_annual_additions
     battery_basis: phi_mapped_global_liion
@@ -46,16 +47,17 @@ learning:
       mode: stochastic_draw   # stochastic_draw | deterministic
       shock_structure: persistent_level_plus_annual
       persistent_scale_source: historical_residual_std
-      annual_scale_fraction: 0.25
+      annual_scale_source: calibrated_residual_innovation
+      annual_scale_shrinkage: 0.25
       random_seed_source: learning_seed
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-      #- correlated_geometric_random_walk
-      #- way_fixed_rho_benchmark_035
-    draws: 500
+      - correlated_geometric_random_walk
+      - way_fixed_rho_benchmark_035
+    draws: 1000
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000
