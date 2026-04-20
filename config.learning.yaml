@@ -32,6 +32,7 @@ learning:
       battery_energy: 2
   deployment_constraints: # testing
     enabled: true
+    formulation: hard_cap   # hard_cap | three_segment_wedge
     mode: first_order   # first_order | second_order | both
     apply_from_year: 2030
     technologies: [solar_power, onwind_power, battery_energy]
@@ -50,6 +51,18 @@ learning:
       annual_scale_source: calibrated_residual_innovation
       annual_scale_shrinkage: 0.25
       random_seed_source: learning_seed
+    wedge:
+      table_csv:
+      threshold_basis: country_history
+      anchor_smoothing_years: 3
+      reference_statistic: mean   # mean | median | max_mean_median
+      battery_basis: local_energy
+      b1_multiplier: 0.8
+      b2_multiplier: 1.2
+      phi2_pct_capex: 0.5
+      phi3_pct_capex: 1.0
+      irena_history_csv: "validation/data/irena_capacity_by_technology.csv"
+      battery_history_csv: "data/energy_storage/battery_storage_capa_bycountry.csv"
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false

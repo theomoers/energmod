@@ -41,8 +41,10 @@ from learning.apply_learning_costs import (
 )
 from learning.deployment_constraints import (
     build_deployment_constraint_block_paths,
+    get_deployment_constraint_formulation,
     get_deployment_constraint_cfg,
     get_constraint_basis_unit,
+    summarize_realized_deployment_wedge_rows,
     summarize_realized_block_additions,
 )
 from learning.learning_data_io import load_historical_capacity
@@ -274,6 +276,7 @@ def export_deployment_constraint_diagnostics(
     rows = []
     cfg = get_deployment_constraint_cfg(learning_cfg)
     if cfg is not None:
+        formulation = get_deployment_constraint_formulation(learning_cfg) or "hard_cap"
         cap_payload = build_deployment_constraint_block_paths(
             learning_cfg,
             current_year=current_year,
@@ -284,41 +287,100 @@ def export_deployment_constraint_diagnostics(
             solved_network_obj = pypsa.Network(solved_network)
         else:
             solved_network_obj = solved_network
-        realized = summarize_realized_block_additions(
-            current_year=current_year,
-            solved_capacity_by_tech=solved_capacity_by_tech,
-            committed_state_payload=committed_payload,
-            learning_cfg=learning_cfg,
-            network=solved_network_obj,
-        )
-        technologies = list(cfg.get("technologies", [])) or sorted(set(cap_payload) | set(realized))
-        for technology in technologies:
-            cap_info = cap_payload.get(technology, {})
-            realized_info = realized.get(technology, {})
-            rows.append(
-                {
-                    "year": int(current_year),
-                    "technology": technology,
-                    "constraint_enabled": True,
-                    "mode": str(cfg.get("mode", "")),
-                    "uncertainty_enabled": bool(((cfg.get("uncertainty", {}) or {}).get("enabled", False))),
-                    "constraint_basis_unit": str(
-                        cap_info.get(
-                            "constraint_basis_unit",
-                            realized_info.get("constraint_basis_unit", get_constraint_basis_unit(technology)),
-                        )
-                    ),
-                    "persistent_shock": float(cap_info.get("persistent_shock", 0.0)),
-                    "annual_shock": json.dumps(cap_info.get("annual_shocks", {}), sort_keys=True),
-                    "allowed_block_addition": float(cap_info.get("allowed_block_addition", np.nan)),
-                    "realized_block_addition_modeled": float(realized_info.get("modeled_block_addition", np.nan)),
-                    "realized_block_addition_constrained_basis": float(realized_info.get("constrained_basis_addition", np.nan)),
-                    "binding_slack": float(cap_info.get("allowed_block_addition", np.nan) - realized_info.get("constrained_basis_addition", np.nan)),
-                    "battery_phi_block": float(realized_info.get("battery_phi_block", np.nan))
-                    if pd.notna(realized_info.get("battery_phi_block", np.nan))
-                    else np.nan,
-                }
+        if formulation == "three_segment_wedge":
+            wedge_rows = summarize_realized_deployment_wedge_rows(
+                solved_network_obj,
+                current_year=current_year,
+                learning_cfg=learning_cfg,
+                technologies=list(cfg.get("technologies", [])),
+                config_file="config.learning.yaml",
             )
+            for _, wedge_row in wedge_rows.iterrows():
+                rows.append(
+                    {
+                        "year": int(current_year),
+                        "country": str(wedge_row.get("country", "")),
+                        "technology": str(wedge_row["technology"]),
+                        "formulation": formulation,
+                        "constraint_enabled": True,
+                        "mode": str(cfg.get("mode", "")),
+                        "uncertainty_enabled": bool(((cfg.get("uncertainty", {}) or {}).get("enabled", False))),
+                        "constraint_basis_unit": str(wedge_row.get("constraint_basis_unit", "")),
+                        "penalty_basis": str(wedge_row.get("penalty_basis", "")),
+                        "persistent_shock": np.nan,
+                        "annual_shock": "",
+                        "allowed_block_addition": np.nan,
+                        "b1": float(wedge_row.get("b1", np.nan)),
+                        "b2": float(wedge_row.get("b2", np.nan)),
+                        "width1": float(wedge_row.get("width1", np.nan)),
+                        "width2": float(wedge_row.get("width2", np.nan)),
+                        "phi2": float(wedge_row.get("phi2", np.nan)),
+                        "phi3": float(wedge_row.get("phi3", np.nan)),
+                        "realized_block_addition_modeled": np.nan,
+                        "realized_block_addition_constrained_basis": float(
+                            wedge_row.get("realized_block_addition_constrained_basis", np.nan)
+                        ),
+                        "realized_seg1": float(wedge_row.get("realized_seg1", np.nan)),
+                        "realized_seg2": float(wedge_row.get("realized_seg2", np.nan)),
+                        "realized_seg3": float(wedge_row.get("realized_seg3", np.nan)),
+                        "realized_wedge_cost_eur": float(wedge_row.get("realized_wedge_cost_eur", np.nan)),
+                        "binding_slack": np.nan,
+                        "battery_phi_block": np.nan,
+                        "history_year": float(wedge_row.get("history_year", np.nan)),
+                        "reference_annual_addition": float(wedge_row.get("reference_annual_addition", np.nan)),
+                    }
+                )
+        else:
+            realized = summarize_realized_block_additions(
+                current_year=current_year,
+                solved_capacity_by_tech=solved_capacity_by_tech,
+                committed_state_payload=committed_payload,
+                learning_cfg=learning_cfg,
+                network=solved_network_obj,
+            )
+            technologies = list(cfg.get("technologies", [])) or sorted(set(cap_payload) | set(realized))
+            for technology in technologies:
+                cap_info = cap_payload.get(technology, {})
+                realized_info = realized.get(technology, {})
+                rows.append(
+                    {
+                        "year": int(current_year),
+                        "country": "",
+                        "technology": technology,
+                        "formulation": formulation,
+                        "constraint_enabled": True,
+                        "mode": str(cfg.get("mode", "")),
+                        "uncertainty_enabled": bool(((cfg.get("uncertainty", {}) or {}).get("enabled", False))),
+                        "constraint_basis_unit": str(
+                            cap_info.get(
+                                "constraint_basis_unit",
+                                realized_info.get("constraint_basis_unit", get_constraint_basis_unit(technology)),
+                            )
+                        ),
+                        "penalty_basis": "",
+                        "persistent_shock": float(cap_info.get("persistent_shock", 0.0)),
+                        "annual_shock": json.dumps(cap_info.get("annual_shocks", {}), sort_keys=True),
+                        "allowed_block_addition": float(cap_info.get("allowed_block_addition", np.nan)),
+                        "b1": np.nan,
+                        "b2": np.nan,
+                        "width1": np.nan,
+                        "width2": np.nan,
+                        "phi2": np.nan,
+                        "phi3": np.nan,
+                        "realized_block_addition_modeled": float(realized_info.get("modeled_block_addition", np.nan)),
+                        "realized_block_addition_constrained_basis": float(realized_info.get("constrained_addition", realized_info.get("constrained_basis_addition", np.nan))),
+                        "realized_seg1": np.nan,
+                        "realized_seg2": np.nan,
+                        "realized_seg3": np.nan,
+                        "realized_wedge_cost_eur": np.nan,
+                        "binding_slack": float(cap_info.get("allowed_block_addition", np.nan) - realized_info.get("constrained_basis_addition", np.nan)),
+                        "battery_phi_block": float(realized_info.get("battery_phi_block", np.nan))
+                        if pd.notna(realized_info.get("battery_phi_block", np.nan))
+                        else np.nan,
+                        "history_year": np.nan,
+                        "reference_annual_addition": np.nan,
+                    }
+                )
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_path, index=False)

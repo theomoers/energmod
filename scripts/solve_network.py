@@ -107,8 +107,11 @@ from pypsa.optimization.abstract import optimize_transmission_expansion_iterativ
 from learning.apply_learning_costs import load_learning_manifest
 from learning.deployment_constraints import (
     build_deployment_constraint_block_paths,
+    build_current_vintage_country_technology_asset_table,
     build_deployment_constraint_lhs,
+    get_deployment_constraint_formulation,
     get_current_vintage_constraint_basis_upper_bound,
+    load_deployment_wedge_table,
 )
 #from apply_build_constraints import add_build_rate_constraints
 #from pypsa.optimization.optimize import optimize
@@ -3401,6 +3404,162 @@ def add_year2025_capacity_targets(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
 
 
+def add_learning_deployment_wedge(n, planning_year, config):
+    learning_cfg = (config or {}).get("learning", {}) or {}
+    deployment_cfg = (learning_cfg.get("deployment_constraints", {}) or {})
+    technologies = list(deployment_cfg.get("technologies", []))
+    wedge_table = load_deployment_wedge_table(
+        learning_cfg,
+        current_year=planning_year,
+        technologies=technologies,
+        config_file="config.learning.yaml",
+    )
+    if wedge_table.empty:
+        logger.warning(
+            "Skipping learning deployment wedge for %s: no country-technology rows were resolved.",
+            planning_year,
+        )
+        return
+
+    if not hasattr(n, "meta") or not isinstance(n.meta, dict):
+        n.meta = {}
+
+    wedge_rows = []
+    extra_cost = 0
+    asset_cost_tolerance = float(deployment_cfg.get("wedge_asset_cost_tolerance", 1.0e-6))
+
+    for technology in technologies:
+        tech_table = wedge_table.loc[wedge_table["technology"].eq(technology)].copy()
+        if tech_table.empty:
+            continue
+
+        asset_table = build_current_vintage_country_technology_asset_table(
+            n,
+            technology,
+            planning_year=planning_year,
+            learning_cfg=learning_cfg,
+        )
+        if asset_table.empty:
+            logger.info(
+                "Skipping learning deployment wedge rows for %s at %s: no current-vintage extendable assets found.",
+                technology,
+                planning_year,
+            )
+            continue
+
+        regions = pd.Index(sorted(set(tech_table["region"]) & set(asset_table["region"])), name="region")
+        if len(regions) == 0:
+            logger.info(
+                "Skipping learning deployment wedge rows for %s at %s: no overlapping country rows between wedge table and network assets.",
+                technology,
+                planning_year,
+            )
+            continue
+
+        tech_table = tech_table.set_index("region").loc[regions].reset_index()
+        tech_by_region = tech_table.set_index("region")
+        asset_table = asset_table.loc[asset_table["region"].isin(regions)].copy()
+        asset_table["basis_objective_cost"] = pd.to_numeric(asset_table["basis_objective_cost"], errors="coerce")
+        asset_table = asset_table.loc[asset_table["basis_objective_cost"].replace([np.inf, -np.inf], np.nan).notna()].copy()
+        if asset_table.empty:
+            logger.warning(
+                "Skipping learning deployment wedge rows for %s at %s: no assets with finite basis costs remained after filtering.",
+                technology,
+                planning_year,
+            )
+            continue
+
+        assets = pd.Index(asset_table["asset"].astype(str), name="asset")
+        width1 = tech_by_region["width1"].reindex(regions).astype(float)
+        width2 = tech_by_region["width2"].reindex(regions).astype(float)
+        seg1 = n.model.add_variables(
+            lower=0.0,
+            coords=[assets],
+            name=f"learning_deployment_seg1__{technology}__{planning_year}",
+        )
+        seg2 = n.model.add_variables(
+            lower=0.0,
+            coords=[assets],
+            name=f"learning_deployment_seg2__{technology}__{planning_year}",
+        )
+        seg3 = n.model.add_variables(
+            lower=0.0,
+            coords=[assets],
+            name=f"learning_deployment_seg3__{technology}__{planning_year}",
+        )
+
+        spec_var = str(asset_table["model_var"].iloc[0])
+        raw_to_basis_divisor = float(asset_table["raw_to_basis_divisor"].iloc[0])
+        basis_cost_by_asset = asset_table.set_index("asset")["basis_objective_cost"].astype(float)
+
+        for _, asset_row in asset_table.iterrows():
+            asset = str(asset_row["asset"])
+            build_expr = n.model[spec_var].loc[asset]
+            build_expr = build_expr / raw_to_basis_divisor
+            n.model.add_constraints(
+                seg1.loc[asset] + seg2.loc[asset] + seg3.loc[asset] == build_expr,
+                name=f"learning_deployment_wedge_asset_balance__{technology}__{planning_year}__{asset}",
+            )
+
+        for _, row in tech_table.iterrows():
+            region = row["region"]
+            region_asset_rows = asset_table.loc[asset_table["region"].eq(region)].copy()
+            region_assets = pd.Index(region_asset_rows["asset"].astype(str), name="asset")
+            if region_assets.empty:
+                continue
+            n.model.add_constraints(
+                seg1.loc[region_assets].sum() <= float(width1.loc[region]),
+                name=f"learning_deployment_wedge_seg1_cap__{technology}__{planning_year}__{region}",
+            )
+            n.model.add_constraints(
+                seg2.loc[region_assets].sum() <= float(width2.loc[region]),
+                name=f"learning_deployment_wedge_seg2_cap__{technology}__{planning_year}__{region}",
+            )
+            penalty_basis = str(row.get("penalty_basis", "%_of_capex")).strip()
+            phi2 = float(row["phi2"])
+            phi3 = float(row["phi3"])
+            if penalty_basis == "%_of_capex":
+                region_extra = (
+                    phi2 * (basis_cost_by_asset.loc[region_assets] * seg2.loc[region_assets]).sum()
+                    + phi3 * (basis_cost_by_asset.loc[region_assets] * seg3.loc[region_assets]).sum()
+                )
+            else:
+                region_extra = phi2 * seg2.loc[region_assets].sum() + phi3 * seg3.loc[region_assets].sum()
+            extra_cost = extra_cost + region_extra
+            region_costs = basis_cost_by_asset.loc[region_assets]
+            finite_costs = pd.to_numeric(region_costs, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            cost_range = float(finite_costs.max() - finite_costs.min()) if not finite_costs.empty else np.nan
+            wedge_rows.append(
+                {
+                    "year": int(planning_year),
+                    "country": region,
+                    "technology": technology,
+                    "constraint_basis_unit": str(row.get("basis_unit", "")),
+                    "penalty_basis": penalty_basis,
+                    "b1": float(row["b1"]),
+                    "b2": float(row["b2"]),
+                    "width1": float(row["width1"]),
+                    "width2": float(row["width2"]),
+                    "phi2": float(row["phi2"]),
+                    "phi3": float(row["phi3"]),
+                    "basis_cost_eur_per_unit_min": float(finite_costs.min()) if not finite_costs.empty else np.nan,
+                    "basis_cost_eur_per_unit_max": float(finite_costs.max()) if not finite_costs.empty else np.nan,
+                    "basis_cost_eur_per_unit_mean": float(finite_costs.mean()) if not finite_costs.empty else np.nan,
+                    "basis_cost_heterogeneous": bool(np.isfinite(cost_range) and cost_range > asset_cost_tolerance),
+                    "asset_count": int(len(region_assets)),
+                }
+            )
+
+    if wedge_rows:
+        n.model.objective = n.model.objective + extra_cost
+        n.meta["learning_deployment_wedge"] = wedge_rows
+        logger.info(
+            "Added LP-safe learning deployment wedge for planning year %s across %d country-technology rows.",
+            planning_year,
+            len(wedge_rows),
+        )
+
+
 def add_learning_deployment_constraints(n, planning_year, config):
     learning_cfg = (config or {}).get("learning", {}) or {}
     deployment_cfg = (learning_cfg.get("deployment_constraints", {}) or {})
@@ -3415,6 +3574,11 @@ def add_learning_deployment_constraints(n, planning_year, config):
         load_learning_manifest(learning_cfg, "config.learning.yaml")
     except Exception as exc:
         logger.warning("Skipping learning deployment constraints: could not load manifest (%s)", exc)
+        return
+
+    formulation = get_deployment_constraint_formulation(learning_cfg)
+    if formulation == "three_segment_wedge":
+        add_learning_deployment_wedge(n, planning_year=planning_year, config=config)
         return
 
     learning_seed = getattr(snakemake.wildcards, "learning_seed", None)
@@ -4093,8 +4257,9 @@ if __name__ == "__main__":
         solving=snakemake.params.solving,
         log_fn=_safe_solver_log(snakemake),
     )
-    n.meta = _json_safe_meta(
-        dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
-    )
+    existing_meta = getattr(n, "meta", {}) if hasattr(n, "meta") else {}
+    merged_meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+    merged_meta.update(dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards))))
+    n.meta = _json_safe_meta(merged_meta)
     n.export_to_netcdf(snakemake.output[0])
     logger.info(f"Objective constant: {n.objective_constant}")
