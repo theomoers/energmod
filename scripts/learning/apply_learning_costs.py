@@ -4020,6 +4020,7 @@ def update_network_costs(
     costs_file,
     learning_rates=None,
     fossil_payload=None,
+    runtime_context=None,
 ):
     """
     Update network component costs in-memory and save.
@@ -4317,6 +4318,10 @@ def update_network_costs(
     if learning_rates is not None:
         n.meta["learning_rates"] = convert_to_native(learning_rates)
         logger.info("Stored learning rates in network metadata")
+
+    if runtime_context:
+        n.meta["learning_runtime"] = convert_to_native(runtime_context)
+        logger.info("Stored learning runtime context in network metadata")
     
     logger.info(f"Saving updated network to {output_path}")
     logger.info(f"  Updated {updates_count} carrier types across components")
@@ -4578,6 +4583,13 @@ def main(snakemake):
     prior_state_payload = {}
     if prev_state_path:
         prior_state_payload = json.loads(Path(prev_state_path).read_text(encoding="utf-8"))
+    runtime_context = {
+        "prev_state_path": str(prev_state_path or ""),
+        "deployment_wedge_state": {
+            "capacity_history": prior_state_payload.get("capacity_history", {}),
+            "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+        },
+    }
 
     # Load regional WACCs if available
     wacc_dict = None
@@ -4653,6 +4665,7 @@ def main(snakemake):
                 costs_file,
                 learning_rates=None,
                 fossil_payload=fossil_payload,
+                runtime_context=runtime_context,
             )
             save_cost_log(learning_costs, snakemake.output.cost_log)
             if hasattr(snakemake.output, "fossil_price_log"):
@@ -4717,6 +4730,7 @@ def main(snakemake):
             costs_file,
             learning_rates=None,
             fossil_payload=fossil_payload,
+            runtime_context=runtime_context,
         )
         save_cost_log(learning_costs, snakemake.output.cost_log)
         if hasattr(snakemake.output, "fossil_price_log"):
@@ -4818,6 +4832,7 @@ def main(snakemake):
             costs_file,
             learning_rates=None,
             fossil_payload=fossil_payload,
+            runtime_context=runtime_context,
         )
         save_cost_log(learning_costs, snakemake.output.cost_log)
         if hasattr(snakemake.output, "fossil_price_log"):
@@ -4976,6 +4991,7 @@ def main(snakemake):
         costs_file,
         learning_rates=learning_rates,
         fossil_payload=fossil_payload,
+        runtime_context=runtime_context,
     )
     
     # Save cost log (includes costs, capacities, and all learning parameters)

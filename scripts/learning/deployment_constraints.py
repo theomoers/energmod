@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_DEPLOYMENT_CONSTRAINT_MODES = {"first_order", "second_order", "both"}
@@ -1012,11 +1016,99 @@ def _battery_capacity_history_to_country_annual_additions(battery_csv, current_y
     return pd.concat(rows, ignore_index=True)
 
 
+def _state_cumulative_history_to_annual_additions(history_map, current_year, basis_unit):
+    if not isinstance(history_map, dict) or not history_map:
+        return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+
+    points = []
+    for year_key, value in history_map.items():
+        try:
+            year = int(year_key)
+            cumulative = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(cumulative) or cumulative < 0.0:
+            continue
+        points.append((year, cumulative))
+
+    points = sorted(points)
+    if len(points) < 2:
+        return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+
+    rows = []
+    for (start_year, start_value), (end_year, end_value) in zip(points[:-1], points[1:]):
+        span = int(end_year) - int(start_year)
+        if span <= 0:
+            continue
+        annual_addition = max(float(end_value) - float(start_value), 0.0) / float(span)
+        for year in range(int(start_year) + 1, min(int(end_year), int(current_year)) + 1):
+            rows.append(
+                {
+                    "region": GLOBAL_DEPLOYMENT_WEDGE_REGION,
+                    "technology": "battery_energy",
+                    "year": int(year),
+                    "annual_addition": float(annual_addition),
+                    "basis_unit": str(basis_unit),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+    return pd.DataFrame(rows)
+
+
+def _load_default_runtime_state_payload(learning_cfg):
+    from learning.apply_learning_costs import get_selected_learning_model, load_stochastic_model_artifacts
+
+    selected_model = get_selected_learning_model(learning_cfg)
+    _, initial_state = load_stochastic_model_artifacts(learning_cfg, selected_model)
+    return initial_state if isinstance(initial_state, dict) else {}
+
+
+def _battery_system_history_to_annual_additions(learning_cfg, current_year, runtime_state_payload=None):
+    payload = runtime_state_payload if runtime_state_payload is not None else {}
+    if not payload:
+        try:
+            payload = _load_default_runtime_state_payload(learning_cfg)
+        except Exception as exc:
+            logger.warning(
+                "Could not load runtime battery history from learning state for deployment wedge in %s: %s",
+                current_year,
+                exc,
+            )
+            payload = {}
+
+    modeled_map = ((payload.get("modeled_capacity_history", {}) or {}).get("battery_energy", {})) or {}
+    if modeled_map:
+        frame = _state_cumulative_history_to_annual_additions(
+            modeled_map,
+            current_year=current_year,
+            basis_unit="GWh",
+        )
+        if not frame.empty:
+            return frame
+
+    cumulative_map = ((payload.get("capacity_history", {}) or {}).get("battery_energy", {})) or {}
+    if cumulative_map:
+        logger.warning(
+            "Falling back to battery capacity_history for deployment wedge in %s because modeled_capacity_history is unavailable.",
+            current_year,
+        )
+        return _state_cumulative_history_to_annual_additions(
+            cumulative_map,
+            current_year=current_year,
+            basis_unit=get_constraint_basis_unit("battery_energy"),
+        )
+
+    return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+
+
 def load_deployment_country_history(
     learning_cfg,
     current_year,
     technologies=None,
     config_file=None,
+    runtime_state_payload=None,
 ):
     wedge_cfg = _get_wedge_cfg(learning_cfg)
     wedge_level = get_deployment_wedge_level(learning_cfg)
@@ -1036,18 +1128,40 @@ def load_deployment_country_history(
             wedge_cfg.get("battery_history_csv", "data/energy_storage/battery_storage_capa_bycountry.csv"),
             config_file=config_file,
         )
-        history = pd.concat(
-            [
-                _irena_capacity_history_to_country_annual_additions(
-                    irena_csv,
-                    techs,
-                    current_year,
-                    wedge_level=wedge_level,
-                ),
-                _battery_capacity_history_to_country_annual_additions(battery_csv, current_year),
-            ],
-            ignore_index=True,
-        )
+        frames = [
+            _irena_capacity_history_to_country_annual_additions(
+                irena_csv,
+                techs,
+                current_year,
+                wedge_level=wedge_level,
+            )
+        ]
+        if "battery_energy" in techs:
+            frames.append(
+                _battery_system_history_to_annual_additions(
+                    learning_cfg,
+                    current_year=current_year,
+                    runtime_state_payload=runtime_state_payload,
+                )
+            )
+        frames = [frame for frame in frames if frame is not None and not frame.empty]
+        if frames:
+            history = pd.concat(frames, ignore_index=True)
+        else:
+            history = pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+        battery_history_missing = history.loc[history["technology"].eq("battery_energy")].empty
+        if "battery_energy" in techs and battery_history_missing:
+            logger.warning(
+                "Falling back to static battery history CSV for deployment wedge in %s because no runtime battery history was available.",
+                current_year,
+            )
+            history = pd.concat(
+                [
+                    history,
+                    _battery_capacity_history_to_country_annual_additions(battery_csv, current_year),
+                ],
+                ignore_index=True,
+            )
 
     if history.empty:
         return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
@@ -1076,12 +1190,14 @@ def build_deployment_wedge_table_from_history(
     current_year,
     technologies=None,
     config_file=None,
+    runtime_state_payload=None,
 ):
     history = load_deployment_country_history(
         learning_cfg,
         current_year=current_year,
         technologies=technologies,
         config_file=config_file,
+        runtime_state_payload=runtime_state_payload,
     )
     empty_cols = [
         "region",
@@ -1149,20 +1265,35 @@ def build_deployment_wedge_table_from_history(
         if recent.empty:
             continue
         row_reference_method = reference_method
-        if reference_method == "growth_projected" and str(technology) != "battery_energy":
-            reference = _growth_projected_wedge_reference(
-                smoothed,
-                current_year=current_year,
-                growth_smoothing_years=growth_smoothing_years,
-            )
-            annual_basis = reference["reference_annual_addition"]
-            block_reference = reference["block_reference"]
-            history_year = reference["history_year"]
-            reference_growth_rate = reference["reference_growth_rate"]
-            reference_latest_annual_addition = reference["reference_latest_annual_addition"]
-        else:
-            if reference_method == "growth_projected" and str(technology) == "battery_energy":
+        if reference_method == "growth_projected":
+            try:
+                reference = _growth_projected_wedge_reference(
+                    smoothed,
+                    current_year=current_year,
+                    growth_smoothing_years=growth_smoothing_years,
+                )
+                annual_basis = reference["reference_annual_addition"]
+                block_reference = reference["block_reference"]
+                history_year = reference["history_year"]
+                reference_growth_rate = reference["reference_growth_rate"]
+                reference_latest_annual_addition = reference["reference_latest_annual_addition"]
+            except ValueError as exc:
                 row_reference_method = "flat_recent"
+                logger.warning(
+                    "Falling back to flat_recent deployment wedge reference for %s / %s in %s: %s",
+                    technology,
+                    region,
+                    current_year,
+                    exc,
+                )
+                annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
+                if not np.isfinite(annual_basis) or annual_basis <= 0.0:
+                    continue
+                block_reference = float(annual_basis) * float(block_years)
+                history_year = recent["year"].max()
+                reference_growth_rate = np.nan
+                reference_latest_annual_addition = annual_basis
+        else:
             annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
             if not np.isfinite(annual_basis) or annual_basis <= 0.0:
                 continue
@@ -1201,6 +1332,7 @@ def load_deployment_wedge_table(
     current_year=None,
     technologies=None,
     config_file=None,
+    runtime_state_payload=None,
 ):
     cfg = get_deployment_constraint_cfg(learning_cfg)
     if cfg is None or get_deployment_constraint_formulation(learning_cfg) != "three_segment_wedge":
@@ -1238,6 +1370,7 @@ def load_deployment_wedge_table(
             current_year=current_year,
             technologies=technologies,
             config_file=config_file,
+            runtime_state_payload=runtime_state_payload,
         )
 
     required = {"region", "technology", "year", "b1", "b2", "phi2", "phi3"}
@@ -1513,11 +1646,16 @@ def summarize_realized_deployment_wedge_rows(
     technologies=None,
     config_file=None,
 ):
+    runtime_state_payload = (
+        (((getattr(n, "meta", {}) or {}).get("learning_runtime", {}) or {}).get("deployment_wedge_state", {}))
+        or None
+    )
     wedge_table = load_deployment_wedge_table(
         learning_cfg,
         current_year=current_year,
         technologies=technologies,
         config_file=config_file,
+        runtime_state_payload=runtime_state_payload,
     )
     if wedge_table.empty:
         return pd.DataFrame()

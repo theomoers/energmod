@@ -3500,11 +3500,16 @@ def add_learning_deployment_wedge(n, planning_year, config):
     technologies = list(deployment_cfg.get("technologies", []))
     wedge_level = get_deployment_wedge_level(learning_cfg)
     wedge_cost_granularity = get_deployment_wedge_cost_granularity(learning_cfg, wedge_level=wedge_level)
+    runtime_state_payload = (
+        (((getattr(n, "meta", {}) or {}).get("learning_runtime", {}) or {}).get("deployment_wedge_state", {}))
+        or None
+    )
     wedge_table = load_deployment_wedge_table(
         learning_cfg,
         current_year=planning_year,
         technologies=technologies,
         config_file="config.learning.yaml",
+        runtime_state_payload=runtime_state_payload,
     )
     if wedge_table.empty:
         logger.warning(
