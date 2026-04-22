@@ -106,10 +106,15 @@ from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
 from learning.apply_learning_costs import load_learning_manifest
 from learning.deployment_constraints import (
+    GLOBAL_DEPLOYMENT_WEDGE_REGION,
     build_deployment_constraint_block_paths,
     build_current_vintage_country_technology_asset_table,
+    build_current_vintage_global_technology_asset_table,
     build_deployment_constraint_lhs,
+    get_applied_learning_wedge_basis_cost,
     get_deployment_constraint_formulation,
+    get_deployment_wedge_cost_granularity,
+    get_deployment_wedge_level,
     get_current_vintage_constraint_basis_upper_bound,
     load_deployment_wedge_table,
 )
@@ -3404,10 +3409,97 @@ def add_year2025_capacity_targets(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
 
 
+def _finite_wedge_basis_costs(values):
+    return pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _wedge_basis_cost_summary(values, cost_tolerance=1.0e-6):
+    finite_costs = _finite_wedge_basis_costs(values)
+    if finite_costs.empty:
+        return {
+            "basis_cost_eur_per_unit_min": np.nan,
+            "basis_cost_eur_per_unit_max": np.nan,
+            "basis_cost_eur_per_unit_mean": np.nan,
+            "basis_cost_eur_per_unit_median": np.nan,
+            "basis_cost_eur_per_unit_representative": np.nan,
+            "basis_cost_source": "asset_costs",
+            "learning_capital_cost": np.nan,
+            "learning_c_overnight": np.nan,
+            "basis_cost_heterogeneous": False,
+        }
+    cost_range = float(finite_costs.max() - finite_costs.min())
+    mean_cost = float(finite_costs.mean())
+    return {
+        "basis_cost_eur_per_unit_min": float(finite_costs.min()),
+        "basis_cost_eur_per_unit_max": float(finite_costs.max()),
+        "basis_cost_eur_per_unit_mean": mean_cost,
+        "basis_cost_eur_per_unit_median": float(finite_costs.median()),
+        "basis_cost_eur_per_unit_representative": mean_cost,
+        "basis_cost_source": "asset_costs",
+        "learning_capital_cost": np.nan,
+        "learning_c_overnight": np.nan,
+        "basis_cost_heterogeneous": bool(np.isfinite(cost_range) and cost_range > cost_tolerance),
+    }
+
+
+def _should_skip_nonbinding_deployment_wedge(
+    n,
+    technology,
+    planning_year,
+    learning_cfg,
+    deployment_cfg,
+    b1,
+    basis_unit,
+):
+    large_rhs_skip_threshold = float(
+        deployment_cfg.get("large_rhs_skip_threshold", 1.0e9)
+    )
+    upper_info = get_current_vintage_constraint_basis_upper_bound(
+        n,
+        technology,
+        planning_year,
+        learning_cfg,
+    )
+    upper = float(upper_info.get("upper_bound_basis_value", np.nan))
+    if bool(upper_info.get("upper_bound_is_finite", False)):
+        tolerance = max(1.0e-9, abs(upper) * 1.0e-9)
+        if float(b1) >= upper - tolerance:
+            logger.info(
+                "Skipping redundant learning deployment wedge for %s at %s: "
+                "B1=%.6f %s >= finite current-vintage upper bound=%.6f %s",
+                technology,
+                planning_year,
+                float(b1),
+                basis_unit,
+                upper,
+                basis_unit,
+            )
+            return True
+        return False
+
+    if large_rhs_skip_threshold > 0.0 and float(b1) >= large_rhs_skip_threshold:
+        logger.warning(
+            "Skipping numerically risky learning deployment wedge for %s at %s: "
+            "B1=%.6g %s exceeds large_rhs_skip_threshold=%.6g and no finite "
+            "current-vintage upper bound is available (%s nonfinite assets).",
+            technology,
+            planning_year,
+            float(b1),
+            basis_unit,
+            large_rhs_skip_threshold,
+            int(upper_info.get("upper_bound_nonfinite_assets", 0)),
+        )
+        return True
+
+    return False
+
+
 def add_learning_deployment_wedge(n, planning_year, config):
     learning_cfg = (config or {}).get("learning", {}) or {}
     deployment_cfg = (learning_cfg.get("deployment_constraints", {}) or {})
     technologies = list(deployment_cfg.get("technologies", []))
+    wedge_level = get_deployment_wedge_level(learning_cfg)
+    wedge_cost_granularity = get_deployment_wedge_cost_granularity(learning_cfg, wedge_level=wedge_level)
     wedge_table = load_deployment_wedge_table(
         learning_cfg,
         current_year=planning_year,
@@ -3416,8 +3508,9 @@ def add_learning_deployment_wedge(n, planning_year, config):
     )
     if wedge_table.empty:
         logger.warning(
-            "Skipping learning deployment wedge for %s: no country-technology rows were resolved.",
+            "Skipping learning deployment wedge for %s: no %s technology rows were resolved.",
             planning_year,
+            wedge_level,
         )
         return
 
@@ -3427,23 +3520,196 @@ def add_learning_deployment_wedge(n, planning_year, config):
     wedge_rows = []
     extra_cost = 0
     asset_cost_tolerance = float(deployment_cfg.get("wedge_asset_cost_tolerance", 1.0e-6))
+    if not technologies:
+        technologies = sorted(wedge_table["technology"].unique())
 
     for technology in technologies:
         tech_table = wedge_table.loc[wedge_table["technology"].eq(technology)].copy()
         if tech_table.empty:
             continue
 
-        asset_table = build_current_vintage_country_technology_asset_table(
-            n,
-            technology,
-            planning_year=planning_year,
-            learning_cfg=learning_cfg,
-        )
+        if wedge_level == "global":
+            asset_table = build_current_vintage_global_technology_asset_table(
+                n,
+                technology,
+                planning_year=planning_year,
+                learning_cfg=learning_cfg,
+            )
+        else:
+            asset_table = build_current_vintage_country_technology_asset_table(
+                n,
+                technology,
+                planning_year=planning_year,
+                learning_cfg=learning_cfg,
+            )
         if asset_table.empty:
             logger.info(
                 "Skipping learning deployment wedge rows for %s at %s: no current-vintage extendable assets found.",
                 technology,
                 planning_year,
+            )
+            continue
+
+        if wedge_level == "global":
+            global_rows = tech_table.loc[tech_table["region"].eq(GLOBAL_DEPLOYMENT_WEDGE_REGION)].copy()
+            if global_rows.empty:
+                logger.info(
+                    "Skipping global learning deployment wedge for %s at %s: no GLOBAL wedge row found.",
+                    technology,
+                    planning_year,
+                )
+                continue
+            row = global_rows.iloc[0]
+            if _should_skip_nonbinding_deployment_wedge(
+                n,
+                technology,
+                planning_year,
+                learning_cfg,
+                deployment_cfg,
+                b1=float(row["b1"]),
+                basis_unit=str(row.get("basis_unit", "")),
+            ):
+                continue
+            asset_table["basis_objective_cost"] = pd.to_numeric(asset_table["basis_objective_cost"], errors="coerce")
+
+            assets = pd.Index(asset_table["asset"].astype(str), name="asset")
+            spec_var = str(asset_table["model_var"].iloc[0])
+            raw_to_basis_divisor = float(asset_table["raw_to_basis_divisor"].iloc[0])
+            basis_cost_by_asset = asset_table.set_index("asset")["basis_objective_cost"].astype(float)
+            cost_summary = _wedge_basis_cost_summary(
+                basis_cost_by_asset.loc[assets],
+                cost_tolerance=asset_cost_tolerance,
+            )
+            penalty_basis = str(row.get("penalty_basis", "%_of_capex")).strip()
+            phi2 = float(row["phi2"])
+            phi3 = float(row["phi3"])
+
+            if wedge_cost_granularity == "applied_learning_cost":
+                if phi2 < 0.0 or phi3 < phi2:
+                    raise ValueError(
+                        "Global applied-learning deployment wedge requires a convex "
+                        f"piecewise cost with 0 <= phi2 <= phi3 for {technology!r}; "
+                        f"got phi2={phi2}, phi3={phi3}."
+                    )
+                applied_cost_info = get_applied_learning_wedge_basis_cost(
+                    n,
+                    technology,
+                    raw_to_basis_divisor=raw_to_basis_divisor,
+                )
+                cost_summary = {**cost_summary, **applied_cost_info}
+                tech_coord = pd.Index([technology], name="technology")
+                excess1 = n.model.add_variables(
+                    lower=0.0,
+                    coords=[tech_coord],
+                    name=f"learning_deployment_excess1_raw__{technology}__{planning_year}",
+                )
+                excess2 = n.model.add_variables(
+                    lower=0.0,
+                    coords=[tech_coord],
+                    name=f"learning_deployment_excess2_raw__{technology}__{planning_year}",
+                )
+                build_expr_raw = sum(n.model[spec_var].loc[str(asset)] for asset in assets)
+                b1_raw = float(row["b1"]) * raw_to_basis_divisor
+                b2_raw = float(row["b2"]) * raw_to_basis_divisor
+                n.model.add_constraints(
+                    excess1.loc[technology] >= build_expr_raw - b1_raw,
+                    name=f"learning_deployment_wedge_excess1_raw__{technology}__{planning_year}__{GLOBAL_DEPLOYMENT_WEDGE_REGION}",
+                )
+                n.model.add_constraints(
+                    excess2.loc[technology] >= build_expr_raw - b2_raw,
+                    name=f"learning_deployment_wedge_excess2_raw__{technology}__{planning_year}__{GLOBAL_DEPLOYMENT_WEDGE_REGION}",
+                )
+                if penalty_basis == "%_of_capex":
+                    representative_cost = float(applied_cost_info["learning_capital_cost"])
+                    global_extra = (
+                        phi2 * representative_cost * excess1.loc[technology]
+                        + (phi3 - phi2) * representative_cost * excess2.loc[technology]
+                    )
+                else:
+                    global_extra = (
+                        phi2 * excess1.loc[technology] / raw_to_basis_divisor
+                        + (phi3 - phi2) * excess2.loc[technology] / raw_to_basis_divisor
+                    )
+                cost_summary["wedge_solver_formulation"] = "epigraph_raw_units"
+                cost_summary["raw_to_basis_divisor"] = raw_to_basis_divisor
+                cost_summary["b1_raw"] = b1_raw
+                cost_summary["b2_raw"] = b2_raw
+            else:
+                asset_table = asset_table.loc[
+                    asset_table["basis_objective_cost"].replace([np.inf, -np.inf], np.nan).notna()
+                ].copy()
+                if asset_table.empty:
+                    logger.warning(
+                        "Skipping global learning deployment wedge for %s at %s: no assets with finite basis costs remained after filtering.",
+                        technology,
+                        planning_year,
+                    )
+                    continue
+                assets = pd.Index(asset_table["asset"].astype(str), name="asset")
+                basis_cost_by_asset = asset_table.set_index("asset")["basis_objective_cost"].astype(float)
+                cost_summary = _wedge_basis_cost_summary(
+                    basis_cost_by_asset.loc[assets],
+                    cost_tolerance=asset_cost_tolerance,
+                )
+                seg1 = n.model.add_variables(
+                    lower=0.0,
+                    coords=[assets],
+                    name=f"learning_deployment_seg1__{technology}__{planning_year}",
+                )
+                seg2 = n.model.add_variables(
+                    lower=0.0,
+                    coords=[assets],
+                    name=f"learning_deployment_seg2__{technology}__{planning_year}",
+                )
+                seg3 = n.model.add_variables(
+                    lower=0.0,
+                    coords=[assets],
+                    name=f"learning_deployment_seg3__{technology}__{planning_year}",
+                )
+
+                for _, asset_row in asset_table.iterrows():
+                    asset = str(asset_row["asset"])
+                    build_expr = n.model[spec_var].loc[asset]
+                    build_expr = build_expr / raw_to_basis_divisor
+                    n.model.add_constraints(
+                        seg1.loc[asset] + seg2.loc[asset] + seg3.loc[asset] == build_expr,
+                        name=f"learning_deployment_wedge_asset_balance__{technology}__{planning_year}__{asset}",
+                    )
+
+                n.model.add_constraints(
+                    seg1.loc[assets].sum() <= float(row["width1"]),
+                    name=f"learning_deployment_wedge_seg1_cap__{technology}__{planning_year}__{GLOBAL_DEPLOYMENT_WEDGE_REGION}",
+                )
+                n.model.add_constraints(
+                    seg2.loc[assets].sum() <= float(row["width2"]),
+                    name=f"learning_deployment_wedge_seg2_cap__{technology}__{planning_year}__{GLOBAL_DEPLOYMENT_WEDGE_REGION}",
+                )
+                if penalty_basis == "%_of_capex":
+                    global_extra = (
+                        phi2 * (basis_cost_by_asset.loc[assets] * seg2.loc[assets]).sum()
+                        + phi3 * (basis_cost_by_asset.loc[assets] * seg3.loc[assets]).sum()
+                    )
+                else:
+                    global_extra = phi2 * seg2.loc[assets].sum() + phi3 * seg3.loc[assets].sum()
+            extra_cost = extra_cost + global_extra
+
+            wedge_rows.append(
+                {
+                    "year": int(planning_year),
+                    "country": GLOBAL_DEPLOYMENT_WEDGE_REGION,
+                    "technology": technology,
+                    "constraint_basis_unit": str(row.get("basis_unit", "")),
+                    "penalty_basis": penalty_basis,
+                    "cost_granularity": wedge_cost_granularity,
+                    "b1": float(row["b1"]),
+                    "b2": float(row["b2"]),
+                    "width1": float(row["width1"]),
+                    "width2": float(row["width2"]),
+                    "phi2": phi2,
+                    "phi3": phi3,
+                    **cost_summary,
+                    "asset_count": int(len(assets)),
+                }
             )
             continue
 
@@ -3527,8 +3793,7 @@ def add_learning_deployment_wedge(n, planning_year, config):
                 region_extra = phi2 * seg2.loc[region_assets].sum() + phi3 * seg3.loc[region_assets].sum()
             extra_cost = extra_cost + region_extra
             region_costs = basis_cost_by_asset.loc[region_assets]
-            finite_costs = pd.to_numeric(region_costs, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            cost_range = float(finite_costs.max() - finite_costs.min()) if not finite_costs.empty else np.nan
+            cost_summary = _wedge_basis_cost_summary(region_costs, cost_tolerance=asset_cost_tolerance)
             wedge_rows.append(
                 {
                     "year": int(planning_year),
@@ -3536,16 +3801,14 @@ def add_learning_deployment_wedge(n, planning_year, config):
                     "technology": technology,
                     "constraint_basis_unit": str(row.get("basis_unit", "")),
                     "penalty_basis": penalty_basis,
+                    "cost_granularity": "asset_exact",
                     "b1": float(row["b1"]),
                     "b2": float(row["b2"]),
                     "width1": float(row["width1"]),
                     "width2": float(row["width2"]),
                     "phi2": float(row["phi2"]),
                     "phi3": float(row["phi3"]),
-                    "basis_cost_eur_per_unit_min": float(finite_costs.min()) if not finite_costs.empty else np.nan,
-                    "basis_cost_eur_per_unit_max": float(finite_costs.max()) if not finite_costs.empty else np.nan,
-                    "basis_cost_eur_per_unit_mean": float(finite_costs.mean()) if not finite_costs.empty else np.nan,
-                    "basis_cost_heterogeneous": bool(np.isfinite(cost_range) and cost_range > asset_cost_tolerance),
+                    **cost_summary,
                     "asset_count": int(len(region_assets)),
                 }
             )
@@ -3553,10 +3816,19 @@ def add_learning_deployment_wedge(n, planning_year, config):
     if wedge_rows:
         n.model.objective = n.model.objective + extra_cost
         n.meta["learning_deployment_wedge"] = wedge_rows
+        solver_formulations = sorted(
+            {
+                str(row.get("wedge_solver_formulation", "segment_basis_units"))
+                for row in wedge_rows
+            }
+        )
         logger.info(
-            "Added LP-safe learning deployment wedge for planning year %s across %d country-technology rows.",
+            "Added LP-safe %s %s learning deployment wedge for planning year %s across %d technology rows (solver_formulations=%s).",
+            wedge_level,
+            wedge_cost_granularity,
             planning_year,
             len(wedge_rows),
+            ",".join(solver_formulations),
         )
 
 

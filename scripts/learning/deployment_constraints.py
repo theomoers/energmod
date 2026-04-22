@@ -13,7 +13,11 @@ import pandas as pd
 
 SUPPORTED_DEPLOYMENT_CONSTRAINT_MODES = {"first_order", "second_order", "both"}
 SUPPORTED_DEPLOYMENT_CONSTRAINT_FORMULATIONS = {"hard_cap", "three_segment_wedge"}
+SUPPORTED_DEPLOYMENT_WEDGE_LEVELS = {"country_level", "global"}
+SUPPORTED_DEPLOYMENT_WEDGE_COST_GRANULARITIES = {"asset_exact", "applied_learning_cost"}
+SUPPORTED_DEPLOYMENT_WEDGE_REFERENCE_METHODS = {"flat_recent", "growth_projected"}
 PERCENT_OF_CAPEX_PENALTY_BASIS = "%_of_capex"
+GLOBAL_DEPLOYMENT_WEDGE_REGION = "GLOBAL"
 
 DEPLOYMENT_CONSTRAINT_SPECS = {
     "solar_power": {
@@ -640,10 +644,74 @@ def _get_wedge_cfg(learning_cfg):
     return wedge_cfg
 
 
+def get_deployment_wedge_level(learning_cfg):
+    level = str(_get_wedge_cfg(learning_cfg).get("level", "country_level")).strip()
+    if level not in SUPPORTED_DEPLOYMENT_WEDGE_LEVELS:
+        raise ValueError(
+            "Unsupported learning.deployment_constraints.wedge.level="
+            f"{level!r}. Supported values: {sorted(SUPPORTED_DEPLOYMENT_WEDGE_LEVELS)}"
+        )
+    return level
+
+
+def get_deployment_wedge_cost_granularity(learning_cfg, wedge_level=None):
+    level = wedge_level or get_deployment_wedge_level(learning_cfg)
+    default = "applied_learning_cost" if level == "global" else "asset_exact"
+    granularity = str(_get_wedge_cfg(learning_cfg).get("cost_granularity", default)).strip()
+    if granularity not in SUPPORTED_DEPLOYMENT_WEDGE_COST_GRANULARITIES:
+        raise ValueError(
+            "Unsupported learning.deployment_constraints.wedge.cost_granularity="
+            f"{granularity!r}. Supported values: "
+            f"{sorted(SUPPORTED_DEPLOYMENT_WEDGE_COST_GRANULARITIES)}"
+        )
+    return granularity
+
+
+def get_deployment_wedge_reference_method(learning_cfg):
+    method = str(_get_wedge_cfg(learning_cfg).get("reference_method", "flat_recent")).strip()
+    if method not in SUPPORTED_DEPLOYMENT_WEDGE_REFERENCE_METHODS:
+        raise ValueError(
+            "Unsupported learning.deployment_constraints.wedge.reference_method="
+            f"{method!r}. Supported values: "
+            f"{sorted(SUPPORTED_DEPLOYMENT_WEDGE_REFERENCE_METHODS)}"
+        )
+    return method
+
+
 def get_deployment_wedge_basis_unit(technology):
     if str(technology) == "battery_energy":
         return "GWh"
     return str(get_constraint_basis_unit(technology))
+
+
+def get_applied_learning_wedge_basis_cost(n, technology, raw_to_basis_divisor=None):
+    meta = getattr(n, "meta", {}) or {}
+    learning_costs = meta.get("learning_costs", {}) or {}
+    if technology not in learning_costs:
+        raise ValueError(
+            "learning.deployment_constraints.wedge.cost_granularity='applied_learning_cost' "
+            f"requires n.meta['learning_costs'][{technology!r}], but it is missing. "
+            "Run apply_learning_costs before solve_network and preserve network metadata."
+        )
+    record = learning_costs.get(technology) or {}
+    capital_cost = _safe_float(record.get("capital_cost", np.nan))
+    if not np.isfinite(capital_cost):
+        raise ValueError(
+            "Invalid applied learning capital_cost for "
+            f"{technology!r}: {record.get('capital_cost')!r}."
+        )
+    divisor = (
+        float(raw_to_basis_divisor)
+        if raw_to_basis_divisor is not None
+        else float(get_deployment_constraint_spec(technology)["raw_to_basis_divisor"])
+    )
+    c_overnight = _safe_float(record.get("c_overnight", np.nan))
+    return {
+        "basis_cost_eur_per_unit_representative": float(capital_cost * divisor),
+        "basis_cost_source": "network_meta_learning_costs",
+        "learning_capital_cost": float(capital_cost),
+        "learning_c_overnight": float(c_overnight) if np.isfinite(c_overnight) else np.nan,
+    }
 
 
 def _resolve_history_addition_to_basis(
@@ -665,8 +733,217 @@ def _resolve_history_addition_to_basis(
     return float(resolved)
 
 
-def _irena_capacity_history_to_country_annual_additions(irena_csv, technologies, current_year):
+def _add_wedge_history_basis(history, current_year, learning_cfg):
+    history = history.copy()
+    if history.empty:
+        history["annual_basis"] = pd.Series(dtype=float)
+        return history
+    history["annual_basis"] = history.apply(
+        lambda row: _resolve_history_addition_to_basis(
+            technology=row["technology"],
+            annual_addition=row["annual_addition"],
+            basis_unit=row.get("basis_unit", ""),
+            current_year=current_year,
+            learning_cfg=learning_cfg,
+        ),
+        axis=1,
+    )
+    return history
+
+
+def _select_wedge_reference_annual_basis(recent, reference_statistic):
+    mean_recent = float(recent["annual_basis"].mean())
+    median_recent = float(recent["annual_basis"].median())
+    if reference_statistic == "max_mean_median":
+        return max(mean_recent, median_recent)
+    if reference_statistic == "median":
+        return median_recent
+    return mean_recent
+
+
+def _growth_projected_wedge_reference(group, current_year, growth_smoothing_years):
+    current_year = int(current_year)
+    growth_smoothing_years = max(int(growth_smoothing_years), 1)
+    annual = (
+        group.loc[:, ["year", "annual_basis"]]
+        .dropna(subset=["year", "annual_basis"])
+        .copy()
+    )
+    if annual.empty:
+        raise ValueError("Cannot compute growth-projected wedge reference from empty history.")
+    annual["year"] = annual["year"].astype(int)
+    annual["annual_basis"] = pd.to_numeric(annual["annual_basis"], errors="coerce")
+    annual = annual.dropna(subset=["annual_basis"]).sort_values("year")
+    if annual.empty:
+        raise ValueError("Cannot compute growth-projected wedge reference from nonnumeric history.")
+
+    latest_year = int(annual["year"].max())
+    base_year = latest_year - growth_smoothing_years
+    annual_by_year = annual.groupby("year")["annual_basis"].sum()
+    latest_addition = float(annual_by_year.loc[latest_year])
+    if base_year not in annual_by_year.index:
+        raise ValueError(
+            "Cannot compute growth-projected deployment wedge reference: "
+            f"missing annual addition for base year {base_year} "
+            f"({growth_smoothing_years} years before latest year {latest_year})."
+        )
+    base_addition = float(annual_by_year.loc[base_year])
+    if not np.isfinite(base_addition) or base_addition <= 0.0:
+        raise ValueError(
+            "Cannot compute growth-projected deployment wedge reference: "
+            f"annual addition in base year {base_year} is nonpositive "
+            f"({base_addition!r})."
+        )
+    if not np.isfinite(latest_addition) or latest_addition < 0.0:
+        raise ValueError(
+            "Cannot compute growth-projected deployment wedge reference: "
+            f"latest annual addition in {latest_year} is invalid "
+            f"({latest_addition!r})."
+        )
+
+    growth_rate = float((latest_addition / base_addition) ** (1.0 / growth_smoothing_years) - 1.0)
+    if not np.isfinite(growth_rate) or (1.0 + growth_rate) < 0.0:
+        raise ValueError(
+            "Cannot compute growth-projected deployment wedge reference: "
+            f"invalid growth rate {growth_rate!r}."
+        )
+
+    projected = []
+    for year in _annual_years_for_block(current_year):
+        if year <= latest_year and year in annual_by_year.index:
+            value = float(annual_by_year.loc[year])
+        else:
+            value = float(latest_addition * ((1.0 + growth_rate) ** (year - latest_year)))
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "Cannot compute growth-projected deployment wedge reference: "
+                f"projected annual addition for {year} is invalid ({value!r})."
+            )
+        projected.append(value)
+
+    block_reference = float(np.sum(projected))
+    if not np.isfinite(block_reference) or block_reference <= 0.0:
+        raise ValueError(
+            "Cannot compute growth-projected deployment wedge reference: "
+            f"block reference is invalid ({block_reference!r})."
+        )
+    return {
+        "block_reference": block_reference,
+        "reference_annual_addition": latest_addition,
+        "history_year": latest_year,
+        "reference_growth_rate": growth_rate,
+        "reference_latest_annual_addition": latest_addition,
+    }
+
+
+def _deployment_wedge_row(
+    region,
+    technology,
+    current_year,
+    block_years,
+    annual_basis,
+    history_year,
+    b1_multiplier,
+    b2_multiplier,
+    phi2_pct_capex,
+    phi3_pct_capex,
+    block_reference=None,
+    reference_method="flat_recent",
+    reference_growth_rate=np.nan,
+    reference_latest_annual_addition=np.nan,
+):
+    block_reference = (
+        float(block_reference)
+        if block_reference is not None
+        else float(annual_basis) * float(block_years)
+    )
+    return {
+        "region": region,
+        "technology": technology,
+        "year": int(current_year),
+        "b1": max(block_reference * b1_multiplier, 0.0),
+        "b2": max(block_reference * b2_multiplier, 0.0),
+        "phi2": max(phi2_pct_capex, 0.0),
+        "phi3": max(phi3_pct_capex, 0.0),
+        "basis_unit": get_deployment_wedge_basis_unit(technology),
+        "penalty_basis": PERCENT_OF_CAPEX_PENALTY_BASIS,
+        "history_year": int(history_year),
+        "reference_annual_addition": float(annual_basis),
+        "reference_method": str(reference_method),
+        "reference_block_addition": float(block_reference),
+        "reference_growth_rate": float(reference_growth_rate),
+        "reference_latest_annual_addition": float(reference_latest_annual_addition),
+    }
+
+
+def _parse_numeric_capacity_value(series):
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).fillna(0.0)
+
+
+def _irena_long_capacity_history_to_annual_additions(frame, technologies, current_year, wedge_level):
+    if wedge_level != "global":
+        raise ValueError(
+            "Long-format IRENA capacity data is supported for global deployment "
+            "wedge calibration only. Use the wide country-by-year IRENA file for "
+            "country_level wedges."
+        )
+
+    product_map = {
+        "solar_power": "Solar photovoltaic",
+        "onwind_power": "Onshore wind energy",
+    }
+    code_col = "Region/area (ISO 3)"
+    value_col = " Value " if " Value " in frame.columns else "Value"
+    rows = []
+    frame = frame.copy()
+    frame["region_code"] = frame[code_col].fillna("").astype(str).str.strip().str.upper()
+    frame["year"] = pd.to_numeric(frame["Year"], errors="coerce")
+    frame["capacity_value"] = _parse_numeric_capacity_value(frame[value_col])
+    frame["product_name"] = frame["Product Name"].fillna("").astype(str).str.strip()
+    frame = frame.loc[frame["region_code"].eq("GLO")].dropna(subset=["year"]).copy()
+    frame["year"] = frame["year"].astype(int)
+    frame = frame.loc[frame["year"].le(int(current_year))].copy()
+
+    for technology in technologies:
+        product_name = product_map.get(str(technology))
+        if product_name is None:
+            continue
+        subset = frame.loc[frame["product_name"].eq(product_name)].copy()
+        if subset.empty:
+            continue
+        capacity = subset.groupby("year", sort=True)["capacity_value"].sum()
+        additions = capacity.diff().clip(lower=0.0).dropna()
+        if additions.empty:
+            continue
+        rows.append(
+            additions.rename("annual_addition")
+            .reset_index()
+            .assign(
+                region=GLOBAL_DEPLOYMENT_WEDGE_REGION,
+                technology=str(technology),
+                basis_unit="MW",
+            )
+            .loc[:, ["region", "technology", "year", "annual_addition", "basis_unit"]]
+        )
+    if not rows:
+        return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+    return pd.concat(rows, ignore_index=True)
+
+
+def _irena_capacity_history_to_country_annual_additions(irena_csv, technologies, current_year, wedge_level="country_level"):
     frame = pd.read_csv(irena_csv)
+    long_required = {"Region/area (ISO 3)", "Year", "Product Name", "Grid Type", "Unit"}
+    if long_required.issubset(frame.columns) and (" Value " in frame.columns or "Value" in frame.columns):
+        return _irena_long_capacity_history_to_annual_additions(
+            frame,
+            technologies=technologies,
+            current_year=current_year,
+            wedge_level=wedge_level,
+        )
+
     frame = frame.rename(columns={col: str(col).replace("\ufeff", "").strip() for col in frame.columns})
     wide_years = sorted(int(c) for c in frame.columns if isinstance(c, str) and c.isdigit())
     if not {"Technology", "Country"}.issubset(frame.columns) or len(wide_years) < 2:
@@ -688,6 +965,7 @@ def _irena_capacity_history_to_country_annual_additions(irena_csv, technologies,
         subset = subset.loc[subset["region"].str.match(r"^[A-Z]{2}$", na=False)].copy()
         if subset.empty:
             continue
+        subset = subset.reset_index(drop=True)
         numeric = subset.loc[:, [str(year) for year in wide_years]].apply(pd.to_numeric, errors="coerce").fillna(0.0)
         additions = numeric.diff(axis=1)
         additions.columns = wide_years
@@ -741,6 +1019,7 @@ def load_deployment_country_history(
     config_file=None,
 ):
     wedge_cfg = _get_wedge_cfg(learning_cfg)
+    wedge_level = get_deployment_wedge_level(learning_cfg)
     cfg = get_deployment_constraint_cfg(learning_cfg) or {}
     techs = list(technologies or cfg.get("technologies", []) or [])
     history_csv = wedge_cfg.get("country_history_csv")
@@ -759,7 +1038,12 @@ def load_deployment_country_history(
         )
         history = pd.concat(
             [
-                _irena_capacity_history_to_country_annual_additions(irena_csv, techs, current_year),
+                _irena_capacity_history_to_country_annual_additions(
+                    irena_csv,
+                    techs,
+                    current_year,
+                    wedge_level=wedge_level,
+                ),
                 _battery_capacity_history_to_country_annual_additions(battery_csv, current_year),
             ],
             ignore_index=True,
@@ -776,7 +1060,10 @@ def load_deployment_country_history(
         history["basis_unit"] = history["technology"].map(get_constraint_basis_unit)
     history["basis_unit"] = history["basis_unit"].fillna("").astype(str).str.strip()
     history = history.dropna(subset=["year", "annual_addition"])
-    history = history.loc[history["region"].str.match(r"^[A-Z]{2}$", na=False)].copy()
+    region_mask = history["region"].str.match(r"^[A-Z]{2}$", na=False)
+    if wedge_level == "global":
+        region_mask = region_mask | history["region"].eq(GLOBAL_DEPLOYMENT_WEDGE_REGION)
+    history = history.loc[region_mask].copy()
     if technologies is not None:
         tech_set = {str(t).strip() for t in technologies}
         history = history.loc[history["technology"].isin(tech_set)].copy()
@@ -810,6 +1097,10 @@ def build_deployment_wedge_table_from_history(
         "penalty_basis",
         "history_year",
         "reference_annual_addition",
+        "reference_method",
+        "reference_block_addition",
+        "reference_growth_rate",
+        "reference_latest_annual_addition",
     ]
     if history.empty:
         return pd.DataFrame(columns=empty_cols)
@@ -834,48 +1125,68 @@ def build_deployment_wedge_table_from_history(
             "Unsupported learning.deployment_constraints.wedge.reference_statistic="
             f"{reference_statistic!r}. Supported values: ['mean', 'median', 'max_mean_median']"
         )
+    reference_method = get_deployment_wedge_reference_method(learning_cfg)
+    growth_smoothing_years = int(wedge_cfg.get("growth_smoothing_years", 3))
+    growth_smoothing_years = max(growth_smoothing_years, 1)
+
+    wedge_level = get_deployment_wedge_level(learning_cfg)
+    history = _add_wedge_history_basis(history, current_year, learning_cfg)
+    history = history.dropna(subset=["annual_basis"]).copy()
+    if history.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    if wedge_level == "global":
+        history = (
+            history.groupby(["technology", "year"], as_index=False, sort=False)
+            .agg(annual_basis=("annual_basis", "sum"))
+            .assign(region=GLOBAL_DEPLOYMENT_WEDGE_REGION)
+        )
 
     rows = []
     for (region, technology), group in history.groupby(["region", "technology"], sort=False):
         smoothed = group.sort_values("year").copy()
-        smoothed["annual_basis"] = smoothed.apply(
-            lambda row: _resolve_history_addition_to_basis(
-                technology=technology,
-                annual_addition=row["annual_addition"],
-                basis_unit=row.get("basis_unit", ""),
-                current_year=current_year,
-                learning_cfg=learning_cfg,
-            ),
-            axis=1,
-        )
         recent = smoothed.dropna(subset=["annual_basis"]).tail(smoothing_years).copy()
         if recent.empty:
             continue
-        mean_recent = float(recent["annual_basis"].mean())
-        median_recent = float(recent["annual_basis"].median())
-        if reference_statistic == "max_mean_median":
-            annual_basis = max(mean_recent, median_recent)
-        elif reference_statistic == "median":
-            annual_basis = median_recent
+        row_reference_method = reference_method
+        if reference_method == "growth_projected" and str(technology) != "battery_energy":
+            reference = _growth_projected_wedge_reference(
+                smoothed,
+                current_year=current_year,
+                growth_smoothing_years=growth_smoothing_years,
+            )
+            annual_basis = reference["reference_annual_addition"]
+            block_reference = reference["block_reference"]
+            history_year = reference["history_year"]
+            reference_growth_rate = reference["reference_growth_rate"]
+            reference_latest_annual_addition = reference["reference_latest_annual_addition"]
         else:
-            annual_basis = mean_recent
-        if not np.isfinite(annual_basis) or annual_basis <= 0.0:
-            continue
-        block_reference = float(annual_basis) * float(block_years)
+            if reference_method == "growth_projected" and str(technology) == "battery_energy":
+                row_reference_method = "flat_recent"
+            annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
+            if not np.isfinite(annual_basis) or annual_basis <= 0.0:
+                continue
+            block_reference = float(annual_basis) * float(block_years)
+            history_year = recent["year"].max()
+            reference_growth_rate = np.nan
+            reference_latest_annual_addition = annual_basis
         rows.append(
-            {
-                "region": region,
-                "technology": technology,
-                "year": current_year,
-                "b1": max(block_reference * b1_multiplier, 0.0),
-                "b2": max(block_reference * b2_multiplier, 0.0),
-                "phi2": max(phi2_pct_capex, 0.0),
-                "phi3": max(phi3_pct_capex, 0.0),
-                "basis_unit": get_deployment_wedge_basis_unit(technology),
-                "penalty_basis": PERCENT_OF_CAPEX_PENALTY_BASIS,
-                "history_year": int(recent["year"].max()),
-                "reference_annual_addition": float(annual_basis),
-            }
+            _deployment_wedge_row(
+                region=region,
+                technology=technology,
+                current_year=current_year,
+                block_years=block_years,
+                annual_basis=annual_basis,
+                history_year=history_year,
+                b1_multiplier=b1_multiplier,
+                b2_multiplier=b2_multiplier,
+                phi2_pct_capex=phi2_pct_capex,
+                phi3_pct_capex=phi3_pct_capex,
+                block_reference=block_reference,
+                reference_method=row_reference_method,
+                reference_growth_rate=reference_growth_rate,
+                reference_latest_annual_addition=reference_latest_annual_addition,
+            )
         )
     if not rows:
         return pd.DataFrame(columns=empty_cols)
@@ -908,6 +1219,10 @@ def load_deployment_wedge_table(
                 "penalty_basis",
                 "history_year",
                 "reference_annual_addition",
+                "reference_method",
+                "reference_block_addition",
+                "reference_growth_rate",
+                "reference_latest_annual_addition",
             ]
         )
 
@@ -933,7 +1248,16 @@ def load_deployment_wedge_table(
             f"{sorted(missing)}"
         )
 
-    keep = required | {"basis_unit", "penalty_basis", "history_year", "reference_annual_addition"}
+    keep = required | {
+        "basis_unit",
+        "penalty_basis",
+        "history_year",
+        "reference_annual_addition",
+        "reference_method",
+        "reference_block_addition",
+        "reference_growth_rate",
+        "reference_latest_annual_addition",
+    }
     frame = frame.loc[:, [col for col in frame.columns if col in keep]].copy()
     frame["region"] = frame["region"].fillna("").astype(str).str.strip().str.upper()
     frame["technology"] = frame["technology"].fillna("").astype(str).str.strip()
@@ -946,12 +1270,26 @@ def load_deployment_wedge_table(
     if "penalty_basis" not in frame.columns:
         frame["penalty_basis"] = PERCENT_OF_CAPEX_PENALTY_BASIS
     frame["penalty_basis"] = frame["penalty_basis"].fillna(PERCENT_OF_CAPEX_PENALTY_BASIS).astype(str).str.strip()
+    if "reference_method" not in frame.columns:
+        frame["reference_method"] = "flat_recent"
+    frame["reference_method"] = frame["reference_method"].fillna("flat_recent").astype(str).str.strip()
+    for col in ("history_year", "reference_annual_addition", "reference_block_addition", "reference_growth_rate", "reference_latest_annual_addition"):
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
     frame = frame.dropna(subset=["year", "b1", "b2", "phi2", "phi3"])
     if current_year is not None:
         frame = frame.loc[frame["year"].astype(int).eq(int(current_year))].copy()
     if technologies is not None:
         techs = {str(t).strip() for t in technologies}
         frame = frame.loc[frame["technology"].isin(techs)].copy()
+    if get_deployment_wedge_level(learning_cfg) == "global":
+        non_global = frame.loc[frame["region"].ne(GLOBAL_DEPLOYMENT_WEDGE_REGION)]
+        if not non_global.empty:
+            examples = non_global.loc[:, ["region", "technology", "year"]].head(5)
+            raise ValueError(
+                "Global deployment wedge tables must use region='GLOBAL'. "
+                f"Examples of non-global rows: {examples.to_dict(orient='records')}"
+            )
     expected_basis_units = frame["technology"].map(get_deployment_wedge_basis_unit)
     unit_mismatch = expected_basis_units.ne(frame["basis_unit"])
     if unit_mismatch.any():
@@ -1050,6 +1388,48 @@ def build_current_vintage_country_technology_asset_table(
     return subset.loc[:, columns].reset_index(drop=True)
 
 
+def build_current_vintage_global_technology_asset_table(
+    n,
+    technology,
+    planning_year,
+    learning_cfg,
+):
+    spec = get_deployment_constraint_spec(technology)
+    idx = get_current_vintage_indices(n, technology, planning_year)
+    columns = [
+        "asset",
+        "region",
+        "technology",
+        "model_var",
+        "raw_to_basis_divisor",
+        "capital_cost",
+        "basis_objective_cost",
+        "basis_unit",
+        "battery_phi_block",
+    ]
+    if len(idx) == 0:
+        return pd.DataFrame(columns=columns)
+    component_df = getattr(n, spec["component_attr"], None)
+    if component_df is None or component_df.empty:
+        return pd.DataFrame(columns=columns)
+    subset = component_df.loc[idx].copy()
+    if "capital_cost" in subset.columns:
+        subset["capital_cost"] = pd.to_numeric(subset["capital_cost"], errors="coerce")
+    else:
+        subset["capital_cost"] = np.nan
+    subset["basis_objective_cost"] = subset["capital_cost"].apply(
+        lambda value: _basis_cost_from_capital_cost(technology, value, planning_year, learning_cfg)
+    )
+    subset["asset"] = subset.index.astype(str)
+    subset["region"] = GLOBAL_DEPLOYMENT_WEDGE_REGION
+    subset["technology"] = str(technology)
+    subset["model_var"] = str(spec["model_var"])
+    subset["raw_to_basis_divisor"] = float(spec["raw_to_basis_divisor"])
+    subset["basis_unit"] = get_deployment_wedge_basis_unit(technology)
+    subset["battery_phi_block"] = get_battery_phi_block(learning_cfg, planning_year) if spec["phi_mapped"] else np.nan
+    return subset.loc[:, columns].reset_index(drop=True)
+
+
 def _get_current_vintage_basis_build_by_region(n, technology, planning_year, learning_cfg):
     spec = get_deployment_constraint_spec(technology)
     idx = get_current_vintage_indices(n, technology, planning_year)
@@ -1068,6 +1448,19 @@ def _get_current_vintage_basis_build_by_region(n, technology, planning_year, lea
     return subset.groupby("region")["basis_value"].sum().sort_index()
 
 
+def _get_current_vintage_basis_build_global(n, technology, planning_year, learning_cfg):
+    spec = get_deployment_constraint_spec(technology)
+    idx = get_current_vintage_indices(n, technology, planning_year)
+    if len(idx) == 0:
+        return 0.0
+    component_df = getattr(n, spec["component_attr"], None)
+    if component_df is None or component_df.empty:
+        return 0.0
+    subset = component_df.loc[idx].copy()
+    optimized_capacity = _get_capacity_series(subset, spec)
+    return float(optimized_capacity.astype(float).sum() / float(spec["raw_to_basis_divisor"]))
+
+
 def partition_three_segment_build(build_value, width1, width2):
     build_value = max(float(build_value), 0.0)
     width1 = max(float(width1), 0.0)
@@ -1076,6 +1469,41 @@ def partition_three_segment_build(build_value, width1, width2):
     seg2 = min(max(build_value - seg1, 0.0), width2)
     seg3 = max(build_value - seg1 - seg2, 0.0)
     return float(seg1), float(seg2), float(seg3)
+
+
+def _summarize_basis_objective_costs(values, cost_tolerance=1.0e-6):
+    finite_costs = (
+        pd.to_numeric(pd.Series(values), errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if finite_costs.empty:
+        return {
+            "basis_cost_eur_per_unit_min": np.nan,
+            "basis_cost_eur_per_unit_max": np.nan,
+            "basis_cost_eur_per_unit_mean": np.nan,
+            "basis_cost_eur_per_unit_median": np.nan,
+            "basis_cost_eur_per_unit_representative": np.nan,
+            "basis_cost_source": "asset_costs",
+            "learning_capital_cost": np.nan,
+            "learning_c_overnight": np.nan,
+            "basis_cost_heterogeneous": False,
+            "asset_count": 0,
+        }
+    cost_range = float(finite_costs.max() - finite_costs.min())
+    mean_cost = float(finite_costs.mean())
+    return {
+        "basis_cost_eur_per_unit_min": float(finite_costs.min()),
+        "basis_cost_eur_per_unit_max": float(finite_costs.max()),
+        "basis_cost_eur_per_unit_mean": mean_cost,
+        "basis_cost_eur_per_unit_median": float(finite_costs.median()),
+        "basis_cost_eur_per_unit_representative": mean_cost,
+        "basis_cost_source": "asset_costs",
+        "learning_capital_cost": np.nan,
+        "learning_c_overnight": np.nan,
+        "basis_cost_heterogeneous": bool(np.isfinite(cost_range) and cost_range > cost_tolerance),
+        "asset_count": int(len(finite_costs)),
+    }
 
 
 def summarize_realized_deployment_wedge_rows(
@@ -1095,22 +1523,47 @@ def summarize_realized_deployment_wedge_rows(
         return pd.DataFrame()
 
     rows = []
+    wedge_level = get_deployment_wedge_level(learning_cfg)
+    wedge_cost_granularity = get_deployment_wedge_cost_granularity(learning_cfg, wedge_level=wedge_level)
     for technology in sorted(wedge_table["technology"].unique()):
-        realized_by_region = _get_current_vintage_basis_build_by_region(
-            n,
-            technology,
-            planning_year=current_year,
-            learning_cfg=learning_cfg,
-        )
-        asset_table = build_current_vintage_country_technology_asset_table(
-            n,
-            technology,
-            planning_year=current_year,
-            learning_cfg=learning_cfg,
-        )
+        if wedge_level == "global":
+            realized_by_region = pd.Series(
+                {
+                    GLOBAL_DEPLOYMENT_WEDGE_REGION: _get_current_vintage_basis_build_global(
+                        n,
+                        technology,
+                        planning_year=current_year,
+                        learning_cfg=learning_cfg,
+                    )
+                },
+                dtype=float,
+            )
+            asset_table = build_current_vintage_global_technology_asset_table(
+                n,
+                technology,
+                planning_year=current_year,
+                learning_cfg=learning_cfg,
+            )
+        else:
+            realized_by_region = _get_current_vintage_basis_build_by_region(
+                n,
+                technology,
+                planning_year=current_year,
+                learning_cfg=learning_cfg,
+            )
+            asset_table = build_current_vintage_country_technology_asset_table(
+                n,
+                technology,
+                planning_year=current_year,
+                learning_cfg=learning_cfg,
+            )
         basis_cost_by_region = {}
+        basis_cost_stats_by_region = {}
         if not asset_table.empty:
-            basis_cost_by_region = asset_table.groupby("region")["basis_objective_cost"].mean().to_dict()
+            for region, region_assets in asset_table.groupby("region"):
+                stats = _summarize_basis_objective_costs(region_assets["basis_objective_cost"])
+                basis_cost_stats_by_region[region] = stats
+                basis_cost_by_region[region] = stats["basis_cost_eur_per_unit_representative"]
         tech_wedge = wedge_table.loc[wedge_table["technology"].eq(technology)]
         for _, wedge_row in tech_wedge.iterrows():
             region = wedge_row["region"]
@@ -1122,6 +1575,11 @@ def summarize_realized_deployment_wedge_rows(
             )
             penalty_basis = str(wedge_row.get("penalty_basis", PERCENT_OF_CAPEX_PENALTY_BASIS))
             basis_cost = _safe_float(basis_cost_by_region.get(region, np.nan))
+            basis_cost_stats = basis_cost_stats_by_region.get(region, _summarize_basis_objective_costs([]))
+            if wedge_level == "global" and wedge_cost_granularity == "applied_learning_cost":
+                applied_cost_info = get_applied_learning_wedge_basis_cost(n, technology)
+                basis_cost_stats = {**basis_cost_stats, **applied_cost_info}
+                basis_cost = _safe_float(applied_cost_info["basis_cost_eur_per_unit_representative"])
             phi2 = float(wedge_row["phi2"])
             phi3 = float(wedge_row["phi3"])
             if penalty_basis == PERCENT_OF_CAPEX_PENALTY_BASIS and np.isfinite(basis_cost):
@@ -1137,12 +1595,14 @@ def summarize_realized_deployment_wedge_rows(
                     "technology": technology,
                     "constraint_basis_unit": str(wedge_row.get("basis_unit", get_constraint_basis_unit(technology))),
                     "penalty_basis": penalty_basis,
+                    "cost_granularity": wedge_cost_granularity if wedge_level == "global" else "asset_exact",
                     "b1": float(wedge_row["b1"]),
                     "b2": float(wedge_row["b2"]),
                     "width1": float(wedge_row["width1"]),
                     "width2": float(wedge_row["width2"]),
                     "phi2": phi2,
                     "phi3": phi3,
+                    **basis_cost_stats,
                     "realized_block_addition_constrained_basis": realized,
                     "realized_seg1": seg1,
                     "realized_seg2": seg2,
@@ -1150,6 +1610,12 @@ def summarize_realized_deployment_wedge_rows(
                     "realized_wedge_cost_eur": float(phi2_cost * seg2 + phi3_cost * seg3),
                     "history_year": _safe_float(wedge_row.get("history_year", np.nan)),
                     "reference_annual_addition": _safe_float(wedge_row.get("reference_annual_addition", np.nan)),
+                    "reference_method": str(wedge_row.get("reference_method", "flat_recent")),
+                    "reference_block_addition": _safe_float(wedge_row.get("reference_block_addition", np.nan)),
+                    "reference_growth_rate": _safe_float(wedge_row.get("reference_growth_rate", np.nan)),
+                    "reference_latest_annual_addition": _safe_float(
+                        wedge_row.get("reference_latest_annual_addition", np.nan)
+                    ),
                 }
             )
     return pd.DataFrame(rows)

@@ -219,6 +219,40 @@ def _learning_costs_to_frame(learning_costs):
     return pd.DataFrame(rows)
 
 
+def _learning_costs_from_cost_log_df(cost_log_df):
+    if cost_log_df is None or cost_log_df.empty:
+        return {}
+    required = {"technology", "capital_cost"}
+    missing = required - set(cost_log_df.columns)
+    if missing:
+        raise ValueError(
+            "Cannot reconstruct applied learning costs from base cost log; "
+            f"missing columns: {sorted(missing)}"
+        )
+    learning_costs = {}
+    for _, row in cost_log_df.iterrows():
+        technology = str(row.get("technology", "")).strip()
+        if not technology:
+            continue
+        record = {}
+        for column in ("capital_cost", "c_overnight", "unit", "planning_horizon", "selected_model", "seed"):
+            if column in cost_log_df.columns:
+                record[column] = row.get(column)
+        learning_costs[technology] = record
+    return learning_costs
+
+
+def _attach_applied_learning_costs_from_log(network, cost_log_df):
+    learning_costs = _learning_costs_from_cost_log_df(cost_log_df)
+    if not learning_costs:
+        return network
+    if not hasattr(network, "meta") or not isinstance(network.meta, dict):
+        network.meta = {}
+    existing = network.meta.get("learning_costs", {}) or {}
+    network.meta["learning_costs"] = {**existing, **learning_costs}
+    return network
+
+
 def _extract_network_capital_cost_summaries(network_path, tech_mapping):
     n = pypsa.Network(network_path)
     carrier_to_tech = dict(tech_mapping)
@@ -272,6 +306,7 @@ def export_deployment_constraint_diagnostics(
     committed_payload,
     solved_capacity_by_tech,
     solved_network,
+    base_cost_log_df=None,
 ):
     rows = []
     cfg = get_deployment_constraint_cfg(learning_cfg)
@@ -287,6 +322,10 @@ def export_deployment_constraint_diagnostics(
             solved_network_obj = pypsa.Network(solved_network)
         else:
             solved_network_obj = solved_network
+        solved_network_obj = _attach_applied_learning_costs_from_log(
+            solved_network_obj,
+            base_cost_log_df,
+        )
         if formulation == "three_segment_wedge":
             wedge_rows = summarize_realized_deployment_wedge_rows(
                 solved_network_obj,
@@ -307,6 +346,27 @@ def export_deployment_constraint_diagnostics(
                         "uncertainty_enabled": bool(((cfg.get("uncertainty", {}) or {}).get("enabled", False))),
                         "constraint_basis_unit": str(wedge_row.get("constraint_basis_unit", "")),
                         "penalty_basis": str(wedge_row.get("penalty_basis", "")),
+                        "cost_granularity": str(wedge_row.get("cost_granularity", "")),
+                        "basis_cost_eur_per_unit_min": float(
+                            wedge_row.get("basis_cost_eur_per_unit_min", np.nan)
+                        ),
+                        "basis_cost_eur_per_unit_max": float(
+                            wedge_row.get("basis_cost_eur_per_unit_max", np.nan)
+                        ),
+                        "basis_cost_eur_per_unit_mean": float(
+                            wedge_row.get("basis_cost_eur_per_unit_mean", np.nan)
+                        ),
+                        "basis_cost_eur_per_unit_median": float(
+                            wedge_row.get("basis_cost_eur_per_unit_median", np.nan)
+                        ),
+                        "basis_cost_eur_per_unit_representative": float(
+                            wedge_row.get("basis_cost_eur_per_unit_representative", np.nan)
+                        ),
+                        "basis_cost_source": str(wedge_row.get("basis_cost_source", "")),
+                        "learning_capital_cost": float(wedge_row.get("learning_capital_cost", np.nan)),
+                        "learning_c_overnight": float(wedge_row.get("learning_c_overnight", np.nan)),
+                        "basis_cost_heterogeneous": bool(wedge_row.get("basis_cost_heterogeneous", False)),
+                        "asset_count": int(wedge_row.get("asset_count", 0)),
                         "persistent_shock": np.nan,
                         "annual_shock": "",
                         "allowed_block_addition": np.nan,
@@ -693,6 +753,7 @@ def main(snakemake):
             committed_payload=payload,
             solved_capacity_by_tech=solved_capacity_by_tech,
             solved_network=solved_network,
+            base_cost_log_df=base_df,
         )
 
     if learning_engine == "stochastic_forecast":
