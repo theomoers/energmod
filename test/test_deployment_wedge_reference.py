@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -21,7 +22,7 @@ def _learning_cfg(reference_method="growth_projected"):
             "mode": "both",
             "technologies": ["battery_energy"],
             "wedge": {
-                "level": "country_level",
+                "level": "global",
                 "reference_method": reference_method,
                 "reference_statistic": "mean",
                 "b1_multiplier": 0.8,
@@ -71,7 +72,7 @@ def test_battery_growth_projected_wedge_evolves_thresholds_by_year(monkeypatch):
     assert row_2035["reference_block_addition"] > row_2030["reference_block_addition"]
 
 
-def test_growth_projected_reference_falls_back_to_flat_recent_when_history_is_insufficient(monkeypatch):
+def test_growth_projected_reference_fails_when_history_is_insufficient(monkeypatch):
     history = pd.DataFrame(
         [
             {"region": "GLOBAL", "technology": "battery_energy", "year": 2024, "annual_addition": 80.0, "basis_unit": "local_energy"},
@@ -84,15 +85,12 @@ def test_growth_projected_reference_falls_back_to_flat_recent_when_history_is_in
         lambda learning_cfg, current_year, technologies=None, config_file=None, runtime_state_payload=None: history.copy(),
     )
 
-    frame = deployment_constraints.build_deployment_wedge_table_from_history(
-        _learning_cfg(),
-        current_year=2030,
-        technologies=["battery_energy"],
-    )
-    row = frame.loc[frame["technology"].eq("battery_energy")].iloc[0]
-
-    assert row["reference_method"] == "flat_recent"
-    assert row["history_year"] == 2024
+    with pytest.raises(ValueError, match="Could not compute growth_projected"):
+        deployment_constraints.build_deployment_wedge_table_from_history(
+            _learning_cfg(),
+            current_year=2030,
+            technologies=["battery_energy"],
+        )
 
 
 def test_battery_history_uses_runtime_modeled_capacity_history_before_static_csv(monkeypatch):

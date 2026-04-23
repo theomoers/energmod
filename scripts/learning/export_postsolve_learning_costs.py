@@ -333,6 +333,7 @@ def export_deployment_constraint_diagnostics(
                 learning_cfg=learning_cfg,
                 technologies=list(cfg.get("technologies", [])),
                 config_file="config.learning.yaml",
+                learning_seed=learning_seed,
             )
             for _, wedge_row in wedge_rows.iterrows():
                 rows.append(
@@ -369,7 +370,12 @@ def export_deployment_constraint_diagnostics(
                         "asset_count": int(wedge_row.get("asset_count", 0)),
                         "persistent_shock": np.nan,
                         "annual_shock": "",
-                        "allowed_block_addition": np.nan,
+                        "allowed_block_addition": float(wedge_row.get("allowed_block_addition", np.nan)),
+                        "thresholds_stochastic": bool(wedge_row.get("thresholds_stochastic", False)),
+                        "threshold_source": str(wedge_row.get("threshold_source", "")),
+                        "threshold_block_addition": float(
+                            wedge_row.get("threshold_block_addition", np.nan)
+                        ),
                         "b1": float(wedge_row.get("b1", np.nan)),
                         "b2": float(wedge_row.get("b2", np.nan)),
                         "width1": float(wedge_row.get("width1", np.nan)),

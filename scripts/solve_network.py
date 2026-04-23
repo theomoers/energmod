@@ -3500,6 +3500,9 @@ def add_learning_deployment_wedge(n, planning_year, config):
     technologies = list(deployment_cfg.get("technologies", []))
     wedge_level = get_deployment_wedge_level(learning_cfg)
     wedge_cost_granularity = get_deployment_wedge_cost_granularity(learning_cfg, wedge_level=wedge_level)
+    snakemake_obj = globals().get("snakemake", None)
+    wildcards = getattr(snakemake_obj, "wildcards", None)
+    learning_seed = getattr(wildcards, "learning_seed", None)
     runtime_state_payload = (
         (((getattr(n, "meta", {}) or {}).get("learning_runtime", {}) or {}).get("deployment_wedge_state", {}))
         or None
@@ -3510,6 +3513,7 @@ def add_learning_deployment_wedge(n, planning_year, config):
         technologies=technologies,
         config_file="config.learning.yaml",
         runtime_state_payload=runtime_state_payload,
+        learning_seed=learning_seed,
     )
     if wedge_table.empty:
         logger.warning(
@@ -3714,6 +3718,10 @@ def add_learning_deployment_wedge(n, planning_year, config):
                     "phi3": phi3,
                     **cost_summary,
                     "asset_count": int(len(assets)),
+                    "thresholds_stochastic": bool(row.get("thresholds_stochastic", False)),
+                    "threshold_source": str(row.get("threshold_source", "historical_reference")),
+                    "threshold_block_addition": float(row.get("threshold_block_addition", np.nan)),
+                    "allowed_block_addition": float(row.get("allowed_block_addition", np.nan)),
                 }
             )
             continue
@@ -3815,6 +3823,10 @@ def add_learning_deployment_wedge(n, planning_year, config):
                     "phi3": float(row["phi3"]),
                     **cost_summary,
                     "asset_count": int(len(region_assets)),
+                    "thresholds_stochastic": bool(row.get("thresholds_stochastic", False)),
+                    "threshold_source": str(row.get("threshold_source", "historical_reference")),
+                    "threshold_block_addition": float(row.get("threshold_block_addition", np.nan)),
+                    "allowed_block_addition": float(row.get("allowed_block_addition", np.nan)),
                 }
             )
 

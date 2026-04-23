@@ -20,6 +20,10 @@ SUPPORTED_DEPLOYMENT_CONSTRAINT_FORMULATIONS = {"hard_cap", "three_segment_wedge
 SUPPORTED_DEPLOYMENT_WEDGE_LEVELS = {"country_level", "global"}
 SUPPORTED_DEPLOYMENT_WEDGE_COST_GRANULARITIES = {"asset_exact", "applied_learning_cost"}
 SUPPORTED_DEPLOYMENT_WEDGE_REFERENCE_METHODS = {"flat_recent", "growth_projected"}
+SUPPORTED_DEPLOYMENT_WEDGE_THRESHOLD_SOURCES = {
+    "stochastic_allowed_block",
+    "stochastic_growth_projected",
+}
 PERCENT_OF_CAPEX_PENALTY_BASIS = "%_of_capex"
 GLOBAL_DEPLOYMENT_WEDGE_REGION = "GLOBAL"
 
@@ -631,6 +635,21 @@ def _safe_float(value, default=np.nan):
     return result
 
 
+def _safe_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(default)
+
+
 def _block_year_count(current_year):
     return max(len(_annual_years_for_block(current_year)), 1)
 
@@ -680,6 +699,172 @@ def get_deployment_wedge_reference_method(learning_cfg):
             f"{sorted(SUPPORTED_DEPLOYMENT_WEDGE_REFERENCE_METHODS)}"
         )
     return method
+
+
+def get_deployment_wedge_uncertainty_cfg(learning_cfg):
+    wedge_cfg = _get_wedge_cfg(learning_cfg)
+    uncertainty_cfg = (wedge_cfg.get("uncertainty", {}) or {})
+    enabled = bool(uncertainty_cfg.get("enabled", False))
+    threshold_source = str(
+        uncertainty_cfg.get("threshold_source", "stochastic_allowed_block")
+    ).strip()
+    if threshold_source not in SUPPORTED_DEPLOYMENT_WEDGE_THRESHOLD_SOURCES:
+        raise ValueError(
+            "Unsupported learning.deployment_constraints.wedge.uncertainty.threshold_source="
+            f"{threshold_source!r}. Supported values: "
+            f"{sorted(SUPPORTED_DEPLOYMENT_WEDGE_THRESHOLD_SOURCES)}"
+        )
+    if enabled:
+        level = get_deployment_wedge_level(learning_cfg)
+        granularity = get_deployment_wedge_cost_granularity(learning_cfg, wedge_level=level)
+        if level != "global" or granularity != "applied_learning_cost":
+            raise ValueError(
+                "learning.deployment_constraints.wedge.uncertainty.enabled=true currently "
+                "supports only wedge.level='global' and "
+                "wedge.cost_granularity='applied_learning_cost'."
+            )
+        deployment_uncertainty_cfg = (
+            (get_deployment_constraint_cfg(learning_cfg) or {}).get("uncertainty", {}) or {}
+        )
+        if not bool(deployment_uncertainty_cfg.get("enabled", False)) or str(
+            deployment_uncertainty_cfg.get("mode", "stochastic_draw")
+        ).strip() != "stochastic_draw":
+            raise ValueError(
+                "learning.deployment_constraints.wedge.uncertainty.enabled=true requires "
+                "learning.deployment_constraints.uncertainty.enabled=true and "
+                "learning.deployment_constraints.uncertainty.mode='stochastic_draw'."
+            )
+        if (
+            threshold_source == "stochastic_growth_projected"
+            and get_deployment_wedge_reference_method(learning_cfg) != "growth_projected"
+        ):
+            raise ValueError(
+                "learning.deployment_constraints.wedge.uncertainty.threshold_source="
+                "'stochastic_growth_projected' requires "
+                "learning.deployment_constraints.wedge.reference_method='growth_projected'."
+            )
+    return {
+        "enabled": enabled,
+        "threshold_source": threshold_source,
+    }
+
+
+def _ensure_deployment_wedge_threshold_columns(frame):
+    frame = frame.copy()
+    if "thresholds_stochastic" not in frame.columns:
+        frame["thresholds_stochastic"] = False
+    else:
+        frame["thresholds_stochastic"] = frame["thresholds_stochastic"].apply(_safe_bool)
+    if "threshold_source" not in frame.columns:
+        frame["threshold_source"] = "historical_reference"
+    frame["threshold_source"] = (
+        frame["threshold_source"].fillna("historical_reference").astype(str).str.strip()
+    )
+    if "threshold_block_addition" not in frame.columns:
+        frame["threshold_block_addition"] = np.nan
+    frame["threshold_block_addition"] = pd.to_numeric(
+        frame["threshold_block_addition"], errors="coerce"
+    )
+    if "allowed_block_addition" not in frame.columns:
+        frame["allowed_block_addition"] = np.nan
+    frame["allowed_block_addition"] = pd.to_numeric(
+        frame["allowed_block_addition"], errors="coerce"
+    )
+    return frame
+
+
+def _convert_threshold_block_addition_to_wedge_basis(
+    technology,
+    threshold_block_addition,
+    threshold_basis_unit,
+    wedge_basis_unit,
+    learning_cfg,
+    current_year,
+):
+    value = _safe_float(threshold_block_addition, np.nan)
+    if not np.isfinite(value):
+        return np.nan
+
+    threshold_basis_unit = str(threshold_basis_unit or "").strip()
+    wedge_basis_unit = str(wedge_basis_unit or "").strip()
+    if not threshold_basis_unit or not wedge_basis_unit or threshold_basis_unit == wedge_basis_unit:
+        return float(value)
+
+    if (
+        str(technology) == "battery_energy"
+        and threshold_basis_unit == get_constraint_basis_unit("battery_energy")
+        and wedge_basis_unit == get_deployment_wedge_basis_unit("battery_energy")
+    ):
+        phi_block = get_battery_phi_block(learning_cfg, current_year)
+        if not np.isfinite(phi_block) or phi_block <= 0.0:
+            raise ValueError(
+                "Could not convert stochastic deployment wedge thresholds for battery_energy "
+                f"from {threshold_basis_unit!r} to {wedge_basis_unit!r}: invalid phi_block={phi_block!r}."
+            )
+        return float(value) / float(phi_block)
+
+    raise ValueError(
+        "Could not convert stochastic deployment wedge thresholds for "
+        f"{technology!r} from {threshold_basis_unit!r} to {wedge_basis_unit!r}."
+    )
+
+
+def _apply_stochastic_deployment_wedge_thresholds(
+    frame,
+    learning_cfg,
+    current_year,
+    learning_seed=None,
+    config_file=None,
+    history=None,
+):
+    frame = _ensure_deployment_wedge_threshold_columns(frame)
+    uncertainty_cfg = get_deployment_wedge_uncertainty_cfg(learning_cfg)
+    if frame.empty or not uncertainty_cfg["enabled"]:
+        return frame
+
+    if uncertainty_cfg["threshold_source"] == "stochastic_growth_projected":
+        return frame
+
+    threshold_payload = build_deployment_constraint_block_paths(
+        learning_cfg,
+        current_year=current_year,
+        learning_seed=learning_seed,
+        config_file=config_file,
+    )
+    if not threshold_payload:
+        return frame
+
+    wedge_cfg = _get_wedge_cfg(learning_cfg)
+    b1_multiplier = float(wedge_cfg.get("b1_multiplier", 0.8))
+    b2_multiplier = float(wedge_cfg.get("b2_multiplier", 1.2))
+
+    frame = frame.copy()
+    for idx, row in frame.iterrows():
+        technology = str(row.get("technology", "")).strip()
+        tech_payload = threshold_payload.get(technology) or {}
+        source_allowed_block_addition = _safe_float(
+            tech_payload.get("allowed_block_addition", np.nan)
+        )
+        if not np.isfinite(source_allowed_block_addition):
+            continue
+        allowed_block_addition = _convert_threshold_block_addition_to_wedge_basis(
+            technology,
+            source_allowed_block_addition,
+            threshold_basis_unit=tech_payload.get(
+                "constraint_basis_unit",
+                get_constraint_basis_unit(technology),
+            ),
+            wedge_basis_unit=row.get("basis_unit", get_deployment_wedge_basis_unit(technology)),
+            learning_cfg=learning_cfg,
+            current_year=current_year,
+        )
+        frame.at[idx, "b1"] = max(float(allowed_block_addition) * b1_multiplier, 0.0)
+        frame.at[idx, "b2"] = max(float(allowed_block_addition) * b2_multiplier, 0.0)
+        frame.at[idx, "thresholds_stochastic"] = True
+        frame.at[idx, "threshold_source"] = uncertainty_cfg["threshold_source"]
+        frame.at[idx, "threshold_block_addition"] = float(allowed_block_addition)
+        frame.at[idx, "allowed_block_addition"] = float(allowed_block_addition)
+    return frame
 
 
 def get_deployment_wedge_basis_unit(technology):
@@ -840,6 +1025,93 @@ def _growth_projected_wedge_reference(group, current_year, growth_smoothing_year
     }
 
 
+def _stochastic_growth_projected_wedge_reference(
+    group,
+    current_year,
+    growth_smoothing_years,
+    learning_cfg,
+    learning_seed,
+    technology,
+    config_file=None,
+):
+    reference = _growth_projected_wedge_reference(
+        group,
+        current_year=current_year,
+        growth_smoothing_years=growth_smoothing_years,
+    )
+    cfg = get_deployment_constraint_cfg(learning_cfg) or {}
+    uncertainty_cfg = (cfg.get("uncertainty", {}) or {})
+    uncertainty_enabled = bool(uncertainty_cfg.get("enabled", False)) and str(
+        uncertainty_cfg.get("mode", "stochastic_draw")
+    ).strip() == "stochastic_draw"
+    if not uncertainty_enabled:
+        return reference
+
+    calibration, history, _ = load_deployment_constraint_support(
+        learning_cfg,
+        config_file=config_file,
+    )
+    row = calibration.loc[calibration["technology"].eq(str(technology))]
+    if row.empty:
+        return reference
+    row = row.iloc[-1]
+    mode = str(cfg.get("mode", "first_order")).strip()
+    sigma_annual, _, _ = _sigma_annual_for_mode(
+        row,
+        mode,
+        str(technology),
+        history,
+        uncertainty_cfg,
+    )
+
+    annual_by_year = (
+        group.sort_values("year")
+        .dropna(subset=["annual_basis"])
+        .set_index("year")["annual_basis"]
+        .astype(float)
+    )
+    latest_year = int(reference["history_year"])
+    latest_addition = float(reference["reference_latest_annual_addition"])
+    deterministic_growth_rate = float(reference["reference_growth_rate"])
+    log_growth = float(np.log1p(deterministic_growth_rate))
+    growth_rate_shock = 0.0
+    if np.isfinite(sigma_annual) and sigma_annual > 0.0:
+        growth_rate_shock = float(
+            _stable_deployment_rng(
+                learning_cfg,
+                learning_seed,
+                str(technology),
+                "wedge_growth_rate",
+            ).normal(0.0, sigma_annual)
+        )
+    seeded_log_growth = float(log_growth + growth_rate_shock)
+
+    projected = []
+    for year in _annual_years_for_block(current_year):
+        if year <= latest_year and year in annual_by_year.index:
+            value = float(annual_by_year.loc[year])
+        else:
+            value = float(latest_addition * np.exp(seeded_log_growth * (year - latest_year)))
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "Cannot compute stochastic growth-projected deployment wedge reference: "
+                f"projected annual addition for {technology!r} in {year} is invalid ({value!r})."
+            )
+        projected.append(value)
+
+    block_reference = float(np.sum(projected))
+    if not np.isfinite(block_reference) or block_reference <= 0.0:
+        raise ValueError(
+            "Cannot compute stochastic growth-projected deployment wedge reference: "
+            f"block reference is invalid ({block_reference!r})."
+        )
+    seeded_growth_rate = float(np.expm1(seeded_log_growth))
+    out = dict(reference)
+    out["block_reference"] = block_reference
+    out["reference_growth_rate"] = seeded_growth_rate
+    return out
+
+
 def _deployment_wedge_row(
     region,
     technology,
@@ -877,6 +1149,10 @@ def _deployment_wedge_row(
         "reference_block_addition": float(block_reference),
         "reference_growth_rate": float(reference_growth_rate),
         "reference_latest_annual_addition": float(reference_latest_annual_addition),
+        "thresholds_stochastic": False,
+        "threshold_source": "historical_reference",
+        "threshold_block_addition": np.nan,
+        "allowed_block_addition": np.nan,
     }
 
 
@@ -1191,6 +1467,7 @@ def build_deployment_wedge_table_from_history(
     technologies=None,
     config_file=None,
     runtime_state_payload=None,
+    learning_seed=None,
 ):
     history = load_deployment_country_history(
         learning_cfg,
@@ -1217,6 +1494,10 @@ def build_deployment_wedge_table_from_history(
         "reference_block_addition",
         "reference_growth_rate",
         "reference_latest_annual_addition",
+        "thresholds_stochastic",
+        "threshold_source",
+        "threshold_block_addition",
+        "allowed_block_addition",
     ]
     if history.empty:
         return pd.DataFrame(columns=empty_cols)
@@ -1242,6 +1523,7 @@ def build_deployment_wedge_table_from_history(
             f"{reference_statistic!r}. Supported values: ['mean', 'median', 'max_mean_median']"
         )
     reference_method = get_deployment_wedge_reference_method(learning_cfg)
+    wedge_uncertainty_cfg = get_deployment_wedge_uncertainty_cfg(learning_cfg)
     growth_smoothing_years = int(wedge_cfg.get("growth_smoothing_years", 3))
     growth_smoothing_years = max(growth_smoothing_years, 1)
 
@@ -1267,32 +1549,32 @@ def build_deployment_wedge_table_from_history(
         row_reference_method = reference_method
         if reference_method == "growth_projected":
             try:
-                reference = _growth_projected_wedge_reference(
-                    smoothed,
-                    current_year=current_year,
-                    growth_smoothing_years=growth_smoothing_years,
-                )
-                annual_basis = reference["reference_annual_addition"]
-                block_reference = reference["block_reference"]
-                history_year = reference["history_year"]
-                reference_growth_rate = reference["reference_growth_rate"]
-                reference_latest_annual_addition = reference["reference_latest_annual_addition"]
+                if wedge_uncertainty_cfg["enabled"] and wedge_uncertainty_cfg["threshold_source"] == "stochastic_growth_projected":
+                    reference = _stochastic_growth_projected_wedge_reference(
+                        smoothed,
+                        current_year=current_year,
+                        growth_smoothing_years=growth_smoothing_years,
+                        learning_cfg=learning_cfg,
+                        learning_seed=learning_seed,
+                        technology=technology,
+                        config_file=config_file,
+                    )
+                else:
+                    reference = _growth_projected_wedge_reference(
+                        smoothed,
+                        current_year=current_year,
+                        growth_smoothing_years=growth_smoothing_years,
+                    )
             except ValueError as exc:
-                row_reference_method = "flat_recent"
-                logger.warning(
-                    "Falling back to flat_recent deployment wedge reference for %s / %s in %s: %s",
-                    technology,
-                    region,
-                    current_year,
-                    exc,
-                )
-                annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
-                if not np.isfinite(annual_basis) or annual_basis <= 0.0:
-                    continue
-                block_reference = float(annual_basis) * float(block_years)
-                history_year = recent["year"].max()
-                reference_growth_rate = np.nan
-                reference_latest_annual_addition = annual_basis
+                raise ValueError(
+                    "Could not compute growth_projected deployment wedge reference "
+                    f"for {technology} / {region} in {current_year}."
+                ) from exc
+            annual_basis = reference["reference_annual_addition"]
+            block_reference = reference["block_reference"]
+            history_year = reference["history_year"]
+            reference_growth_rate = reference["reference_growth_rate"]
+            reference_latest_annual_addition = reference["reference_latest_annual_addition"]
         else:
             annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
             if not np.isfinite(annual_basis) or annual_basis <= 0.0:
@@ -1301,27 +1583,39 @@ def build_deployment_wedge_table_from_history(
             history_year = recent["year"].max()
             reference_growth_rate = np.nan
             reference_latest_annual_addition = annual_basis
-        rows.append(
-            _deployment_wedge_row(
-                region=region,
-                technology=technology,
-                current_year=current_year,
-                block_years=block_years,
-                annual_basis=annual_basis,
-                history_year=history_year,
-                b1_multiplier=b1_multiplier,
-                b2_multiplier=b2_multiplier,
-                phi2_pct_capex=phi2_pct_capex,
-                phi3_pct_capex=phi3_pct_capex,
-                block_reference=block_reference,
-                reference_method=row_reference_method,
-                reference_growth_rate=reference_growth_rate,
-                reference_latest_annual_addition=reference_latest_annual_addition,
-            )
+        wedge_row = _deployment_wedge_row(
+            region=region,
+            technology=technology,
+            current_year=current_year,
+            block_years=block_years,
+            annual_basis=annual_basis,
+            history_year=history_year,
+            b1_multiplier=b1_multiplier,
+            b2_multiplier=b2_multiplier,
+            phi2_pct_capex=phi2_pct_capex,
+            phi3_pct_capex=phi3_pct_capex,
+            block_reference=block_reference,
+            reference_method=row_reference_method,
+            reference_growth_rate=reference_growth_rate,
+            reference_latest_annual_addition=reference_latest_annual_addition,
         )
+        if wedge_uncertainty_cfg["enabled"] and wedge_uncertainty_cfg["threshold_source"] == "stochastic_growth_projected":
+            wedge_row["thresholds_stochastic"] = True
+            wedge_row["threshold_source"] = "stochastic_growth_projected"
+            wedge_row["threshold_block_addition"] = float(block_reference)
+            wedge_row["allowed_block_addition"] = float(block_reference)
+        rows.append(wedge_row)
     if not rows:
         return pd.DataFrame(columns=empty_cols)
     frame = pd.DataFrame(rows)
+    frame = _apply_stochastic_deployment_wedge_thresholds(
+        frame,
+        learning_cfg,
+        current_year=current_year,
+        learning_seed=learning_seed,
+        config_file=config_file,
+        history=history,
+    )
     frame["width1"] = frame["b1"].astype(float)
     frame["width2"] = (frame["b2"] - frame["b1"]).clip(lower=0.0).astype(float)
     return frame.sort_values(["technology", "region"], ignore_index=True)
@@ -1333,6 +1627,7 @@ def load_deployment_wedge_table(
     technologies=None,
     config_file=None,
     runtime_state_payload=None,
+    learning_seed=None,
 ):
     cfg = get_deployment_constraint_cfg(learning_cfg)
     if cfg is None or get_deployment_constraint_formulation(learning_cfg) != "three_segment_wedge":
@@ -1355,6 +1650,10 @@ def load_deployment_wedge_table(
                 "reference_block_addition",
                 "reference_growth_rate",
                 "reference_latest_annual_addition",
+                "thresholds_stochastic",
+                "threshold_source",
+                "threshold_block_addition",
+                "allowed_block_addition",
             ]
         )
 
@@ -1371,6 +1670,7 @@ def load_deployment_wedge_table(
             technologies=technologies,
             config_file=config_file,
             runtime_state_payload=runtime_state_payload,
+            learning_seed=learning_seed,
         )
 
     required = {"region", "technology", "year", "b1", "b2", "phi2", "phi3"}
@@ -1390,6 +1690,10 @@ def load_deployment_wedge_table(
         "reference_block_addition",
         "reference_growth_rate",
         "reference_latest_annual_addition",
+        "thresholds_stochastic",
+        "threshold_source",
+        "threshold_block_addition",
+        "allowed_block_addition",
     }
     frame = frame.loc[:, [col for col in frame.columns if col in keep]].copy()
     frame["region"] = frame["region"].fillna("").astype(str).str.strip().str.upper()
@@ -1409,6 +1713,7 @@ def load_deployment_wedge_table(
     for col in ("history_year", "reference_annual_addition", "reference_block_addition", "reference_growth_rate", "reference_latest_annual_addition"):
         if col in frame.columns:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame = _ensure_deployment_wedge_threshold_columns(frame)
     frame = frame.dropna(subset=["year", "b1", "b2", "phi2", "phi3"])
     if current_year is not None:
         frame = frame.loc[frame["year"].astype(int).eq(int(current_year))].copy()
@@ -1645,6 +1950,7 @@ def summarize_realized_deployment_wedge_rows(
     learning_cfg,
     technologies=None,
     config_file=None,
+    learning_seed=None,
 ):
     runtime_state_payload = (
         (((getattr(n, "meta", {}) or {}).get("learning_runtime", {}) or {}).get("deployment_wedge_state", {}))
@@ -1656,6 +1962,7 @@ def summarize_realized_deployment_wedge_rows(
         technologies=technologies,
         config_file=config_file,
         runtime_state_payload=runtime_state_payload,
+        learning_seed=learning_seed,
     )
     if wedge_table.empty:
         return pd.DataFrame()
@@ -1754,6 +2061,12 @@ def summarize_realized_deployment_wedge_rows(
                     "reference_latest_annual_addition": _safe_float(
                         wedge_row.get("reference_latest_annual_addition", np.nan)
                     ),
+                    "thresholds_stochastic": _safe_bool(wedge_row.get("thresholds_stochastic", False)),
+                    "threshold_source": str(wedge_row.get("threshold_source", "historical_reference")),
+                    "threshold_block_addition": _safe_float(
+                        wedge_row.get("threshold_block_addition", np.nan)
+                    ),
+                    "allowed_block_addition": _safe_float(wedge_row.get("allowed_block_addition", np.nan)),
                 }
             )
     return pd.DataFrame(rows)

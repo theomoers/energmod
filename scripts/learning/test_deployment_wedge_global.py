@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,8 +21,10 @@ from learning.deployment_constraints import (  # noqa: E402
     GLOBAL_DEPLOYMENT_WEDGE_REGION,
     build_deployment_wedge_table_from_history,
     get_deployment_wedge_cost_granularity,
+    load_deployment_wedge_table,
     summarize_realized_deployment_wedge_rows,
 )
+from learning.apply_learning_costs import load_config_learning, load_learning_manifest  # noqa: E402
 from learning.export_postsolve_learning_costs import (  # noqa: E402
     _attach_applied_learning_costs_from_log,
 )
@@ -29,6 +32,12 @@ from solve_network import add_learning_deployment_wedge  # noqa: E402
 
 
 class GlobalDeploymentWedgeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config_path = ROOT_DIR / "config.learning.yaml"
+        cls.runtime_learning_cfg = load_config_learning(cls.config_path)
+        load_learning_manifest(cls.runtime_learning_cfg, cls.config_path)
+
     def make_learning_cfg(self, tmpdir, level="global", technologies=None):
         irena_path = Path(tmpdir) / "irena.csv"
         battery_path = Path(tmpdir) / "battery.csv"
@@ -67,6 +76,26 @@ class GlobalDeploymentWedgeTests(unittest.TestCase):
                 },
             }
         }
+
+    def make_stochastic_runtime_wedge_cfg(
+        self,
+        level="global",
+        cost_granularity="applied_learning_cost",
+        threshold_source="stochastic_allowed_block",
+    ):
+        learning_cfg = deepcopy(self.runtime_learning_cfg)
+        deployment_cfg = learning_cfg.setdefault("deployment_constraints", {})
+        deployment_cfg["enabled"] = True
+        deployment_cfg["formulation"] = "three_segment_wedge"
+        deployment_cfg["technologies"] = ["onwind_power"]
+        deployment_cfg.setdefault("uncertainty", {})["enabled"] = True
+        deployment_cfg["uncertainty"]["mode"] = "stochastic_draw"
+        wedge_cfg = deployment_cfg.setdefault("wedge", {})
+        wedge_cfg["level"] = level
+        wedge_cfg["cost_granularity"] = cost_granularity
+        wedge_cfg.setdefault("uncertainty", {})["enabled"] = True
+        wedge_cfg["uncertainty"]["threshold_source"] = threshold_source
+        return learning_cfg
 
     def test_global_wedge_table_aggregates_country_history(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -202,6 +231,128 @@ class GlobalDeploymentWedgeTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             get_deployment_wedge_cost_granularity(learning_cfg)
+
+    def test_global_stochastic_thresholds_are_seed_specific_and_reproducible(self):
+        learning_cfg = self.make_stochastic_runtime_wedge_cfg()
+
+        table_seed_a = load_deployment_wedge_table(
+            learning_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0000",
+        )
+        table_seed_a_repeat = load_deployment_wedge_table(
+            learning_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0000",
+        )
+        table_seed_b = load_deployment_wedge_table(
+            learning_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0001",
+        )
+
+        row_a = table_seed_a.iloc[0]
+        row_a_repeat = table_seed_a_repeat.iloc[0]
+        row_b = table_seed_b.iloc[0]
+        self.assertTrue(bool(row_a["thresholds_stochastic"]))
+        self.assertEqual(row_a["threshold_source"], "stochastic_allowed_block")
+        self.assertAlmostEqual(float(row_a["b1"]), float(row_a_repeat["b1"]), places=9)
+        self.assertAlmostEqual(float(row_a["b2"]), float(row_a_repeat["b2"]), places=9)
+        self.assertAlmostEqual(
+            float(row_a["allowed_block_addition"]),
+            float(row_a["threshold_block_addition"]),
+            places=9,
+        )
+        self.assertNotAlmostEqual(float(row_a["b1"]), float(row_b["b1"]), places=9)
+        self.assertNotAlmostEqual(float(row_a["b2"]), float(row_b["b2"]), places=9)
+
+    def test_global_stochastic_growth_projected_thresholds_preserve_old_scale(self):
+        deterministic_cfg = self.make_stochastic_runtime_wedge_cfg(
+            threshold_source="stochastic_growth_projected"
+        )
+        deterministic_cfg["deployment_constraints"]["wedge"]["uncertainty"]["enabled"] = False
+        stochastic_cfg = self.make_stochastic_runtime_wedge_cfg(
+            threshold_source="stochastic_growth_projected"
+        )
+
+        deterministic = load_deployment_wedge_table(
+            deterministic_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0000",
+        ).iloc[0]
+        stochastic_a = load_deployment_wedge_table(
+            stochastic_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0000",
+        ).iloc[0]
+        stochastic_b = load_deployment_wedge_table(
+            stochastic_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0001",
+        ).iloc[0]
+
+        self.assertEqual(stochastic_a["threshold_source"], "stochastic_growth_projected")
+        self.assertTrue(bool(stochastic_a["thresholds_stochastic"]))
+        self.assertNotAlmostEqual(float(stochastic_a["b1"]), float(stochastic_b["b1"]), places=9)
+        self.assertLess(abs(float(stochastic_a["b1"]) - float(deterministic["b1"])), float(deterministic["b1"]))
+
+    def test_global_stochastic_thresholds_leave_deterministic_mode_unchanged(self):
+        learning_cfg = self.make_stochastic_runtime_wedge_cfg()
+        learning_cfg["deployment_constraints"]["wedge"]["uncertainty"]["enabled"] = False
+
+        table_seed_a = load_deployment_wedge_table(
+            learning_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0000",
+        )
+        table_seed_b = load_deployment_wedge_table(
+            learning_cfg,
+            current_year=2030,
+            technologies=["onwind_power"],
+            config_file=self.config_path,
+            learning_seed="s0001",
+        )
+
+        row_a = table_seed_a.iloc[0]
+        row_b = table_seed_b.iloc[0]
+        self.assertFalse(bool(row_a["thresholds_stochastic"]))
+        self.assertAlmostEqual(float(row_a["b1"]), float(row_b["b1"]), places=9)
+        self.assertAlmostEqual(float(row_a["b2"]), float(row_b["b2"]), places=9)
+
+    def test_stochastic_thresholds_reject_unsupported_wedge_modes(self):
+        asset_exact_cfg = self.make_stochastic_runtime_wedge_cfg(cost_granularity="asset_exact")
+        country_level_cfg = self.make_stochastic_runtime_wedge_cfg(level="country_level")
+
+        with self.assertRaises(ValueError):
+            load_deployment_wedge_table(
+                asset_exact_cfg,
+                current_year=2030,
+                technologies=["onwind_power"],
+                config_file=self.config_path,
+                learning_seed="s0000",
+            )
+        with self.assertRaises(ValueError):
+            load_deployment_wedge_table(
+                country_level_cfg,
+                current_year=2030,
+                technologies=["onwind_power"],
+                config_file=self.config_path,
+                learning_seed="s0000",
+            )
 
     def test_global_wedge_diagnostics_use_global_realized_build(self):
         buses = pd.DataFrame(
