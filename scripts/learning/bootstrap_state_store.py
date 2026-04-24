@@ -301,25 +301,42 @@ def save_bootstrap_state(
 def restore_bootstrap_state(
     source_dir: Path,
     target_sector_dir: Path,
+    *,
+    hardlink_first: bool = True,
+    exclude_relative_prefixes: tuple[str, ...] = (),
 ) -> dict[str, object]:
     source_dir = _require_directory(source_dir, "Bootstrap state source")
     required_counts = validate_state_source(source_dir)
     results_excluder = None
+    normalized_excludes = tuple(
+        str(prefix).strip("/").split("/") for prefix in exclude_relative_prefixes if str(prefix).strip("/")
+    )
+
+    def explicit_excluder(path: Path) -> bool:
+        if not normalized_excludes:
+            return False
+        try:
+            rel = path.resolve().relative_to(source_dir.resolve())
+        except Exception:
+            return False
+        return any(rel.parts[: len(prefix_parts)] == tuple(prefix_parts) for prefix_parts in normalized_excludes)
+
     try:
         _infer_sector_name_from_results_dir(source_dir)
-        results_excluder = _build_nested_scenario_excluder(
+        nested_excluder = _build_nested_scenario_excluder(
             source_dir,
             shared_dir_names=DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS,
             scenario_markers=DEFAULT_RESULTS_SCENARIO_MARKERS,
         )
+        results_excluder = lambda path: explicit_excluder(path) or nested_excluder(path)
     except ValueError:
-        results_excluder = None
+        results_excluder = explicit_excluder if normalized_excludes else None
 
     summaries = [
         mirror_tree(
             source_dir,
             target_sector_dir,
-            hardlink_first=True,
+            hardlink_first=hardlink_first,
             exclude_path=results_excluder,
         )
     ]
@@ -345,7 +362,7 @@ def restore_bootstrap_state(
                 mirror_tree(
                     companion_resources_source,
                     target_resources_dir,
-                    hardlink_first=True,
+                    hardlink_first=hardlink_first,
                     exclude_path=resources_excluder,
                 )
             )

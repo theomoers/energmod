@@ -10,6 +10,7 @@ if str(LEARNING_DIR) not in sys.path:
     sys.path.insert(0, str(LEARNING_DIR))
 
 import submit_learning_phi_calibration_array as phi_array
+import bootstrap_state_store
 from bootstrap_state_store import restore_bootstrap_state
 
 
@@ -79,6 +80,48 @@ class PhiCalibrationGridTests(unittest.TestCase):
             self.assertTrue((target / "configs" / "config.yaml").is_file())
             self.assertFalse((target / "phi_calibration" / "old_run").exists())
             self.assertGreater(summary["copied"] + summary["linked"], 0)
+
+    def test_submission_restores_one_shared_phi_working_sector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            (source / "learning").mkdir(parents=True)
+            (source / "learning" / "bootstrap_complete_elec_s_test.txt").write_text("ok\n", encoding="utf-8")
+            (source / "prenetworks").mkdir()
+            (source / "prenetworks" / "elec_s_test_export.nc").write_text("network\n", encoding="utf-8")
+
+            old_root = phi_array.ROOT_DIR
+            old_bootstrap_root = bootstrap_state_store.ROOT_DIR
+            phi_array.ROOT_DIR = root
+            bootstrap_state_store.ROOT_DIR = root
+            try:
+                tasks = phi_array.build_tasks(phi2_count=1, phi3_count=2)
+                phi_array.restore_phi_calibration_state(tasks, source)
+            finally:
+                phi_array.ROOT_DIR = old_root
+                bootstrap_state_store.ROOT_DIR = old_bootstrap_root
+
+            shared = root / "results" / phi_array.resolve_working_sector_name()
+            self.assertTrue((shared / "learning" / "bootstrap_complete_elec_s_test.txt").is_file())
+            for task in tasks:
+                self.assertFalse((root / "results" / task["sector_name"]).exists())
+
+    def test_worker_symlinks_shared_phi_state_into_task_sector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir)
+            task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]
+            shared = job_dir / "results" / phi_array.resolve_working_sector_name()
+            (shared / "learning").mkdir(parents=True)
+            (shared / "learning" / "bootstrap_complete_elec_s_test.txt").write_text("ok\n", encoding="utf-8")
+            (shared / "prenetworks").mkdir()
+            (shared / "prenetworks" / "elec_s_test_export.nc").write_text("network\n", encoding="utf-8")
+
+            linked = phi_array._stage_task_bootstrap_state(task, job_dir)
+            target = job_dir / "results" / task["sector_name"]
+
+            self.assertEqual(linked, 2)
+            self.assertTrue((target / "learning" / "bootstrap_complete_elec_s_test.txt").is_symlink())
+            self.assertTrue((target / "prenetworks" / "elec_s_test_export.nc").is_symlink())
 
 
 if __name__ == "__main__":

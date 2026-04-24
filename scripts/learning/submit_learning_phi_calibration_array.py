@@ -27,6 +27,7 @@ DEFAULT_JOB_ROOT = ROOT_DIR / "cluster_workdirs"
 DEFAULT_SUBMIT_ROOT = ROOT_DIR / "cluster_submissions"
 DEFAULT_RESULTS_ROOT = ROOT_DIR / "results" / "Global_200" / "phi_calibration"
 DEFAULT_BOOTSTRAP_STATE_SOURCE = ROOT_DIR / "results" / "Global_200"
+DEFAULT_WORKING_SECTOR_NAME = "Global_200/phi_calibration/_bootstrap_state"
 DEFAULT_CONDA_ENV = "/shared/share_cki25/envs/sh-pypsa-earth-main"
 DEFAULT_GRID_MEM = "90G"
 DEFAULT_GRID_NCPUS = "12"
@@ -65,6 +66,10 @@ def expand_and_resolve(pathlike: str | os.PathLike) -> Path:
 
 def resolve_task_sector_names(tasks: list[dict]) -> list[str]:
     return sorted({str(task["sector_name"]) for task in tasks})
+
+
+def resolve_working_sector_name() -> str:
+    return DEFAULT_WORKING_SECTOR_NAME
 
 
 def build_tasks(
@@ -131,6 +136,7 @@ def write_submission_metadata(
         "results_root": str(Path(args.results_root).resolve()),
         "job_root": str(expand_and_resolve(args.job_root)),
         "bootstrap_state_source": str(expand_and_resolve(args.bootstrap_state_source)),
+        "working_sector_name": resolve_working_sector_name(),
         "resolved_sector_names": resolve_task_sector_names(tasks),
         "conda_env": args.conda_env,
         "grid_mem": args.grid_mem,
@@ -161,20 +167,21 @@ def write_submission_metadata(
 
 
 def restore_phi_calibration_state(tasks: list[dict], bootstrap_source: Path) -> None:
-    """Mirror the regular stochastic-array copied-sector setup for each phi task."""
+    """Mirror the regular stochastic-array copied-sector setup once per submission."""
     required_counts = validate_state_source(bootstrap_source)
+    working_sector_name = resolve_working_sector_name()
+    target_dir = resolve_results_sector_dir(ROOT_DIR, working_sector_name)
     print("BOOTSTRAP_STATE_SOURCE", str(bootstrap_source.resolve()))
     print("BOOTSTRAP_STATE_VALIDATED", json.dumps(required_counts, sort_keys=True))
-    for sector_name in resolve_task_sector_names(tasks):
-        target_dir = resolve_results_sector_dir(ROOT_DIR, sector_name)
-        restore_summary = restore_bootstrap_state(
-            bootstrap_source,
-            target_dir,
-            exclude_relative_prefixes=("phi_calibration",),
-            hardlink_first=False,
-        )
-        mark_tree_current(target_dir)
-        print("BOOTSTRAP_STATE_RESTORED", json.dumps(restore_summary, sort_keys=True))
+    restore_summary = restore_bootstrap_state(
+        bootstrap_source,
+        target_dir,
+        exclude_relative_prefixes=("phi_calibration",),
+        hardlink_first=False,
+    )
+    mark_tree_current(target_dir)
+    print("BOOTSTRAP_STATE_TARGET", target_dir)
+    print("BOOTSTRAP_STATE_RESTORED", json.dumps(restore_summary, sort_keys=True))
 
 
 def mark_tree_current(path: Path) -> None:
@@ -221,8 +228,7 @@ def submit_array(args: argparse.Namespace) -> None:
     if args.print_only:
         print("BOOTSTRAP_STATE_SOURCE", str(bootstrap_state_source))
         print("BOOTSTRAP_STATE_VALIDATED", json.dumps(required_counts, sort_keys=True))
-        for sector_name in resolve_task_sector_names(tasks):
-            print("BOOTSTRAP_STATE_TARGET", resolve_results_sector_dir(ROOT_DIR, sector_name))
+        print("BOOTSTRAP_STATE_TARGET", resolve_results_sector_dir(ROOT_DIR, resolve_working_sector_name()))
         print("TASK_MANIFEST", manifest_path)
         print("SUBMISSION_METADATA", metadata_path)
         print("ARRAY_SIZE", len(tasks))
@@ -255,6 +261,43 @@ def _stage_job_dir(task: dict, job_root: Path) -> Path:
             raise RuntimeError(f"Existing non-symlink path blocks staged job entry: {target}")
         target.symlink_to(child)
     return job_dir
+
+
+def _link_tree(source_dir: Path, target_dir: Path) -> int:
+    source_dir = source_dir.resolve()
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Shared phi calibration working sector is missing: {source_dir}")
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"Shared phi calibration working sector is not a directory: {source_dir}")
+
+    linked = 0
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for src in sorted(source_dir.rglob("*")):
+        rel = src.relative_to(source_dir)
+        dst = target_dir / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+            continue
+        if os.path.lexists(dst):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(src, dst)
+        linked += 1
+    return linked
+
+
+def _unlink_output_if_symlink(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+
+
+def _stage_task_bootstrap_state(task: dict, job_dir: Path) -> int:
+    source = job_dir / "results" / resolve_working_sector_name()
+    target = job_dir / "results" / str(task["sector_name"])
+    linked = _link_tree(source, target)
+    for output_path in phi_calibration_output_paths(task):
+        _unlink_output_if_symlink(job_dir / output_path)
+    return linked
 
 
 def _write_overlay(task: dict, output_dir: Path) -> Path:
@@ -332,6 +375,22 @@ def phi_calibration_target(task: dict) -> str:
     return str(Path("results") / str(task["sector_name"]) / "learning" / f"cost_log_solved_{token}.csv")
 
 
+def phi_calibration_output_paths(task: dict) -> list[str]:
+    year = phi_calibration_year(task)
+    token = _scenario_token(year)
+    token_ec = _scenario_token_ec(year)
+    sector = Path("results") / str(task["sector_name"])
+    return [
+        str(sector / "postnetworks" / f"{token_ec}.nc"),
+        str(sector / "postnetworks" / "lpfiles" / f"{token_ec}.lp"),
+        str(sector / "learning" / f"cost_log_solved_{token}.csv"),
+        str(sector / "learning" / f"state_committed_{token}.json"),
+        str(sector / "learning" / f"system_costs_{token}.csv"),
+        str(sector / "learning" / f"statistics_{token}.csv"),
+        str(sector / "learning" / f"deployment_constraints_{token}.csv"),
+    ]
+
+
 def build_worker_snakemake_cmd(
     task: dict,
     job_dir: Path,
@@ -373,6 +432,7 @@ def run_worker(args: argparse.Namespace) -> None:
     task = tasks[task_index]
     job_root = Path(os.path.expandvars(args.job_root)).resolve()
     job_dir = _stage_job_dir(task, job_root)
+    linked = _stage_task_bootstrap_state(task, job_dir)
     validate_state_source(job_dir / "results" / str(task["sector_name"]))
     overlay_path = _write_overlay(task, job_dir)
     snakemake_jobs = os.environ.get("JOBS") or os.environ.get("NSLOTS") or "4"
@@ -400,6 +460,7 @@ def run_worker(args: argparse.Namespace) -> None:
     print(f"  b1_multiplier={task['b1_multiplier']}")
     print(f"  b2_multiplier={task['b2_multiplier']}")
     print(f"  job_dir={job_dir}")
+    print(f"  linked_bootstrap_files={linked}")
     print(f"  overlay={overlay_path}")
     print(f"  target={job_dir / phi_calibration_target(task)}")
 
