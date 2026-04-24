@@ -11,13 +11,18 @@ The script compares:
 from __future__ import annotations
 
 import argparse
+import contextlib
 from functools import lru_cache
+import io
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sys
 from typing import Any
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp")
 
 import matplotlib
 import numpy as np
@@ -128,6 +133,18 @@ IRENA_FOSSIL_AGGREGATE_TECHS = {
     "Oil",
     "Fossil fuels n.e.s.",
     "Other non-renewable energy",
+}
+
+IRENA_LONG_TO_VALIDATION_TECH = {
+    "Solar photovoltaic": "solar",
+    "Onshore wind energy": "onshore_wind",
+    "Offshore wind energy": "offshore_wind",
+    "Renewable hydropower": "hydro",
+    "Geothermal energy": "geothermal",
+    "Solid biofuels": "bioenergy",
+    "Liquid biofuels": "bioenergy",
+    "Gas biofuels": "bioenergy",
+    "Renewable municipal waste": "bioenergy",
 }
 
 
@@ -650,16 +667,79 @@ def _baseyear_extendability_audit(
     return audit_df, summary
 
 
+@lru_cache(maxsize=4096)
 def _safe_iso3_to_iso2(code: str) -> str | np.nan:
     if not isinstance(code, str) or len(code) != 3:
         return np.nan
     try:
-        iso2 = three_2_two_digits_country(code)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            iso2 = three_2_two_digits_country(code)
     except Exception:
         return np.nan
     if not isinstance(iso2, str) or len(iso2) != 2:
         return np.nan
     return iso2
+
+
+def _clean_irena_columns(irena: pd.DataFrame) -> pd.DataFrame:
+    return irena.rename(
+        columns={col: str(col).replace("\ufeff", "").strip() for col in irena.columns}
+    )
+
+
+def _read_irena_capacity_csv(irena_csv: Path) -> pd.DataFrame:
+    return _clean_irena_columns(pd.read_csv(irena_csv, encoding="utf-8-sig"))
+
+
+def _irena_value_column(irena: pd.DataFrame) -> str:
+    for col in irena.columns:
+        if str(col).strip().lower() == "value":
+            return col
+    raise ValueError("Could not find IRENA value column")
+
+
+def _is_irena_long_capacity_format(irena: pd.DataFrame) -> bool:
+    required = {
+        "Region/area (ISO 3)",
+        "Year",
+        "Data Type",
+        "Product Name",
+        "Grid Type",
+        "Unit",
+    }
+    return required.issubset(irena.columns) and any(
+        str(col).strip().lower() == "value" for col in irena.columns
+    )
+
+
+def _irena_long_capacity_by_country_tech(irena: pd.DataFrame, year: int) -> pd.DataFrame:
+    value_col = _irena_value_column(irena)
+    ref = irena.copy()
+    ref["Year"] = pd.to_numeric(ref["Year"], errors="coerce")
+    ref = ref.loc[ref["Year"].eq(int(year))].copy()
+    ref["Data Type"] = ref["Data Type"].astype(str).str.strip()
+    ref["Product Name"] = ref["Product Name"].astype(str).str.strip()
+    ref["Grid Type"] = ref["Grid Type"].astype(str).str.strip()
+    ref["Unit"] = ref["Unit"].astype(str).str.strip()
+    ref = ref.loc[
+        ref["Data Type"].eq("Electrical Capacity")
+        & ref["Grid Type"].eq("OnGrid")
+        & ref["Unit"].eq("Megawatt")
+    ].copy()
+    ref["validation_tech"] = ref["Product Name"].map(IRENA_LONG_TO_VALIDATION_TECH)
+    iso3 = ref["Region/area (ISO 3)"].astype(str).str.strip()
+    iso3_lookup = {code: _safe_iso3_to_iso2(code) for code in iso3.dropna().unique()}
+    ref["country"] = iso3.map(iso3_lookup)
+    ref["reference_mw"] = pd.to_numeric(
+        ref[value_col]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .replace({"-": np.nan, "": np.nan}),
+        errors="coerce",
+    ).fillna(0.0)
+    ref = ref.loc[ref["country"].notna() & ref["validation_tech"].notna()].copy()
+    return ref.groupby(["country", "validation_tech"], as_index=False)["reference_mw"].sum()
 
 
 def _link_electric_capacity(
@@ -855,7 +935,10 @@ def _model_capacity_by_country_tech(
 
 
 def _irena_capacity_by_country_tech(irena_csv: Path, year: int) -> pd.DataFrame:
-    irena = pd.read_csv(irena_csv)
+    irena = _read_irena_capacity_csv(irena_csv)
+    if _is_irena_long_capacity_format(irena):
+        return _irena_long_capacity_by_country_tech(irena, year)
+
     year_col = str(year)
     if year_col not in irena.columns:
         raise ValueError(f"Year column '{year_col}' not found in {irena_csv}")
@@ -872,7 +955,10 @@ def _irena_capacity_by_country_tech(irena_csv: Path, year: int) -> pd.DataFrame:
 
 
 def _irena_fossil_aggregated_capacity_by_country(irena_csv: Path, year: int) -> pd.DataFrame:
-    irena = pd.read_csv(irena_csv)
+    irena = _read_irena_capacity_csv(irena_csv)
+    if _is_irena_long_capacity_format(irena):
+        return pd.DataFrame(columns=["country", "validation_tech", "reference_mw"])
+
     year_col = str(year)
     if year_col not in irena.columns:
         raise ValueError(f"Year column '{year_col}' not found in {irena_csv}")
@@ -888,7 +974,18 @@ def _irena_fossil_aggregated_capacity_by_country(irena_csv: Path, year: int) -> 
 
 
 def _irena_single_tech_capacity_by_country(irena_csv: Path, year: int, tech: str) -> pd.DataFrame:
-    irena = pd.read_csv(irena_csv)
+    irena = _read_irena_capacity_csv(irena_csv)
+    if _is_irena_long_capacity_format(irena):
+        long_tech = {
+            "Nuclear": None,
+            "Coal and peat": None,
+        }.get(tech)
+        if long_tech is None:
+            return pd.DataFrame(columns=["country", "reference_mw"])
+        ref = _irena_long_capacity_by_country_tech(irena, year)
+        ref = ref.loc[ref["validation_tech"].eq(long_tech)].copy()
+        return ref.loc[:, ["country", "reference_mw"]]
+
     year_col = str(year)
     if year_col not in irena.columns:
         raise ValueError(f"Year column '{year_col}' not found in {irena_csv}")

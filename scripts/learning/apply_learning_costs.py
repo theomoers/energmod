@@ -53,6 +53,9 @@ from learning.learning_data_io import load_historical_capacity, load_historical_
 # (historical Li-ion pack cost in 2020 EUR/kWh),
 # then apply that multiplier to learning-based battery_energy costs.
 BATTERY_ENERGY_BOS_REFERENCE_YEAR = 2020
+BATTERY_ENERGY_RAW_COST_BASIS = "liion_pack"
+BATTERY_ENERGY_NETWORK_COST_BASIS = "grid_storage_energy"
+DEFAULT_NETWORK_COST_BASIS = "network_cost"
 
 # Global scaling factors for technologies where model covers only a fraction of
 # global deployment. Battery energy is handled separately via the bundled
@@ -254,6 +257,72 @@ def get_battery_energy_bos_multiplier(learning_cfg, costs_file):
     )
     cache[cache_key] = float(value)
     return value
+
+
+def _runtime_source_cost_basis(tech, selected_model=None, runtime_metadata=None):
+    """Return the native cost basis for runtime level-cost inputs."""
+    if tech != "battery_energy":
+        return DEFAULT_NETWORK_COST_BASIS
+
+    runtime_metadata = runtime_metadata or {}
+    model = str(
+        selected_model
+        or runtime_metadata.get("selected_model")
+        or runtime_metadata.get("model_name")
+        or ""
+    )
+    engine = str(runtime_metadata.get("engine", ""))
+
+    if model in SUPPORTED_STOCHASTIC_MODELS or engine == "stochastic_forecast":
+        return BATTERY_ENERGY_RAW_COST_BASIS
+    return BATTERY_ENERGY_NETWORK_COST_BASIS
+
+
+def convert_runtime_cost_levels_to_network_basis(
+    applied_c_overnight,
+    terminal_c_overnight,
+    tech,
+    learning_cfg,
+    costs_file,
+    selected_model=None,
+    runtime_metadata=None,
+):
+    """
+    Convert runtime level costs into the basis expected by energymod network costs.
+
+    Stochastic battery_energy artifacts are learned on global Li-ion pack/cell costs,
+    while the PyPSA Store named "battery storage" needs installed grid-storage
+    energy-side cost. Keep the raw values for auditability, but return applied
+    values on the network basis for annualization and network updates.
+    """
+    raw_applied = float(applied_c_overnight)
+    raw_terminal = float(terminal_c_overnight)
+    source_basis = _runtime_source_cost_basis(
+        tech,
+        selected_model=selected_model,
+        runtime_metadata=runtime_metadata,
+    )
+    network_basis = (
+        BATTERY_ENERGY_NETWORK_COST_BASIS
+        if tech == "battery_energy"
+        else DEFAULT_NETWORK_COST_BASIS
+    )
+    multiplier = 1.0
+
+    if tech == "battery_energy" and source_basis == BATTERY_ENERGY_RAW_COST_BASIS:
+        multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
+
+    applied = raw_applied * multiplier
+    terminal = raw_terminal * multiplier
+    return {
+        "applied_c_overnight": applied,
+        "terminal_c_overnight": terminal,
+        "raw_c_overnight": raw_applied,
+        "raw_c_overnight_terminal_point": raw_terminal,
+        "source_cost_basis": source_basis,
+        "network_cost_basis": network_basis,
+        "cost_basis_conversion_multiplier": float(multiplier),
+    }
 
 
 def normalize_optional_input(value):
@@ -2355,6 +2424,7 @@ def _learning_costs_from_stochastic_state(
             selected_model=selected_model,
             learning_cfg=learning_cfg,
             costs_file=costs_file,
+            runtime_metadata=runtime_metadata,
         )
     for tech, artifact in artifacts.items():
         if tech not in cumulative_capacity_map:
@@ -2371,8 +2441,10 @@ def _learning_costs_from_stochastic_state(
                 snapshot = _cgrw_runtime_snapshot(artifact)
         if cost_expectation_mode == "block_average_expected":
             diag = expectation_diagnostics[tech]
-            applied_c_overnight = float(diag["c_overnight"])
-            terminal_c_overnight = float(diag["c_overnight_terminal_point"])
+            applied_c_overnight = float(diag.get("raw_c_overnight", diag["c_overnight"]))
+            terminal_c_overnight = float(
+                diag.get("raw_c_overnight_terminal_point", diag["c_overnight_terminal_point"])
+            )
         else:
             applied_c_overnight = point_c_overnight
             terminal_c_overnight = point_c_overnight
@@ -2388,8 +2460,8 @@ def _learning_costs_from_stochastic_state(
             wacc_dict=wacc_dict,
         )
         if cost_expectation_mode != "block_average_expected":
-            record["log_capex_runtime"] = log_cost
-            record["log_capex_terminal_point"] = log_cost
+            record["raw_log_capex_runtime"] = log_cost
+            record["raw_log_capex_terminal_point"] = log_cost
         elif diag:
             record.update(diag)
         learning_costs[tech] = record
@@ -2421,9 +2493,20 @@ def _cost_statistics_from_levels(
     learning_cfg,
     costs_file,
     tech,
+    selected_model=None,
+    runtime_metadata=None,
 ):
-    applied_c_overnight = float(applied_c_overnight)
-    terminal_c_overnight = float(terminal_c_overnight)
+    converted = convert_runtime_cost_levels_to_network_basis(
+        applied_c_overnight=applied_c_overnight,
+        terminal_c_overnight=terminal_c_overnight,
+        tech=tech,
+        learning_cfg=learning_cfg,
+        costs_file=costs_file,
+        selected_model=selected_model,
+        runtime_metadata=runtime_metadata,
+    )
+    applied_c_overnight = float(converted["applied_c_overnight"])
+    terminal_c_overnight = float(converted["terminal_c_overnight"])
     return {
         "c_overnight": applied_c_overnight,
         "capital_cost": convert_to_capital_cost(
@@ -2442,6 +2525,11 @@ def _cost_statistics_from_levels(
             costs_file,
         ),
         "log_capex_terminal_point": float(np.log(max(terminal_c_overnight, 1.0e-12) * 1000.0)),
+        "raw_c_overnight": float(converted["raw_c_overnight"]),
+        "raw_c_overnight_terminal_point": float(converted["raw_c_overnight_terminal_point"]),
+        "source_cost_basis": converted["source_cost_basis"],
+        "network_cost_basis": converted["network_cost_basis"],
+        "cost_basis_conversion_multiplier": float(converted["cost_basis_conversion_multiplier"]),
     }
 
 
@@ -2462,6 +2550,7 @@ def _runtime_cost_record(
         learning_cfg=learning_cfg,
         costs_file=costs_file,
         tech=tech,
+        runtime_metadata=runtime_metadata,
     )
     return {
         "cumulative_capacity_GW": float(cumulative_capacity),
@@ -2552,6 +2641,8 @@ def _legacy_global_current_window_diagnostics(
     weights,
     learning_cfg,
     costs_file,
+    selected_model=None,
+    runtime_metadata=None,
 ):
     expectation_years = int(len(weights))
     diagnostics = {}
@@ -2575,21 +2666,29 @@ def _legacy_global_current_window_diagnostics(
         weighted_costs = expectation_sequence @ weights
         applied_c_overnight = float(np.mean(weighted_costs))
         terminal_c_overnight = float(np.mean(level_costs[:, -1]))
+        raw_kernel_costs = [endpoint_level] + [
+            float(np.mean(level_costs[:, idx])) for idx in range(level_costs.shape[1] - 1)
+        ]
+        cost_stats = _cost_statistics_from_levels(
+            applied_c_overnight=applied_c_overnight,
+            terminal_c_overnight=terminal_c_overnight,
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+            tech=tech,
+            selected_model=selected_model,
+            runtime_metadata=runtime_metadata,
+        )
+        basis_multiplier = float(cost_stats.get("cost_basis_conversion_multiplier", 1.0))
         diagnostics[tech] = {
-            **_cost_statistics_from_levels(
-                applied_c_overnight=applied_c_overnight,
-                terminal_c_overnight=terminal_c_overnight,
-                learning_cfg=learning_cfg,
-                costs_file=costs_file,
-                tech=tech,
-            ),
+            **cost_stats,
             "kernel_year_start": int(kernel_years[0]),
             "kernel_year_end": int(kernel_years[-1]),
             "kernel_years_json": _serialize_year_list(kernel_years),
             "known_kernel_years_json": _serialize_year_list(kernel_years[:1]),
             "expected_kernel_years_json": _serialize_year_list(kernel_years[1:]),
+            "raw_kernel_costs_json": _serialize_float_list(raw_kernel_costs),
             "applied_kernel_costs_json": _serialize_float_list(
-                [endpoint_level] + [float(np.mean(level_costs[:, idx])) for idx in range(level_costs.shape[1] - 1)]
+                [value * basis_multiplier for value in raw_kernel_costs]
             ),
         }
     return diagnostics
@@ -2602,6 +2701,7 @@ def _compute_block_average_expected_costs(
     selected_model,
     learning_cfg,
     costs_file,
+    runtime_metadata=None,
 ):
     weights = get_cost_expectation_weights(learning_cfg)
     kernel_length = int(len(weights))
@@ -2626,6 +2726,8 @@ def _compute_block_average_expected_costs(
             weights=weights,
             learning_cfg=learning_cfg,
             costs_file=costs_file,
+            selected_model=selected_model,
+            runtime_metadata=runtime_metadata,
         )
 
     kernel_years_by_tech = {
@@ -2671,20 +2773,27 @@ def _compute_block_average_expected_costs(
             float(np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0),
         )
         applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+        cost_stats = _cost_statistics_from_levels(
+            applied_c_overnight=applied_c_overnight,
+            terminal_c_overnight=terminal_c_overnight,
+            learning_cfg=learning_cfg,
+            costs_file=costs_file,
+            tech=tech,
+            selected_model=selected_model,
+            runtime_metadata=runtime_metadata,
+        )
+        basis_multiplier = float(cost_stats.get("cost_basis_conversion_multiplier", 1.0))
         diagnostics[tech] = {
-            **_cost_statistics_from_levels(
-                applied_c_overnight=applied_c_overnight,
-                terminal_c_overnight=terminal_c_overnight,
-                learning_cfg=learning_cfg,
-                costs_file=costs_file,
-                tech=tech,
-            ),
+            **cost_stats,
             "kernel_year_start": int(kernel_years[0]),
             "kernel_year_end": int(kernel_years[-1]),
             "kernel_years_json": _serialize_year_list(kernel_years),
             "known_kernel_years_json": _serialize_year_list(known_years),
             "expected_kernel_years_json": _serialize_year_list(expected_years),
-            "applied_kernel_costs_json": _serialize_float_list(kernel_costs),
+            "raw_kernel_costs_json": _serialize_float_list(kernel_costs),
+            "applied_kernel_costs_json": _serialize_float_list(
+                [value * basis_multiplier for value in kernel_costs]
+            ),
         }
     return diagnostics
 
@@ -4395,6 +4504,11 @@ def save_cost_log(learning_costs, output_file):
         "capital_cost",
         "capital_cost_terminal_point",
         "unit",
+        "source_cost_basis",
+        "network_cost_basis",
+        "cost_basis_conversion_multiplier",
+        "raw_c_overnight",
+        "raw_c_overnight_terminal_point",
         "c_overnight",
         "c_overnight_terminal_point",
         "kernel_year_start",
@@ -4402,7 +4516,10 @@ def save_cost_log(learning_costs, output_file):
         "kernel_years_json",
         "known_kernel_years_json",
         "expected_kernel_years_json",
+        "raw_kernel_costs_json",
         "applied_kernel_costs_json",
+        "raw_log_capex_runtime",
+        "raw_log_capex_terminal_point",
         "log_capex_runtime",
         "log_capex_terminal_point",
         "wacc_dict",

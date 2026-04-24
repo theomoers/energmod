@@ -77,6 +77,7 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
     }
 
     monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    monkeypatch.setattr(alc, "get_battery_energy_bos_multiplier", lambda learning_cfg, costs_file: 2.0)
     expected_levels = np.log(
         np.array([[40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]], dtype=float) * 1000.0
     )
@@ -114,7 +115,66 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
     assert json.loads(diagnostics["solar_power"]["expected_kernel_years_json"]) == [2026, 2027]
 
     assert diagnostics["onwind_power"]["c_overnight"] == pytest.approx(30.8)
-    assert diagnostics["battery_energy"]["c_overnight"] == pytest.approx(40.5)
+    assert diagnostics["battery_energy"]["raw_c_overnight"] == pytest.approx(40.5)
+    assert diagnostics["battery_energy"]["c_overnight"] == pytest.approx(81.0)
+    assert diagnostics["battery_energy"]["source_cost_basis"] == "liion_pack"
+    assert diagnostics["battery_energy"]["network_cost_basis"] == "grid_storage_energy"
+    assert diagnostics["battery_energy"]["cost_basis_conversion_multiplier"] == pytest.approx(2.0)
+    assert json.loads(diagnostics["battery_energy"]["raw_kernel_costs_json"]) == pytest.approx([
+        15.0,
+        25.0,
+        40.0,
+        50.0,
+        60.0,
+    ])
+    assert json.loads(diagnostics["battery_energy"]["applied_kernel_costs_json"]) == pytest.approx([
+        30.0,
+        50.0,
+        80.0,
+        100.0,
+        120.0,
+    ])
+
+
+def test_stochastic_point_cost_converts_battery_basis_without_mutating_raw_log(monkeypatch):
+    learning_cfg = {}
+    runtime_metadata = {
+        "engine": "stochastic_forecast",
+        "selected_model": "shared_state_bayesian_regime_wright",
+        "cost_expectation_mode": "point_cost",
+    }
+    state = _make_state(
+        2025,
+        {"solar_power": 30.0, "battery_energy": 25.0},
+    )
+    artifacts = {
+        "solar_power": {},
+        "battery_energy": {},
+    }
+    monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    monkeypatch.setattr(alc, "get_battery_energy_bos_multiplier", lambda learning_cfg, costs_file: 2.5)
+
+    costs = alc._learning_costs_from_stochastic_state(
+        artifacts=artifacts,
+        state=state,
+        current_year=2030,
+        selected_model="shared_state_bayesian_regime_wright",
+        cumulative_capacity_map={"solar_power": 1.0, "battery_energy": 1.0},
+        learning_cfg=learning_cfg,
+        costs_file="costs.csv",
+        wacc_dict=None,
+        runtime_metadata=runtime_metadata,
+    )
+
+    battery = costs["battery_energy"]
+    assert battery["raw_c_overnight"] == pytest.approx(25.0)
+    assert battery["c_overnight"] == pytest.approx(62.5)
+    assert battery["capital_cost"] == pytest.approx(62.5)
+    assert battery["log_capex_runtime"] == pytest.approx(math.log(62.5 * 1000.0))
+    assert battery["raw_log_capex_runtime"] == pytest.approx(math.log(25.0 * 1000.0))
+    assert state["technology_states"]["battery_energy"]["last_log_capex"] == pytest.approx(
+        math.log(25.0 * 1000.0)
+    )
 
 
 def test_legacy_global_current_window_behavior_is_preserved(monkeypatch):
