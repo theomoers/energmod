@@ -1,0 +1,12 @@
+scenario:
+  learning_rate:
+    - "base"
+  learning_model:
+    - "iea_weo_exogenous_path"
+
+learning:
+  engine: exogenous_path
+  selected_model: iea_weo_exogenous_path
+  exogenous_cost_path:
+    source: iea_weo_2025_latest_central
+    interpolation: log_linear

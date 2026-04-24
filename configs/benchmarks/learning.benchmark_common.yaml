@@ -1,0 +1,27 @@
+learning:
+  execution_mode: full
+  monte_carlo:
+    enable: false
+  cost_expectations:
+    mode: point_cost
+  deployment_constraints:
+    enabled: true
+    formulation: hard_cap
+    mode: first_order
+    apply_from_year: 2030
+    technologies: [solar_power, onwind_power, battery_energy]
+    calibration:
+      window_start_year: 2015
+      window_end_year: 2024
+      anchor_smoothing_years: 3
+      quantile: 0.9
+      difference_space: log_annual_additions
+    battery_basis: phi_mapped_global_liion
+    uncertainty:
+      enabled: false
+      mode: deterministic
+      shock_structure: persistent_level_plus_annual
+      persistent_scale_source: historical_residual_std
+      annual_scale_source: calibrated_residual_innovation
+      annual_scale_shrinkage: 0.25
+      random_seed_source: learning_seed

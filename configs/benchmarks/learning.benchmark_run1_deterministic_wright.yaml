@@ -1,0 +1,10 @@
+scenario:
+  learning_rate:
+    - "base"
+  learning_model:
+    - "legacy_curve"
+
+learning:
+  engine: legacy_curve
+  selected_model: legacy_curve
+  training_window: full_sample
