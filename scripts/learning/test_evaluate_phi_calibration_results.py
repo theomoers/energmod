@@ -94,6 +94,58 @@ class PhiCalibrationEvaluationTests(unittest.TestCase):
             self.assertEqual(len(tasks), 1)
             self.assertEqual(tasks[0]["name"], "phi2_0p00_phi3_0p10")
 
+    def test_evaluate_tasks_scores_wind_and_solar_together(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            old_eval_root = evaluator.ROOT_DIR
+            old_submit_root = phi_array.ROOT_DIR
+            evaluator.ROOT_DIR = root
+            phi_array.ROOT_DIR = root
+            try:
+                tasks = phi_array.build_tasks(phi2_count=1, phi3_count=1)
+                task = tasks[0]
+                for rel_path in phi_array.phi_calibration_output_paths(task):
+                    path = root / rel_path
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if path.name.startswith("deployment_constraints_"):
+                        pd.DataFrame(
+                            [
+                                {
+                                    "year": 2025,
+                                    "technology": "solar_power",
+                                    "constraint_basis_unit": "GW",
+                                    "realized_block_addition_constrained_basis": 90.0,
+                                    "realized_wedge_cost_eur": 10.0,
+                                },
+                                {
+                                    "year": 2025,
+                                    "technology": "onwind_power",
+                                    "constraint_basis_unit": "GW",
+                                    "realized_block_addition_constrained_basis": 55.0,
+                                    "realized_wedge_cost_eur": 20.0,
+                                },
+                            ]
+                        ).to_csv(path, index=False)
+                    elif path.name.startswith("system_costs_"):
+                        pd.DataFrame([{"total_system_cost_eur": 1.0}]).to_csv(path, index=False)
+                    else:
+                        path.write_text("ok\n", encoding="utf-8")
+
+                frame = evaluator.evaluate_tasks(
+                    tasks,
+                    technology=["solar_power", "onwind_power"],
+                    planning_year=2025,
+                    target_block_additions={"solar_power": 100.0, "onwind_power": 50.0},
+                )
+            finally:
+                evaluator.ROOT_DIR = old_eval_root
+                phi_array.ROOT_DIR = old_submit_root
+
+            self.assertEqual(frame.iloc[0]["solar_power__target_abs_error"], 10.0)
+            self.assertEqual(frame.iloc[0]["onwind_power__target_abs_error"], 5.0)
+            self.assertEqual(frame.iloc[0]["aggregate_target_abs_error"], 15.0)
+            self.assertEqual(frame.iloc[0]["scored_technology_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate phi2/phi3 battery deployment-wedge calibration results."""
+"""Evaluate phi2/phi3 deployment-wedge calibration results."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from submit_learning_phi_calibration_array import (
 
 
 PHI_TASK_RE = re.compile(r"^phi2_(?P<phi2>[0-9]+p[0-9]+)_phi3_(?P<phi3>[0-9]+p[0-9]+)$")
-DEFAULT_TECHNOLOGY = "battery_energy"
+DEFAULT_TECHNOLOGIES = ("solar_power", "onwind_power")
 
 
 def _decode_phi_token(token: str) -> float:
@@ -71,6 +71,46 @@ def _load_tasks_from_manifest(manifest_path: Path) -> list[dict]:
     if not isinstance(tasks, list):
         raise ValueError(f"Expected task manifest to contain a list: {manifest_path}")
     return tasks
+
+
+def parse_technologies(raw_values: list[str] | str | None) -> list[str]:
+    if raw_values is None:
+        return list(DEFAULT_TECHNOLOGIES)
+    if isinstance(raw_values, str):
+        raw_values = [raw_values]
+    technologies = []
+    for value in raw_values:
+        for part in str(value).split(","):
+            technology = part.strip()
+            if technology:
+                technologies.append(technology)
+    return list(dict.fromkeys(technologies)) or list(DEFAULT_TECHNOLOGIES)
+
+
+def load_target_block_additions(path: Path | None) -> dict[str, float]:
+    if path is None:
+        return {}
+    frame = pd.read_csv(path)
+    rename = {}
+    for column in frame.columns:
+        key = str(column).strip().lower()
+        if key in {"tech", "technology", "carrier"}:
+            rename[column] = "technology"
+        elif key in {"target", "target_block_addition", "actual", "actual_block_addition"}:
+            rename[column] = "target_block_addition"
+    frame = frame.rename(columns=rename)
+    required = {"technology", "target_block_addition"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"Target CSV must include columns {sorted(required)}; missing {sorted(missing)}"
+        )
+    targets = {}
+    for _, row in frame.iterrows():
+        technology = str(row["technology"]).strip()
+        if technology:
+            targets[technology] = float(row["target_block_addition"])
+    return targets
 
 
 def _latest_submission_dir(submit_root: Path) -> Path:
@@ -232,27 +272,106 @@ def evaluate_task(task: dict, technology: str, planning_year: int, target_block_
     return row
 
 
+def _prefix_metrics(metrics: dict, technology: str) -> dict:
+    return {f"{technology}__{key}": value for key, value in metrics.items()}
+
+
+def evaluate_task_multi(
+    task: dict,
+    technologies: list[str],
+    planning_year: int,
+    target_block_additions: dict[str, float],
+) -> dict:
+    solved_cost_log = ROOT_DIR / phi_calibration_target(task)
+    deploy_path = deployment_constraint_path(task)
+    system_path = system_cost_path(task)
+    missing_outputs = [
+        str(ROOT_DIR / rel_path)
+        for rel_path in phi_calibration_output_paths(task)
+        if not (ROOT_DIR / rel_path).exists()
+    ]
+    row = {
+        "name": task["name"],
+        "sector_name": task["sector_name"],
+        "phi2_pct_capex": _safe_float(task.get("phi2_pct_capex")),
+        "phi3_pct_capex": _safe_float(task.get("phi3_pct_capex")),
+        "planning_year": int(planning_year),
+        "solved_cost_log_exists": solved_cost_log.is_file(),
+        "complete": len(missing_outputs) == 0,
+        "missing_output_count": len(missing_outputs),
+        "first_missing_output": missing_outputs[0] if missing_outputs else "",
+    }
+    aggregate_abs_error = 0.0
+    aggregate_sq_pct_error = 0.0
+    scored_technologies = 0
+    for technology in technologies:
+        metrics = _read_deployment_metrics(deploy_path, technology, planning_year)
+        target = target_block_additions.get(technology)
+        if target is not None:
+            realized = _safe_float(metrics.get("realized_block_addition_constrained_basis"))
+            metrics["target_block_addition"] = float(target)
+            metrics["target_error"] = realized - float(target)
+            metrics["target_abs_error"] = abs(metrics["target_error"]) if math.isfinite(realized) else math.nan
+            if math.isfinite(_safe_float(metrics["target_abs_error"])):
+                aggregate_abs_error += float(metrics["target_abs_error"])
+                if abs(float(target)) > 0.0:
+                    aggregate_sq_pct_error += (float(metrics["target_error"]) / float(target)) ** 2
+                scored_technologies += 1
+        row.update(_prefix_metrics(metrics, technology))
+    row.update(_read_system_cost_metrics(system_path))
+    if scored_technologies:
+        row["aggregate_target_abs_error"] = aggregate_abs_error
+        row["aggregate_target_rmse_pct"] = math.sqrt(aggregate_sq_pct_error / scored_technologies)
+        row["scored_technology_count"] = scored_technologies
+    return row
+
+
 def evaluate_tasks(
     tasks: list[dict],
-    technology: str,
+    technology: str | list[str],
     planning_year: int,
     target_block_addition: float | None = None,
+    target_block_additions: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    rows = [
-        evaluate_task(
-            task,
-            technology=technology,
-            planning_year=planning_year,
-            target_block_addition=target_block_addition,
-        )
-        for task in tasks
-    ]
+    if isinstance(technology, str):
+        technologies = [technology]
+    else:
+        technologies = list(technology)
+    target_block_additions = target_block_additions or {}
+    if len(technologies) == 1 and not target_block_additions:
+        rows = [
+            evaluate_task(
+                task,
+                technology=technologies[0],
+                planning_year=planning_year,
+                target_block_addition=target_block_addition,
+            )
+            for task in tasks
+        ]
+    else:
+        if target_block_addition is not None and len(technologies) == 1:
+            target_block_additions = {technologies[0]: float(target_block_addition)}
+        rows = [
+            evaluate_task_multi(
+                task,
+                technologies=technologies,
+                planning_year=planning_year,
+                target_block_additions=target_block_additions,
+            )
+            for task in tasks
+        ]
     frame = pd.DataFrame(rows)
     if frame.empty:
         return frame
     sort_cols = ["complete"]
     ascending = [False]
-    if target_block_addition is not None and "target_abs_error" in frame.columns:
+    if "aggregate_target_rmse_pct" in frame.columns:
+        sort_cols.append("aggregate_target_rmse_pct")
+        ascending.append(True)
+    elif "aggregate_target_abs_error" in frame.columns:
+        sort_cols.append("aggregate_target_abs_error")
+        ascending.append(True)
+    elif target_block_addition is not None and "target_abs_error" in frame.columns:
         sort_cols.append("target_abs_error")
         ascending.append(True)
     sort_cols.extend(["phi2_pct_capex", "phi3_pct_capex"])
@@ -271,6 +390,8 @@ def write_outputs(frame: pd.DataFrame, output_dir: Path, prefix: str) -> dict[st
             "realized_block_addition_constrained_basis",
             "realized_wedge_cost_eur",
             "target_abs_error",
+            "aggregate_target_abs_error",
+            "aggregate_target_rmse_pct",
             "total_system_cost_eur",
         ]:
             if metric not in frame.columns:
@@ -287,19 +408,22 @@ def write_outputs(frame: pd.DataFrame, output_dir: Path, prefix: str) -> dict[st
     return outputs
 
 
-def print_report(frame: pd.DataFrame, outputs: dict[str, Path], target_block_addition: float | None) -> None:
+def print_report(frame: pd.DataFrame, outputs: dict[str, Path], has_targets: bool) -> None:
     print("PHI_CALIBRATION_EVALUATION", outputs["summary"])
     print("RUNS_TOTAL", len(frame))
     if frame.empty:
         return
     print("RUNS_COMPLETE", int(frame["complete"].sum()) if "complete" in frame.columns else 0)
-    if target_block_addition is not None and "target_abs_error" in frame.columns:
-        ranked = frame.loc[frame["target_abs_error"].notna()].head(5)
-        print("BEST_BY_TARGET_ABS_ERROR")
+    if has_targets and ("aggregate_target_rmse_pct" in frame.columns or "target_abs_error" in frame.columns):
+        score_col = "aggregate_target_rmse_pct" if "aggregate_target_rmse_pct" in frame.columns else "target_abs_error"
+        ranked = frame.loc[frame[score_col].notna()].head(5)
+        print("BEST_BY_TARGET_ERROR")
         cols = [
             "name",
             "phi2_pct_capex",
             "phi3_pct_capex",
+            "aggregate_target_abs_error",
+            "aggregate_target_rmse_pct",
             "realized_block_addition_constrained_basis",
             "target_block_addition",
             "target_abs_error",
@@ -328,9 +452,17 @@ def main() -> int:
     parser.add_argument("--results-root", default=str(DEFAULT_RESULTS_ROOT))
     parser.add_argument("--output-dir", help="Directory for evaluation CSVs")
     parser.add_argument("--output-prefix", default="phi_calibration")
-    parser.add_argument("--technology", default=DEFAULT_TECHNOLOGY)
+    parser.add_argument(
+        "--technology",
+        action="append",
+        help="Technology to evaluate; comma-separated or repeatable. Default: solar_power,onwind_power",
+    )
     parser.add_argument("--planning-year", type=int, default=2025)
     parser.add_argument("--target-block-addition", type=float)
+    parser.add_argument(
+        "--target-block-additions-csv",
+        help="CSV with technology,target_block_addition columns for multi-technology scoring",
+    )
     parser.add_argument("--default-grid", action="store_true", help="Evaluate the default task grid if no manifest is supplied")
     parser.add_argument("--model", default="shared_state_bayesian_regime_wright")
     parser.add_argument("--seed", type=int, default=0)
@@ -357,11 +489,21 @@ def main() -> int:
             "--latest-submission, --default-grid, or run after result directories exist."
         )
 
+    technologies = parse_technologies(args.technology)
+    target_block_additions = load_target_block_additions(
+        Path(args.target_block_additions_csv).resolve()
+        if args.target_block_additions_csv
+        else None
+    )
+    if args.target_block_addition is not None and len(technologies) != 1:
+        raise ValueError("--target-block-addition is only valid with exactly one --technology")
+
     frame = evaluate_tasks(
         tasks,
-        technology=args.technology,
+        technology=technologies,
         planning_year=args.planning_year,
         target_block_addition=args.target_block_addition,
+        target_block_additions=target_block_additions,
     )
     output_dir = Path(args.output_dir).resolve() if args.output_dir else results_root / "evaluation"
     outputs = write_outputs(frame, output_dir, args.output_prefix)
@@ -369,14 +511,15 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "manifest": str(manifest) if manifest else None,
         "results_root": str(results_root),
-        "technology": args.technology,
+        "technologies": technologies,
         "planning_year": args.planning_year,
         "target_block_addition": args.target_block_addition,
+        "target_block_additions": target_block_additions,
         "outputs": {key: str(path) for key, path in outputs.items()},
     }
     metadata_path = output_dir / f"{args.output_prefix}_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-    print_report(frame, outputs, args.target_block_addition)
+    print_report(frame, outputs, bool(target_block_additions) or args.target_block_addition is not None)
     print("PHI_CALIBRATION_EVALUATION_METADATA", metadata_path)
     return 0
 
