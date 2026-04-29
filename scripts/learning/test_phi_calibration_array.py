@@ -1,6 +1,8 @@
 import sys
 import tempfile
 import unittest
+import argparse
+import json
 from pathlib import Path
 
 
@@ -51,6 +53,49 @@ class PhiCalibrationGridTests(unittest.TestCase):
         self.assertNotIn("mtime", cmd)
         self.assertNotIn("solve_network_myopic_learning_bootstrap", cmd)
         self.assertNotIn("export_postsolve_learning_costs_learning_bootstrap", cmd)
+
+    def test_phi_overlay_disables_2025_historical_constraints(self):
+        task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            overlay = phi_array._write_overlay(task, Path(tmpdir))
+            text = overlay.read_text(encoding="utf-8")
+
+        self.assertIn("year2025_generation_constraint: false", text)
+        self.assertIn("year2025_capacity_constraint: false", text)
+
+    def test_submission_metadata_records_disabled_2025_historical_constraints(self):
+        task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            args = argparse.Namespace(
+                results_root=str(root / "results"),
+                job_root=str(root / "jobs"),
+                bootstrap_state_source=str(root / "bootstrap"),
+                conda_env="/tmp/env",
+                grid_mem="1G",
+                grid_ncpus="1",
+                grid_submit="batch",
+                phi2_min=0.0,
+                phi2_max=0.0,
+                phi2_count=1,
+                phi3_min=0.1,
+                phi3_max=0.1,
+                phi3_count=1,
+                model=task["model"],
+                seed=task["seed"],
+            )
+            submit_dir = root / "submit"
+            submit_dir.mkdir()
+            metadata_path = phi_array.write_submission_metadata(
+                submit_dir,
+                args,
+                submit_dir / "task_manifest.json",
+                [task],
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(metadata["fixed_parameters"]["year2025_generation_constraint"])
+        self.assertFalse(metadata["fixed_parameters"]["year2025_capacity_constraint"])
 
     def test_restore_supports_nested_phi_target_without_copying_old_phi_runs(self):
         with tempfile.TemporaryDirectory(dir=str(ROOT_DIR / "results")) as tmpdir:

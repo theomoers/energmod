@@ -158,6 +158,8 @@ def write_submission_metadata(
             "planning_horizons": [2020, 2025],
             "model": args.model,
             "seed": args.seed,
+            "year2025_generation_constraint": False,
+            "year2025_capacity_constraint": False,
         },
         "tasks": tasks,
     }
@@ -328,6 +330,12 @@ def _write_overlay(task: dict, output_dir: Path) -> Path:
                     "permstore:",
                     "  path: permstorage",
                     "",
+                    "global_specific:",
+                    "  year2025_generation:",
+                    "    year2025_generation_constraint: false",
+                    "  year2025_capacity:",
+                    "    year2025_capacity_constraint: false",
+                    "",
                     "learning:",
                     "  enabled: true",
                     "  execution_mode: \"bootstrap\"",
@@ -382,7 +390,6 @@ def phi_calibration_output_paths(task: dict) -> list[str]:
     sector = Path("results") / str(task["sector_name"])
     return [
         str(sector / "postnetworks" / f"{token_ec}.nc"),
-        str(sector / "postnetworks" / "lpfiles" / f"{token_ec}.lp"),
         str(sector / "learning" / f"cost_log_solved_{token}.csv"),
         str(sector / "learning" / f"state_committed_{token}.json"),
         str(sector / "learning" / f"system_costs_{token}.csv"),
