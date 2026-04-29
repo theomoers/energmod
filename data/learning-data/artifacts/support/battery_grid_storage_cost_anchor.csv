@@ -1,0 +1,2 @@
+year,cost_usd2025_per_kwh,cost_eur2020_per_kwh,source,note
+2025,125.0,88.07002359846918,confirmed_grid_storage_historical_cost,"Installed grid-storage battery energy cost anchor; converted from USD2025 to EUR2020 using the paper plotting conversion factor."

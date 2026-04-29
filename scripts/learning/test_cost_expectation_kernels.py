@@ -52,6 +52,36 @@ def test_get_known_annual_cost_prefers_runtime_state_and_history(monkeypatch):
     assert alc.get_known_annual_cost_for_year("solar_power", 2024, state, {}) == pytest.approx(2024.0)
 
 
+def test_battery_bos_multiplier_uses_confirmed_grid_storage_anchor(tmp_path, monkeypatch):
+    anchor = tmp_path / "battery_grid_storage_cost_anchor.csv"
+    anchor.write_text(
+        "year,cost_usd2025_per_kwh,cost_eur2020_per_kwh,source\n"
+        "2025,125.0,88.07002359846918,test_anchor\n",
+        encoding="utf-8",
+    )
+    learning_cfg = {
+        "_manifest_root": tmp_path,
+        "_manifest": {
+            "battery_treatment": {
+                "grid_storage_cost_anchor": {
+                    "series_csv": "battery_grid_storage_cost_anchor.csv",
+                },
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        alc,
+        "load_cost_from_historical_csv",
+        lambda tech, year, cfg: 76.2053294936,
+    )
+
+    multiplier = alc.get_battery_energy_bos_multiplier(learning_cfg, "costs_2030.csv")
+
+    assert multiplier == pytest.approx(88.07002359846918 / 76.2053294936)
+    assert learning_cfg["_battery_energy_bos_cache"]["confirmed_grid_storage_anchor"] == pytest.approx(multiplier)
+
+
 def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeypatch):
     learning_cfg = {
         "seed": 0,

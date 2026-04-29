@@ -47,12 +47,16 @@ from learning.fuel_price_io import (
 )
 from learning.learning_data_io import load_historical_capacity, load_historical_cost
 
-# Battery energy-side BOS multiplier reference year.
-# We derive the multiplier from data as:
-# (battery storage investment cost in costs_2020.csv) /
-# (historical Li-ion pack cost in 2020 EUR/kWh),
-# then apply that multiplier to learning-based battery_energy costs.
-BATTERY_ENERGY_BOS_REFERENCE_YEAR = 2020
+# Battery energy-side BOS multiplier reference.
+# The stochastic battery process is estimated on global Li-ion pack costs, but
+# PyPSA's "battery storage" Store needs installed grid-storage energy cost. Anchor
+# that conversion to the confirmed 2025 grid-storage cost observation so future
+# applied model costs evolve from the historical grid-storage basis, not the older
+# PyPSA technology-data row.
+BATTERY_GRID_STORAGE_COST_ANCHOR_YEAR = 2025
+BATTERY_GRID_STORAGE_COST_ANCHOR_USD2025_PER_KWH = 125.0
+BATTERY_GRID_STORAGE_COST_ANCHOR_EUR2020_PER_KWH = 88.07002359846918
+BATTERY_ENERGY_BOS_REFERENCE_YEAR = BATTERY_GRID_STORAGE_COST_ANCHOR_YEAR
 BATTERY_ENERGY_RAW_COST_BASIS = "liion_pack"
 BATTERY_ENERGY_NETWORK_COST_BASIS = "grid_storage_energy"
 DEFAULT_NETWORK_COST_BASIS = "network_cost"
@@ -216,6 +220,61 @@ def load_battery_storage_investment_cost(costs_file):
     )
 
 
+def get_battery_grid_storage_cost_anchor(learning_cfg):
+    """
+    Return the confirmed installed grid-storage battery cost anchor.
+
+    Values are in the same real-cost basis used by the bundled historical
+    learning data: 2020 EUR/kWh. The manifest may point to a one-row CSV to make
+    the empirical anchor auditable; otherwise the built-in confirmed value is
+    used.
+    """
+    fallback = {
+        "year": BATTERY_GRID_STORAGE_COST_ANCHOR_YEAR,
+        "cost_eur2020_per_kwh": BATTERY_GRID_STORAGE_COST_ANCHOR_EUR2020_PER_KWH,
+        "cost_usd2025_per_kwh": BATTERY_GRID_STORAGE_COST_ANCHOR_USD2025_PER_KWH,
+        "source": "confirmed_grid_storage_historical_cost",
+    }
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    anchor_cfg = (manifest.get("battery_treatment", {}) or {}).get(
+        "grid_storage_cost_anchor",
+        {},
+    ) or {}
+    series_csv = anchor_cfg.get("series_csv")
+    if not series_csv:
+        return fallback
+
+    path = (root / series_csv).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Battery grid-storage cost anchor file not found: {path}")
+
+    df = pd.read_csv(path)
+    required = {"year", "cost_eur2020_per_kwh"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Battery grid-storage cost anchor file {path} is missing columns: {sorted(missing)}"
+        )
+    if df.empty:
+        raise ValueError(f"Battery grid-storage cost anchor file is empty: {path}")
+
+    row = df.sort_values("year").iloc[-1]
+    cost_eur2020 = float(row["cost_eur2020_per_kwh"])
+    if not np.isfinite(cost_eur2020) or cost_eur2020 <= 0.0:
+        raise ValueError(
+            f"Invalid battery grid-storage anchor cost {cost_eur2020!r} in {path}"
+        )
+    return {
+        "year": int(row["year"]),
+        "cost_eur2020_per_kwh": cost_eur2020,
+        "cost_usd2025_per_kwh": float(row["cost_usd2025_per_kwh"])
+        if "cost_usd2025_per_kwh" in row.index and pd.notna(row["cost_usd2025_per_kwh"])
+        else np.nan,
+        "source": str(row["source"]) if "source" in row.index and pd.notna(row["source"]) else str(path),
+    }
+
+
 def get_battery_energy_bos_multiplier(learning_cfg, costs_file):
     """
     Return data-derived energy-side multiplier applied to battery_energy costs.
@@ -225,19 +284,17 @@ def get_battery_energy_bos_multiplier(learning_cfg, costs_file):
     separately on links.
     """
     cache = learning_cfg.setdefault("_battery_energy_bos_cache", {})
-    cache_key = f"{Path(costs_file).resolve()}::{BATTERY_ENERGY_BOS_REFERENCE_YEAR}"
+    cache_key = "confirmed_grid_storage_anchor"
     if cache_key in cache:
         return float(cache[cache_key])
 
-    reference_costs_file = _resolve_reference_costs_file(
-        costs_file,
-        BATTERY_ENERGY_BOS_REFERENCE_YEAR,
-    )
-    energy_side_system_cost = load_battery_storage_investment_cost(reference_costs_file)
+    anchor = get_battery_grid_storage_cost_anchor(learning_cfg)
+    reference_year = int(anchor["year"])
+    energy_side_system_cost = float(anchor["cost_eur2020_per_kwh"])
     liion_pack_cost = float(
         load_cost_from_historical_csv(
             "battery_energy",
-            BATTERY_ENERGY_BOS_REFERENCE_YEAR,
+            reference_year,
             learning_cfg,
         )
     )
@@ -247,13 +304,13 @@ def get_battery_energy_bos_multiplier(learning_cfg, costs_file):
             f"Invalid derived battery energy-side multiplier={value!r}; must be finite and > 0."
         )
     logger.info(
-        "Derived battery energy-side multiplier %.4f from %s: "
-        "battery storage investment %.3f EUR/kWh / Li-ion pack %.3f EUR/kWh (year %s)",
+        "Derived battery energy-side multiplier %.4f from confirmed %s grid-storage anchor: "
+        "%.3f EUR2020/kWh / Li-ion pack %.3f EUR2020/kWh (year %s)",
         value,
-        reference_costs_file,
+        anchor.get("source", "battery_grid_storage_cost_anchor"),
         energy_side_system_cost,
         liion_pack_cost,
-        BATTERY_ENERGY_BOS_REFERENCE_YEAR,
+        reference_year,
     )
     cache[cache_key] = float(value)
     return value
@@ -3617,7 +3674,17 @@ def calculate_learning_costs(
                 ) from e
             if tech == 'battery_energy':
                 c_overnight_cell = c_overnight
-                c_overnight = c_overnight_cell * battery_energy_bos_multiplier
+                battery_anchor = get_battery_grid_storage_cost_anchor(learning_cfg)
+                if int(current_year) == int(battery_anchor["year"]):
+                    c_overnight = float(battery_anchor["cost_eur2020_per_kwh"])
+                    logger.info(
+                        "    Battery grid-storage bootstrap uses confirmed %s anchor: %.3f EUR/%s",
+                        int(battery_anchor["year"]),
+                        c_overnight,
+                        unit,
+                    )
+                else:
+                    c_overnight = c_overnight_cell * battery_energy_bos_multiplier
                 logger.info(
                     "    Battery historical Li-ion cost: %.3f EUR/%s, energy-side cost (×%.4f): %.3f EUR/%s",
                     c_overnight_cell,

@@ -1,6 +1,9 @@
 {
   "battery_treatment": {
     "battery_power": "deterministic_only",
+    "grid_storage_cost_anchor": {
+      "series_csv": "artifacts/support/battery_grid_storage_cost_anchor.csv"
+    },
     "global_liion_mapping": {
       "block_aggregation": "arithmetic_mean",
       "fallback_mode": "recent_window_geometric_mean",
