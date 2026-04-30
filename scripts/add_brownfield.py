@@ -61,6 +61,64 @@ def _validate_imported_capacity_transfer(n, c, attr):
             )
 
 
+def _reroute_legacy_biomass_power_links(n):
+    """Connect imported biomass-electric links to the structural power biomass store."""
+    cfg = snakemake.config.get("global_specific", {}).get("post2020_structural_biomass", {}) or {}
+    if not cfg.get("enable", False):
+        return
+
+    if "solid biomass power" not in set(n.buses.carrier):
+        return
+
+    biomass_power_carriers = {
+        "biomass",
+        "biomass EOP",
+        "urban central solid biomass CHP",
+        "urban central solid biomass CHP CC",
+    }
+    link_mask = n.links.carrier.isin(biomass_power_carriers)
+    if not link_mask.any():
+        return
+
+    ac_output = pd.Series(False, index=n.links.index)
+    for port in range(1, 5):
+        bus_col = f"bus{port}"
+        if bus_col in n.links.columns:
+            ac_output |= n.links[bus_col].map(n.buses.carrier).fillna("").eq("AC")
+
+    bus0 = n.links.loc[link_mask & ac_output, "bus0"].astype(str)
+    old_biomass_bus = bus0.map(n.buses.carrier).fillna("").eq("solid biomass")
+    candidate_links = bus0.index[old_biomass_bus]
+    if candidate_links.empty:
+        return
+
+    def power_bus_name(name):
+        if name.endswith(" solid biomass"):
+            return name[: -len(" solid biomass")] + " solid biomass power"
+        return name + " power"
+
+    target_bus = bus0.loc[candidate_links].map(power_bus_name)
+    existing_target = target_bus.isin(n.buses.index)
+    if not existing_target.all():
+        missing = target_bus.loc[~existing_target].unique()[:10].tolist()
+        logger.warning(
+            "Could not reroute %d biomass power links to structural biomass power stores; "
+            "missing target buses sample: %s",
+            int((~existing_target).sum()),
+            missing,
+        )
+
+    reroute_links = target_bus.index[existing_target]
+    if reroute_links.empty:
+        return
+
+    n.links.loc[reroute_links, "bus0"] = target_bus.loc[reroute_links].values
+    logger.info(
+        "Rerouted %d biomass electricity links from solid biomass to solid biomass power.",
+        len(reroute_links),
+    )
+
+
 def add_brownfield(n, n_p, year):
     logger.info(f"Preparing brownfield for the year {year}")
 
@@ -207,6 +265,8 @@ def add_brownfield(n, n_p, year):
             )
             n.links.loc[new_pipes, "p_nom"] = 0.0
             n.links.loc[new_pipes, "p_nom_min"] = 0.0
+
+    _reroute_legacy_biomass_power_links(n)
 
 
 def disable_grid_expansion_if_limit_hit(n):

@@ -164,7 +164,13 @@ def ln_cp():
   else
     IFS= read -r src && IFS= read -r dst
   fi
-  ( ln -sf "$src" "$dst" 2>/dev/null ) || cp -a "$src" "$dst"
+  mkdir -p "$(dirname "$dst")"
+  if abs_src="$(readlink -f "$src" 2>/dev/null)"; then
+    ( ln -sf "$abs_src" "$dst" 2>/dev/null ) || {{ rm -f "$dst"; cp -a "$src" "$dst"; }}
+  else
+    rm -f "$dst"
+    cp -a "$src" "$dst"
+  fi
 }}; __lncp'''
 
 load_data_paths = get_load_paths_gegis("data", config)

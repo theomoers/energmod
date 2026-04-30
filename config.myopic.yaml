@@ -1,5 +1,5 @@
 run:
-  name: "Earth_200" # use this to keep track of runs with different settings
+  name: "Earth_200_v2" # use this to keep track of runs with different settings
   sector_name: "Global_200" # use this to keep track of sector scenario runs
   shared_cutouts: true # set to true to share the default cutout(s) across runs
   allow_scenario_failure: true # If True, the workflow will continue even if a scenario in run_scenario fails
@@ -105,7 +105,7 @@ global_specific:
   
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_generation:
-    baseyear_generation_constraint: true # 2020 country-level electricity generation constrained to OWID historical values
+    baseyear_generation_constraint: false # 2020 country-level electricity generation constrained to OWID historical values
     year: 2020
     owid_csv: validation/data/owid-energy-data.csv
     electricity_demand_baseline_network: results/Global_200/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
@@ -131,7 +131,7 @@ global_specific:
       - electricity_generation
 
   year2025_generation: 
-    year2025_generation_constraint: true
+    year2025_generation_constraint: false
     year: 2025 # numbers below are 2024 but we have 10% tolerance
     tolerance: 0.1
     units: TWh
@@ -142,26 +142,26 @@ global_specific:
       onshore_wind: 2350.0
       #offshore_wind: 250.0
       #hydro: 4418.0
-      #nuclear: 2760.0
+      nuclear: 2760.0
       coal_lignite_power: 10587.0
       gas_power: 6795.0
       oil_power: 857.0
-      #biomass: 712.0
+      biomass: 712.0
       #geothermal: 88.0
     carriers_map:
       solar: ["solar"]
       onshore_wind: ["onwind"]
       #offshore_wind: ["offwind-ac","offwind-dc"]
       #hydro: ["ror", "hydro"]
-      #nuclear: ["nuclear"]
+      nuclear: ["nuclear"]
       coal_lignite_power: ["coal", "lignite"]
       gas_power: ["CCGT","OCGT"]
-      #oil_power: ["oil"]
-      #biomass: 
-      #  - "urban central solid biomass CHP CC"
-      #  - "urban central solid biomass CHP"
-      #  - "biomass"
-      #  - "biomass EOP"
+      oil_power: ["oil"]
+      biomass: 
+        - "urban central solid biomass CHP CC"
+        - "urban central solid biomass CHP"
+        - "biomass"
+        - "biomass EOP"
       #geothermal: ["geothermal"]
 
   year2025_capacity:
@@ -206,24 +206,24 @@ permstore:
   path: /shared/share_cki25/energymodels/pypsa-earth/permstorage
   scenario: "Global_200"
   use:
-    shapes: true
-    base_network: true
-    bus_regions: true # should be false if base_network is false !
-    demand_profiles: true # elec only
-    powerplants: true 
-    pop_layouts: true
-    pop_layouts_clustered: true
-    temperatures: true
-    heat_demand: true
-    transport_data: true
-    gas_network: true
+    shapes: false
+    base_network: false
+    bus_regions: false # should be false if base_network is false !
+    demand_profiles: false # elec only
+    powerplants: false 
+    pop_layouts: false
+    pop_layouts_clustered: false
+    temperatures: false
+    heat_demand: false
+    transport_data: false
+    gas_network: false
     industry_distribution: false # adjusted for gadm clustering
     elec_prepared: false
-    renewable_profiles: true
-    solar_thermal_profile: true
+    renewable_profiles: false
+    solar_thermal_profile: false
     costs: true
     raw_osm: true
-    clean_osm: true
+    clean_osm: false
     base_energy_totals: true # use permstorage for energy_totals_base instead of downloading from UN database 
 
 electricity:

@@ -343,6 +343,7 @@ def eez(
     geo_crs,
     country_shapes,
     EEZ_gpkg,
+    *,
     out_logging=False,
     distance=0.01,
     minarea=0.01,
@@ -357,6 +358,18 @@ def eez(
 
     if out_logging:
         logger.info("Stage 2 of 5: Create offshore shapes")
+
+    if not isinstance(out_logging, bool):
+        raise TypeError(f"eez(out_logging=...) must be bool, got {type(out_logging).__name__}")
+    if not isinstance(simplify_gadm, bool):
+        raise TypeError(f"eez(simplify_gadm=...) must be bool, got {type(simplify_gadm).__name__}")
+    for name, value in {
+        "distance": distance,
+        "minarea": minarea,
+        "tolerance": tolerance,
+    }.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"eez({name}=...) must be numeric, got {type(value).__name__}")
 
     # load data
     df_eez = load_EEZ(countries, geo_crs, EEZ_gpkg)
@@ -1399,7 +1412,12 @@ if __name__ == "__main__":
     country_shapes.to_file(snakemake.output.country_shapes)
 
     offshore_shapes = eez(
-        countries_list, geo_crs, country_shapes, EEZ_gpkg, out_logging, simplify_gadm=simplify_gadm,
+        countries_list,
+        geo_crs,
+        country_shapes,
+        EEZ_gpkg,
+        out_logging=out_logging,
+        simplify_gadm=simplify_gadm,
     )
 
     offshore_shapes.reset_index().to_file(snakemake.output.offshore_shapes)

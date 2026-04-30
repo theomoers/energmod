@@ -52,6 +52,7 @@ if hasattr(_validation_hooks, "align_country_electricity_demand_to_owid"):
     )
     apply_renewable_profile_fallbacks = _validation_hooks.apply_renewable_profile_fallbacks
     align_country_hydro_reservoir_inflow_to_owid = _validation_hooks.align_country_hydro_reservoir_inflow_to_owid
+    adjust_hydro = _validation_hooks.adjust_hydro
     align_country_onwind_profiles_to_owid = _validation_hooks.align_country_onwind_profiles_to_owid
     apply_country_wind_iteration_scaling = _validation_hooks.apply_country_wind_iteration_scaling
     apply_country_solar_iteration_scaling = _validation_hooks.apply_country_solar_iteration_scaling
@@ -317,16 +318,24 @@ def ensure_biomass_resource_bus(n):
     if "solid biomass" not in n.carriers.index:
         n.add("Carrier", "solid biomass")
 
-    biomass_buses = pd.Index(spatial.biomass.nodes)
+    if biomass_allocation is not None:
+        carrier_name = "solid biomass power"
+        if carrier_name not in n.carriers.index:
+            n.add("Carrier", carrier_name)
+        biomass_buses = pd.Index(spatial.biomass.power)
+    else:
+        carrier_name = "solid biomass"
+        biomass_buses = pd.Index(spatial.biomass.nodes)
+
     biomass_buses_new = biomass_buses.difference(n.buses.index)
     if len(biomass_buses_new):
         n.madd(
             "Bus",
             biomass_buses_new,
             location=biomass_buses_new.to_series().map(
-                dict(zip(spatial.biomass.nodes, spatial.biomass.locations))
+                dict(zip(biomass_buses, spatial.biomass.locations))
             ),
-            carrier="solid biomass",
+            carrier=carrier_name,
         )
 
 
@@ -549,7 +558,7 @@ def add_generation(
             if generator not in n.carriers.index:
                 n.add("Carrier", generator, co2_emissions=0.0)
             carrier_nodes = broadcast_madd_value(
-                spatial.biomass.nodes,
+                spatial.biomass.power if biomass_allocation is not None else spatial.biomass.nodes,
                 spatial.nodes,
                 "biomass generation bus0",
             )
@@ -4296,8 +4305,6 @@ if __name__ == "__main__":
     # Patch missing/all-zero wind/solar/offshore profiles in every planning year
     # without reapplying baseyear country-level CF scaling.
     apply_renewable_profile_fallbacks(n, investment_year, snakemake.config)
-    # Scale hydro reservoir inflow (StorageUnit carrier='hydro') by country
-    # against OWID hydro electricity in baseyear.
     align_country_hydro_reservoir_inflow_to_owid(n, investment_year, snakemake.config)
     # Optional per-country iterative hydro overrides (reservoir+ror jointly).
     apply_country_hydro_iteration_scaling(n, investment_year, snakemake.config)
@@ -4335,10 +4342,11 @@ if __name__ == "__main__":
     if snakemake.params.water_costs:
         add_custom_water_cost(n)
 
+    adjust_hydro(n, investment_year, snakemake.config)
     
     # Match geothermal capacity to CSV data by country
     geothermal_csv = snakemake.input.geothermal_capacity
-   
+
     regions_shapefile = snakemake.input.shapes_path
     
     match_geothermal_capacity_from_csv(

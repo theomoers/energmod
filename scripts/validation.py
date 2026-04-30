@@ -1885,6 +1885,23 @@ def align_country_hydro_reservoir_inflow_to_owid(n, investment_year, config):
     )
 
 
+def adjust_hydro(n, investment_year, config):
+    scale = 4347.02 / 3614.71
+    hydro = n.storage_units.index[n.storage_units.carrier.astype(str).eq("hydro")] if not n.storage_units.empty else pd.Index([])
+    inflow_cols = n.storage_units_t.inflow.columns.intersection(hydro) if not n.storage_units_t.inflow.empty else pd.Index([])
+    if len(inflow_cols):
+        n.storage_units_t.inflow.loc[:, inflow_cols] = n.storage_units_t.inflow.loc[:, inflow_cols].fillna(0.0) * scale
+    ror = n.generators.index[n.generators.carrier.astype(str).eq("ror")] if not n.generators.empty else pd.Index([])
+    if len(ror):
+        ts_cols = n.generators_t.p_max_pu.columns.intersection(ror) if not n.generators_t.p_max_pu.empty else pd.Index([])
+        static_cols = ror.difference(ts_cols)
+        if len(ts_cols):
+            n.generators_t.p_max_pu.loc[:, ts_cols] = n.generators_t.p_max_pu.loc[:, ts_cols].fillna(0.0) * scale
+        if len(static_cols):
+            n.generators.loc[static_cols, "p_max_pu"] = pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce").fillna(0.0) * scale
+    logger.info("Adjusted hydro for %s with global scale %.6f (reservoir_assets=%d, ror_assets=%d).", investment_year, scale, len(inflow_cols), len(ror))
+
+
 def align_country_onwind_profiles_to_owid(n, investment_year, config):
     """
     Scale onshore-wind availability profiles by country in baseyear using
