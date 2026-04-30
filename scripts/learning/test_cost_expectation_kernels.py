@@ -207,6 +207,39 @@ def test_stochastic_point_cost_converts_battery_basis_without_mutating_raw_log(m
     )
 
 
+def test_battery_power_cannot_be_mapped_to_discharger(monkeypatch, tmp_path):
+    class FakeNetwork:
+        def __init__(self, path):
+            self.links = pd.DataFrame(
+                {
+                    "carrier": ["battery charger", "battery discharger"],
+                    "capital_cost": [10.0, 0.0],
+                }
+            )
+            self.generators = pd.DataFrame()
+            self.storage_units = pd.DataFrame()
+            self.stores = pd.DataFrame()
+            self.meta = {}
+
+    monkeypatch.setattr(alc.pypsa, "Network", FakeNetwork)
+
+    with pytest.raises(ValueError, match="battery_power costs must not be mapped"):
+        alc.update_network_costs(
+            network_path="input.nc",
+            learning_costs={
+                "battery_power": {
+                    "unit": "kW",
+                    "capital_cost": 99.0,
+                    "c_overnight": 100.0,
+                }
+            },
+            tech_mapping={"battery discharger": "battery_power"},
+            output_path=tmp_path / "output.nc",
+            learning_cfg={},
+            costs_file="costs_2030.csv",
+        )
+
+
 def test_legacy_global_current_window_behavior_is_preserved(monkeypatch):
     learning_cfg = {
         "seed": 0,

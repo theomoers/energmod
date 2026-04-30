@@ -1700,7 +1700,7 @@ def load_fom_from_costs(costs_file, tech_key):
             # This applies to technologies like "battery storage" which have no FOM in cost files
             if cost_tech_name == "battery storage":
                 logger.debug(f"  No FOM data found for {cost_tech_name}, using default FOM=0. "
-                             f"TODO: ADD BATTERY INVERTER LEARNING!")
+                             f"battery inverter costs remain deterministic on the charger link.")
                 return 0.0
             else:
                 raise ValueError(
@@ -4240,6 +4240,11 @@ def update_network_costs(
             carrier_to_tech.setdefault("battery charger", "battery_power")
             logger.info(
                 "Applying battery_power learning costs to link carrier: ['battery charger']"
+            )
+        if carrier_to_tech.get("battery discharger") == "battery_power":
+            raise ValueError(
+                "battery_power costs must not be mapped to 'battery discharger'; "
+                "PyPSA battery inverter/power costs are represented on the charger link only."
             )
     
     # Map learning tech names to carrier names for regional WACC lookup
