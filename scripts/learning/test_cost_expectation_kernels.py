@@ -38,6 +38,29 @@ def test_build_lagged_kernel_years_and_split():
     assert expected == [2026, 2027]
 
 
+def test_historical_bootstrap_kernel_uses_lagged_years_and_weights(monkeypatch):
+    loaded = []
+
+    def fake_load_cost(tech, year, learning_cfg):
+        loaded.append((tech, int(year)))
+        return float(year)
+
+    monkeypatch.setattr(alc, "load_cost_from_historical_csv", fake_load_cost)
+
+    years = alc.build_lagged_kernel_years(2025, lag_year=2, kernel_length=5)
+    value, costs = alc.load_historical_kernel_cost(
+        "solar_power",
+        years,
+        [1, 1, 1, 1, 1],
+        {},
+    )
+
+    assert years == [2019, 2020, 2021, 2022, 2023]
+    assert loaded == [("solar_power", year) for year in years]
+    assert costs == pytest.approx([2019.0, 2020.0, 2021.0, 2022.0, 2023.0])
+    assert value == pytest.approx(2021.0)
+
+
 def test_get_known_annual_cost_prefers_runtime_state_and_history(monkeypatch):
     state = _make_state(
         2030,

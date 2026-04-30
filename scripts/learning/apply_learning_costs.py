@@ -130,13 +130,8 @@ COST_HISTORICAL_CAPACITY_YEARS = {
     2025: 2020,
 }
 
-# Bootstrap cost windows (inclusive) for deterministic historical pricing.
-# 2020 solve uses average historical cost over 2015-2019.
-# 2025 solve uses average historical cost over 2020-2024.
-COST_HISTORICAL_COST_WINDOWS = {
-    2020: (2015, 2019),
-    2025: (2020, 2024),
-}
+# Bootstrap pricing uses the same five-year procurement kernel as later
+# horizons, but all kernel-year costs are read from historical cost data.
 
 
 def get_global_scale_factors(learning_cfg):
@@ -2145,6 +2140,42 @@ def load_average_cost_from_historical_csv(tech, start_year, end_year, learning_c
     return average_cost
 
 
+def load_historical_kernel_cost(tech, kernel_years, weights, learning_cfg):
+    """
+    Load a weighted historical procurement-kernel cost.
+
+    Returns:
+        Tuple of (weighted overnight cost, annual historical costs).
+    """
+    kernel_years = [int(year) for year in kernel_years]
+    weights = np.asarray(weights, dtype=float)
+    if len(kernel_years) != len(weights):
+        raise ValueError(
+            f"Historical kernel length mismatch for {tech}: "
+            f"{len(kernel_years)} years but {len(weights)} weights."
+        )
+    if np.any(~np.isfinite(weights)):
+        raise ValueError(f"Historical kernel weights for {tech} must be finite.")
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
+        raise ValueError(f"Historical kernel weights for {tech} must sum to > 0.")
+    normalized_weights = weights / weight_sum
+    costs = [
+        float(load_cost_from_historical_csv(tech, year, learning_cfg))
+        for year in kernel_years
+    ]
+    value = float(np.dot(np.asarray(costs, dtype=float), normalized_weights))
+    unit = "EUR/kWh" if tech in ENERGY_TECHS else "EUR/kW"
+    logger.info(
+        "    Historical procurement kernel cost for %s: years=%s, value=%.3f %s",
+        tech,
+        kernel_years,
+        value,
+        unit,
+    )
+    return value, costs
+
+
 def _normalize_annual_cost_history(state):
     raw_history = (state.get("annual_cost_history", {}) or {})
     normalized = {}
@@ -3585,6 +3616,8 @@ def calculate_learning_costs(
     
     learning_costs = {}
     battery_energy_bos_multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
+    bootstrap_kernel_weights = get_cost_expectation_weights(learning_cfg)
+    bootstrap_lag_years_by_tech = get_cost_expectation_lag_years_by_tech(learning_cfg)
     
     for tech in params.index:
         logger.info(f"  Processing {tech}...")
@@ -3653,49 +3686,49 @@ def calculate_learning_costs(
             logger.error(f"    Numerical validation failed: {e}")
             raise
         
+        kernel_diag = {}
         if current_year in COST_HISTORICAL_CAPACITY_YEARS:
-            historical_year = COST_HISTORICAL_CAPACITY_YEARS[current_year]
-            cost_window = COST_HISTORICAL_COST_WINDOWS.get(
+            kernel_years = build_lagged_kernel_years(
                 current_year,
-                (historical_year, historical_year),
+                bootstrap_lag_years_by_tech[tech],
+                kernel_length=len(bootstrap_kernel_weights),
             )
             try:
-                c_overnight = load_average_cost_from_historical_csv(
+                c_overnight, kernel_costs = load_historical_kernel_cost(
                     tech,
-                    cost_window[0],
-                    cost_window[1],
+                    kernel_years,
+                    bootstrap_kernel_weights,
                     learning_cfg,
                 )
             except Exception as e:
                 logger.error(f"    Failed to load historical cost for {tech}: {e}")
                 raise ValueError(
-                    f"Failed to load average historical cost {cost_window[0]}-{cost_window[1]} "
+                    f"Failed to load historical procurement-kernel costs {kernel_years[0]}-{kernel_years[-1]} "
                     f"for {tech}: {e}"
                 ) from e
             if tech == 'battery_energy':
                 c_overnight_cell = c_overnight
-                battery_anchor = get_battery_grid_storage_cost_anchor(learning_cfg)
-                if int(current_year) == int(battery_anchor["year"]):
-                    c_overnight = float(battery_anchor["cost_eur2020_per_kwh"])
-                    logger.info(
-                        "    Battery grid-storage bootstrap uses confirmed %s anchor: %.3f EUR/%s",
-                        int(battery_anchor["year"]),
-                        c_overnight,
-                        unit,
-                    )
-                else:
-                    c_overnight = c_overnight_cell * battery_energy_bos_multiplier
+                c_overnight = c_overnight_cell * battery_energy_bos_multiplier
                 logger.info(
-                    "    Battery historical Li-ion cost: %.3f EUR/%s, energy-side cost (×%.4f): %.3f EUR/%s",
+                    "    Battery historical Li-ion kernel cost: %.3f EUR/%s, energy-side cost (×%.4f): %.3f EUR/%s",
                     c_overnight_cell,
                     unit,
                     battery_energy_bos_multiplier,
                     c_overnight,
                     unit,
                 )
+                kernel_costs = [float(cost) * battery_energy_bos_multiplier for cost in kernel_costs]
+            kernel_diag = {
+                "kernel_year_start": int(kernel_years[0]),
+                "kernel_year_end": int(kernel_years[-1]),
+                "kernel_years_json": _serialize_year_list(kernel_years),
+                "known_kernel_years_json": _serialize_year_list(kernel_years),
+                "expected_kernel_years_json": _serialize_year_list([]),
+                "applied_kernel_costs_json": _serialize_float_list(kernel_costs),
+            }
             logger.info(
-                f"    Using historical average cost window for bootstrap: "
-                f"{current_year} <- {cost_window[0]}-{cost_window[1]}, "
+                f"    Using historical procurement kernel for bootstrap: "
+                f"{current_year} <- {kernel_years[0]}-{kernel_years[-1]}, "
                 f"c_overnight={c_overnight:.3f} EUR/{unit}"
             )
         else:
@@ -3744,6 +3777,7 @@ def calculate_learning_costs(
             "log_capex_terminal_point": float(np.log(max(c_overnight, 1.0e-12) * 1000.0)),
             "wacc_dict": wacc_dict,  # Store for per-bus calculation
         }
+        learning_costs[tech].update(kernel_diag)
         
         # Determine capital cost unit for logging
         cap_cost_unit = "EUR/MW-yr" if unit == "kW" else "EUR/MWh-yr"
