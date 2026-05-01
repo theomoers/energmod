@@ -3925,6 +3925,111 @@ def _is_missing_historical_fossil_price_error(exc):
     return "Historical market price missing for " in str(exc)
 
 
+def _historical_fossil_price(fuel_type, market, year, historical_by_key):
+    key = (str(fuel_type), str(market), int(year))
+    if key not in historical_by_key:
+        raise ValueError(
+            f"Historical market price missing for {fuel_type}/{market}/{int(year)} "
+            "in fossil price bundle."
+        )
+    return float(historical_by_key[key])
+
+
+def _latest_historical_fossil_state_at_or_before(params_row, current_year, historical_by_key):
+    fuel_type = str(params_row["fuel_type"])
+    market = str(params_row["market"])
+    current_year = int(current_year)
+    available_years = [
+        int(year)
+        for (fuel, price_market, year) in historical_by_key
+        if str(fuel) == fuel_type and str(price_market) == market and int(year) <= current_year
+    ]
+    if not available_years:
+        raise ValueError(
+            "No historical fossil price points available for "
+            f"{fuel_type}/{market} at or before {current_year}."
+        )
+    year = max(available_years)
+    price = _historical_fossil_price(fuel_type, market, year, historical_by_key)
+    return {
+        "realized_log_price": float(np.log(price)),
+        "realized_price_eur_mwh": price,
+        "last_state_year": int(year),
+        "source_state_year": int(year),
+    }
+
+
+def _compute_fossil_bootstrap_historical_average_price(
+    *,
+    params_row,
+    current_year,
+    historical_by_key,
+    expectation_weights,
+):
+    current_year = int(current_year)
+    expectation_years = int(len(expectation_weights))
+    first_weight_year = current_year - expectation_years + 1
+    expectation_sequence = []
+    available_weights = []
+    effective_weights = np.zeros(expectation_years, dtype=float)
+    skipped_years = []
+    fuel_type = str(params_row["fuel_type"])
+    market = str(params_row["market"])
+
+    for offset, expectation_year in enumerate(range(first_weight_year, current_year + 1)):
+        slot_weight = float(expectation_weights[offset])
+        if slot_weight <= 0.0:
+            continue
+        try:
+            price = _historical_fossil_price(
+                fuel_type,
+                market,
+                expectation_year,
+                historical_by_key,
+            )
+        except ValueError:
+            skipped_years.append(int(expectation_year))
+            continue
+        expectation_sequence.append(price)
+        available_weights.append(slot_weight)
+        effective_weights[offset] = slot_weight
+
+    if not available_weights:
+        raise ValueError(
+            "No historical fossil price points available for "
+            f"{fuel_type}/{market} in bootstrap expectation window "
+            f"{first_weight_year}-{current_year}."
+        )
+
+    available_weights = np.asarray(available_weights, dtype=float)
+    normalized_weights = available_weights / float(available_weights.sum())
+    effective_weights /= float(available_weights.sum())
+    applied_price = float(np.dot(np.asarray(expectation_sequence, dtype=float), normalized_weights))
+
+    if skipped_years:
+        logger.warning(
+            "Fossil bootstrap historical expectation window for %s/%s at %s is missing years %s; "
+            "renormalizing weights over available years.",
+            fuel_type,
+            market,
+            current_year,
+            skipped_years,
+        )
+
+    return applied_price, json.dumps([float(weight) for weight in effective_weights.tolist()])
+
+
+def _compute_fossil_bootstrap_current_year_price(*, params_row, current_year, historical_by_key, weight_count):
+    fuel_type = str(params_row["fuel_type"])
+    market = str(params_row["market"])
+    current_year = int(current_year)
+    price = _historical_fossil_price(fuel_type, market, current_year, historical_by_key)
+    effective_weights = np.zeros(int(weight_count), dtype=float)
+    if len(effective_weights) > 0:
+        effective_weights[-1] = 1.0
+    return price, json.dumps([float(weight) for weight in effective_weights.tolist()])
+
+
 def _compute_fossil_block_average_expected_price(
     *,
     params_row,
@@ -4036,13 +4141,20 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
         for params_row in fuel_params.to_dict(orient="records"):
             market = str(params_row["market"])
             existing_state = (input_states.get(fuel_type, {}) or {}).get(market)
-            resolved = _resolve_fossil_state(
-                params_row=params_row,
-                existing_state=existing_state,
-                target_year=current_year,
-                seed=seed,
-                historical_by_key=bundle["historical_by_key"],
-            )
+            if int(current_year) == 2025 and int(current_year) in COST_HISTORICAL_CAPACITY_YEARS:
+                resolved = _latest_historical_fossil_state_at_or_before(
+                    params_row,
+                    current_year,
+                    bundle["historical_by_key"],
+                )
+            else:
+                resolved = _resolve_fossil_state(
+                    params_row=params_row,
+                    existing_state=existing_state,
+                    target_year=current_year,
+                    seed=seed,
+                    historical_by_key=bundle["historical_by_key"],
+                )
             next_states.setdefault(fuel_type, {})[market] = resolved
 
     country_rows = []
@@ -4066,14 +4178,29 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
             if expectation_mode == "block_average_expected":
                 start_state = (input_states.get(fuel_type, {}) or {}).get(market)
                 params_row = bundle["params_by_key"][(fuel_type, market)]
-                applied_price, row_expectation_weights_json = _compute_fossil_block_average_expected_price(
-                    params_row=params_row,
-                    start_state=start_state,
-                    current_year=current_year,
-                    seed=seed,
-                    historical_by_key=bundle["historical_by_key"],
-                    expectation_weights=expectation_weights,
-                )
+                if int(current_year) == 2020 and int(current_year) in COST_HISTORICAL_CAPACITY_YEARS:
+                    applied_price, row_expectation_weights_json = _compute_fossil_bootstrap_current_year_price(
+                        params_row=params_row,
+                        current_year=current_year,
+                        historical_by_key=bundle["historical_by_key"],
+                        weight_count=len(expectation_weights),
+                    )
+                elif int(current_year) == 2025 and int(current_year) in COST_HISTORICAL_CAPACITY_YEARS:
+                    applied_price, row_expectation_weights_json = _compute_fossil_bootstrap_historical_average_price(
+                        params_row=params_row,
+                        current_year=current_year,
+                        historical_by_key=bundle["historical_by_key"],
+                        expectation_weights=expectation_weights,
+                    )
+                else:
+                    applied_price, row_expectation_weights_json = _compute_fossil_block_average_expected_price(
+                        params_row=params_row,
+                        start_state=start_state,
+                        current_year=current_year,
+                        seed=seed,
+                        historical_by_key=bundle["historical_by_key"],
+                        expectation_weights=expectation_weights,
+                    )
             country_rows.append(
                 {
                     "learning_seed": runtime_metadata.get("learning_seed", ""),

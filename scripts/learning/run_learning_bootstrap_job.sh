@@ -108,6 +108,7 @@ CMD=(
   --configfile
   config.myopic.yaml
   config.learning.yaml
+  validation/config.iteration_common.yaml
   "$OVERLAY_FILE"
   --rerun-trigger
   mtime

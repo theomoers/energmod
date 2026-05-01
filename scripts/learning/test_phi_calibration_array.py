@@ -16,17 +16,34 @@ import bootstrap_state_store
 from bootstrap_state_store import restore_bootstrap_state
 
 
+def write_phi_bootstrap_prereqs(source: Path) -> None:
+    (source / "prenetworks").mkdir(parents=True)
+    (source / "prenetworks" / "elec_s_test_2025_export.nc").write_text("2025 prenetwork\n", encoding="utf-8")
+    (source / "postnetworks").mkdir(parents=True)
+    (source / "postnetworks" / "elec_s_test_2020_export_base.nc").write_text("2020 solved\n", encoding="utf-8")
+    (source / "learning").mkdir(parents=True)
+    (source / "learning" / "cost_log_solved_elec_s_test_2020_export_base.csv").write_text(
+        "technology,cost\n",
+        encoding="utf-8",
+    )
+    (source / "learning" / "state_committed_elec_s_test_2020_export_base.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+
 class PhiCalibrationGridTests(unittest.TestCase):
     def test_default_grid_has_stable_contract(self):
         tasks = phi_array.build_tasks()
+        b1_multiplier, b2_multiplier = phi_array.load_wedge_b_multipliers()
         self.assertEqual(len(tasks), 84)
         self.assertEqual(tasks[0]["name"], "phi2_0p00_phi3_0p10")
         self.assertEqual(tasks[-1]["name"], "phi2_0p45_phi3_1p00")
 
         for task in tasks:
             self.assertGreaterEqual(task["phi3_pct_capex"], task["phi2_pct_capex"])
-            self.assertEqual(task["b1_multiplier"], 0.8)
-            self.assertEqual(task["b2_multiplier"], 1.5)
+            self.assertEqual(task["b1_multiplier"], b1_multiplier)
+            self.assertEqual(task["b2_multiplier"], b2_multiplier)
             self.assertEqual(task["planning_horizons"], [2020, 2025])
             self.assertTrue(
                 task["sector_name"].startswith("Global_200/phi_calibration/"),
@@ -53,17 +70,32 @@ class PhiCalibrationGridTests(unittest.TestCase):
         self.assertNotIn("mtime", cmd)
         self.assertNotIn("solve_network_myopic_learning_bootstrap", cmd)
         self.assertNotIn("export_postsolve_learning_costs_learning_bootstrap", cmd)
+        self.assertIn("validation/config.iteration_common.yaml", cmd)
 
-    def test_phi_overlay_disables_2025_historical_constraints(self):
+    def test_phi_overlay_enables_only_target_2025_generation_metrics(self):
         task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             overlay = phi_array._write_overlay(task, Path(tmpdir))
             text = overlay.read_text(encoding="utf-8")
 
-        self.assertIn("year2025_generation_constraint: false", text)
+        self.assertIn("year2025_generation_constraint: true", text)
+        self.assertIn("      - biofuel_electricity", text)
+        self.assertIn("      - electricity_generation", text)
+        self.assertNotIn("      - coal_electricity", text)
+        self.assertNotIn("      - gas_electricity", text)
+        self.assertNotIn("      - oil_electricity", text)
+        self.assertNotIn("      - hydro_electricity", text)
+        self.assertNotIn("      - nuclear_electricity", text)
+        self.assertNotIn("      - solar_electricity", text)
+        self.assertNotIn("      - wind_electricity", text)
+        self.assertNotIn("      - other_renewable_electricity", text)
         self.assertIn("year2025_capacity_constraint: false", text)
+        self.assertIn("fossil_price_tuning_enabled: true", text)
+        self.assertIn("fossil_price_tuning_apply_years:", text)
+        self.assertIn("      - 2020", text)
+        self.assertIn("      - 2025", text)
 
-    def test_submission_metadata_records_disabled_2025_historical_constraints(self):
+    def test_submission_metadata_records_target_2025_historical_constraints(self):
         task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -94,7 +126,11 @@ class PhiCalibrationGridTests(unittest.TestCase):
             )
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-        self.assertFalse(metadata["fixed_parameters"]["year2025_generation_constraint"])
+        self.assertTrue(metadata["fixed_parameters"]["year2025_generation_constraint"])
+        self.assertEqual(
+            metadata["fixed_parameters"]["year2025_generation_metrics"],
+            ["biofuel_electricity", "electricity_generation"],
+        )
         self.assertFalse(metadata["fixed_parameters"]["year2025_capacity_constraint"])
 
     def test_restore_supports_nested_phi_target_without_copying_old_phi_runs(self):
@@ -130,10 +166,7 @@ class PhiCalibrationGridTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source = root / "source"
-            (source / "learning").mkdir(parents=True)
-            (source / "learning" / "bootstrap_complete_elec_s_test.txt").write_text("ok\n", encoding="utf-8")
-            (source / "prenetworks").mkdir()
-            (source / "prenetworks" / "elec_s_test_export.nc").write_text("network\n", encoding="utf-8")
+            write_phi_bootstrap_prereqs(source)
 
             old_root = phi_array.ROOT_DIR
             old_bootstrap_root = bootstrap_state_store.ROOT_DIR
@@ -147,7 +180,11 @@ class PhiCalibrationGridTests(unittest.TestCase):
                 bootstrap_state_store.ROOT_DIR = old_bootstrap_root
 
             shared = root / "results" / phi_array.resolve_working_sector_name()
-            self.assertTrue((shared / "learning" / "bootstrap_complete_elec_s_test.txt").is_file())
+            self.assertFalse((shared / "learning" / "bootstrap_complete_elec_s_test.txt").exists())
+            self.assertTrue((shared / "prenetworks" / "elec_s_test_2025_export.nc").is_file())
+            self.assertTrue((shared / "postnetworks" / "elec_s_test_2020_export_base.nc").is_file())
+            self.assertTrue((shared / "learning" / "cost_log_solved_elec_s_test_2020_export_base.csv").is_file())
+            self.assertTrue((shared / "learning" / "state_committed_elec_s_test_2020_export_base.json").is_file())
             for task in tasks:
                 self.assertFalse((root / "results" / task["sector_name"]).exists())
 
@@ -156,17 +193,17 @@ class PhiCalibrationGridTests(unittest.TestCase):
             job_dir = Path(tmpdir)
             task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]
             shared = job_dir / "results" / phi_array.resolve_working_sector_name()
-            (shared / "learning").mkdir(parents=True)
-            (shared / "learning" / "bootstrap_complete_elec_s_test.txt").write_text("ok\n", encoding="utf-8")
-            (shared / "prenetworks").mkdir()
-            (shared / "prenetworks" / "elec_s_test_export.nc").write_text("network\n", encoding="utf-8")
+            write_phi_bootstrap_prereqs(shared)
 
             linked = phi_array._stage_task_bootstrap_state(task, job_dir)
             target = job_dir / "results" / task["sector_name"]
 
-            self.assertEqual(linked, 2)
-            self.assertTrue((target / "learning" / "bootstrap_complete_elec_s_test.txt").is_symlink())
-            self.assertTrue((target / "prenetworks" / "elec_s_test_export.nc").is_symlink())
+            self.assertEqual(linked, 4)
+            self.assertFalse((target / "learning" / "bootstrap_complete_elec_s_test.txt").exists())
+            self.assertTrue((target / "prenetworks" / "elec_s_test_2025_export.nc").is_symlink())
+            self.assertTrue((target / "postnetworks" / "elec_s_test_2020_export_base.nc").is_symlink())
+            self.assertTrue((target / "learning" / "cost_log_solved_elec_s_test_2020_export_base.csv").is_symlink())
+            self.assertTrue((target / "learning" / "state_committed_elec_s_test_2020_export_base.json").is_symlink())
 
 
 if __name__ == "__main__":

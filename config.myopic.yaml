@@ -105,16 +105,16 @@ global_specific:
   
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_generation:
-    baseyear_generation_constraint: false # 2020 country-level electricity generation constrained to OWID historical values
+    baseyear_generation_constraint: true # 2020 country-level electricity generation constrained to OWID historical values
     year: 2020
     owid_csv: validation/data/owid-energy-data.csv
     electricity_demand_baseline_network: results/Global_200/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
     electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
-    tolerance: 0.10
+    tolerance: 0.02
     absolute_tolerance_twh: 0.25
     min_reference_twh: 1.0
     min_country_electric_load_twh: 0.5
-    slack_penalty_eur_per_mwh: 200.0
+    slack_penalty_eur_per_mwh: 1000.0
     units: TWh
     link_bus_carrier: AC
     gen_bus_carrier: AC
@@ -131,38 +131,28 @@ global_specific:
       - electricity_generation
 
   year2025_generation: 
-    year2025_generation_constraint: false
-    year: 2025 # numbers below are 2024 but we have 10% tolerance
-    tolerance: 0.1
+    year2025_generation_constraint: true
+    year: 2025
+    owid_csv: validation/data/owid-elecbalance2025.csv
+    tolerance: 0.02
+    absolute_tolerance_twh: 0.25
+    min_reference_twh: 1.0
+    min_country_electric_load_twh: 0.5
+    slack_penalty_eur_per_mwh: 1000.0
     units: TWh
     link_bus_carrier: AC
     gen_bus_carrier: AC
-    targets:
-      solar: 2130.0
-      onshore_wind: 2350.0
-      #offshore_wind: 250.0
-      #hydro: 4418.0
-      nuclear: 2760.0
-      coal_lignite_power: 10587.0
-      gas_power: 6795.0
-      oil_power: 857.0
-      biomass: 712.0
-      #geothermal: 88.0
-    carriers_map:
-      solar: ["solar"]
-      onshore_wind: ["onwind"]
-      #offshore_wind: ["offwind-ac","offwind-dc"]
-      #hydro: ["ror", "hydro"]
-      nuclear: ["nuclear"]
-      coal_lignite_power: ["coal", "lignite"]
-      gas_power: ["CCGT","OCGT"]
-      oil_power: ["oil"]
-      biomass: 
-        - "urban central solid biomass CHP CC"
-        - "urban central solid biomass CHP"
-        - "biomass"
-        - "biomass EOP"
-      #geothermal: ["geothermal"]
+    metrics:
+      - coal_electricity
+      - gas_electricity
+      - oil_electricity
+      - biofuel_electricity
+      - hydro_electricity
+      - nuclear_electricity
+      - solar_electricity
+      - wind_electricity
+      - other_renewable_electricity
+      - electricity_generation
 
   year2025_capacity:
     year2025_capacity_constraint: true
@@ -172,10 +162,12 @@ global_specific:
     reference_year: 2025
     fallback_to_latest_available: false
     geothermal_extendable_fallback: true
-    lower_multiplier: 1.0 # 2025 must be at least 2024 installed capacity
-    upper_multiplier: 1.5 # allow up to +20% growth from 2024 to 2025
+    tolerance: 0.05 # +/- tolerance around 2025 IRENA installed capacity
     min_reference_mw: 1.0
     absolute_tolerance_mw: 0.0
+    add_missing_fixed_generators: true
+    missing_fixed_generator_constraints: [solar, onwind, offshore_wind]
+    fixed_capacity_overshoot_policy: constrain_additions_only
     irena_technology_by_constraint:
       solar: ["Solar photovoltaic"] # excludes CSP / solar thermal
       onwind: ["Onshore wind energy"]
@@ -195,11 +187,10 @@ global_specific:
     global_capacity_band:
       enable: true
       year: 2025
-      tolerance: 0.05
+      tolerance: 0.02
       units: GW
-      targets:
-        solar: 2383.0
-        onwind: 1999.0
+      target_carriers: [solar, onwind]
+      # Targets are inferred from `irena_csv` and `irena_technology_by_constraint` above.
 
 permstore:
   enable: true

@@ -304,9 +304,10 @@ def restore_bootstrap_state(
     *,
     hardlink_first: bool = True,
     exclude_relative_prefixes: tuple[str, ...] = (),
+    required_patterns: tuple[str, ...] = DEFAULT_REQUIRED_PATTERNS,
 ) -> dict[str, object]:
     source_dir = _require_directory(source_dir, "Bootstrap state source")
-    required_counts = validate_state_source(source_dir)
+    required_counts = validate_state_source(source_dir, required_patterns=required_patterns)
     results_excluder = None
     normalized_excludes = tuple(
         str(prefix).strip("/").split("/") for prefix in exclude_relative_prefixes if str(prefix).strip("/")

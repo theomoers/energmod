@@ -29,6 +29,12 @@ rules:
     carrier_regex: "(?i)co2"
     rationale: "CO2 accounting chains may be extendable and are not physical electricity assets."
 
+  - id: urban_central_water_tanks_store
+    classification: allowed
+    component: Store
+    carrier: urban central water tanks
+    rationale: "Thermal water tank stores are sectoral heat storage and are excluded from the 2020 electric-capacity extendability gate."
+
   - id: baseyear_h2_fuel_cell_blocked
     classification: unexpected
     component: Link

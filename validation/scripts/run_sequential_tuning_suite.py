@@ -194,7 +194,6 @@ def _build_step_command(args: argparse.Namespace, step: str, *, unlock: bool) ->
         str(args.snakemake_cores),
     ]
     cfgs = _step_default_configfiles(step)
-    cfgs.extend(args.extra_configfiles)
     if args.disable_generation_constraints:
         cfgs.append(args.no_constraint_overlay_config)
     cmd += ["--configfiles", *cfgs]
@@ -685,12 +684,6 @@ def parse_args() -> argparse.Namespace:
         "--no-constraint-overlay-config",
         default="validation/config.no_baseyear_generation_constraint.yaml",
         help="Overlay config appended to tuning-step Snakemake configfiles when generation constraints are disabled.",
-    )
-    p.add_argument(
-        "--extra-configfiles",
-        nargs="*",
-        default=[],
-        help="Additional Snakemake config overlays appended to each tuning step.",
     )
     p.add_argument(
         "--run-name",

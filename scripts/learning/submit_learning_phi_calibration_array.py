@@ -14,6 +14,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - exercised on lean system Python installs
+    yaml = None
+
 from bootstrap_state_store import (
     resolve_results_sector_dir,
     restore_bootstrap_state,
@@ -35,8 +40,17 @@ DEFAULT_GRID_SUBMIT = "batch"
 DEFAULT_GRID_ARRAY_CONCURRENCY = 100
 DEFAULT_MODEL = "shared_state_bayesian_regime_wright"
 DEFAULT_SEED = 0
-FIXED_B1_MULTIPLIER = 0.8
-FIXED_B2_MULTIPLIER = 1.5
+CONFIG_LEARNING_PATH = ROOT_DIR / "config.learning.yaml"
+PHI_CALIBRATION_YEAR2025_GENERATION_METRICS = [
+    "biofuel_electricity",
+    "electricity_generation",
+]
+PHI_CALIBRATION_REQUIRED_BOOTSTRAP_PATTERNS = (
+    "prenetworks/elec_s*2025*export.nc",
+    "postnetworks/elec_s*2020*export_base.nc",
+    "learning/cost_log_solved_elec_s*2020*export_base.csv",
+    "learning/state_committed_elec_s*2020*export_base.json",
+)
 
 
 def _format_phi(value: float) -> str:
@@ -64,6 +78,48 @@ def expand_and_resolve(pathlike: str | os.PathLike) -> Path:
     return Path(os.path.expandvars(str(pathlike))).resolve()
 
 
+def load_wedge_b_multipliers(config_path: Path = CONFIG_LEARNING_PATH) -> tuple[float, float]:
+    if yaml is None:
+        return _load_wedge_b_multipliers_without_yaml(config_path)
+
+    with config_path.open(encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+
+    try:
+        wedge = config["learning"]["deployment_constraints"]["wedge"]
+        return float(wedge["b1_multiplier"]), float(wedge["b2_multiplier"])
+    except KeyError as exc:
+        raise KeyError(f"Missing learning deployment wedge b multiplier in {config_path}: {exc}") from exc
+
+
+def _load_wedge_b_multipliers_without_yaml(config_path: Path) -> tuple[float, float]:
+    target_path = ("learning", "deployment_constraints", "wedge")
+    stack: list[tuple[int, str]] = []
+    values: dict[str, float] = {}
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        content = raw_line.split("#", 1)[0].rstrip()
+        if not content.strip():
+            continue
+        indent = len(content) - len(content.lstrip(" "))
+        key, sep, raw_value = content.strip().partition(":")
+        if not sep:
+            continue
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        current_path = tuple(name for _, name in stack)
+        value = raw_value.strip()
+        if value:
+            if current_path == target_path and key in {"b1_multiplier", "b2_multiplier"}:
+                values[key] = float(value.strip("\"'"))
+        else:
+            stack.append((indent, key))
+
+    try:
+        return values["b1_multiplier"], values["b2_multiplier"]
+    except KeyError as exc:
+        raise KeyError(f"Missing learning deployment wedge b multiplier in {config_path}: {exc}") from exc
+
+
 def resolve_task_sector_names(tasks: list[dict]) -> list[str]:
     return sorted({str(task["sector_name"]) for task in tasks})
 
@@ -84,6 +140,7 @@ def build_tasks(
     seed: int = DEFAULT_SEED,
 ) -> list[dict]:
     tasks = []
+    b1_multiplier, b2_multiplier = load_wedge_b_multipliers()
     for phi2 in _float_grid(phi2_min, phi2_max, phi2_count):
         for phi3 in _float_grid(phi3_min, phi3_max, phi3_count):
             if phi3 < phi2:
@@ -97,8 +154,8 @@ def build_tasks(
                     "seed": int(seed),
                     "phi2_pct_capex": float(_format_phi(phi2)),
                     "phi3_pct_capex": float(_format_phi(phi3)),
-                    "b1_multiplier": FIXED_B1_MULTIPLIER,
-                    "b2_multiplier": FIXED_B2_MULTIPLIER,
+                    "b1_multiplier": b1_multiplier,
+                    "b2_multiplier": b2_multiplier,
                     "planning_horizons": [2020, 2025],
                 }
             )
@@ -152,13 +209,14 @@ def write_submission_metadata(
             "constraint": "phi3_pct_capex >= phi2_pct_capex",
         },
         "fixed_parameters": {
-            "b1_multiplier": FIXED_B1_MULTIPLIER,
-            "b2_multiplier": FIXED_B2_MULTIPLIER,
+            "b1_multiplier": tasks[0]["b1_multiplier"],
+            "b2_multiplier": tasks[0]["b2_multiplier"],
             "apply_from_year": 2025,
             "planning_horizons": [2020, 2025],
             "model": args.model,
             "seed": args.seed,
-            "year2025_generation_constraint": False,
+            "year2025_generation_constraint": True,
+            "year2025_generation_metrics": PHI_CALIBRATION_YEAR2025_GENERATION_METRICS,
             "year2025_capacity_constraint": False,
         },
         "tasks": tasks,
@@ -170,7 +228,10 @@ def write_submission_metadata(
 
 def restore_phi_calibration_state(tasks: list[dict], bootstrap_source: Path) -> None:
     """Mirror the regular stochastic-array copied-sector setup once per submission."""
-    required_counts = validate_state_source(bootstrap_source)
+    required_counts = validate_state_source(
+        bootstrap_source,
+        required_patterns=PHI_CALIBRATION_REQUIRED_BOOTSTRAP_PATTERNS,
+    )
     working_sector_name = resolve_working_sector_name()
     target_dir = resolve_results_sector_dir(ROOT_DIR, working_sector_name)
     print("BOOTSTRAP_STATE_SOURCE", str(bootstrap_source.resolve()))
@@ -180,6 +241,7 @@ def restore_phi_calibration_state(tasks: list[dict], bootstrap_source: Path) -> 
         target_dir,
         exclude_relative_prefixes=("phi_calibration",),
         hardlink_first=False,
+        required_patterns=PHI_CALIBRATION_REQUIRED_BOOTSTRAP_PATTERNS,
     )
     mark_tree_current(target_dir)
     print("BOOTSTRAP_STATE_TARGET", target_dir)
@@ -225,7 +287,10 @@ def submit_array(args: argparse.Namespace) -> None:
 
     grid_run_cmd = build_grid_run_cmd(args, manifest_path, len(tasks))
     bootstrap_state_source = expand_and_resolve(args.bootstrap_state_source)
-    required_counts = validate_state_source(bootstrap_state_source)
+    required_counts = validate_state_source(
+        bootstrap_state_source,
+        required_patterns=PHI_CALIBRATION_REQUIRED_BOOTSTRAP_PATTERNS,
+    )
 
     if args.print_only:
         print("BOOTSTRAP_STATE_SOURCE", str(bootstrap_state_source))
@@ -331,8 +396,21 @@ def _write_overlay(task: dict, output_dir: Path) -> Path:
                     "  path: permstorage",
                     "",
                     "global_specific:",
+                    "  baseyear_generation:",
+                    "    fossil_price_tuning_enabled: true",
+                    "    fossil_price_override_csv: validation/data/fossil_price_tuning_overrides.csv",
+                    "    fossil_price_tuning_apply_years:",
+                    "      - 2020",
+                    "      - 2025",
+                    "    fossil_price_tuning_source_years:",
+                    "      - 2020",
                     "  year2025_generation:",
-                    "    year2025_generation_constraint: false",
+                    "    year2025_generation_constraint: true",
+                    "    metrics:",
+                    *[
+                        f"      - {metric}"
+                        for metric in PHI_CALIBRATION_YEAR2025_GENERATION_METRICS
+                    ],
                     "  year2025_capacity:",
                     "    year2025_capacity_constraint: false",
                     "",
@@ -413,6 +491,7 @@ def build_worker_snakemake_cmd(
         "--configfile",
         "config.myopic.yaml",
         "config.learning.yaml",
+        "validation/config.iteration_common.yaml",
         str(overlay_path),
         "--rerun-triggers",
         "code",
@@ -440,7 +519,10 @@ def run_worker(args: argparse.Namespace) -> None:
     job_root = Path(os.path.expandvars(args.job_root)).resolve()
     job_dir = _stage_job_dir(task, job_root)
     linked = _stage_task_bootstrap_state(task, job_dir)
-    validate_state_source(job_dir / "results" / str(task["sector_name"]))
+    validate_state_source(
+        job_dir / "results" / str(task["sector_name"]),
+        required_patterns=PHI_CALIBRATION_REQUIRED_BOOTSTRAP_PATTERNS,
+    )
     overlay_path = _write_overlay(task, job_dir)
     snakemake_jobs = os.environ.get("JOBS") or os.environ.get("NSLOTS") or "4"
     snakemake_executable = shutil.which("snakemake") or str(

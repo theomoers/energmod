@@ -3265,81 +3265,13 @@ if hasattr(_validation_hooks, "_storageunit_output_energy_by_buscarrier"):
 
 
 def add_year2025_generation_band(n, planning_year, config):
-    """
-    Add 2025 generation constraints similar to baseyear constraints.
-    Constrains annual generation by carrier to match 2025 targets +/- tolerance.
-    """
-    global_cfg = config.get("global_specific", {})
-    cfg = global_cfg.get("year2025_generation", {})
-    if not cfg or not cfg.get("year2025_generation_constraint", False):
-        return
-
-    target_year = str(cfg.get("year", 2025))
-    if str(planning_year) != target_year:
-        logger.info(f"Skipping 2025 generation constraints for {planning_year} (configured for {target_year})")
-        return
-
-    logger.info(f"Adding 2025 generation constraints for {planning_year}")
-
-    tol   = float(cfg.get("tolerance", 0.15))
-    units = str(cfg.get("units", "TWh")).lower()
-    unit_scale = {"mwh":1.0, "gwh":1e3, "twh":1e6}.get(units, 1e6)
-
-    carriers_map     = cfg.get("carriers_map", {})
-    targets          = cfg.get("targets", {})
-    link_bus_carrier = cfg.get("link_bus_carrier", "AC")
-    gen_bus_carrier  = cfg.get("gen_bus_carrier",  "AC")
-
-    gen_E  = _generator_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
-    link_E = _link_output_energy_by_buscarrier(n, bus_carrier=link_bus_carrier) # [carrier] MWh
-    su_E = _storageunit_output_energy_by_buscarrier(n, bus_carrier=gen_bus_carrier) # [carrier] MWh
-
-    def _sum_tokens(tokens):
-        toks = tokens if isinstance(tokens, (list, tuple)) else [tokens]
-        pieces = []
-
-        gen_list  = list(gen_E.indexes.get("carrier", []))  if gen_E.size  else []
-        link_list = list(link_E.indexes.get("carrier", [])) if link_E.size else []
-        su_list   = list(su_E.indexes.get("carrier", []))   if su_E.size   else []
-
-        for t in toks:
-            if isinstance(t, str) and t.startswith("re:"):
-                pat = re.compile(t[3:])
-                g = [c for c in gen_list  if pat.search(c)]
-                l = [c for c in link_list if pat.search(c)]
-                s = [c for c in su_list   if pat.search(c)]
-                if g: pieces.append(gen_E.sel(carrier=g).sum("carrier"))
-                if l: pieces.append(link_E.sel(carrier=l).sum("carrier"))
-                if s: pieces.append(su_E.sel(carrier=s).sum("carrier"))
-            else:
-                if t in gen_list:  pieces.append(gen_E.sel(carrier=t))
-                if t in link_list: pieces.append(link_E.sel(carrier=t))
-                if t in su_list:   pieces.append(su_E.sel(carrier=t))
-
-        if not pieces:
-            return None
-        out = pieces[0]
-        for p in pieces[1:]:
-            out = out + p
-        return out
-
-    for alias, target in targets.items():
-        if isinstance(target, str) and target.upper().startswith("X"):
-            logger.info(f"Skipping {alias} (placeholder target '{target}')")
-            continue
-
-        tokens = carriers_map.get(alias, [alias])  # e.g., ["coal"] or ["coal","lignite"]
-        lhs = _sum_tokens(tokens)
-        if lhs is None:
-            logger.warning(f"No carriers matched for alias '{alias}' with tokens {tokens}")
-            continue
-
-        lower = float(target) * (1.0 - tol) * unit_scale
-        upper = float(target) * (1.0 + tol) * unit_scale
-
-        logger.info(f"{alias}: {lower/unit_scale:.2f} ≤ AC-side energy ≤ {upper/unit_scale:.2f} {units.upper()} (tokens={tokens})")
-        n.model.add_constraints(lhs >= lower, name=f"year2025_energy_min__{alias}")
-        n.model.add_constraints(lhs <= upper, name=f"year2025_energy_max__{alias}")
+    if hasattr(_validation_hooks, "add_year2025_generation_band"):
+        return _validation_hooks.add_year2025_generation_band(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
+    logger.warning("Centralized 2025 generation constraint hook is unavailable.")
 
 
 def add_year2025_capacity_targets(n, planning_year, config):
@@ -4143,6 +4075,15 @@ def solve_network(n, config, solving, **kwargs):
     n = apply_optional_sector_clustering(n, config)
 
     planning_year = _infer_planning_year(n)
+    if planning_year is not None and hasattr(
+        _validation_hooks, "add_year2025_irena_missing_fixed_generators"
+    ):
+        _validation_hooks.add_year2025_irena_missing_fixed_generators(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
+
     if planning_year is not None and hasattr(
         _validation_hooks, "add_year2025_geothermal_extendable_fallback"
     ):

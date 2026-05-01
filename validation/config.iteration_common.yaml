@@ -1,30 +1,5 @@
 global_specific:
   baseyear_generation:
-    year: 2020
-    owid_csv: validation/data/owid-energy-data.csv
-
-    # Keep the tuned/baseyear-constraint settings together in validation overlays
-    # instead of the main config so they are easy to revert.
-    tolerance: 0.10
-    absolute_tolerance_twh: 0.25
-    min_reference_twh: 1.0
-    min_country_electric_load_twh: 0.5
-    slack_penalty_eur_per_mwh: 1000.0
-    units: TWh
-    link_bus_carrier: AC
-    gen_bus_carrier: AC
-    metrics:
-      - coal_electricity
-      - gas_electricity
-      - oil_electricity
-      - biofuel_electricity
-      - hydro_electricity
-      - nuclear_electricity
-      - solar_electricity
-      - wind_electricity
-      - other_renewable_electricity
-      - electricity_generation
-
     hydro_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
     hydro_inflow_alignment: true
     hydro_inflow_min_reference_twh: 1.0
@@ -75,7 +50,9 @@ global_specific:
     nuclear_iteration_scale_max: 20.0
     nuclear_p_max_pu_cap: 1.0
 
-    # Kept disabled by default in common overlay; fossil tuner enables this
-    # explicitly for its own step.
-    fossil_price_tuning_enabled: false
+    # Apply tuned fossil price overrides only for the historical calibration
+    # horizons. Later myopic years use the normal fossil price path.
+    fossil_price_tuning_enabled: true
     fossil_price_override_csv: validation/data/fossil_price_tuning_overrides.csv
+    fossil_price_tuning_apply_years: [2020, 2025]
+    fossil_price_tuning_source_years: [2020]

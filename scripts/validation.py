@@ -2199,11 +2199,10 @@ def apply_country_wind_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Skipping iterative wind scaling for %s (configured baseyear is %s).",
+            "Applying iterative wind scaling to %s using overrides calibrated from baseyear %s.",
             investment_year,
             baseyear,
         )
-        return
 
     override_csv_cfg = base_cfg.get("wind_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -2339,11 +2338,10 @@ def apply_country_solar_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Skipping iterative solar scaling for %s (configured baseyear is %s).",
+            "Applying iterative solar scaling to %s using overrides calibrated from baseyear %s.",
             investment_year,
             baseyear,
         )
-        return
 
     override_csv_cfg = base_cfg.get("solar_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -2897,6 +2895,339 @@ def _geothermal_template_from_network(n):
     return template
 
 
+def _generator_template_from_network(n, carrier):
+    gens = n.generators.loc[n.generators.carrier.astype(str).eq(str(carrier))].copy()
+    template = {}
+    numeric_defaults = {
+        "marginal_cost": 0.0,
+        "capital_cost": 0.0,
+        "efficiency": 1.0,
+        "lifetime": np.inf,
+        "p_max_pu": 1.0,
+    }
+    if gens.empty:
+        return numeric_defaults
+
+    for col, default in numeric_defaults.items():
+        if col not in gens.columns:
+            template[col] = default
+            continue
+        values = pd.to_numeric(gens[col], errors="coerce")
+        values = values.replace([np.inf, -np.inf], np.nan).dropna()
+        template[col] = float(values.median()) if not values.empty else default
+    return template
+
+
+def _pick_country_ac_bus(n, country, bus_country, preferred_gens=None):
+    if preferred_gens is not None and not preferred_gens.empty:
+        existing_bus = str(preferred_gens.iloc[0]["bus"])
+        if existing_bus in n.buses.index:
+            return existing_bus
+
+    bus_country = bus_country.astype(str).str.strip().str.upper()
+    bus_carrier = (
+        n.buses["carrier"].astype(str)
+        if "carrier" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    ac_buses = pd.Index(n.buses.index[bus_country.eq(country) & bus_carrier.eq("AC")])
+    if len(ac_buses) == 0:
+        return None
+
+    if not n.loads.empty and "p_set" in n.loads_t:
+        load_bus = n.loads["bus"].reindex(n.loads.index)
+        country_loads = n.loads.index[load_bus.isin(ac_buses)]
+        if len(country_loads) > 0:
+            load_totals = (
+                n.loads_t.p_set.reindex(columns=country_loads)
+                .fillna(0.0)
+                .sum(axis=0)
+                .groupby(load_bus.loc[country_loads])
+                .sum()
+            )
+            if not load_totals.empty:
+                return str(load_totals.idxmax())
+
+    return str(ac_buses.sort_values()[0])
+
+
+def _carrier_profile_name_parts(carrier):
+    carrier = str(carrier)
+    if carrier == "offwind-ac":
+        return "offwind", "-ac"
+    if carrier == "offwind-dc":
+        return "offwind", "-dc"
+    return carrier, ""
+
+
+def _fixed_generator_profile(n, gen_name, bus, carrier, current_year):
+    if not hasattr(n, "generators_t") or "p_max_pu" not in n.generators_t:
+        return None
+
+    generator, suffix = _carrier_profile_name_parts(carrier)
+    profile_col = f"{bus} {generator}{suffix}-{current_year}"
+    profile = pd.DataFrame(0.0, index=n.snapshots, columns=[profile_col])
+    profile = _replace_zero_profile_columns_with_nearest(
+        n=n,
+        p_max_pu=profile,
+        generator=generator,
+        suffix=suffix,
+        source_year=current_year,
+        target_year=current_year,
+    )
+    series = pd.to_numeric(profile[profile_col], errors="coerce").fillna(0.0)
+    if series.abs().sum() > 1e-12:
+        series = series.clip(lower=0.0, upper=1.0)
+        series.name = gen_name
+        return series
+
+    pool_cols = [
+        c
+        for c in n.generators_t.p_max_pu.columns
+        if isinstance(c, str) and f" {generator}{suffix}-" in c
+    ]
+    if pool_cols:
+        pool = n.generators_t.p_max_pu[pool_cols].fillna(0.0)
+        nonzero = pool.columns[pool.sum(axis=0).abs() > 1e-12]
+        if len(nonzero) > 0:
+            logger.warning(
+                "Using generic non-zero %s profile %s for fixed 2025 IRENA generator %s.",
+                carrier,
+                nonzero[0],
+                gen_name,
+            )
+            return pd.to_numeric(pool[nonzero[0]], errors="coerce").fillna(0.0).clip(
+                lower=0.0,
+                upper=1.0,
+            )
+
+    logger.warning(
+        "No %s p_max_pu fallback profile found for fixed 2025 IRENA generator %s on %s; using p_max_pu=1.0.",
+        carrier,
+        gen_name,
+        bus,
+    )
+    return pd.Series(1.0, index=n.snapshots, name=gen_name)
+
+
+def add_year2025_irena_missing_fixed_generators(n, planning_year, config):
+    """
+    Materialize known 2025 IRENA solar/wind capacity before optimization.
+
+    This handles countries that gain a technology in the 2025 data but have no
+    model asset/variable capable of reaching the hard country-capacity lower band.
+    The added asset is fixed at the exact missing capacity needed to bring the
+    country/constraint group to the IRENA reference.
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+    if not bool(cfg.get("add_missing_fixed_generators", True)):
+        return
+
+    try:
+        current_year = int(float(planning_year))
+    except Exception:
+        logger.warning(
+            "Could not parse planning year '%s' for 2025 IRENA fixed-generator materialization",
+            planning_year,
+        )
+        return
+
+    target_year = int(cfg.get("year", 2025))
+    if current_year != target_year:
+        return
+
+    materialize_constraints = set(
+        str(c)
+        for c in cfg.get(
+            "missing_fixed_generator_constraints",
+            ["solar", "onwind", "offshore_wind"],
+        )
+    )
+    if not materialize_constraints:
+        return
+
+    irena_csv = _repo_path(
+        cfg.get("irena_csv", "validation/data/irena_capacity_by_technology.csv")
+    )
+    if not os.path.exists(irena_csv):
+        logger.warning(
+            "2025 IRENA fixed-generator materialization skipped: file not found at %s",
+            irena_csv,
+        )
+        return
+
+    tolerance = float(cfg.get("tolerance", 0.10))
+    absolute_tolerance_mw = float(cfg.get("absolute_tolerance_mw", 0.0))
+    min_reference_mw = float(cfg.get("min_reference_mw", 0.0))
+    reference_year = int(cfg.get("reference_year", target_year))
+    fallback_to_latest = bool(cfg.get("fallback_to_latest_available", True))
+    constraint_technology_map = cfg.get(
+        "irena_technology_by_constraint",
+        cfg.get("irena_technology_by_carrier", {}),
+    )
+    model_carriers_by_constraint = cfg.get(
+        "model_carriers_by_constraint",
+        {key: [key] for key in (constraint_technology_map or {}).keys()},
+    )
+
+    try:
+        ref, used_reference_year = _irena_country_capacity_reference(
+            irena_csv=irena_csv,
+            year=reference_year,
+            carrier_technology_map=constraint_technology_map,
+            fallback_to_latest=fallback_to_latest,
+        )
+    except Exception as exc:
+        logger.warning("2025 IRENA fixed-generator materialization skipped: %s", exc)
+        return
+
+    ref = ref.loc[ref["carrier"].astype(str).isin(materialize_constraints)].copy()
+    if ref.empty or n.generators.empty:
+        return
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    gen = n.generators.copy()
+    gen["country"] = (
+        gen["bus"].map(bus_country).fillna("").astype(str).str.strip().str.upper()
+    )
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen["p_nom"] = pd.to_numeric(gen.get("p_nom", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_min"] = pd.to_numeric(gen.get("p_nom_min", 0.0), errors="coerce").fillna(0.0)
+    if "p_nom_max" in gen.columns:
+        gen["p_nom_max"] = pd.to_numeric(gen["p_nom_max"], errors="coerce")
+    else:
+        gen["p_nom_max"] = np.nan
+    gen["p_nom_extendable"] = gen.get("p_nom_extendable", False).fillna(False).astype(bool)
+
+    model_carrier_to_constraint = {}
+    for constraint_name, carriers in (model_carriers_by_constraint or {}).items():
+        if isinstance(carriers, str):
+            carriers = [carriers]
+        for c in carriers or []:
+            model_carrier_to_constraint[str(c)] = str(constraint_name)
+    gen["constraint_carrier"] = gen["carrier"].map(model_carrier_to_constraint)
+    gen = gen.loc[
+        gen["country"].str.match(r"^[A-Z]{2}$", na=False)
+        & gen["constraint_carrier"].notna()
+    ].copy()
+
+    added = 0
+    skipped_no_bus = 0
+    skipped_no_model_carrier = 0
+    skipped_already_feasible = 0
+    for row in ref.itertuples(index=False):
+        country = str(row.country).upper()
+        constraint_carrier = str(row.carrier)
+        target_mw = float(row.reference_mw)
+        if target_mw < min_reference_mw:
+            continue
+
+        carriers = model_carriers_by_constraint.get(constraint_carrier, [])
+        if isinstance(carriers, str):
+            carriers = [carriers]
+        carriers = [str(c) for c in carriers]
+        if not carriers:
+            skipped_no_model_carrier += 1
+            continue
+
+        group = gen.loc[
+            gen["country"].eq(country)
+            & gen["constraint_carrier"].eq(constraint_carrier)
+        ].copy()
+        committed = 0.0
+        max_feasible = 0.0
+        if not group.empty:
+            committed = float(
+                pd.concat([group["p_nom"], group["p_nom_min"]], axis=1).max(axis=1).sum()
+            )
+            max_vals = pd.to_numeric(group["p_nom_max"], errors="coerce")
+            extendable = group["p_nom_extendable"].astype(bool)
+            fixed_like = group.loc[~extendable, "p_nom"].sum()
+            ext_max = np.inf if max_vals.loc[extendable].isna().any() else max_vals.loc[extendable].sum()
+            max_feasible = float(fixed_like + ext_max)
+
+        band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
+        lower_total = max(target_mw - band_mw, 0.0)
+        if max_feasible + 1e-6 >= lower_total:
+            skipped_already_feasible += 1
+            continue
+
+        missing_mw = max(target_mw - committed, 0.0)
+        if missing_mw <= 1e-6:
+            skipped_already_feasible += 1
+            continue
+
+        carrier = carriers[0]
+        preferred = group.loc[group["carrier"].eq(carrier)] if not group.empty else None
+        bus = _pick_country_ac_bus(n, country, bus_country, preferred_gens=preferred)
+        if bus is None:
+            skipped_no_bus += 1
+            logger.warning(
+                "Skipping fixed 2025 IRENA %s generator for %s: no valid AC bus found.",
+                constraint_carrier,
+                country,
+            )
+            continue
+
+        base_name = f"{bus} {carrier}-{current_year}-irena-fixed"
+        gen_name = base_name
+        suffix = 2
+        while gen_name in n.generators.index:
+            gen_name = f"{base_name}-{suffix}"
+            suffix += 1
+
+        if carrier not in n.carriers.index:
+            n.add("Carrier", carrier)
+
+        template = _generator_template_from_network(n, carrier)
+        add_kwargs = {
+            "bus": bus,
+            "carrier": carrier,
+            "p_nom": missing_mw,
+            "p_nom_min": missing_mw,
+            "p_nom_max": missing_mw,
+            "p_nom_extendable": False,
+            "marginal_cost": template["marginal_cost"],
+            "capital_cost": template["capital_cost"],
+            "efficiency": template["efficiency"],
+            "build_year": current_year,
+            "lifetime": template["lifetime"],
+        }
+        n.add("Generator", gen_name, **add_kwargs)
+        profile = _fixed_generator_profile(
+            n,
+            gen_name=gen_name,
+            bus=bus,
+            carrier=carrier,
+            current_year=current_year,
+        )
+        if profile is not None:
+            n.generators_t.p_max_pu[gen_name] = profile.values
+
+        added += 1
+        logger.info(
+            "Added fixed 2025 IRENA %s generator for %s on %s with p_nom=%.2f MW (target=%.2f MW, committed_before=%.2f MW, reference_year=%s).",
+            constraint_carrier,
+            country,
+            bus,
+            missing_mw,
+            target_mw,
+            committed,
+            used_reference_year,
+        )
+
+    logger.info(
+        "2025 IRENA fixed-generator materialization summary: added=%d, skipped_already_feasible=%d, skipped_no_bus=%d, skipped_no_model_carrier=%d",
+        added,
+        skipped_already_feasible,
+        skipped_no_bus,
+        skipped_no_model_carrier,
+    )
+
+
 def _pick_country_geothermal_fallback_bus(n, country, bus_country, geo_country_gens):
     if not geo_country_gens.empty:
         existing_bus = str(geo_country_gens.iloc[0]["bus"])
@@ -3142,7 +3473,26 @@ def _owid_country_metric_reference(owid_csv, year, metrics):
     if "other_renewable_electricity" in metrics:
         usecols.add("other_renewable_exc_biofuel_electricity")
         usecols.add("other_renewable_electricity")
-    owid = pd.read_csv(owid_csv, usecols=lambda c: c in usecols)
+    ember_col_map = {
+        "Code": "iso_code",
+        "Year": "year",
+        "Coal": "coal_electricity",
+        "Gas": "gas_electricity",
+        "Oil": "oil_electricity",
+        "Bioenergy": "biofuel_electricity",
+        "Hydropower": "hydro_electricity",
+        "Nuclear": "nuclear_electricity",
+        "Solar": "solar_electricity",
+        "Wind": "wind_electricity",
+        "Other renewables": "other_renewable_electricity",
+    }
+    owid = pd.read_csv(owid_csv)
+    owid = owid.rename(columns={c: ember_col_map.get(c, c) for c in owid.columns})
+    if not {"year", "iso_code"}.issubset(owid.columns):
+        logger.warning("OWID reference file %s lacks year/iso_code columns", owid_csv)
+        return pd.DataFrame(columns=["country", "metric", "reference_twh"])
+    keep_cols = [c for c in owid.columns if c in usecols or c in set(ember_col_map.values())]
+    owid = owid.loc[:, keep_cols].copy()
     owid = owid.loc[owid["year"] == int(year)].copy()
     if owid.empty:
         return pd.DataFrame(columns=["country", "metric", "reference_twh"])
@@ -3164,6 +3514,42 @@ def _owid_country_metric_reference(owid_csv, year, metrics):
     for col in metric_cols:
         owid[col] = pd.to_numeric(owid[col], errors="coerce")
 
+    aggregate_defs = {
+        "fossil_electricity": ["coal_electricity", "gas_electricity", "oil_electricity"],
+        "renewables_electricity": [
+            "hydro_electricity",
+            "solar_electricity",
+            "wind_electricity",
+            "biofuel_electricity",
+            "other_renewable_electricity",
+        ],
+        "low_carbon_electricity": [
+            "hydro_electricity",
+            "solar_electricity",
+            "wind_electricity",
+            "biofuel_electricity",
+            "other_renewable_electricity",
+            "nuclear_electricity",
+        ],
+        "electricity_generation": [
+            "coal_electricity",
+            "gas_electricity",
+            "oil_electricity",
+            "hydro_electricity",
+            "solar_electricity",
+            "wind_electricity",
+            "biofuel_electricity",
+            "other_renewable_electricity",
+            "nuclear_electricity",
+        ],
+    }
+    for metric, parts in aggregate_defs.items():
+        if metric in metrics and metric not in owid.columns:
+            available = [p for p in parts if p in owid.columns]
+            if available:
+                owid[metric] = owid[available].sum(axis=1, min_count=1)
+
+    metric_cols = [m for m in metrics if m in owid.columns]
     grouped = owid.groupby("country", as_index=False)[metric_cols].sum(min_count=1)
     ref = grouped.melt(
         id_vars="country",
@@ -3367,6 +3753,202 @@ def _irena_country_capacity_reference(irena_csv, year, carrier_technology_map, f
     )
 
 
+def _irena_reference_year(available_years, requested_year, irena_csv, fallback_to_latest=True):
+    available_years = sorted(int(y) for y in available_years)
+    if not available_years:
+        raise ValueError(f"No valid `Year` rows found in IRENA capacity file: {irena_csv}")
+
+    requested_year = int(requested_year)
+    if requested_year in available_years:
+        return requested_year
+
+    if not fallback_to_latest:
+        raise ValueError(
+            f"Year row '{requested_year}' not found in {irena_csv}. "
+            f"Available years: {available_years[0]}-{available_years[-1]}"
+        )
+
+    earlier_or_equal = [y for y in available_years if y <= requested_year]
+    chosen_year = max(earlier_or_equal) if earlier_or_equal else available_years[-1]
+    logger.warning(
+        "IRENA capacity reference year %s not found in %s; using %s instead.",
+        requested_year,
+        irena_csv,
+        chosen_year,
+    )
+    return chosen_year
+
+
+def _irena_value_to_mw(value, unit):
+    parsed = pd.to_numeric(
+        pd.Series(value)
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .replace({"-": np.nan, "": np.nan}),
+        errors="coerce",
+    ).fillna(0.0)
+    normalized_unit = pd.Series(unit).astype(str).str.strip().str.lower()
+    multipliers = normalized_unit.map(
+        {
+            "w": 1.0e-6,
+            "watt": 1.0e-6,
+            "watts": 1.0e-6,
+            "kw": 1.0e-3,
+            "kilowatt": 1.0e-3,
+            "kilowatts": 1.0e-3,
+            "mw": 1.0,
+            "megawatt": 1.0,
+            "megawatts": 1.0,
+            "gw": 1.0e3,
+            "gigawatt": 1.0e3,
+            "gigawatts": 1.0e3,
+        }
+    )
+    unknown_units = sorted(set(normalized_unit.loc[multipliers.isna()].dropna()))
+    if unknown_units:
+        raise ValueError(f"Unsupported IRENA capacity units: {unknown_units}")
+    return (parsed * multipliers.fillna(0.0)).astype(float)
+
+
+def _global_markers(series):
+    values = series.astype(str).str.strip().str.upper()
+    return values.isin({"GLO", "GLOBAL", "WORLD", "WRLD", "WLD"})
+
+
+def _capacity_reference_from_country_sum(irena_csv, year, carrier_technology_map, fallback_to_latest=True):
+    ref, chosen_year = _irena_country_capacity_reference(
+        irena_csv=irena_csv,
+        year=year,
+        carrier_technology_map=carrier_technology_map,
+        fallback_to_latest=fallback_to_latest,
+    )
+    if ref.empty:
+        return {}, chosen_year
+    grouped = ref.groupby("carrier")["reference_mw"].sum(min_count=1)
+    return {
+        str(carrier): float(reference_mw)
+        for carrier, reference_mw in grouped.dropna().items()
+    }, chosen_year
+
+
+def _irena_global_capacity_reference(
+    irena_csv,
+    year,
+    carrier_technology_map,
+    fallback_to_latest=True,
+    grid_types=None,
+):
+    irena = pd.read_csv(irena_csv)
+    irena = irena.rename(
+        columns={
+            col: str(col).replace("\ufeff", "").strip()
+            for col in irena.columns
+        }
+    )
+
+    tech_to_carrier = {}
+    for carrier, techs in (carrier_technology_map or {}).items():
+        if isinstance(techs, str):
+            techs = [techs]
+        for tech in techs or []:
+            tech_to_carrier[str(tech)] = str(carrier)
+    if not tech_to_carrier:
+        return {}, int(year)
+
+    requested_year = int(year)
+
+    # Wide legacy format: one column per year.
+    wide_years = sorted(int(c) for c in irena.columns if isinstance(c, str) and c.isdigit())
+    if {"Technology", "Country"}.issubset(irena.columns) and wide_years:
+        chosen_year = _irena_reference_year(
+            wide_years,
+            requested_year,
+            irena_csv,
+            fallback_to_latest=fallback_to_latest,
+        )
+        year_col = str(chosen_year)
+        ref = irena[["Technology", "Country", year_col]].copy()
+        global_rows = _global_markers(ref["Country"])
+        if global_rows.any():
+            ref = ref.loc[global_rows].copy()
+        ref["Technology"] = ref["Technology"].astype(str).str.strip()
+        ref["carrier"] = ref["Technology"].map(tech_to_carrier)
+        ref["reference_mw"] = pd.to_numeric(ref[year_col], errors="coerce").fillna(0.0)
+        ref = ref.loc[ref["carrier"].notna()].copy()
+        if ref.empty:
+            return {}, chosen_year
+        grouped = ref.groupby("carrier")["reference_mw"].sum(min_count=1)
+        return {
+            str(carrier): float(reference_mw)
+            for carrier, reference_mw in grouped.dropna().items()
+        }, chosen_year
+
+    # New IRENA Renewable Capacity Statistics long format.
+    new_long_cols = {
+        "Region/area (ISO 3)",
+        "Year",
+        "Data Type",
+        "Product Name",
+        "Grid Type",
+        "Unit",
+        "Value",
+    }
+    if new_long_cols.issubset(irena.columns):
+        irena["Year"] = pd.to_numeric(irena["Year"], errors="coerce")
+        available_years = sorted(int(y) for y in irena["Year"].dropna().unique())
+        chosen_year = _irena_reference_year(
+            available_years,
+            requested_year,
+            irena_csv,
+            fallback_to_latest=fallback_to_latest,
+        )
+        ref = irena.loc[irena["Year"].eq(chosen_year)].copy()
+        ref["Data Type"] = ref["Data Type"].astype(str).str.strip()
+        ref["Product Name"] = ref["Product Name"].astype(str).str.strip()
+        ref["Grid Type"] = ref["Grid Type"].astype(str).str.strip()
+        ref = ref.loc[
+            ref["Data Type"].eq("Electrical Capacity")
+            & _global_markers(ref["Region/area (ISO 3)"])
+        ].copy()
+        if grid_types is not None:
+            if isinstance(grid_types, str):
+                grid_types = [grid_types]
+            allowed_grid_types = {str(grid_type).strip() for grid_type in grid_types}
+            ref = ref.loc[ref["Grid Type"].isin(allowed_grid_types)].copy()
+        ref["carrier"] = ref["Product Name"].map(tech_to_carrier)
+        ref = ref.loc[ref["carrier"].notna()].copy()
+        if ref.empty:
+            return _capacity_reference_from_country_sum(
+                irena_csv,
+                chosen_year,
+                carrier_technology_map,
+                fallback_to_latest=True,
+            )
+        ref["reference_mw"] = _irena_value_to_mw(ref["Value"], ref["Unit"])
+        grouped = ref.groupby("carrier")["reference_mw"].sum(min_count=1)
+        return {
+            str(carrier): float(reference_mw)
+            for carrier, reference_mw in grouped.dropna().items()
+        }, chosen_year
+
+    # Long row-wise format without explicit global rows: sum country references.
+    required_long_cols = {"Technology", "Year", "Electricity Installed Capacity (MW)"}
+    if required_long_cols.issubset(irena.columns):
+        return _capacity_reference_from_country_sum(
+            irena_csv,
+            requested_year,
+            carrier_technology_map,
+            fallback_to_latest=fallback_to_latest,
+        )
+
+    raise ValueError(
+        f"Unsupported IRENA capacity file schema in {irena_csv}. "
+        "Expected wide year columns or long format with `Year` and "
+        "`Electricity Installed Capacity (MW)`."
+    )
+
+
 def _country_ac_load_twh(n):
     if n.loads.empty or "p_set" not in n.loads_t:
         return pd.Series(dtype=float)
@@ -3498,27 +4080,28 @@ def _storageunit_output_energy_by_buscarrier(n, bus_carrier="AC"):
     return (p_su * w).sum("snapshot").groupby(su_car).sum("StorageUnit")
 
 
-def add_baseyear_generation_band(n, planning_year, config):
+def _add_owid_country_generation_band(n, planning_year, config, cfg_key, enabled_key, label):
     global_cfg = config.get("global_specific", {})
-    cfg = global_cfg.get("baseyear_generation", {})
-    if not cfg or not cfg.get("baseyear_generation_constraint", False):
+    cfg = global_cfg.get(cfg_key, {})
+    if not cfg or not cfg.get(enabled_key, False):
         return
 
-    baseyear = int(cfg.get("year", 2020))
+    target_year = int(cfg.get("year", 2020))
     try:
         current_year = int(float(planning_year))
     except Exception:
-        logger.warning("Could not parse planning year '%s' for baseyear constraints", planning_year)
+        logger.warning("Could not parse planning year '%s' for %s constraints", planning_year, label)
         return
-    if current_year != baseyear:
+    if current_year != target_year:
         logger.info(
-            "Skipping baseyear generation constraints for %s (configured for %s)",
+            "Skipping %s generation constraints for %s (configured for %s)",
+            label,
             planning_year,
-            baseyear,
+            target_year,
         )
         return
 
-    logger.info("Adding baseyear OWID country-level generation constraints for %s", planning_year)
+    logger.info("Adding %s OWID country-level generation constraints for %s", label, planning_year)
 
     tolerance = float(cfg.get("tolerance", 0.10))
     absolute_tolerance_twh = float(cfg.get("absolute_tolerance_twh", 0.5))
@@ -3536,12 +4119,12 @@ def add_baseyear_generation_band(n, planning_year, config):
         link_bus_carrier=link_bus_carrier,
     )
     if not model_expr:
-        logger.warning("No model country-metric expressions found for baseyear generation constraints")
+        logger.warning("No model country-metric expressions found for %s generation constraints", label)
         return
 
-    ref = _owid_country_metric_reference(owid_csv, baseyear, metrics)
+    ref = _owid_country_metric_reference(owid_csv, target_year, metrics)
     if ref.empty:
-        logger.warning("No OWID references found in %s for year %s", owid_csv, baseyear)
+        logger.warning("No OWID references found in %s for year %s", owid_csv, target_year)
         return
 
     network_countries = {
@@ -3587,29 +4170,29 @@ def add_baseyear_generation_band(n, planning_year, config):
         if slack_penalty_eur_per_mwh > 0.0:
             slack_low = n.model.add_variables(
                 lower=0.0,
-                name=f"baseyear_owid_country_metric_min_slack__{country_token}__{metric_token}",
+                name=f"{label}_owid_country_metric_min_slack__{country_token}__{metric_token}",
             )
             slack_high = n.model.add_variables(
                 lower=0.0,
-                name=f"baseyear_owid_country_metric_max_slack__{country_token}__{metric_token}",
+                name=f"{label}_owid_country_metric_max_slack__{country_token}__{metric_token}",
             )
             n.model.add_constraints(
                 lhs + slack_low >= lower,
-                name=f"baseyear_owid_country_metric_min__{country_token}__{metric_token}",
+                name=f"{label}_owid_country_metric_min__{country_token}__{metric_token}",
             )
             n.model.add_constraints(
                 lhs - slack_high <= upper,
-                name=f"baseyear_owid_country_metric_max__{country_token}__{metric_token}",
+                name=f"{label}_owid_country_metric_max__{country_token}__{metric_token}",
             )
             slack_terms.extend([slack_low, slack_high])
         else:
             n.model.add_constraints(
                 lhs >= lower,
-                name=f"baseyear_owid_country_metric_min__{country_token}__{metric_token}",
+                name=f"{label}_owid_country_metric_min__{country_token}__{metric_token}",
             )
             n.model.add_constraints(
                 lhs <= upper,
-                name=f"baseyear_owid_country_metric_max__{country_token}__{metric_token}",
+                name=f"{label}_owid_country_metric_max__{country_token}__{metric_token}",
             )
         added += 1
 
@@ -3629,6 +4212,28 @@ def add_baseyear_generation_band(n, planning_year, config):
         absolute_tolerance_twh,
         min_country_electric_load_twh,
         slack_penalty_eur_per_mwh,
+    )
+
+
+def add_baseyear_generation_band(n, planning_year, config):
+    _add_owid_country_generation_band(
+        n,
+        planning_year=planning_year,
+        config=config,
+        cfg_key="baseyear_generation",
+        enabled_key="baseyear_generation_constraint",
+        label="baseyear",
+    )
+
+
+def add_year2025_generation_band(n, planning_year, config):
+    _add_owid_country_generation_band(
+        n,
+        planning_year=planning_year,
+        config=config,
+        cfg_key="year2025_generation",
+        enabled_key="year2025_generation_constraint",
+        label="year2025",
     )
 
 
@@ -3669,14 +4274,10 @@ def add_year2025_geothermal_extendable_fallback(n, planning_year, config):
         return
 
     tolerance = float(cfg.get("tolerance", 0.10))
-    lower_multiplier = cfg.get("lower_multiplier")
-    upper_multiplier = cfg.get("upper_multiplier")
-    lower_multiplier = (
-        float(lower_multiplier) if lower_multiplier is not None else None
-    )
-    upper_multiplier = (
-        float(upper_multiplier) if upper_multiplier is not None else None
-    )
+    if tolerance < 0.0:
+        raise ValueError(
+            f"global_specific.year2025_capacity.tolerance must be >= 0, got {tolerance}"
+        )
     absolute_tolerance_mw = float(cfg.get("absolute_tolerance_mw", 0.0))
     min_reference_mw = float(cfg.get("min_reference_mw", 0.0))
     reference_year = int(cfg.get("reference_year", target_year))
@@ -3769,17 +4370,9 @@ def add_year2025_geothermal_extendable_fallback(n, planning_year, config):
             skipped_existing_extendable += 1
             continue
 
-        if lower_multiplier is not None or upper_multiplier is not None:
-            lower_mult = 1.0 if lower_multiplier is None else lower_multiplier
-            upper_mult = (
-                (1.0 + tolerance) if upper_multiplier is None else upper_multiplier
-            )
-            lower_total = max(target_mw * lower_mult, 0.0)
-            upper_total = target_mw * upper_mult
-        else:
-            band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
-            lower_total = max(target_mw - band_mw, 0.0)
-            upper_total = target_mw + band_mw
+        band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
+        lower_total = max(target_mw - band_mw, 0.0)
+        upper_total = target_mw + band_mw
 
         if existing_capacity_mw + 1e-6 >= lower_total:
             continue
@@ -3866,12 +4459,12 @@ def add_year2025_geothermal_extendable_fallback(n, planning_year, config):
 
 def add_year2025_irena_country_capacity_band(n, planning_year, config):
     """
-    Add hard country-level renewable capacity constraints around IRENA references.
+    Add hard country-level renewable capacity constraints around IRENA 2025 references.
 
     The config block is `global_specific.year2025_capacity`. Constraints apply only when
     `planning_year` matches `cfg["year"]`. Total capacity is generator `p_nom` by
     (country, configured constraint group), including fixed and extendable assets.
-    Supports either symmetric `tolerance` bands or explicit one-sided multipliers.
+    The band is symmetric around the IRENA reference: reference +/- tolerance.
     """
     global_cfg = config.get("global_specific", {})
     cfg = global_cfg.get("year2025_capacity", {})
@@ -3905,12 +4498,25 @@ def add_year2025_irena_country_capacity_band(n, planning_year, config):
         return
 
     tolerance = float(cfg.get("tolerance", 0.10))
-    lower_multiplier = cfg.get("lower_multiplier")
-    upper_multiplier = cfg.get("upper_multiplier")
-    lower_multiplier = float(lower_multiplier) if lower_multiplier is not None else None
-    upper_multiplier = float(upper_multiplier) if upper_multiplier is not None else None
+    if tolerance < 0.0:
+        raise ValueError(
+            f"global_specific.year2025_capacity.tolerance must be >= 0, got {tolerance}"
+        )
     absolute_tolerance_mw = float(cfg.get("absolute_tolerance_mw", 0.0))
     min_reference_mw = float(cfg.get("min_reference_mw", 0.0))
+    fixed_capacity_overshoot_policy = str(
+        cfg.get("fixed_capacity_overshoot_policy", "raise")
+    ).strip().lower()
+    valid_fixed_overshoot_policies = {
+        "raise",
+        "constrain_additions_only",
+    }
+    if fixed_capacity_overshoot_policy not in valid_fixed_overshoot_policies:
+        raise ValueError(
+            "global_specific.year2025_capacity.fixed_capacity_overshoot_policy "
+            f"must be one of {sorted(valid_fixed_overshoot_policies)}, got "
+            f"{fixed_capacity_overshoot_policy!r}"
+        )
     reference_year = int(cfg.get("reference_year", target_year))
     fallback_to_latest = bool(cfg.get("fallback_to_latest_available", True))
     units = str(cfg.get("units", "GW")).lower()
@@ -4072,7 +4678,7 @@ def add_year2025_irena_country_capacity_band(n, planning_year, config):
     missing_variable_violations = 0
     skipped_infeasible_by_upper_bound = 0
     skipped_infeasible_by_lower_bound = 0
-    clipped_fixed_upper_overshoot = 0
+    constrained_fixed_overshoot_additions = 0
 
     for row in ref.itertuples(index=False):
         country = str(row.country).upper()
@@ -4087,27 +4693,33 @@ def add_year2025_irena_country_capacity_band(n, planning_year, config):
         existing_capacity_mw = float(fixed_capacity.get(key, 0.0))
         ext_idx = ext_groups.get(key, pd.Index([]))
 
-        if lower_multiplier is not None or upper_multiplier is not None:
-            lower_mult = 1.0 if lower_multiplier is None else lower_multiplier
-            upper_mult = (1.0 + tolerance) if upper_multiplier is None else upper_multiplier
-            lower_total = max(target_mw * lower_mult, 0.0)
-            upper_total = target_mw * upper_mult
-        else:
-            band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
-            lower_total = max(target_mw - band_mw, 0.0)
-            upper_total = target_mw + band_mw
+        band_mw = max(absolute_tolerance_mw, tolerance * abs(target_mw))
+        lower_total = max(target_mw - band_mw, 0.0)
+        upper_total = target_mw + band_mw
         if len(ext_idx) == 0:
             if existing_capacity_mw + 1e-6 < lower_total or existing_capacity_mw - 1e-6 > upper_total:
                 missing_variable_violations += 1
-                logger.warning(
-                    "Cannot enforce IRENA country-capacity band for %s/%s: no extendable generators and fixed capacity %.2f %s is outside [%.2f, %.2f] %s.",
-                    country,
-                    carrier,
-                    existing_capacity_mw / unit_scale,
-                    units.upper(),
-                    lower_total / unit_scale,
-                    upper_total / unit_scale,
-                    units.upper(),
+                if (
+                    fixed_capacity_overshoot_policy == "constrain_additions_only"
+                    and existing_capacity_mw - 1e-6 > upper_total
+                ):
+                    constrained_fixed_overshoot_additions += 1
+                    logger.warning(
+                        "Cannot satisfy hard IRENA country-capacity upper band for %s/%s because fixed capacity is already too high and no extendable generator exists: fixed %.2f %s > upper %.2f %s. No additional-build variable is available, so the row is treated as an exogenous retained-capacity overshoot.",
+                        country,
+                        carrier,
+                        existing_capacity_mw / unit_scale,
+                        units.upper(),
+                        upper_total / unit_scale,
+                        units.upper(),
+                    )
+                    continue
+                raise ValueError(
+                    "Cannot enforce hard IRENA country-capacity band for "
+                    f"{country}/{carrier}: no extendable generators and fixed "
+                    f"capacity {existing_capacity_mw / unit_scale:.2f} {units.upper()} "
+                    f"is outside [{lower_total / unit_scale:.2f}, "
+                    f"{upper_total / unit_scale:.2f}] {units.upper()}."
                 )
             else:
                 skipped_no_variable_but_satisfied += 1
@@ -4124,30 +4736,18 @@ def add_year2025_irena_country_capacity_band(n, planning_year, config):
         max_total_feasible = existing_capacity_mw + ext_max_mw
 
         if min_total_feasible - 1e-6 > upper_total:
-            # Pragmatic fallback: if fixed capacity already overshoots the upper band,
-            # clip the fixed offset used by this validation constraint.
-            clipped_existing_capacity_mw = max(upper_total - ext_min_mw, 0.0)
-            if clipped_existing_capacity_mw + 1e-6 < existing_capacity_mw:
-                logger.warning(
-                    "Clipping effective fixed capacity for IRENA country-capacity band %s/%s from %.2f to %.2f %s to respect upper bound %.2f %s (extendable p_nom_min=%.2f).",
-                    country,
-                    carrier,
-                    existing_capacity_mw / unit_scale,
-                    clipped_existing_capacity_mw / unit_scale,
-                    units.upper(),
-                    upper_total / unit_scale,
-                    units.upper(),
-                    ext_min_mw / unit_scale,
+            skipped_infeasible_by_upper_bound += 1
+            if fixed_capacity_overshoot_policy == "constrain_additions_only":
+                lhs = p_nom_var.loc[ext_idx].sum()
+                country_token = _sanitize_constraint_token(country)
+                carrier_token = _sanitize_constraint_token(carrier)
+                n.model.add_constraints(
+                    lhs <= ext_min_mw,
+                    name=f"year2025_irena_country_capacity_no_additions__{country_token}__{carrier_token}",
                 )
-                existing_capacity_mw = clipped_existing_capacity_mw
-                min_total_feasible = existing_capacity_mw + ext_min_mw
-                max_total_feasible = existing_capacity_mw + ext_max_mw
-                clipped_fixed_upper_overshoot += 1
-
-            if min_total_feasible - 1e-6 > upper_total:
-                skipped_infeasible_by_upper_bound += 1
+                constrained_fixed_overshoot_additions += 1
                 logger.warning(
-                    "Skipping IRENA country-capacity band for %s/%s: minimum feasible total %.2f %s exceeds upper bound %.2f %s even after clipping (fixed=%.2f, extendable p_nom_min=%.2f).",
+                    "Cannot satisfy hard IRENA country-capacity upper band for %s/%s because retained fixed capacity is already too high: minimum feasible %.2f %s > upper %.2f %s. Added a hard no-additional-build constraint for extendable capacity instead (fixed=%.2f, extendable p_nom_min=%.2f).",
                     country,
                     carrier,
                     min_total_feasible / unit_scale,
@@ -4158,51 +4758,54 @@ def add_year2025_irena_country_capacity_band(n, planning_year, config):
                     ext_min_mw / unit_scale,
                 )
                 continue
+            raise ValueError(
+                "Cannot enforce hard IRENA country-capacity band for "
+                f"{country}/{carrier}: minimum feasible total "
+                f"{min_total_feasible / unit_scale:.2f} {units.upper()} exceeds "
+                f"upper bound {upper_total / unit_scale:.2f} {units.upper()} "
+                f"(fixed={existing_capacity_mw / unit_scale:.2f}, "
+                f"extendable p_nom_min={ext_min_mw / unit_scale:.2f})."
+            )
 
         if max_total_feasible + 1e-6 < lower_total:
             skipped_infeasible_by_lower_bound += 1
-            logger.warning(
-                "Skipping IRENA country-capacity band for %s/%s: maximum feasible total %.2f %s is below lower bound %.2f %s (fixed=%.2f, extendable p_nom_max=%s).",
-                country,
-                carrier,
-                max_total_feasible / unit_scale,
-                units.upper(),
-                lower_total / unit_scale,
-                units.upper(),
-                existing_capacity_mw / unit_scale,
-                "inf" if not np.isfinite(ext_max_mw) else f"{ext_max_mw / unit_scale:.2f}",
+            raise ValueError(
+                "Cannot enforce hard IRENA country-capacity band for "
+                f"{country}/{carrier}: maximum feasible total "
+                f"{max_total_feasible / unit_scale:.2f} {units.upper()} is below "
+                f"lower bound {lower_total / unit_scale:.2f} {units.upper()} "
+                f"(fixed={existing_capacity_mw / unit_scale:.2f}, "
+                f"extendable p_nom_max="
+                f"{'inf' if not np.isfinite(ext_max_mw) else f'{ext_max_mw / unit_scale:.2f}'})."
             )
-            continue
 
-        lower_var = lower_total - existing_capacity_mw
-        upper_var = upper_total - existing_capacity_mw
-        lhs = p_nom_var.loc[ext_idx].sum()
+        lhs = p_nom_var.loc[ext_idx].sum() + existing_capacity_mw
         country_token = _sanitize_constraint_token(country)
         carrier_token = _sanitize_constraint_token(carrier)
 
         n.model.add_constraints(
-            lhs >= lower_var,
+            lhs >= lower_total,
             name=f"year2025_irena_country_capacity_min__{country_token}__{carrier_token}",
         )
         n.model.add_constraints(
-            lhs <= upper_var,
+            lhs <= upper_total,
             name=f"year2025_irena_country_capacity_max__{country_token}__{carrier_token}",
         )
         added += 1
 
     logger.info(
-        "Added %d IRENA country-capacity constraints for planning year %s (reference_year=%s, tolerance=%s%%, lower_multiplier=%s, upper_multiplier=%s, min_reference=%.2f MW, skipped_low_reference=%d, skipped_fixed_only_satisfied=%d, fixed_only_violations=%d, clipped_fixed_upper_overshoot=%d, skipped_infeasible_upper=%d, skipped_infeasible_lower=%d)",
+        "Added %d hard IRENA country-capacity constraints for planning year %s (reference_year=%s, tolerance=%s%%, absolute_tolerance=%.2f MW, min_reference=%.2f MW, fixed_overshoot_policy=%s, fixed_overshoot_no_additions=%d, skipped_low_reference=%d, skipped_fixed_only_satisfied=%d, fixed_only_violations=%d, infeasible_upper=%d, infeasible_lower=%d)",
         added,
         planning_year,
         used_reference_year,
         100.0 * tolerance,
-        lower_multiplier if lower_multiplier is not None else "default",
-        upper_multiplier if upper_multiplier is not None else "default",
+        absolute_tolerance_mw,
         min_reference_mw,
+        fixed_capacity_overshoot_policy,
+        constrained_fixed_overshoot_additions,
         skipped_low_reference,
         skipped_no_variable_but_satisfied,
         missing_variable_violations,
-        clipped_fixed_upper_overshoot,
         skipped_infeasible_by_upper_bound,
         skipped_infeasible_by_lower_bound,
     )
@@ -4213,8 +4816,9 @@ def add_year2025_global_capacity_band(n, planning_year, config):
     Add 2025 global installed-capacity band constraints for selected technologies.
 
     This is intended to complement (not replace) the country-level IRENA capacity
-    band. Total global installed capacity is constrained around configured targets
-    (e.g. solar, onwind) with a symmetric tolerance.
+    band. Total global installed capacity is constrained around IRENA global
+    references, or explicit configured targets when provided, with a symmetric
+    tolerance.
     """
     global_cfg = config.get("global_specific", {})
     parent_cfg = global_cfg.get("year2025_capacity", {})
@@ -4252,14 +4856,68 @@ def add_year2025_global_capacity_band(n, planning_year, config):
     units = str(cfg.get("units", "GW")).lower()
     unit_scale = {"mw": 1.0, "gw": 1e3, "tw": 1e6}.get(units, 1e3)
 
-    targets = cfg.get("targets", {}) or {}
-    if not targets:
-        logger.warning("2025 global capacity constraints enabled but no targets configured.")
+    manual_targets = cfg.get("targets", None)
+    if manual_targets:
+        target_mw_by_carrier = {}
+        for carrier, target in manual_targets.items():
+            if isinstance(target, str) and target.upper().startswith("X"):
+                logger.info(
+                    "Skipping %s global-capacity target (placeholder target '%s')",
+                    carrier,
+                    target,
+                )
+                continue
+            target_mw_by_carrier[str(carrier)] = float(target) * unit_scale
+        target_source = "configured targets"
+        reference_year = target_year
+    else:
+        irena_csv = _repo_path(parent_cfg.get("irena_csv", "validation/data/irena_capacity_by_technology.csv"))
+        reference_year = int(cfg.get("reference_year", parent_cfg.get("reference_year", target_year)))
+        fallback_to_latest = bool(
+            cfg.get(
+                "fallback_to_latest_available",
+                parent_cfg.get("fallback_to_latest_available", True),
+            )
+        )
+        carrier_technology_map = cfg.get(
+            "irena_technology_by_constraint",
+            parent_cfg.get(
+                "irena_technology_by_constraint",
+                parent_cfg.get(
+                    "irena_technology_by_carrier",
+                    {
+                        "solar": ["PV"],
+                        "onwind": ["Onshore"],
+                    },
+                ),
+            ),
+        )
+        target_carriers = cfg.get("target_carriers", None)
+        if target_carriers is not None:
+            if isinstance(target_carriers, str):
+                target_carriers = [target_carriers]
+            target_carriers = {str(carrier) for carrier in target_carriers}
+            carrier_technology_map = {
+                str(carrier): techs
+                for carrier, techs in (carrier_technology_map or {}).items()
+                if str(carrier) in target_carriers
+            }
+        target_mw_by_carrier, reference_year = _irena_global_capacity_reference(
+            irena_csv=irena_csv,
+            year=reference_year,
+            carrier_technology_map=carrier_technology_map,
+            fallback_to_latest=fallback_to_latest,
+            grid_types=cfg.get("grid_types", None),
+        )
+        target_source = f"IRENA global reference ({irena_csv}, {reference_year})"
+
+    if not target_mw_by_carrier:
+        logger.warning("2025 global capacity constraints enabled but no targets could be resolved.")
         return
 
     model_carriers_by_constraint = parent_cfg.get(
         "model_carriers_by_constraint",
-        {key: [key] for key in targets.keys()},
+        {key: [key] for key in target_mw_by_carrier.keys()},
     )
 
     if n.generators.empty:
@@ -4333,13 +4991,8 @@ def add_year2025_global_capacity_band(n, planning_year, config):
     added = 0
     skipped_no_variable_but_satisfied = 0
 
-    for carrier, target in targets.items():
-        if isinstance(target, str) and target.upper().startswith("X"):
-            logger.info("Skipping %s global-capacity target (placeholder target '%s')", carrier, target)
-            continue
-
+    for carrier, target_mw in target_mw_by_carrier.items():
         carrier = str(carrier)
-        target_mw = float(target) * unit_scale
         lower_total = target_mw * (1.0 - tolerance)
         upper_total = target_mw * (1.0 + tolerance)
 
@@ -4373,21 +5026,25 @@ def add_year2025_global_capacity_band(n, planning_year, config):
 
         logger.info(
             "Global %s capacity band for %s: %.2f ≤ total installed capacity ≤ %.2f %s "
-            "(fixed-equivalent: %.2f %s)",
+            "(target: %.2f %s, fixed-equivalent: %.2f %s, source: %s)",
             carrier,
             planning_year,
             lower_total / unit_scale,
             upper_total / unit_scale,
             units.upper(),
+            target_mw / unit_scale,
+            units.upper(),
             existing_capacity_mw / unit_scale,
             units.upper(),
+            target_source,
         )
 
     logger.info(
-        "Added %d global 2025 capacity bands for planning year %s (tolerance=%.2f%%, skipped_fixed_only_satisfied=%d)",
+        "Added %d global 2025 capacity bands for planning year %s (tolerance=%.2f%%, target_source=%s, skipped_fixed_only_satisfied=%d)",
         added,
         planning_year,
         100.0 * tolerance,
+        target_source,
         skipped_no_variable_but_satisfied,
     )
 
@@ -4642,13 +5299,36 @@ def apply_country_fuel_price_overrides(fuel_price_dict, investment_year, costs, 
         return fuel_price_dict
 
     baseyear = int(base_cfg.get("year", 2020))
-    if int(investment_year) != baseyear:
+    apply_years_cfg = base_cfg.get(
+        "fossil_price_tuning_apply_years",
+        [baseyear, 2025],
+    )
+    if isinstance(apply_years_cfg, (int, float, str)):
+        apply_years_cfg = [apply_years_cfg]
+    apply_years = {
+        int(year)
+        for year in (apply_years_cfg or [])
+        if pd.notna(pd.to_numeric(pd.Series([year]), errors="coerce").iloc[0])
+    }
+    if int(investment_year) not in apply_years:
         logger.info(
-            "Skipping fossil price overrides for %s (configured baseyear is %s).",
+            "Skipping fossil price overrides for %s (configured apply years are %s).",
             investment_year,
-            baseyear,
+            sorted(apply_years),
         )
         return fuel_price_dict
+
+    source_years_cfg = base_cfg.get(
+        "fossil_price_tuning_source_years",
+        [baseyear],
+    )
+    if isinstance(source_years_cfg, (int, float, str)):
+        source_years_cfg = [source_years_cfg]
+    source_years = {
+        int(year)
+        for year in (source_years_cfg or [])
+        if pd.notna(pd.to_numeric(pd.Series([year]), errors="coerce").iloc[0])
+    }
 
     override_csv_cfg = base_cfg.get("fossil_price_override_csv", "")
     if not override_csv_cfg:
@@ -4710,9 +5390,17 @@ def apply_country_fuel_price_overrides(fuel_price_dict, investment_year, costs, 
 
     if "year" in override.columns:
         override["year"] = pd.to_numeric(override["year"], errors="coerce")
+        exact_year = override["year"].eq(int(investment_year))
+        reusable_source_year = override["year"].isin(source_years)
+        no_year = override["year"].isna()
         override = override.loc[
-            override["year"].isna() | override["year"].eq(int(investment_year))
+            no_year | exact_year | reusable_source_year
         ].copy()
+        override["_year_priority"] = np.select(
+            [exact_year.loc[override.index], no_year.loc[override.index]],
+            [2, 1],
+            default=0,
+        )
 
     override["country"] = override["country"].astype(str).str.upper().str.strip()
     override["fuel_type"] = override["fuel_type"].astype(str).str.lower().str.strip()
@@ -4720,6 +5408,12 @@ def apply_country_fuel_price_overrides(fuel_price_dict, investment_year, costs, 
         override["country"].str.len().eq(2)
         & override["fuel_type"].isin(["oil", "gas", "coal"])
     ].copy()
+    if "_year_priority" in override.columns:
+        override = (
+            override.sort_values(["country", "fuel_type", "_year_priority"])
+            .drop_duplicates(["country", "fuel_type"], keep="last")
+            .drop(columns=["_year_priority"])
+        )
     if override.empty:
         logger.warning(
             "Fossil price override CSV %s has no valid rows for year %s.",

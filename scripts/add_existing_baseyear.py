@@ -479,9 +479,14 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
             # For renewables, check existing capacity vs external data (irena) for this specific grouping_year
             # Only process if this grouping_year is at or before the baseyear
             # (future years don't have existing generators yet)
+            carrier_match = (
+                ["offwind-ac", "offwind-dc"]
+                if generator == "offwind"
+                else [carrier_label]
+            )
             existing_renewable_gens = n.generators.index[
                 (n.generators.build_year == grouping_year) & 
-                (n.generators.carrier == carrier_label)
+                (n.generators.carrier.isin(carrier_match))
             ]
             
             if not existing_renewable_gens.empty and grouping_year <= baseyear:

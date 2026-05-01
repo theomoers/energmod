@@ -82,9 +82,19 @@ def _load_model_wind_by_country(network_path):
     off = eb.loc[eb.carrier.isin(["offwind-ac", "offwind-dc"])].groupby("country")["energy_mwh"].sum() / 1e6
 
     cap = n.generators.copy()
+    bus_country = n.buses["country"].replace("", np.nan)
+
+    on_cap = pd.Series(dtype=float)
+    on_cap_df = cap.loc[cap.carrier.eq("onwind")]
+    if len(on_cap_df) > 0:
+        on_country = on_cap_df.bus.map(bus_country).fillna("")
+        on_cap_df = on_cap_df.loc[on_country != ""].copy()
+        on_country = on_country.loc[on_cap_df.index]
+        on_cap = pd.to_numeric(on_cap_df.get("p_nom_opt", on_cap_df["p_nom"]), errors="coerce").fillna(0.0)
+        on_cap = on_cap.groupby(on_country).sum()
+
     cap = cap.loc[cap.carrier.isin(["offwind-ac", "offwind-dc"])]
     if len(cap) > 0:
-        bus_country = n.buses["country"].replace("", np.nan)
         cap_country = cap.bus.map(bus_country).fillna("")
         cap = cap.loc[cap_country != ""].copy()
         cap_country = cap_country.loc[cap.index]
@@ -93,7 +103,7 @@ def _load_model_wind_by_country(network_path):
     else:
         off_cap = pd.Series(dtype=float)
 
-    out = pd.DataFrame({"on_twh": on, "off_twh": off, "off_cap_mw": off_cap}).fillna(0.0)
+    out = pd.DataFrame({"on_twh": on, "off_twh": off, "on_cap_mw": on_cap, "off_cap_mw": off_cap}).fillna(0.0)
     out["wind_total_twh"] = out["on_twh"] + out["off_twh"]
     return out.sort_index()
 
@@ -197,6 +207,8 @@ def _update_scales(
     max_adjust,
     min_total_scale,
     max_total_scale,
+    min_update_capacity_mw,
+    min_update_model_twh,
 ):
     countries = target_df.index
     scales = current_scales.reindex(countries).fillna(1.0).copy()
@@ -222,6 +234,28 @@ def _update_scales(
 
     on_adj = pd.Series(on_adj, index=countries, dtype=float)
     off_adj = pd.Series(off_adj, index=countries, dtype=float)
+
+    # If there is no modeled capacity, or the model has effectively zero dispatch,
+    # a profile multiplier cannot calibrate the country. Reset to neutral instead
+    # of creating unphysical CFs that can distort later runs.
+    on_guard = (
+        (target_df["target_on_twh"] > 0.0)
+        & (
+            (model["on_cap_mw"] <= min_update_capacity_mw)
+            | (model["on_twh"] <= min_update_model_twh)
+        )
+    )
+    off_guard = (
+        (target_df["target_off_twh"] > 0.0)
+        & (
+            (model["off_cap_mw"] <= min_update_capacity_mw)
+            | (model["off_twh"] <= min_update_model_twh)
+        )
+    )
+    scales.loc[on_guard, "onwind_scale"] = 1.0
+    scales.loc[off_guard, "offwind_scale"] = 1.0
+    on_adj.loc[on_guard] = 1.0
+    off_adj.loc[off_guard] = 1.0
 
     # Damped multiplicative update.
     scales["onwind_scale"] = (
@@ -384,6 +418,8 @@ def parse_args():
     p.add_argument("--max-adjust", type=float, default=4.0)
     p.add_argument("--min-total-scale", type=float, default=0.05)
     p.add_argument("--max-total-scale", type=float, default=20.0)
+    p.add_argument("--min-update-capacity-mw", type=float, default=1.0)
+    p.add_argument("--min-update-model-twh", type=float, default=0.001)
     p.add_argument("--snakemake-cores", type=int, default=1)
     p.add_argument(
         "--force-rules",
@@ -538,6 +574,8 @@ def main():
             max_adjust=args.max_adjust,
             min_total_scale=args.min_total_scale,
             max_total_scale=args.max_total_scale,
+            min_update_capacity_mw=args.min_update_capacity_mw,
+            min_update_model_twh=args.min_update_model_twh,
         )
         scales_out = scales.reset_index().rename(columns={"index": "country"})
         scales_out = scales_out.sort_values("country")

@@ -87,7 +87,11 @@ def _reroute_legacy_biomass_power_links(n):
             ac_output |= n.links[bus_col].map(n.buses.carrier).fillna("").eq("AC")
 
     bus0 = n.links.loc[link_mask & ac_output, "bus0"].astype(str)
-    old_biomass_bus = bus0.map(n.buses.carrier).fillna("").eq("solid biomass")
+    old_biomass_bus = (
+        bus0.map(n.buses.carrier).fillna("").eq("solid biomass")
+        | bus0.eq("Earth solid biomass")
+        | bus0.str.endswith(" solid biomass")
+    )
     candidate_links = bus0.index[old_biomass_bus]
     if candidate_links.empty:
         return
