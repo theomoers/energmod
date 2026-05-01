@@ -15,6 +15,10 @@ MODULE_PATH = ROOT / "scripts" / "learning" / "apply_learning_costs.py"
 SPEC = importlib.util.spec_from_file_location("apply_learning_costs_module", MODULE_PATH)
 alc = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(alc)
+EXPORT_MODULE_PATH = ROOT / "scripts" / "learning" / "export_postsolve_learning_costs.py"
+EXPORT_SPEC = importlib.util.spec_from_file_location("export_postsolve_learning_costs_module", EXPORT_MODULE_PATH)
+ep = importlib.util.module_from_spec(EXPORT_SPEC)
+EXPORT_SPEC.loader.exec_module(ep)
 
 
 def _make_state(committed_year, level_by_tech):
@@ -238,7 +242,7 @@ def test_get_known_annual_cost_prefers_runtime_state_and_history(monkeypatch):
     assert alc.get_known_annual_cost_for_year("solar_power", 2024, state, {}) == pytest.approx(2024.0)
 
 
-def test_battery_bos_multiplier_uses_confirmed_grid_storage_anchor(tmp_path, monkeypatch):
+def test_battery_bos_adder_uses_confirmed_grid_storage_anchor(tmp_path, monkeypatch):
     anchor = tmp_path / "battery_grid_storage_cost_anchor.csv"
     anchor.write_text(
         "year,cost_usd2025_per_kwh,cost_eur2020_per_kwh,source\n"
@@ -262,10 +266,62 @@ def test_battery_bos_multiplier_uses_confirmed_grid_storage_anchor(tmp_path, mon
         lambda tech, year, cfg: 76.2053294936,
     )
 
-    multiplier = alc.get_battery_energy_bos_multiplier(learning_cfg, "costs_2030.csv")
+    adder = alc.get_battery_energy_bos_adder(learning_cfg, "costs_2030.csv")
 
-    assert multiplier == pytest.approx(88.07002359846918 / 76.2053294936)
-    assert learning_cfg["_battery_energy_bos_cache"]["confirmed_grid_storage_anchor"] == pytest.approx(multiplier)
+    assert adder == pytest.approx(88.07002359846918 - 76.2053294936)
+    assert learning_cfg["_battery_energy_bos_cache"]["confirmed_grid_storage_anchor_adder"] == pytest.approx(adder)
+
+
+def test_battery_phi_future_years_hold_last_observed_value(tmp_path):
+    mapping_csv = tmp_path / "battery_phi_mapping.csv"
+    mapping_csv.write_text(
+        "year,rolling_median_5yr_phi\n"
+        "2022,17.75\n"
+        "2023,13.97318861400647\n"
+        "2024,11.0\n",
+        encoding="utf-8",
+    )
+    learning_cfg = {
+        "_manifest_root": tmp_path,
+        "_manifest": {
+            "battery_treatment": {
+                "global_liion_mapping": {
+                    "series_csv": "battery_phi_mapping.csv",
+                    "series_column": "rolling_median_5yr_phi",
+                    "fallback_value": 16.97314803391489,
+                    "block_aggregation": "arithmetic_mean",
+                },
+            },
+        },
+    }
+
+    assert alc.get_battery_phi_for_year(learning_cfg, 2024) == pytest.approx(11.0)
+    assert alc.get_battery_phi_for_year(learning_cfg, 2030) == pytest.approx(11.0)
+    assert alc.get_battery_phi_for_block(learning_cfg, 2025, 2030) == pytest.approx(11.0)
+
+
+def test_committed_battery_state_records_experience_increment(monkeypatch):
+    monkeypatch.setattr(ep, "get_battery_phi_for_block", lambda learning_cfg, prev_year, current_year: 11.0)
+    payload = {
+        "technology_states": {"battery_energy": {}},
+        "capacity_history": {"battery_energy": {"2025": 1000.0}},
+        "modeled_capacity_history": {"battery_energy": {"2025": 50.0}},
+    }
+
+    updated = ep._update_committed_capacity_histories(
+        payload,
+        solved_capacity_by_tech={"battery_energy": 60.0},
+        learning_cfg={},
+        current_year=2030,
+    )
+
+    assert updated["modeled_capacity_history"]["battery_energy"]["2030"] == pytest.approx(60.0)
+    assert updated["experience_increment_history"]["battery_energy"]["2030"] == pytest.approx(110.0)
+    assert updated["capacity_history"]["battery_energy"]["2030"] == pytest.approx(1110.0)
+    details = updated["experience_increment_details"]["battery_energy"]["2030"]
+    assert details["modeled_block_addition"] == pytest.approx(10.0)
+    assert details["phi"] == pytest.approx(11.0)
+    assert details["experience_increment"] == pytest.approx(110.0)
 
 
 def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeypatch):
@@ -293,7 +349,8 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
     }
 
     monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
-    monkeypatch.setattr(alc, "get_battery_energy_bos_multiplier", lambda learning_cfg, costs_file: 2.0)
+    monkeypatch.setattr(alc, "get_battery_energy_bos_adder", lambda learning_cfg, costs_file: 2.0)
+    monkeypatch.setattr(alc, "load_battery_power_investment_cost", lambda costs_file: 100.0)
     expected_levels = np.log(
         np.array([[40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]], dtype=float) * 1000.0
     )
@@ -332,10 +389,13 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
 
     assert diagnostics["onwind_power"]["c_overnight"] == pytest.approx(30.8)
     assert diagnostics["battery_energy"]["raw_c_overnight"] == pytest.approx(40.5)
-    assert diagnostics["battery_energy"]["c_overnight"] == pytest.approx(81.0)
+    assert diagnostics["battery_energy"]["c_overnight"] == pytest.approx(42.5)
     assert diagnostics["battery_energy"]["source_cost_basis"] == "liion_pack"
     assert diagnostics["battery_energy"]["network_cost_basis"] == "grid_storage_energy"
-    assert diagnostics["battery_energy"]["cost_basis_conversion_multiplier"] == pytest.approx(2.0)
+    assert diagnostics["battery_energy"]["cost_basis_conversion_method"] == "additive_pack_plus_fixed_energy_bos"
+    assert diagnostics["battery_energy"]["cost_basis_conversion_multiplier"] == pytest.approx(1.0)
+    assert diagnostics["battery_energy"]["battery_energy_bos_adder_eur_per_kwh"] == pytest.approx(2.0)
+    assert diagnostics["battery_energy"]["reported_4h_bess_capex_eur_per_kwh"] == pytest.approx(42.5 + 25.0)
     assert json.loads(diagnostics["battery_energy"]["raw_kernel_costs_json"]) == pytest.approx([
         15.0,
         25.0,
@@ -344,11 +404,11 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
         60.0,
     ])
     assert json.loads(diagnostics["battery_energy"]["applied_kernel_costs_json"]) == pytest.approx([
-        30.0,
-        50.0,
-        80.0,
-        100.0,
-        120.0,
+        17.0,
+        27.0,
+        42.0,
+        52.0,
+        62.0,
     ])
 
 
@@ -368,7 +428,8 @@ def test_stochastic_point_cost_converts_battery_basis_without_mutating_raw_log(m
         "battery_energy": {},
     }
     monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
-    monkeypatch.setattr(alc, "get_battery_energy_bos_multiplier", lambda learning_cfg, costs_file: 2.5)
+    monkeypatch.setattr(alc, "get_battery_energy_bos_adder", lambda learning_cfg, costs_file: 2.5)
+    monkeypatch.setattr(alc, "load_battery_power_investment_cost", lambda costs_file: 80.0)
 
     costs = alc._learning_costs_from_stochastic_state(
         artifacts=artifacts,
@@ -384,9 +445,12 @@ def test_stochastic_point_cost_converts_battery_basis_without_mutating_raw_log(m
 
     battery = costs["battery_energy"]
     assert battery["raw_c_overnight"] == pytest.approx(25.0)
-    assert battery["c_overnight"] == pytest.approx(62.5)
-    assert battery["capital_cost"] == pytest.approx(62.5)
-    assert battery["log_capex_runtime"] == pytest.approx(math.log(62.5 * 1000.0))
+    assert battery["c_overnight"] == pytest.approx(27.5)
+    assert battery["capital_cost"] == pytest.approx(27.5)
+    assert battery["battery_pack_learning_cost_eur_per_kwh"] == pytest.approx(25.0)
+    assert battery["battery_energy_bos_adder_eur_per_kwh"] == pytest.approx(2.5)
+    assert battery["reported_4h_bess_capex_eur_per_kwh"] == pytest.approx(47.5)
+    assert battery["log_capex_runtime"] == pytest.approx(math.log(27.5 * 1000.0))
     assert battery["raw_log_capex_runtime"] == pytest.approx(math.log(25.0 * 1000.0))
     assert state["technology_states"]["battery_energy"]["last_log_capex"] == pytest.approx(
         math.log(25.0 * 1000.0)

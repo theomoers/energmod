@@ -47,12 +47,12 @@ from learning.fuel_price_io import (
 )
 from learning.learning_data_io import load_historical_capacity, load_historical_cost
 
-# Battery energy-side BOS multiplier reference.
+# Battery energy-side BOS adder reference.
 # The stochastic battery process is estimated on global Li-ion pack costs, but
 # PyPSA's "battery storage" Store needs installed grid-storage energy cost. Anchor
-# that conversion to the confirmed 2025 grid-storage cost observation so future
-# applied model costs evolve from the historical grid-storage basis, not the older
-# PyPSA technology-data row.
+# the fixed non-pack energy-side adder to the confirmed 2025 grid-storage cost
+# observation. The learned pack component moves with the stochastic artifact; the
+# non-pack energy BOS/container/integration component is held fixed.
 BATTERY_GRID_STORAGE_COST_ANCHOR_YEAR = 2025
 BATTERY_GRID_STORAGE_COST_ANCHOR_USD2025_PER_KWH = 125.0
 BATTERY_GRID_STORAGE_COST_ANCHOR_EUR2020_PER_KWH = 88.07002359846918
@@ -215,6 +215,31 @@ def load_battery_storage_investment_cost(costs_file):
     )
 
 
+def load_battery_power_investment_cost(costs_file):
+    """
+    Load deterministic battery charger/inverter investment cost as EUR/kW.
+    """
+    df = pd.read_csv(costs_file)
+    rows = df[
+        df["technology"].astype(str).str.strip().eq("battery inverter")
+        & df["parameter"].astype(str).str.strip().eq("investment")
+    ]
+    if rows.empty:
+        raise ValueError(
+            f"No battery inverter investment row found in costs file: {costs_file}"
+        )
+    value = float(rows.iloc[0]["value"])
+    unit = str(rows.iloc[0]["unit"]).strip().lower()
+    if unit == "eur/kw":
+        return value
+    if unit == "eur/mw":
+        return value / 1000.0
+    raise ValueError(
+        f"Unsupported battery inverter investment unit '{rows.iloc[0]['unit']}' in {costs_file}. "
+        "Expected EUR/kW or EUR/MW."
+    )
+
+
 def get_battery_grid_storage_cost_anchor(learning_cfg):
     """
     Return the confirmed installed grid-storage battery cost anchor.
@@ -270,45 +295,80 @@ def get_battery_grid_storage_cost_anchor(learning_cfg):
     }
 
 
-def get_battery_energy_bos_multiplier(learning_cfg, costs_file):
+def get_battery_energy_bos_adder(learning_cfg, costs_file):
     """
-    Return data-derived energy-side multiplier applied to battery_energy costs.
+    Return fixed energy-side non-pack adder applied to battery_energy costs.
 
-    This multiplier is intended for energy-side adders only and should exclude
+    This adder is intended for energy-side non-pack costs only and should exclude
     battery_power components (inverter/power electronics), which are modeled
     separately on links.
     """
     cache = learning_cfg.setdefault("_battery_energy_bos_cache", {})
-    cache_key = "confirmed_grid_storage_anchor"
+    cache_key = "confirmed_grid_storage_anchor_adder"
     if cache_key in cache:
         return float(cache[cache_key])
 
     anchor = get_battery_grid_storage_cost_anchor(learning_cfg)
     reference_year = int(anchor["year"])
     energy_side_system_cost = float(anchor["cost_eur2020_per_kwh"])
-    liion_pack_cost = float(
+    learned_battery_pack_cost_eur_per_kwh = float(
         load_cost_from_historical_csv(
             "battery_energy",
             reference_year,
             learning_cfg,
         )
     )
-    value = energy_side_system_cost / liion_pack_cost
-    if not np.isfinite(value) or value <= 0.0:
+    value = energy_side_system_cost - learned_battery_pack_cost_eur_per_kwh
+    if not np.isfinite(value):
         raise ValueError(
-            f"Invalid derived battery energy-side multiplier={value!r}; must be finite and > 0."
+            f"Invalid derived battery energy-side BOS adder={value!r}; must be finite."
         )
     logger.info(
-        "Derived battery energy-side multiplier %.4f from confirmed %s grid-storage anchor: "
-        "%.3f EUR2020/kWh / Li-ion pack %.3f EUR2020/kWh (year %s)",
+        "Derived fixed battery energy-side BOS adder %.4f EUR2020/kWh from confirmed %s "
+        "grid-storage anchor: %.3f EUR2020/kWh - Li-ion pack %.3f EUR2020/kWh (year %s)",
         value,
         anchor.get("source", "battery_grid_storage_cost_anchor"),
         energy_side_system_cost,
-        liion_pack_cost,
+        learned_battery_pack_cost_eur_per_kwh,
         reference_year,
     )
     cache[cache_key] = float(value)
     return value
+
+
+def _battery_store_cost_from_pack_cost(learned_battery_pack_cost_eur_per_kwh, learning_cfg, costs_file):
+    battery_energy_bos_adder_eur_per_kwh = get_battery_energy_bos_adder(learning_cfg, costs_file)
+    battery_store_cost_eur_per_kwh = (
+        float(learned_battery_pack_cost_eur_per_kwh) + battery_energy_bos_adder_eur_per_kwh
+    )
+    return battery_store_cost_eur_per_kwh, battery_energy_bos_adder_eur_per_kwh
+
+
+def _battery_basis_additive_diagnostics(
+    learned_battery_pack_cost_eur_per_kwh,
+    battery_store_cost_eur_per_kwh,
+    battery_energy_bos_adder_eur_per_kwh,
+    costs_file,
+):
+    battery_power_deterministic_cost_eur_per_kw = load_battery_power_investment_cost(costs_file)
+    reported_4h_bess_charger_cost_eur_per_kwh = battery_power_deterministic_cost_eur_per_kw / 4.0
+    reported_4h_bess_capex_eur_per_kwh = (
+        battery_store_cost_eur_per_kwh + reported_4h_bess_charger_cost_eur_per_kwh
+    )
+    return {
+        "cost_basis_conversion_method": "additive_pack_plus_fixed_energy_bos",
+        "cost_basis_conversion_multiplier": 1.0,
+        "battery_pack_learning_cost_eur_per_kwh": float(learned_battery_pack_cost_eur_per_kwh),
+        "battery_energy_bos_adder_eur_per_kwh": float(battery_energy_bos_adder_eur_per_kwh),
+        "battery_store_cost_eur_per_kwh": float(battery_store_cost_eur_per_kwh),
+        "battery_power_deterministic_cost_eur_per_kw": float(battery_power_deterministic_cost_eur_per_kw),
+        "reported_4h_bess_duration_h": 4.0,
+        "reported_4h_bess_pack_cost_eur_per_kwh": float(learned_battery_pack_cost_eur_per_kwh),
+        "reported_4h_bess_energy_bos_adder_eur_per_kwh": float(battery_energy_bos_adder_eur_per_kwh),
+        "reported_4h_bess_charger_cost_eur_per_kw": float(battery_power_deterministic_cost_eur_per_kw),
+        "reported_4h_bess_charger_cost_eur_per_kwh": float(reported_4h_bess_charger_cost_eur_per_kwh),
+        "reported_4h_bess_capex_eur_per_kwh": float(reported_4h_bess_capex_eur_per_kwh),
+    }
 
 
 def _runtime_source_cost_basis(tech, selected_model=None, runtime_metadata=None):
@@ -359,13 +419,38 @@ def convert_runtime_cost_levels_to_network_basis(
         if tech == "battery_energy"
         else DEFAULT_NETWORK_COST_BASIS
     )
-    multiplier = 1.0
+    diagnostics = {
+        "cost_basis_conversion_method": "identity",
+        "cost_basis_conversion_multiplier": 1.0,
+    }
 
     if tech == "battery_energy" and source_basis == BATTERY_ENERGY_RAW_COST_BASIS:
-        multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
+        applied, battery_energy_bos_adder = _battery_store_cost_from_pack_cost(
+            raw_applied,
+            learning_cfg,
+            costs_file,
+        )
+        terminal, _ = _battery_store_cost_from_pack_cost(
+            raw_terminal,
+            learning_cfg,
+            costs_file,
+        )
+        diagnostics = _battery_basis_additive_diagnostics(
+            learned_battery_pack_cost_eur_per_kwh=raw_applied,
+            battery_store_cost_eur_per_kwh=applied,
+            battery_energy_bos_adder_eur_per_kwh=battery_energy_bos_adder,
+            costs_file=costs_file,
+        )
+        diagnostics.update(
+            {
+                "battery_pack_learning_cost_terminal_point_eur_per_kwh": raw_terminal,
+                "battery_store_cost_terminal_point_eur_per_kwh": terminal,
+            }
+        )
+    else:
+        applied = raw_applied
+        terminal = raw_terminal
 
-    applied = raw_applied * multiplier
-    terminal = raw_terminal * multiplier
     return {
         "applied_c_overnight": applied,
         "terminal_c_overnight": terminal,
@@ -373,7 +458,7 @@ def convert_runtime_cost_levels_to_network_basis(
         "raw_c_overnight_terminal_point": raw_terminal,
         "source_cost_basis": source_basis,
         "network_cost_basis": network_basis,
-        "cost_basis_conversion_multiplier": float(multiplier),
+        **diagnostics,
     }
 
 
@@ -1556,8 +1641,22 @@ def get_battery_phi_for_year(learning_cfg, year):
     mapping = support["config"]
     series = support["series"]
     series_col = mapping["series_column"]
+    year = int(year)
 
-    row = series.loc[series["year"] == int(year)]
+    valid_series = series.loc[
+        pd.to_numeric(series[series_col], errors="coerce").gt(0.0)
+        & pd.to_numeric(series[series_col], errors="coerce").notna()
+    ].copy()
+    if valid_series.empty:
+        raise ValueError("Battery phi mapping series has no positive finite observed values.")
+
+    latest_row = valid_series.sort_values("year").iloc[-1]
+    latest_year = int(latest_row["year"])
+    latest_value = float(latest_row[series_col])
+    if year > latest_year:
+        return latest_value
+
+    row = series.loc[series["year"] == year]
     if not row.empty:
         value = float(row[series_col].iloc[-1])
         if np.isfinite(value) and value > 0.0:
@@ -2302,6 +2401,8 @@ def _reinitialize_stochastic_runtime_state_for_model(state, initial_state, selec
         "capacity_history",
         "annual_cost_history",
         "modeled_capacity_history",
+        "experience_increment_history",
+        "experience_increment_details",
         "last_applied_year",
         "committed_from_network",
         "battery_power_treatment",
@@ -2618,7 +2719,28 @@ def _cost_statistics_from_levels(
         "source_cost_basis": converted["source_cost_basis"],
         "network_cost_basis": converted["network_cost_basis"],
         "cost_basis_conversion_multiplier": float(converted["cost_basis_conversion_multiplier"]),
+        "cost_basis_conversion_method": converted["cost_basis_conversion_method"],
+        "battery_pack_learning_cost_eur_per_kwh": converted.get("battery_pack_learning_cost_eur_per_kwh", np.nan),
+        "battery_pack_learning_cost_terminal_point_eur_per_kwh": converted.get("battery_pack_learning_cost_terminal_point_eur_per_kwh", np.nan),
+        "battery_energy_bos_adder_eur_per_kwh": converted.get("battery_energy_bos_adder_eur_per_kwh", np.nan),
+        "battery_store_cost_eur_per_kwh": converted.get("battery_store_cost_eur_per_kwh", np.nan),
+        "battery_store_cost_terminal_point_eur_per_kwh": converted.get("battery_store_cost_terminal_point_eur_per_kwh", np.nan),
+        "battery_power_deterministic_cost_eur_per_kw": converted.get("battery_power_deterministic_cost_eur_per_kw", np.nan),
+        "reported_4h_bess_duration_h": converted.get("reported_4h_bess_duration_h", np.nan),
+        "reported_4h_bess_pack_cost_eur_per_kwh": converted.get("reported_4h_bess_pack_cost_eur_per_kwh", np.nan),
+        "reported_4h_bess_energy_bos_adder_eur_per_kwh": converted.get("reported_4h_bess_energy_bos_adder_eur_per_kwh", np.nan),
+        "reported_4h_bess_charger_cost_eur_per_kw": converted.get("reported_4h_bess_charger_cost_eur_per_kw", np.nan),
+        "reported_4h_bess_charger_cost_eur_per_kwh": converted.get("reported_4h_bess_charger_cost_eur_per_kwh", np.nan),
+        "reported_4h_bess_capex_eur_per_kwh": converted.get("reported_4h_bess_capex_eur_per_kwh", np.nan),
     }
+
+
+def _apply_network_basis_to_kernel_costs(tech, raw_kernel_costs, cost_stats):
+    if tech == "battery_energy" and cost_stats.get("cost_basis_conversion_method") == "additive_pack_plus_fixed_energy_bos":
+        adder = float(cost_stats["battery_energy_bos_adder_eur_per_kwh"])
+        return [float(value) + adder for value in raw_kernel_costs]
+    basis_multiplier = float(cost_stats.get("cost_basis_conversion_multiplier", 1.0))
+    return [float(value) * basis_multiplier for value in raw_kernel_costs]
 
 
 def _runtime_cost_record(
@@ -2766,7 +2888,6 @@ def _legacy_global_current_window_diagnostics(
             selected_model=selected_model,
             runtime_metadata=runtime_metadata,
         )
-        basis_multiplier = float(cost_stats.get("cost_basis_conversion_multiplier", 1.0))
         diagnostics[tech] = {
             **cost_stats,
             "kernel_year_start": int(kernel_years[0]),
@@ -2776,7 +2897,7 @@ def _legacy_global_current_window_diagnostics(
             "expected_kernel_years_json": _serialize_year_list(kernel_years[1:]),
             "raw_kernel_costs_json": _serialize_float_list(raw_kernel_costs),
             "applied_kernel_costs_json": _serialize_float_list(
-                [value * basis_multiplier for value in raw_kernel_costs]
+                _apply_network_basis_to_kernel_costs(tech, raw_kernel_costs, cost_stats)
             ),
         }
     return diagnostics
@@ -2870,7 +2991,6 @@ def _compute_block_average_expected_costs(
             selected_model=selected_model,
             runtime_metadata=runtime_metadata,
         )
-        basis_multiplier = float(cost_stats.get("cost_basis_conversion_multiplier", 1.0))
         diagnostics[tech] = {
             **cost_stats,
             "kernel_year_start": int(kernel_years[0]),
@@ -2880,7 +3000,7 @@ def _compute_block_average_expected_costs(
             "expected_kernel_years_json": _serialize_year_list(expected_years),
             "raw_kernel_costs_json": _serialize_float_list(kernel_costs),
             "applied_kernel_costs_json": _serialize_float_list(
-                [value * basis_multiplier for value in kernel_costs]
+                _apply_network_basis_to_kernel_costs(tech, kernel_costs, cost_stats)
             ),
         }
     return diagnostics
@@ -3278,6 +3398,8 @@ def update_stochastic_runtime_state(
             "capacity_history": state.get("capacity_history", {}),
             "annual_cost_history": existing_annual_cost_history,
             "modeled_capacity_history": state.get("modeled_capacity_history", {}),
+            "experience_increment_history": state.get("experience_increment_history", {}),
+            "experience_increment_details": state.get("experience_increment_details", {}),
         }
         if int(current_year) > base_year and "annual_log_cost_paths" in shared_result:
             next_state["annual_cost_history"] = _merge_annual_cost_history(
@@ -3316,6 +3438,8 @@ def update_stochastic_runtime_state(
         "capacity_history": state.get("capacity_history", {}),
         "annual_cost_history": existing_annual_cost_history,
         "modeled_capacity_history": state.get("modeled_capacity_history", {}),
+        "experience_increment_history": state.get("experience_increment_history", {}),
+        "experience_increment_details": state.get("experience_increment_details", {}),
     }
     annual_log_cost_paths_by_tech = {}
     for tech, artifact in artifacts.items():
@@ -3615,7 +3739,7 @@ def calculate_learning_costs(
         )
     
     learning_costs = {}
-    battery_energy_bos_multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
+    battery_energy_bos_adder_eur_per_kwh = get_battery_energy_bos_adder(learning_cfg, costs_file)
     bootstrap_kernel_weights = get_cost_expectation_weights(learning_cfg)
     bootstrap_lag_years_by_tech = get_cost_expectation_lag_years_by_tech(learning_cfg)
     
@@ -3707,17 +3831,18 @@ def calculate_learning_costs(
                     f"for {tech}: {e}"
                 ) from e
             if tech == 'battery_energy':
-                c_overnight_cell = c_overnight
-                c_overnight = c_overnight_cell * battery_energy_bos_multiplier
+                learned_battery_pack_cost_eur_per_kwh = c_overnight
+                c_overnight = learned_battery_pack_cost_eur_per_kwh + battery_energy_bos_adder_eur_per_kwh
                 logger.info(
-                    "    Battery historical Li-ion kernel cost: %.3f EUR/%s, energy-side cost (×%.4f): %.3f EUR/%s",
-                    c_overnight_cell,
+                    "    Battery historical Li-ion kernel cost: %.3f EUR/%s, energy-side adder %.3f EUR/%s, store cost: %.3f EUR/%s",
+                    learned_battery_pack_cost_eur_per_kwh,
                     unit,
-                    battery_energy_bos_multiplier,
+                    battery_energy_bos_adder_eur_per_kwh,
+                    unit,
                     c_overnight,
                     unit,
                 )
-                kernel_costs = [float(cost) * battery_energy_bos_multiplier for cost in kernel_costs]
+                kernel_costs = [float(cost) + battery_energy_bos_adder_eur_per_kwh for cost in kernel_costs]
             kernel_diag = {
                 "kernel_year_start": int(kernel_years[0]),
                 "kernel_year_end": int(kernel_years[-1]),
@@ -3733,18 +3858,19 @@ def calculate_learning_costs(
             )
         else:
             # Calculate overnight cost using learning curve: c = A * L^(-β)
-            c_overnight_cell = A * (cumulative_capacity ** (-beta))
+            learned_battery_pack_cost_eur_per_kwh = A * (cumulative_capacity ** (-beta))
 
-            # For batteries, apply data-derived energy-side multiplier
+            # For batteries, add fixed energy-side BOS/container/integration adder
             # (learning at Li-ion pack level, converted to model battery-energy cost object).
             if tech == 'battery_energy':
-                c_overnight = c_overnight_cell * battery_energy_bos_multiplier
+                c_overnight = learned_battery_pack_cost_eur_per_kwh + battery_energy_bos_adder_eur_per_kwh
                 logger.info(
-                    f"    Battery cell cost: {c_overnight_cell:.2f} EUR/{unit}, "
-                    f"energy-side cost (×{battery_energy_bos_multiplier:.4f}): {c_overnight:.2f} EUR/{unit}"
+                    f"    Battery pack cost: {learned_battery_pack_cost_eur_per_kwh:.2f} EUR/{unit}, "
+                    f"energy-side adder: {battery_energy_bos_adder_eur_per_kwh:.2f} EUR/{unit}, "
+                    f"store cost: {c_overnight:.2f} EUR/{unit}"
                 )
             else:
-                c_overnight = c_overnight_cell
+                c_overnight = learned_battery_pack_cost_eur_per_kwh
         
         # Convert to capital_cost (EUR/MW-yr or EUR/MWh-yr)
         # NOTE: For renewable technologies, we calculate a global average capital cost here
@@ -3777,6 +3903,21 @@ def calculate_learning_costs(
             "log_capex_terminal_point": float(np.log(max(c_overnight, 1.0e-12) * 1000.0)),
             "wacc_dict": wacc_dict,  # Store for per-bus calculation
         }
+        if tech == "battery_energy":
+            learning_costs[tech].update(
+                {
+                    "source_cost_basis": BATTERY_ENERGY_RAW_COST_BASIS,
+                    "network_cost_basis": BATTERY_ENERGY_NETWORK_COST_BASIS,
+                    "cost_basis_conversion_method": "additive_pack_plus_fixed_energy_bos",
+                    "cost_basis_conversion_multiplier": 1.0,
+                    **_battery_basis_additive_diagnostics(
+                        learned_battery_pack_cost_eur_per_kwh=learned_battery_pack_cost_eur_per_kwh,
+                        battery_store_cost_eur_per_kwh=c_overnight,
+                        battery_energy_bos_adder_eur_per_kwh=battery_energy_bos_adder_eur_per_kwh,
+                        costs_file=costs_file,
+                    ),
+                }
+            )
         learning_costs[tech].update(kernel_diag)
         
         # Determine capital cost unit for logging
@@ -4739,9 +4880,22 @@ def save_cost_log(learning_costs, output_file):
         "unit",
         "source_cost_basis",
         "network_cost_basis",
+        "cost_basis_conversion_method",
         "cost_basis_conversion_multiplier",
         "raw_c_overnight",
         "raw_c_overnight_terminal_point",
+        "battery_pack_learning_cost_eur_per_kwh",
+        "battery_pack_learning_cost_terminal_point_eur_per_kwh",
+        "battery_energy_bos_adder_eur_per_kwh",
+        "battery_store_cost_eur_per_kwh",
+        "battery_store_cost_terminal_point_eur_per_kwh",
+        "battery_power_deterministic_cost_eur_per_kw",
+        "reported_4h_bess_duration_h",
+        "reported_4h_bess_pack_cost_eur_per_kwh",
+        "reported_4h_bess_energy_bos_adder_eur_per_kwh",
+        "reported_4h_bess_charger_cost_eur_per_kw",
+        "reported_4h_bess_charger_cost_eur_per_kwh",
+        "reported_4h_bess_capex_eur_per_kwh",
         "c_overnight",
         "c_overnight_terminal_point",
         "kernel_year_start",
@@ -4938,6 +5092,8 @@ def main(snakemake):
         "deployment_wedge_state": {
             "capacity_history": prior_state_payload.get("capacity_history", {}),
             "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+            "experience_increment_history": prior_state_payload.get("experience_increment_history", {}),
+            "experience_increment_details": prior_state_payload.get("experience_increment_details", {}),
         },
     }
 
@@ -5117,6 +5273,8 @@ def main(snakemake):
                 "technology_states": {},
                 "capacity_history": prior_state_payload.get("capacity_history", {}),
                 "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+                "experience_increment_history": prior_state_payload.get("experience_increment_history", {}),
+                "experience_increment_details": prior_state_payload.get("experience_increment_details", {}),
                 "fossil_price_states": prior_state_payload.get("fossil_price_states", {}),
             }
             cost_log_context = {
@@ -5142,6 +5300,8 @@ def main(snakemake):
                 "technology_states": {},
                 "capacity_history": prior_state_payload.get("capacity_history", {}),
                 "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+                "experience_increment_history": prior_state_payload.get("experience_increment_history", {}),
+                "experience_increment_details": prior_state_payload.get("experience_increment_details", {}),
                 "exogenous_cost_path_source": exogenous_info["source"],
                 "exogenous_cost_path_interpolation": exogenous_info["interpolation"],
                 "fossil_price_states": prior_state_payload.get("fossil_price_states", {}),
@@ -5296,6 +5456,8 @@ def main(snakemake):
         "last_applied_year": int(year),
         "capacity_history": prior_state_payload.get("capacity_history", {}),
         "modeled_capacity_history": prior_state_payload.get("modeled_capacity_history", {}),
+        "experience_increment_history": prior_state_payload.get("experience_increment_history", {}),
+        "experience_increment_details": prior_state_payload.get("experience_increment_details", {}),
         "fossil_price_states": prior_state_payload.get("fossil_price_states", {}),
         "technology_states": {
             tech: {

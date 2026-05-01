@@ -26,8 +26,8 @@ from learning.apply_learning_costs import (
     build_learning_base_capacity_map,
     convert_to_capital_cost,
     extract_capacity_from_network,
+    get_battery_energy_bos_adder,
     get_battery_phi_for_block,
-    get_battery_energy_bos_multiplier,
     get_learning_engine,
     get_manifest_historical_datafile,
     get_selected_learning_model,
@@ -38,6 +38,7 @@ from learning.apply_learning_costs import (
     resolve_runtime_seed,
     update_stochastic_runtime_state,
     validate_runtime_contract,
+    _battery_basis_additive_diagnostics,
 )
 from learning.deployment_constraints import (
     build_deployment_constraint_block_paths,
@@ -136,6 +137,8 @@ def _load_historical_cumulative(tech, year, learning_cfg):
 def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learning_cfg, current_year):
     cumulative_history = payload.get("capacity_history", {}) or {}
     modeled_history = payload.get("modeled_capacity_history", {}) or {}
+    experience_increment_history = payload.get("experience_increment_history", {}) or {}
+    experience_increment_details = payload.get("experience_increment_details", {}) or {}
     tracked_techs = set((payload.get("technology_states", {}) or {}).keys())
     tracked_techs.update(cumulative_history.keys())
     tracked_techs.update(modeled_history.keys())
@@ -146,6 +149,8 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
             continue
         tech_cumulative = cumulative_history.get(tech, {}) or {}
         tech_modeled = modeled_history.get(tech, {}) or {}
+        tech_experience_increment = experience_increment_history.get(tech, {}) or {}
+        tech_experience_details = experience_increment_details.get(tech, {}) or {}
         current_year_str = str(int(current_year))
         solved_capacity = float(solved_capacity)
         if solved_capacity <= 0.0:
@@ -167,6 +172,9 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
                     current_year,
                     solved_capacity,
                 )
+            additions = 0.0
+            experience_increment = 0.0
+            phi_block = np.nan
         else:
             prev_year = prior_years[-1]
             prev_year_str = str(prev_year)
@@ -179,25 +187,40 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
             additions = max(solved_capacity - prev_modeled, 0.0)
             if tech == "battery_energy":
                 phi_block = get_battery_phi_for_block(learning_cfg, prev_year, current_year)
-                cumulative_value = prev_cumulative + additions * phi_block
+                experience_increment = additions * phi_block
+                cumulative_value = prev_cumulative + experience_increment
                 logger.info(
                     "Battery mapping %s-%s: modeled additions %.3f GWh × phi %.3f = %.3f GWh global Li-ion additions",
                     prev_year,
                     current_year,
                     additions,
                     phi_block,
-                    additions * phi_block,
+                    experience_increment,
                 )
             else:
-                cumulative_value = prev_cumulative + additions
+                phi_block = np.nan
+                experience_increment = additions
+                cumulative_value = prev_cumulative + experience_increment
 
         tech_cumulative[current_year_str] = cumulative_value
         tech_modeled[current_year_str] = solved_capacity
+        tech_experience_increment[current_year_str] = float(experience_increment)
+        tech_experience_details[current_year_str] = {
+            "modeled_block_addition": float(additions),
+            "phi": float(phi_block) if np.isfinite(phi_block) else np.nan,
+            "experience_increment": float(experience_increment),
+            "cumulative_capacity": float(cumulative_value),
+            "basis_unit": "GWh" if tech == "battery_energy" else "GW",
+        }
         cumulative_history[tech] = tech_cumulative
         modeled_history[tech] = tech_modeled
+        experience_increment_history[tech] = tech_experience_increment
+        experience_increment_details[tech] = tech_experience_details
 
     payload["capacity_history"] = cumulative_history
     payload["modeled_capacity_history"] = modeled_history
+    payload["experience_increment_history"] = experience_increment_history
+    payload["experience_increment_details"] = experience_increment_details
     return payload
 
 
@@ -461,6 +484,10 @@ def _build_export_learning_cost_log(base_df, postsolve_df, postsolve_state_year,
     rename_map = {
         "c_overnight": "postsolve_c_overnight",
         "c_overnight_terminal_point": "postsolve_c_overnight_terminal_point",
+        "battery_pack_learning_cost_eur_per_kwh": "postsolve_battery_pack_learning_cost_eur_per_kwh",
+        "battery_energy_bos_adder_eur_per_kwh": "postsolve_battery_energy_bos_adder_eur_per_kwh",
+        "battery_store_cost_eur_per_kwh": "postsolve_battery_store_cost_eur_per_kwh",
+        "reported_4h_bess_capex_eur_per_kwh": "postsolve_reported_4h_bess_capex_eur_per_kwh",
         "capital_cost": "postsolve_capital_cost",
         "capital_cost_terminal_point": "postsolve_capital_cost_terminal_point",
         "log_capex_terminal_point": "postsolve_log_capex_terminal_point",
@@ -513,7 +540,7 @@ def build_postsolve_cost_log(
 ):
     """Recalculate learning costs using solved capacity from current horizon."""
     learning_costs = {}
-    battery_energy_bos_multiplier = get_battery_energy_bos_multiplier(learning_cfg, costs_file)
+    battery_energy_bos_adder_eur_per_kwh = get_battery_energy_bos_adder(learning_cfg, costs_file)
 
     for _, row in base_cost_log_df.iterrows():
         tech = row["technology"]
@@ -562,7 +589,7 @@ def build_postsolve_cost_log(
         else:
             c_overnight = A * (cumulative_capacity ** (-beta))
             if tech == "battery_energy":
-                c_overnight *= battery_energy_bos_multiplier
+                c_overnight += battery_energy_bos_adder_eur_per_kwh
 
             capital_cost = convert_to_capital_cost(
                 c_overnight=c_overnight,
@@ -632,6 +659,34 @@ def build_postsolve_cost_log(
             "expected_kernel_years_json": row.get("expected_kernel_years_json", ""),
             "applied_kernel_costs_json": row.get("applied_kernel_costs_json", ""),
         }
+        if tech == "battery_energy":
+            learned_battery_pack_cost_eur_per_kwh = (
+                _to_float(row.get("raw_c_overnight"), fallback=np.nan)
+                if pd.notna(row.get("raw_c_overnight", np.nan))
+                else c_overnight - battery_energy_bos_adder_eur_per_kwh
+            )
+            learning_costs[tech].update(
+                {
+                    "source_cost_basis": row.get("source_cost_basis", "liion_pack"),
+                    "network_cost_basis": row.get("network_cost_basis", "grid_storage_energy"),
+                    "raw_c_overnight": learned_battery_pack_cost_eur_per_kwh,
+                    "raw_c_overnight_terminal_point": _to_float(
+                        row.get("raw_c_overnight_terminal_point"),
+                        fallback=learned_battery_pack_cost_eur_per_kwh,
+                    ),
+                    "battery_pack_learning_cost_terminal_point_eur_per_kwh": _to_float(
+                        row.get("battery_pack_learning_cost_terminal_point_eur_per_kwh"),
+                        fallback=learned_battery_pack_cost_eur_per_kwh,
+                    ),
+                    "battery_store_cost_terminal_point_eur_per_kwh": c_overnight_terminal_point,
+                    **_battery_basis_additive_diagnostics(
+                        learned_battery_pack_cost_eur_per_kwh=learned_battery_pack_cost_eur_per_kwh,
+                        battery_store_cost_eur_per_kwh=c_overnight,
+                        battery_energy_bos_adder_eur_per_kwh=battery_energy_bos_adder_eur_per_kwh,
+                        costs_file=costs_file,
+                    ),
+                }
+            )
 
         logger.info(
             "Post-solve %s: capacity=%.3f, c_overnight=%.3f, capital_cost=%.3f",
