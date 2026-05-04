@@ -90,10 +90,12 @@ class PhiCalibrationGridTests(unittest.TestCase):
         self.assertNotIn("      - wind_electricity", text)
         self.assertNotIn("      - other_renewable_electricity", text)
         self.assertIn("year2025_capacity_constraint: false", text)
+        self.assertIn("wind_iteration_scaling_enabled: false", text)
+        self.assertIn("solar_iteration_scaling_enabled: false", text)
         self.assertIn("fossil_price_tuning_enabled: true", text)
         self.assertIn("fossil_price_tuning_apply_years:", text)
         self.assertIn("      - 2020", text)
-        self.assertIn("      - 2025", text)
+        self.assertNotIn("      - 2025", text)
 
     def test_submission_metadata_records_target_2025_historical_constraints(self):
         task = phi_array.build_tasks(phi2_count=1, phi3_count=1)[0]

@@ -50,9 +50,9 @@ global_specific:
     nuclear_iteration_scale_max: 20.0
     nuclear_p_max_pu_cap: 1.0
 
-    # Apply tuned fossil price overrides only for the historical calibration
-    # horizons. Later myopic years use the normal fossil price path.
+    # Apply tuned fossil price overrides only for the baseyear calibration
+    # horizon. Later myopic years use the normal fossil price path.
     fossil_price_tuning_enabled: true
     fossil_price_override_csv: validation/data/fossil_price_tuning_overrides.csv
-    fossil_price_tuning_apply_years: [2020, 2025]
+    fossil_price_tuning_apply_years: [2020]
     fossil_price_tuning_source_years: [2020]

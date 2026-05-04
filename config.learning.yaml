@@ -28,7 +28,7 @@ learning:
     annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
     lag_years_by_tech:
       solar_power: 1
-      onwind_power: 2
+      onwind_power: 4
       battery_energy: 1
   deployment_constraints: 
     enabled: true
@@ -66,8 +66,8 @@ learning:
       battery_basis: local_energy
       b1_multiplier: 0.8
       b2_multiplier: 1.2
-      phi2_pct_capex: 0.15
-      phi3_pct_capex: 0.5
+      phi2_pct_capex: 0.35 # calibrated on latest May 1st
+      phi3_pct_capex: 0.5 # calibrated on latest May 1st
       irena_history_csv: "validation/data/IRENA_2025_capacity.csv"
       battery_history_csv: "data/energy_storage/battery_storage_capa_bycountry.csv"
   monte_carlo:
@@ -75,9 +75,9 @@ learning:
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-      - correlated_geometric_random_walk
-      - way_fixed_rho_benchmark_035
-    draws: 500
+      #- correlated_geometric_random_walk
+      #- way_fixed_rho_benchmark_035
+    draws: 50
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000

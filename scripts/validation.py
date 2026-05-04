@@ -2199,10 +2199,11 @@ def apply_country_wind_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Applying iterative wind scaling to %s using overrides calibrated from baseyear %s.",
+            "Skipping iterative wind scaling for %s (configured baseyear is %s).",
             investment_year,
             baseyear,
         )
+        return
 
     override_csv_cfg = base_cfg.get("wind_iteration_override_csv", "")
     if not override_csv_cfg:
@@ -2338,10 +2339,11 @@ def apply_country_solar_iteration_scaling(n, investment_year, config):
     baseyear = int(base_cfg.get("year", 2020))
     if int(investment_year) != baseyear:
         logger.info(
-            "Applying iterative solar scaling to %s using overrides calibrated from baseyear %s.",
+            "Skipping iterative solar scaling for %s (configured baseyear is %s).",
             investment_year,
             baseyear,
         )
+        return
 
     override_csv_cfg = base_cfg.get("solar_iteration_override_csv", "")
     if not override_csv_cfg:

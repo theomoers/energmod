@@ -4491,5 +4491,7 @@ if __name__ == "__main__":
     merged_meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
     merged_meta.update(dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards))))
     n.meta = _json_safe_meta(merged_meta)
-    n.export_to_netcdf(snakemake.output[0])
+    output_network = Path(snakemake.output[0])
+    output_network.parent.mkdir(parents=True, exist_ok=True)
+    n.export_to_netcdf(output_network)
     logger.info(f"Objective constant: {n.objective_constant}")
