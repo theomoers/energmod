@@ -1,4 +1,4 @@
-technology,A_over_unit,beta,beta_raw,unit,anchor_year,anchor_cost_per_unit,anchor_cumulative_capacity,source_model
-solar_power,6145.787499710682,0.3184725950514887,0.3184725950514887,kW,2020,754.915418063,723.638287,fd_wright_deterministic
-onwind_power,1154.6130051093778,1e-06,-0.02505978816103102,kW,2020,1154.60538675,733.784,fd_wright_deterministic
-battery_energy,126.0870386686995,0.0072191846008377355,0.0072191846008377355,kWh,2020,120.070113935,874.058,fd_wright_deterministic
+technology,A_over_unit,beta,beta_raw,unit,anchor_year,anchor_cost_per_unit,anchor_cumulative_capacity,source_model,model_version
+solar_power,7207.01215606235,0.34266465443202865,0.34266465443202865,kW,2020,754.915418063,723.638287,fd_wright_deterministic,fdwl_v3_no_intercept_iid
+onwind_power,2450.213264200056,0.1140333365382846,0.1140333365382846,kW,2020,1154.60538675,733.784,fd_wright_deterministic,fdwl_v3_no_intercept_iid
+battery_energy,362.01009614659637,0.16293700543843392,0.16293700543843392,kWh,2020,120.070113935,874.058,fd_wright_deterministic,fdwl_v3_no_intercept_iid

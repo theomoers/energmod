@@ -2,13 +2,17 @@
   "family": "benchmark",
   "fit_summary": {
     "aic": -36.03068484768269,
+    "b_learning_exponent": null,
+    "b_source": null,
     "bic": -32.143174249669705,
     "converged": 1,
     "fit_fragile": 0,
     "intercept_dlog": -0.11225195055487158,
     "last_dlog_capex": -0.1362648795192296,
     "last_log_capex": 11.695831133929119,
+    "learning_rate": null,
     "llf": 21.015342423841346,
+    "model_version": "cgrw_ar1_dlogcost_v2_common_support",
     "mu": -0.1322659982749606,
     "rho": 0.15131664963872943,
     "sigma": 0.11110444774598398,
@@ -27,10 +31,17 @@
   },
   "model_label": "Correlated geometric random walk",
   "model_name": "correlated_geometric_random_walk",
+  "model_version": "cgrw_ar1_dlogcost_v2_common_support",
+  "n_obs": 29,
+  "origin_year": 2020,
   "parameter_summary": {
     "alpha": -0.11225195055487158,
+    "b_learning_exponent": null,
+    "b_source": null,
     "last_dlog_capex": -0.1362648795192296,
     "last_log_capex": 11.695831133929119,
+    "learning_rate": null,
+    "model_version": "cgrw_ar1_dlogcost_v2_common_support",
     "rho": 0.15131664963872943,
     "sigma": 0.11110444774598398
   },
@@ -51,7 +62,7 @@
     "train_end_year": 2020,
     "train_start_year": 1992
   },
-  "schema_version": "annual-model-artifact-v1",
+  "schema_version": "annual-model-artifact-v3-way-style-wright-core",
   "state_variables": {
     "last_dlog_capex": -0.1362648795192296,
     "last_log_capex": 11.695831133929119,
@@ -59,5 +70,5 @@
   },
   "technology": "battery_energy",
   "uncertainty_terms": {},
-  "version_hash": "b212ac443ea0e805a084d351301edd24bf3bd1ba3e4d8f32748778e1934ba7ce"
+  "version_hash": "dcb8dfaf673f2293c53c1ed49d57561a4f235e55d04ff06d5766494cdd16a5bc"
 }

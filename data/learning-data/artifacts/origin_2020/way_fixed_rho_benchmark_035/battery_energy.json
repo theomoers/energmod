@@ -1,18 +1,23 @@
 {
   "family": "learning",
   "fit_summary": {
-    "aic": -39.058940075323925,
-    "alpha": -0.11519624255973518,
-    "bic": -35.284650461259474,
+    "aic": -32.24513267403326,
+    "b_learning_exponent": 0.17264316584315956,
+    "b_source": "fdwl_no_intercept_way_lafond",
+    "bic": -29.58072365368285,
     "converged": 1,
     "fit_fragile": 0,
-    "last_innovation": 0.03235705925390453,
+    "last_innovation": -0.017052575342993002,
     "last_log_capex": 11.695831133929119,
-    "learning_exponent": 0.06724194640756366,
-    "llf": 22.529470037661962,
-    "sigma": 0.10146726583749573,
-    "slope_dlog_experience": -0.06724194640756366,
-    "theta_ma1": 0.35,
+    "learning_rate": 0.11278427929878021,
+    "llf": 18.12256633701663,
+    "model_version": "way_fdwl_v3_no_intercept",
+    "rho_fixed": 0.4,
+    "sigma": 0.1266696231411294,
+    "sigma_u": 0.1266696231411294,
+    "support_end": 2020,
+    "support_start": 1993,
+    "theta_ma1": 0.4,
     "warning_count": 0
   },
   "metadata": {
@@ -26,16 +31,24 @@
     "sample_end_year": 2020,
     "training_window": "origin_cutoff"
   },
-  "model_label": "Way-style fixed-rho benchmark (rho = 0.35)",
+  "model_label": "Way-style fixed-rho benchmark (selected rho = 0.40)",
   "model_name": "way_fixed_rho_benchmark_035",
+  "model_version": "way_fdwl_v3_no_intercept",
+  "n_obs": 29,
+  "origin_year": 2020,
   "parameter_summary": {
-    "alpha": -0.11519624255973518,
-    "last_innovation": 0.03235705925390453,
+    "b_learning_exponent": 0.17264316584315956,
+    "b_source": "fdwl_no_intercept_way_lafond",
+    "last_innovation": -0.017052575342993002,
     "last_log_capex": 11.695831133929119,
-    "learning_exponent": 0.06724194640756366,
-    "sigma": 0.10146726583749573,
-    "slope_dlog_experience": -0.06724194640756366,
-    "theta_ma1": 0.35
+    "learning_rate": 0.11278427929878021,
+    "model_version": "way_fdwl_v3_no_intercept",
+    "rho_fixed": 0.4,
+    "sigma": 0.1266696231411294,
+    "sigma_u": 0.1266696231411294,
+    "support_end": 2020,
+    "support_start": 1993,
+    "theta_ma1": 0.4
   },
   "sample_window": {
     "conditioning_mode": "conditional_realized_experience",
@@ -54,14 +67,14 @@
     "train_end_year": 2020,
     "train_start_year": 1992
   },
-  "schema_version": "annual-model-artifact-v1",
+  "schema_version": "annual-model-artifact-v3-way-style-wright-core",
   "state_variables": {
-    "last_innovation": 0.03235705925390453,
+    "last_innovation": -0.017052575342993002,
     "last_log_capex": 11.695831133929119,
     "state_type": "ma1_wright_fixed_rho",
-    "theta_ma1": 0.35
+    "theta_ma1": 0.4
   },
   "technology": "battery_energy",
   "uncertainty_terms": {},
-  "version_hash": "7471cb4c05313cb217ccca7fd4c4b154205b303c4291a94b88df3cdb2c9b0cba"
+  "version_hash": "58f7810a5861558e24bf611231453a03623fa594d372b8dd2c1d419c2a3e2bb9"
 }

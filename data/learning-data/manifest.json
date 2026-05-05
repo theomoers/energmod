@@ -1,9 +1,6 @@
 {
   "battery_treatment": {
     "battery_power": "deterministic_only",
-    "grid_storage_cost_anchor": {
-      "series_csv": "artifacts/support/battery_grid_storage_cost_anchor.csv"
-    },
     "global_liion_mapping": {
       "block_aggregation": "arithmetic_mean",
       "fallback_mode": "recent_window_geometric_mean",
@@ -40,15 +37,15 @@
         "interpolation": "log_linear",
         "scenario": "Stated Policies Scenario",
         "start_year": 2030,
-        "weighting_method": "ssbr_2020_generation_weighted_geographic_proxy",
-        "weighting_reference": "pypsa-results/full-500/shared_state_bayesian_regime_wright/seed_s0001/generation_country_carrier.csv"
+        "weighting_method": "equal_region_weighted_proxy",
+        "weighting_reference": "bundle_internal_equal_region_weights"
       }
     },
     "proxy_weights_2020": {
-      "China": 0.41603783145945433,
-      "European Union": 0.278357128857158,
-      "India": 0.06951792096900039,
-      "United States": 0.23608711871438734
+      "China": 0.25,
+      "European Union": 0.25,
+      "India": 0.25,
+      "United States": 0.25
     },
     "supported_models": [
       "iea_weo_exogenous_path"
@@ -61,6 +58,7 @@
     "solar_power": "artifacts/support/legacy_curve/historical/solar.csv"
   },
   "initial_year": 2020,
+  "learning_calibration_version": "learning_calibration_v3_way_style_wright_core",
   "legacy_curve": {
     "note": "Updated deterministic Wright export from learning_estimation.",
     "supported_training_windows": [
@@ -85,9 +83,12 @@
       }
     }
   },
-  "schema_version": "energymod-learning-bundle-v1",
+  "runtime_cost_update_version": "runtime_cost_update_v3_monotone_wright_core",
+  "schema_version": "energymod-learning-bundle-v3-way-style-wright-core",
   "stochastic_forecast": {
     "initial_year": 2020,
+    "learning_calibration_version": "learning_calibration_v3_way_style_wright_core",
+    "runtime_cost_update_version": "runtime_cost_update_v3_monotone_wright_core",
     "supported_models": [
       "shared_state_bayesian_regime_wright",
       "way_fixed_rho_benchmark_035",

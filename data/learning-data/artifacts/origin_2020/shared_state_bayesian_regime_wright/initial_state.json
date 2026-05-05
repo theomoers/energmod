@@ -4,8 +4,8 @@
   "shared_regime_state": {
     "current_regime": null,
     "initial_regime_probs": [
-      0.02206450516696558,
-      0.9779354948330348
+      0.024173653627335253,
+      0.9758263463726652
     ]
   },
   "technology_states": {

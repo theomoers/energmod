@@ -3,22 +3,22 @@
   "model_name": "way_fixed_rho_benchmark_035",
   "technology_states": {
     "battery_energy": {
-      "last_innovation": 0.03235705925390453,
+      "last_innovation": -0.017052575342993002,
       "last_log_capex": 11.695831133929119,
       "state_type": "ma1_wright_fixed_rho",
-      "theta_ma1": 0.35
+      "theta_ma1": 0.4
     },
     "onwind_power": {
-      "last_innovation": -0.08259332595474117,
+      "last_innovation": -0.09520263739496158,
       "last_log_capex": 13.959269187066647,
       "state_type": "ma1_wright_fixed_rho",
-      "theta_ma1": 0.35
+      "theta_ma1": 0.4
     },
     "solar_power": {
-      "last_innovation": -0.013741317822455995,
+      "last_innovation": -0.018895185211860954,
       "last_log_capex": 13.53436099289981,
       "state_type": "ma1_wright_fixed_rho",
-      "theta_ma1": 0.35
+      "theta_ma1": 0.4
     }
   }
 }

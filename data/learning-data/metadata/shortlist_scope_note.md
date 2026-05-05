@@ -2,24 +2,25 @@
 
 ## Included Models
 
-- `Shared-state Bayesian regime Wright`: primary rank 1, LR CRPS=0.0854507, beta CRPS=0.164741, log score=-13.4698, fit availability=0.901, fit success=1.000.
-- `Correlated geometric random walk`: primary rank 2, LR CRPS=0.0872444, beta CRPS=0.16976, log score=-13.5394, fit availability=1.000, fit success=1.000.
-- `Way-style fixed-rho benchmark (rho = 0.35)`: primary rank 3, LR CRPS=0.0926192, beta CRPS=0.177143, log score=-13.6686, fit availability=1.000, fit success=1.000.
+- `Correlated geometric random walk`: primary rank 1, LR CRPS=0.0872444, beta CRPS=0.16976, log score=-13.5394, fit availability=1.000, fit success=1.000.
+- `Way-style fixed-rho benchmark (selected rho = 0.40)`: primary rank 2, LR CRPS=0.0941153, beta CRPS=0.170377, log score=-13.6323, fit availability=1.000, fit success=1.000.
+- `Shared-state Bayesian residual-regime Wright`: primary rank 3, LR CRPS=0.0975061, beta CRPS=0.176391, log score=-13.6779, fit availability=0.901, fit success=1.000.
 
 ## Excluded Models
 
-- `Random walk`: outperformed by shortlisted models.
-- `Random walk with drift`: outperformed by shortlisted models.
 - `Local linear trend`: warning rate too high.
-- `Time-trend regression`: outperformed by shortlisted models.
-- `Stochastic Wright iid`: outperformed by shortlisted models.
-- `Autocorrelated Wright (estimated MA1)`: outperformed by shortlisted models.
 - `Way-style fixed-rho benchmark`: outperformed by shortlisted models.
-- `ECM Wright`: outperformed by shortlisted models.
-- `Distributed-lag Wright`: outperformed by shortlisted models.
-- `TVP Wright`: warning rate too high; fragility too high.
-- `Hierarchical Bayesian Wright`: outperformed by shortlisted models.
-- `Regime-switching Wright`: fragility too high.
+- `Regime-switching Wright`: excluded by selection rule; fragility too high.
+- `Distributed-lag Wright`: excluded by selection rule.
+- `Random walk with drift`: outperformed by shortlisted models.
+- `ECM Wright`: excluded by selection rule.
+- `Stochastic Wright iid`: outperformed by shortlisted models.
+- `Autocorrelated Wright (estimated MA1)`: excluded by selection rule.
+- `FD Wright (parameter uncertainty)`: outperformed by shortlisted models.
+- `Random walk`: outperformed by shortlisted models.
+- `TVP Wright`: excluded by selection rule; warning rate too high; fragility too high.
+- `Time-trend regression`: outperformed by shortlisted models.
+- `Hierarchical Bayesian Wright`: excluded by selection rule.
 
 ## Current Scope
 

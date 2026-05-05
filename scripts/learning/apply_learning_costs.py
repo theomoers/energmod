@@ -1219,16 +1219,15 @@ def _serialize_stochastic_snapshot(snapshot):
 def _shared_runtime_snapshot(pars, current_regime, regime_probs, p_ss, p_ff, sample_mode):
     alpha_slow = _single_or_median(pars["alpha_slow"], sample_mode)
     alpha_fast = _single_or_median(pars["alpha_fast"], sample_mode)
-    beta_slow_slope = _single_or_median(pars["beta_slow"], sample_mode)
-    beta_fast_slope = _single_or_median(pars["beta_fast"], sample_mode)
+    b_learning_exponent = _single_or_median(pars["b_learning_exponent"], sample_mode)
     sigma = _single_or_median(pars["sigma"], sample_mode)
     p_slow_slow = _single_or_median(p_ss, sample_mode)
     p_fast_fast = _single_or_median(p_ff, sample_mode)
     regime = int(round(_single_or_median(current_regime, sample_mode)))
-    active_slope = beta_slow_slope if regime == 0 else beta_fast_slope
 
     return {
         "family": "shared_state_bayesian_regime_wright",
+        "model_version": "ssbr_v3_wright_core_residual_regime",
         "current_regime": regime,
         "regime_prob_slow": float(regime_probs[0]),
         "regime_prob_fast": float(regime_probs[1]),
@@ -1236,26 +1235,19 @@ def _shared_runtime_snapshot(pars, current_regime, regime_probs, p_ss, p_ff, sam
         "p_fast_fast": p_fast_fast,
         "alpha_slow": alpha_slow,
         "alpha_fast": alpha_fast,
-        "beta_slow_experience": beta_slow_slope,
-        "beta_fast_experience": beta_fast_slope,
-        "implied_learning_exponent_slow": float(-beta_slow_slope),
-        "implied_learning_exponent_fast": float(-beta_fast_slope),
-        "implied_learning_exponent_runtime": float(-active_slope),
-        "implied_learning_rate_slow": _implied_lr_from_experience_slope(beta_slow_slope),
-        "implied_learning_rate_fast": _implied_lr_from_experience_slope(beta_fast_slope),
-        "implied_learning_rate_runtime": _implied_lr_from_experience_slope(active_slope),
+        "b_learning_exponent": b_learning_exponent,
+        "implied_learning_rate_runtime": _implied_lr_from_learning_exponent(b_learning_exponent),
         "sigma": sigma,
     }
 
 
 def _way_runtime_snapshot(artifact):
     params = artifact["parameter_summary"]
-    learning_exponent = params.get("learning_exponent")
+    learning_exponent = params.get("b_learning_exponent")
     return {
         "family": "way_fixed_rho_benchmark_035",
-        "alpha": float(params["alpha"]),
-        "slope_dlog_experience": float(params["slope_dlog_experience"]),
-        "learning_exponent": None if learning_exponent is None else float(learning_exponent),
+        "model_version": str(params.get("model_version", "way_fdwl_v3_no_intercept")),
+        "b_learning_exponent": None if learning_exponent is None else float(learning_exponent),
         "implied_learning_rate": _implied_lr_from_learning_exponent(learning_exponent),
         "theta_ma1": float(params["theta_ma1"]),
         "sigma": float(params["sigma"]),
@@ -1287,9 +1279,9 @@ def _generic_stochastic_fields_from_snapshot(snapshot):
             "beta_adjusted": False,
         }
 
-    if "implied_learning_exponent_runtime" in snapshot:
-        beta = snapshot.get("implied_learning_exponent_runtime")
-        lr = snapshot.get("implied_learning_rate_runtime")
+    if "b_learning_exponent" in snapshot:
+        beta = snapshot.get("b_learning_exponent")
+        lr = snapshot.get("implied_learning_rate_runtime", snapshot.get("implied_learning_rate"))
     else:
         beta = snapshot.get("learning_exponent")
         lr = snapshot.get("implied_learning_rate")
@@ -1328,7 +1320,7 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
             f"Supported values: {sorted(SUPPORTED_SAMPLE_MODES)}"
         )
 
-    training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
+    training_window = str(learning_cfg.get("training_window", "full_sample"))
     if training_window not in SUPPORTED_TRAINING_WINDOWS:
         raise ValueError(
             f"Unsupported learning.training_window='{training_window}'. "
@@ -1732,7 +1724,7 @@ def build_learning_base_capacity_map(state, solved_capacity_by_tech, current_yea
 
 
 def get_training_window_config(learning_cfg):
-    training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
+    training_window = str(learning_cfg.get("training_window", "full_sample"))
     origin_year = int(learning_cfg.get("training_window_origin_year", 2020))
     return training_window, origin_year
 
@@ -2383,9 +2375,46 @@ def load_stochastic_model_artifacts(learning_cfg, selected_model):
     for tech in model_info["technologies"]:
         path = artifact_dir / f"{tech}.json"
         artifacts[tech] = json.loads(path.read_text(encoding="utf-8"))
+        _validate_v3_learning_artifact(artifacts[tech], selected_model, tech)
     initial_state_path = root / model_info["initial_state"]
     initial_state = json.loads(initial_state_path.read_text(encoding="utf-8"))
     return artifacts, initial_state
+
+
+def _validate_v3_learning_artifact(artifact, selected_model, tech):
+    schema_version = str(artifact.get("schema_version", ""))
+    params = artifact.get("parameter_summary", {}) or {}
+    unc = artifact.get("uncertainty_terms", {}) or {}
+    if "v3" not in schema_version and "way-style-wright-core" not in schema_version:
+        raise ValueError(
+            f"{selected_model}/{tech} artifact uses schema_version={schema_version!r}; "
+            "regenerate v3 Way/Lafond Wright-core artifacts before runtime."
+        )
+    if selected_model.startswith("way_fixed_rho_benchmark"):
+        if "b_learning_exponent" not in params:
+            raise ValueError(f"{selected_model}/{tech} is missing b_learning_exponent")
+        legacy = {"alpha", "intercept", "constant", "slope_dlog_experience"} & set(params)
+        if legacy:
+            raise ValueError(f"{selected_model}/{tech} exposes legacy Way intercept/slope fields: {sorted(legacy)}")
+        if str(params.get("model_version", "")) != "way_fdwl_v3_no_intercept":
+            raise ValueError(f"{selected_model}/{tech} is not a way_fdwl_v3_no_intercept artifact")
+    elif selected_model == "shared_state_bayesian_regime_wright":
+        if "b_learning_exponent" not in params:
+            raise ValueError(f"{selected_model}/{tech} is missing b_learning_exponent")
+        legacy = {"beta_slow_mean", "beta_fast_mean"} & set(params)
+        legacy_draws = {"beta_slow_draws", "beta_fast_draws"} & set(unc)
+        if legacy or legacy_draws:
+            raise ValueError(
+                f"{selected_model}/{tech} exposes legacy unrestricted beta fields: "
+                f"{sorted(legacy | legacy_draws)}"
+            )
+        if "b_learning_exponent_draws" not in unc:
+            raise ValueError(f"{selected_model}/{tech} is missing b_learning_exponent_draws")
+        if str(params.get("model_version", "")) != "ssbr_v3_wright_core_residual_regime":
+            raise ValueError(f"{selected_model}/{tech} is not an ssbr_v3_wright_core_residual_regime artifact")
+    elif selected_model == "correlated_geometric_random_walk":
+        if str(params.get("model_version", "")) != "cgrw_ar1_dlogcost_v2_common_support":
+            raise ValueError(f"{selected_model}/{tech} is not a cgrw_ar1_dlogcost_v2_common_support artifact")
 
 
 def load_runtime_state(prev_state_path, initial_state):
@@ -3038,8 +3067,7 @@ def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode, n_sa
 
 def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, rng, sample_mode, n_samples=None):
     params = artifact["parameter_summary"]
-    alpha = float(params["alpha"])
-    beta = float(params["slope_dlog_experience"])
+    b_learning_exponent = float(params["b_learning_exponent"])
     theta = float(params["theta_ma1"])
     sigma = float(params["sigma"])
     last_log = float(state["last_log_capex"])
@@ -3069,7 +3097,7 @@ def simulate_way_runtime(artifact, state, block_dlog_experience, elapsed_years, 
     annual_log_cost_paths = _empty_annual_log_cost_paths(n, years)
     for _ in range(years):
         eps = sigma * rng.standard_normal(n)
-        dlog = alpha + beta * x_curr + eps + theta * eps_prev
+        dlog = -b_learning_exponent * x_curr + eps + theta * eps_prev
         log_cost = log_cost + dlog
         eps_prev = eps
         annual_log_cost_paths[:, _] = log_cost
@@ -3138,8 +3166,7 @@ def simulate_shared_state_runtime(
         param_cache[tech] = {
             "alpha_slow": _draws("alpha_slow_draws", "alpha_slow_mean"),
             "alpha_fast": _draws("alpha_fast_draws", "alpha_fast_mean"),
-            "beta_slow": _draws("beta_slow_draws", "beta_slow_mean"),
-            "beta_fast": _draws("beta_fast_draws", "beta_fast_mean"),
+            "b_learning_exponent": _draws("b_learning_exponent_draws", "b_learning_exponent"),
             "sigma": _draws("sigma_draws", "sigma_mean"),
         }
 
@@ -3183,8 +3210,7 @@ def simulate_shared_state_runtime(
             x_curr = x_step_by_tech[tech]
             pars = param_cache[tech]
             alpha = np.where(current_regime == 0, pars["alpha_slow"], pars["alpha_fast"])
-            beta = np.where(current_regime == 0, pars["beta_slow"], pars["beta_fast"])
-            dlog = alpha + beta * x_curr + pars["sigma"] * rng.standard_normal(n)
+            dlog = -pars["b_learning_exponent"] * x_curr + alpha + pars["sigma"] * rng.standard_normal(n)
             log_costs[tech] = log_costs[tech] + dlog
             annual_log_cost_paths[tech][:, step] = log_costs[tech]
 
@@ -3266,7 +3292,7 @@ def calculate_stochastic_learning_costs(
 
 
 def _stochastic_alignment_years_by_tech(artifacts, learning_cfg, current_year, base_year):
-    training_window = str(learning_cfg.get("training_window", "origin_cutoff"))
+    training_window = str(learning_cfg.get("training_window", "full_sample"))
     if training_window != "full_sample":
         return {tech: 0 for tech in artifacts}
 
