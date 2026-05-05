@@ -3375,6 +3375,13 @@ def apply_renewable_nodal_share_caps(n, investment_year, config):
 def apply_country_onwind_mean_cf_caps(n, investment_year):
     """Clip country-internal onwind CF outliers by scaling their full profile."""
 
+    if int(investment_year) != 2020:
+        logger.info(
+            "Skipping country onwind mean-CF cap for %s; onwind CF caps are baseyear-only.",
+            investment_year,
+        )
+        return 0
+
     if n.generators.empty or n.generators_t.p_max_pu.empty:
         return 0
 

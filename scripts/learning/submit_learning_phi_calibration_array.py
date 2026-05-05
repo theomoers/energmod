@@ -167,6 +167,7 @@ def build_grid_run_cmd(args: argparse.Namespace, manifest_path: Path, task_count
     if task_count > DEFAULT_GRID_ARRAY_CONCURRENCY:
         grid_array = f"{grid_array}/{DEFAULT_GRID_ARRAY_CONCURRENCY}"
     worker_script = str((SCRIPT_DIR / "run_learning_phi_calibration_array_task.sh").resolve())
+    job_run_root = Path(os.path.expandvars(args.job_root)).resolve() / manifest_path.parent.name
     return [
         "grid_run",
         f"--grid_mem={args.grid_mem}",
@@ -175,7 +176,7 @@ def build_grid_run_cmd(args: argparse.Namespace, manifest_path: Path, task_count
         f"--grid_array={grid_array}",
         worker_script,
         str(manifest_path),
-        f"PHI_CALIBRATION_JOB_ROOT={Path(os.path.expandvars(args.job_root)).resolve()}",
+        f"PHI_CALIBRATION_JOB_ROOT={job_run_root}",
         f"PHI_CALIBRATION_CONDA_ENV={args.conda_env}",
     ]
 
@@ -192,6 +193,7 @@ def write_submission_metadata(
         "task_count": len(tasks),
         "results_root": str(Path(args.results_root).resolve()),
         "job_root": str(expand_and_resolve(args.job_root)),
+        "job_run_root": str(expand_and_resolve(args.job_root) / manifest_path.parent.name),
         "bootstrap_state_source": str(expand_and_resolve(args.bootstrap_state_source)),
         "working_sector_name": resolve_working_sector_name(),
         "resolved_sector_names": resolve_task_sector_names(tasks),

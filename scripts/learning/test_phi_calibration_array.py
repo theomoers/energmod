@@ -129,6 +129,7 @@ class PhiCalibrationGridTests(unittest.TestCase):
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
         self.assertTrue(metadata["fixed_parameters"]["year2025_generation_constraint"])
+        self.assertEqual(metadata["job_run_root"], str((root / "jobs" / "submit").resolve()))
         self.assertEqual(
             metadata["fixed_parameters"]["year2025_generation_metrics"],
             ["biofuel_electricity", "electricity_generation"],
