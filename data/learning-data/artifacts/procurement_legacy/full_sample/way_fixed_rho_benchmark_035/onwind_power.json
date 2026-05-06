@@ -1,0 +1,67 @@
+{
+  "family": "learning",
+  "fit_summary": {
+    "aic": -99.6732023724319,
+    "alpha": -0.06832398854777118,
+    "bic": -94.68251743404296,
+    "converged": 1,
+    "fit_fragile": 0,
+    "last_innovation": -0.06130901352907893,
+    "last_log_capex": 13.53148329307132,
+    "learning_exponent": -0.1244067865733709,
+    "llf": 52.83660118621595,
+    "sigma": 0.06231963673770937,
+    "slope_dlog_experience": 0.1244067865733709,
+    "theta_ma1": 0.35,
+    "warning_count": 0
+  },
+  "metadata": {
+    "export_scope": "energymod_runtime",
+    "initial_year": 2020,
+    "runtime_technology_scope": [
+      "solar_power",
+      "onwind_power",
+      "battery_energy"
+    ],
+    "sample_end_year": 2025,
+    "training_window": "full_sample"
+  },
+  "model_label": "Way-style fixed-rho benchmark (rho = 0.35)",
+  "model_name": "way_fixed_rho_benchmark_035",
+  "parameter_summary": {
+    "alpha": -0.06832398854777118,
+    "last_innovation": -0.06130901352907893,
+    "last_log_capex": 13.53148329307132,
+    "learning_exponent": -0.1244067865733709,
+    "sigma": 0.06231963673770937,
+    "slope_dlog_experience": 0.1244067865733709,
+    "theta_ma1": 0.35
+  },
+  "sample_window": {
+    "conditioning_mode": "conditional_realized_experience",
+    "forecast_horizons": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "forecast_origin_year": 2025,
+    "model_name": "way_fixed_rho_benchmark_035",
+    "n_train_diff_obs": 41,
+    "n_train_obs": 42,
+    "technology": "onwind_power",
+    "train_end_year": 2024,
+    "train_start_year": 1983
+  },
+  "schema_version": "annual-model-artifact-v1",
+  "state_variables": {
+    "last_innovation": -0.06130901352907893,
+    "last_log_capex": 13.53148329307132,
+    "state_type": "ma1_wright_fixed_rho",
+    "theta_ma1": 0.35
+  },
+  "technology": "onwind_power",
+  "uncertainty_terms": {},
+  "version_hash": "b24d32d5065d4c809f42ecc2c4eacbbc3b27c27880dd06c7a61f44ada5be9d3a"
+}

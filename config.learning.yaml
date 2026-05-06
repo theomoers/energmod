@@ -31,6 +31,15 @@ learning:
       solar_power: 2
       onwind_power: 4
       battery_energy: 2
+    procurement_imputation:
+      enabled: true
+      anchor: latest_realized_cost
+      shock_mode: seeded_stochastic
+      persist_state: true
+      model_by_selected_model:
+        shared_state_bayesian_regime_wright: shared_state_bayesian_regime_wright
+        way_fixed_rho_benchmark: way_fixed_rho_benchmark_035
+        correlated_geometric_random_walk: none
   deployment_constraints: 
     enabled: true
     formulation: three_segment_wedge   # hard_cap | three_segment_wedge

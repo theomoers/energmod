@@ -447,6 +447,117 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
     ])
 
 
+def test_legacy_ssbr_procurement_uses_state_dependent_sigma():
+    artifacts = {
+        "solar_power": {
+            "state_variables": {"filtered_last_probs_mean": [1.0, 0.0]},
+            "uncertainty_terms": {
+                "alpha_slow_draws": [0.0],
+                "alpha_fast_draws": [0.0],
+                "sigma_slow_draws": [0.0],
+                "sigma_fast_draws": [0.5],
+                "p_slow_slow_draws": [1.0],
+                "p_fast_fast_draws": [1.0],
+            },
+        }
+    }
+    state = _make_state(2025, {"solar_power": 100.0})
+    slow_paths, _ = alc._simulate_legacy_ssbr_procurement(
+        artifacts=artifacts,
+        state=state,
+        procurement_state={"procurement_model": "shared_state_bayesian_regime_wright", "current_regime": 0},
+        base_year=2025,
+        target_year=2027,
+        rng=np.random.default_rng(7),
+    )
+    fast_paths, fast_state = alc._simulate_legacy_ssbr_procurement(
+        artifacts=artifacts,
+        state=state,
+        procurement_state={"procurement_model": "shared_state_bayesian_regime_wright", "current_regime": 1},
+        base_year=2025,
+        target_year=2027,
+        rng=np.random.default_rng(7),
+    )
+
+    assert slow_paths["solar_power"][2027] == pytest.approx(100.0)
+    assert fast_paths["solar_power"][2027] != pytest.approx(100.0)
+    assert fast_state["technology_states"]["solar_power"]["sigma_fast"] == pytest.approx(0.5)
+
+
+def test_legacy_way_procurement_is_anchored_at_latest_realized_cost():
+    artifacts = {
+        "solar_power": {
+            "parameter_summary": {
+                "alpha": -0.1,
+                "theta_ma1": 0.0,
+                "sigma": 0.0,
+                "last_innovation": 0.0,
+            }
+        }
+    }
+    state = _make_state(2025, {"solar_power": 100.0})
+    paths, next_state = alc._simulate_legacy_way_procurement(
+        artifacts=artifacts,
+        state=state,
+        procurement_state={"procurement_model": "way_fixed_rho_benchmark_035"},
+        base_year=2025,
+        target_year=2027,
+        rng=np.random.default_rng(11),
+    )
+
+    assert paths["solar_power"][2026] == pytest.approx(100.0 * math.exp(-0.1))
+    assert paths["solar_power"][2027] == pytest.approx(100.0 * math.exp(-0.2))
+    assert next_state["anchor_policy"] == "latest_realized_cost"
+
+
+def test_cgrw_block_average_expectation_remains_on_existing_path(monkeypatch):
+    learning_cfg = {
+        "seed": 0,
+        "cost_expectations": {
+            "mode": "block_average_expected",
+            "kernel_mode": "technology_specific_lagged_window",
+            "annual_weights": [1, 1, 1, 1, 1],
+            "lag_years_by_tech": {
+                "solar_power": 2,
+                "onwind_power": 4,
+                "battery_energy": 2,
+            },
+            "procurement_imputation": {
+                "enabled": True,
+                "model_by_selected_model": {
+                    "correlated_geometric_random_walk": "none",
+                },
+            },
+        },
+    }
+    state = _make_state(2025, {"solar_power": 30.0})
+    artifacts = {"solar_power": {}}
+    monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    monkeypatch.setattr(
+        alc,
+        "get_known_annual_cost_for_year",
+        lambda tech, year, state, cfg: float(year - 2000),
+    )
+    called = {"frozen": False}
+
+    def fake_frozen(*args, **kwargs):
+        called["frozen"] = True
+        return {"solar_power": np.log(np.array([[40.0, 50.0, 60.0]], dtype=float) * 1000.0)}
+
+    monkeypatch.setattr(alc, "_simulate_frozen_block_expectation_annual_paths", fake_frozen)
+    diagnostics = alc._compute_block_average_expected_costs(
+        artifacts=artifacts,
+        state=state,
+        current_year=2030,
+        selected_model="correlated_geometric_random_walk",
+        learning_cfg=learning_cfg,
+        costs_file="costs.csv",
+    )
+
+    assert called["frozen"] is True
+    assert diagnostics["solar_power"]["c_overnight"] == pytest.approx((24 + 25 + 40 + 50 + 60) / 5)
+
+
 def test_stochastic_point_cost_converts_battery_basis_without_mutating_raw_log(monkeypatch):
     learning_cfg = {}
     runtime_metadata = {

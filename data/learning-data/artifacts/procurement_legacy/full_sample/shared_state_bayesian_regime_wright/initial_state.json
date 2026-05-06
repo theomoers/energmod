@@ -1,0 +1,22 @@
+{
+  "last_applied_year": 2025,
+  "model_name": "shared_state_bayesian_regime_wright",
+  "shared_regime_state": {
+    "current_regime": null,
+    "initial_regime_probs": [
+      0.14251227882145734,
+      0.8574877211785429
+    ]
+  },
+  "technology_states": {
+    "battery_energy": {
+      "last_log_capex": 11.241186680089882
+    },
+    "onwind_power": {
+      "last_log_capex": 13.53148329307132
+    },
+    "solar_power": {
+      "last_log_capex": 13.121686048224701
+    }
+  }
+}

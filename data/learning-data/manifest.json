@@ -129,6 +129,28 @@
             ]
           }
         },
+        "procurement_imputation": {
+          "models": {
+            "shared_state_bayesian_regime_wright": {
+              "artifact_dir": "artifacts/procurement_legacy/full_sample/shared_state_bayesian_regime_wright",
+              "initial_state": "artifacts/procurement_legacy/full_sample/shared_state_bayesian_regime_wright/initial_state.json",
+              "technologies": [
+                "solar_power",
+                "onwind_power",
+                "battery_energy"
+              ]
+            },
+            "way_fixed_rho_benchmark_035": {
+              "artifact_dir": "artifacts/procurement_legacy/full_sample/way_fixed_rho_benchmark_035",
+              "initial_state": "artifacts/procurement_legacy/full_sample/way_fixed_rho_benchmark_035/initial_state.json",
+              "technologies": [
+                "solar_power",
+                "onwind_power",
+                "battery_energy"
+              ]
+            }
+          }
+        },
         "origin_year": null,
         "sample_end_year": 2025
       },
@@ -160,6 +182,28 @@
               "onwind_power",
               "battery_energy"
             ]
+          }
+        },
+        "procurement_imputation": {
+          "models": {
+            "shared_state_bayesian_regime_wright": {
+              "artifact_dir": "artifacts/procurement_legacy/origin_2020/shared_state_bayesian_regime_wright",
+              "initial_state": "artifacts/procurement_legacy/origin_2020/shared_state_bayesian_regime_wright/initial_state.json",
+              "technologies": [
+                "solar_power",
+                "onwind_power",
+                "battery_energy"
+              ]
+            },
+            "way_fixed_rho_benchmark_035": {
+              "artifact_dir": "artifacts/procurement_legacy/origin_2020/way_fixed_rho_benchmark_035",
+              "initial_state": "artifacts/procurement_legacy/origin_2020/way_fixed_rho_benchmark_035/initial_state.json",
+              "technologies": [
+                "solar_power",
+                "onwind_power",
+                "battery_energy"
+              ]
+            }
           }
         },
         "origin_year": 2020,

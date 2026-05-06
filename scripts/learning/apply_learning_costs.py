@@ -106,6 +106,8 @@ SUPPORTED_COST_EXPECTATION_KERNEL_MODES = {
     "global_current_window",
     "technology_specific_lagged_window",
 }
+SUPPORTED_PROCUREMENT_IMPUTATION_ANCHORS = {"latest_realized_cost"}
+SUPPORTED_PROCUREMENT_IMPUTATION_SHOCK_MODES = {"seeded_stochastic"}
 BATTERY_POWER_TREATMENT = "deterministic_default_costs"
 LEGACY_LEARNING_SEED = "deterministic"
 DEFAULT_COST_EXPECTATION_MODE = "point_cost"
@@ -118,6 +120,11 @@ DEFAULT_COST_EXPECTATION_LAG_YEARS_BY_TECH = {
     "solar_power": 3,
     "onwind_power": 4,
     "battery_energy": 2,
+}
+DEFAULT_PROCUREMENT_IMPUTATION_MODEL_BY_SELECTED_MODEL = {
+    "shared_state_bayesian_regime_wright": "shared_state_bayesian_regime_wright",
+    "way_fixed_rho_benchmark": "way_fixed_rho_benchmark_035",
+    "correlated_geometric_random_walk": "none",
 }
 
 # Mapping of solve horizon to the historical lag-year used for bootstrap
@@ -1061,6 +1068,53 @@ def get_cost_expectation_lag_years_json(learning_cfg):
     return json.dumps(get_cost_expectation_lag_years_by_tech(learning_cfg), sort_keys=True)
 
 
+def get_procurement_imputation_cfg(learning_cfg):
+    cfg = (learning_cfg.get("cost_expectations", {}) or {}).get("procurement_imputation", {}) or {}
+    enabled = bool(cfg.get("enabled", False))
+    anchor = str(cfg.get("anchor", "latest_realized_cost"))
+    shock_mode = str(cfg.get("shock_mode", "seeded_stochastic"))
+    persist_state = bool(cfg.get("persist_state", True))
+    model_map = dict(DEFAULT_PROCUREMENT_IMPUTATION_MODEL_BY_SELECTED_MODEL)
+    raw_map = cfg.get("model_by_selected_model", {}) or {}
+    if not isinstance(raw_map, dict):
+        raise ValueError("learning.cost_expectations.procurement_imputation.model_by_selected_model must be a mapping.")
+    model_map.update({str(key): str(value) for key, value in raw_map.items()})
+    if anchor not in SUPPORTED_PROCUREMENT_IMPUTATION_ANCHORS:
+        raise ValueError(
+            "Unsupported learning.cost_expectations.procurement_imputation.anchor="
+            f"{anchor!r}. Supported values: {sorted(SUPPORTED_PROCUREMENT_IMPUTATION_ANCHORS)}"
+        )
+    if shock_mode not in SUPPORTED_PROCUREMENT_IMPUTATION_SHOCK_MODES:
+        raise ValueError(
+            "Unsupported learning.cost_expectations.procurement_imputation.shock_mode="
+            f"{shock_mode!r}. Supported values: {sorted(SUPPORTED_PROCUREMENT_IMPUTATION_SHOCK_MODES)}"
+        )
+    return {
+        "enabled": enabled,
+        "anchor": anchor,
+        "shock_mode": shock_mode,
+        "persist_state": persist_state,
+        "model_by_selected_model": model_map,
+    }
+
+
+def get_procurement_imputation_cfg_json(learning_cfg):
+    cfg = get_procurement_imputation_cfg(learning_cfg)
+    payload = {
+        "enabled": bool(cfg["enabled"]),
+        "anchor": str(cfg["anchor"]),
+        "shock_mode": str(cfg["shock_mode"]),
+        "persist_state": bool(cfg["persist_state"]),
+        "model_by_selected_model": dict(cfg["model_by_selected_model"]),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def get_procurement_imputation_model_name(learning_cfg, selected_model):
+    cfg = get_procurement_imputation_cfg(learning_cfg)
+    return str(cfg["model_by_selected_model"].get(str(selected_model), "none"))
+
+
 def build_lagged_kernel_years(network_year, lag_year, kernel_length=5):
     network_year = int(network_year)
     lag_year = int(lag_year)
@@ -1164,6 +1218,8 @@ def build_runtime_metadata(learning_cfg, learning_engine, selected_model, cost_e
         "cost_expectation_kernel_mode": get_requested_cost_expectation_kernel_mode(learning_cfg),
         "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg),
         "cost_expectation_lag_years_json": get_cost_expectation_lag_years_json(learning_cfg),
+        "procurement_imputation_cfg_json": get_procurement_imputation_cfg_json(learning_cfg),
+        "procurement_imputation_model": get_procurement_imputation_model_name(learning_cfg, selected_model),
         "fossil_price_uncertainty_enabled": bool(fossil_cfg["enabled"]),
         "fossil_price_bundle_path": str(fossil_bundle.get("manifest_path", "")),
         "fossil_price_bundle_schema_version": str(fossil_bundle.get("schema_version", "")),
@@ -2386,6 +2442,39 @@ def load_stochastic_model_artifacts(learning_cfg, selected_model):
     return artifacts, initial_state
 
 
+def load_procurement_imputation_artifacts(learning_cfg, selected_model):
+    procurement_model = get_procurement_imputation_model_name(learning_cfg, selected_model)
+    if procurement_model == "none":
+        return procurement_model, {}, {}
+    manifest = learning_cfg.get("_manifest", {}) or {}
+    root = Path(learning_cfg.get("_manifest_root", "."))
+    stochastic = (manifest.get("stochastic_forecast", {}) or {})
+    training_windows = (stochastic.get("training_windows", {}) or {})
+    training_window, origin_year = get_training_window_config(learning_cfg)
+    if training_window not in training_windows:
+        raise ValueError(
+            f"Selected training window '{training_window}' not found in learning manifest. "
+            f"Available windows: {sorted(training_windows.keys())}"
+        )
+    window_info = training_windows[training_window]
+    procurement = (window_info.get("procurement_imputation", {}) or {}).get("models", {}) or {}
+    if procurement_model not in procurement:
+        raise ValueError(
+            f"Procurement imputation model '{procurement_model}' not found in manifest for "
+            f"training_window={training_window!r}. Available: {sorted(procurement)}"
+        )
+    model_info = procurement[procurement_model]
+    artifact_dir = root / model_info["artifact_dir"]
+    artifacts = {}
+    for tech in model_info["technologies"]:
+        artifacts[tech] = json.loads((artifact_dir / f"{tech}.json").read_text(encoding="utf-8"))
+    initial_state = {}
+    initial_state_path = model_info.get("initial_state")
+    if initial_state_path:
+        initial_state = json.loads((root / initial_state_path).read_text(encoding="utf-8"))
+    return procurement_model, artifacts, initial_state
+
+
 def _validate_v3_learning_artifact(artifact, selected_model, tech):
     schema_version = str(artifact.get("schema_version", ""))
     params = artifact.get("parameter_summary", {}) or {}
@@ -2889,6 +2978,249 @@ def _expected_annual_level_costs_from_paths(annual_paths, base_year):
     return expected
 
 
+def _procurement_imputation_rng(learning_cfg, state, current_year):
+    seed = int(learning_cfg.get("seed", 0))
+    base_year = int(state.get("last_applied_year", current_year))
+    return np.random.default_rng(seed + 1000 * base_year + 37 * int(current_year) + 271)
+
+
+def _existing_procurement_state(state, procurement_model):
+    existing = state.get("procurement_expectation_state", {}) or {}
+    if str(existing.get("procurement_model", "")) == str(procurement_model):
+        return json.loads(json.dumps(existing))
+    return {"procurement_model": str(procurement_model), "technology_states": {}}
+
+
+def _procurement_anchor_log_costs(state, artifacts):
+    technology_states = state.get("technology_states", {}) or {}
+    anchors = {}
+    for tech in artifacts:
+        tech_state = technology_states.get(tech, {}) or {}
+        if "last_log_capex" not in tech_state:
+            raise ValueError(f"Missing realized last_log_capex anchor for procurement imputation: {tech}")
+        anchors[tech] = float(tech_state["last_log_capex"])
+    return anchors
+
+
+def _draw_index(rng, n):
+    n = int(n)
+    if n <= 0:
+        return 0
+    return int(min(rng.integers(0, n), n - 1))
+
+
+def _simulate_legacy_ssbr_procurement(
+    artifacts,
+    state,
+    procurement_state,
+    base_year,
+    target_year,
+    rng,
+):
+    base_year = int(base_year)
+    target_year = int(target_year)
+    anchors = _procurement_anchor_log_costs(state, artifacts)
+    tech_states = procurement_state.get("technology_states", {}) or {}
+    paths = {tech: {} for tech in artifacts}
+
+    first_artifact = next(iter(artifacts.values()))
+    first_unc = first_artifact.get("uncertainty_terms", {}) or {}
+    p_slow_draws = np.asarray(first_unc.get("p_slow_slow_draws", []), dtype=float)
+    p_fast_draws = np.asarray(first_unc.get("p_fast_fast_draws", []), dtype=float)
+    if p_slow_draws.size == 0 or p_fast_draws.size == 0:
+        raise ValueError("Legacy SSBR procurement artifacts are missing transition-probability draws.")
+
+    draw_index = procurement_state.get("transition_draw_index", None)
+    if draw_index is None:
+        draw_index = _draw_index(rng, min(p_slow_draws.size, p_fast_draws.size))
+    draw_index = int(draw_index)
+    p_slow_slow = float(p_slow_draws[draw_index])
+    p_fast_fast = float(p_fast_draws[draw_index])
+
+    if "current_regime" in procurement_state:
+        current_regime = int(procurement_state["current_regime"])
+    else:
+        state_vars = first_artifact.get("state_variables", {}) or {}
+        probs = state_vars.get("filtered_last_probs_mean", [0.5, 0.5])
+        current_regime = int(rng.random() > float(probs[0]))
+
+    param_cache = {}
+    for tech, artifact in artifacts.items():
+        unc = artifact.get("uncertainty_terms", {}) or {}
+        tech_state = tech_states.get(tech, {}) or {}
+        tech_draw = tech_state.get("draw_index", None)
+        sigma_slow_key = "sigma_slow_draws" if "sigma_slow_draws" in unc else "sigma_draws"
+        sigma_fast_key = "sigma_fast_draws" if "sigma_fast_draws" in unc else "sigma_draws"
+        n_draws = min(
+            len(unc.get("alpha_slow_draws", [])),
+            len(unc.get("alpha_fast_draws", [])),
+            len(unc.get(sigma_slow_key, [])),
+            len(unc.get(sigma_fast_key, [])),
+        )
+        if n_draws <= 0:
+            raise ValueError(f"Legacy SSBR procurement artifact for {tech} is missing alpha/sigma draws.")
+        if tech_draw is None:
+            tech_draw = _draw_index(rng, n_draws)
+        tech_draw = int(tech_draw)
+        param_cache[tech] = {
+            "draw_index": tech_draw,
+            "alpha_slow": float(np.asarray(unc["alpha_slow_draws"], dtype=float)[tech_draw]),
+            "alpha_fast": float(np.asarray(unc["alpha_fast_draws"], dtype=float)[tech_draw]),
+            "sigma_slow": float(np.asarray(unc[sigma_slow_key], dtype=float)[tech_draw]),
+            "sigma_fast": float(np.asarray(unc[sigma_fast_key], dtype=float)[tech_draw]),
+        }
+
+    log_costs = dict(anchors)
+    for year in range(base_year + 1, target_year + 1):
+        stay_prob = p_slow_slow if current_regime == 0 else p_fast_fast
+        if rng.random() > stay_prob:
+            current_regime = 1 - current_regime
+        for tech, pars in param_cache.items():
+            alpha = pars["alpha_slow"] if current_regime == 0 else pars["alpha_fast"]
+            sigma = pars["sigma_slow"] if current_regime == 0 else pars["sigma_fast"]
+            log_costs[tech] = float(log_costs[tech] + alpha + sigma * rng.standard_normal())
+            paths[tech][year] = float(np.exp(log_costs[tech]) / 1000.0)
+
+    next_state = {
+        "procurement_model": "shared_state_bayesian_regime_wright",
+        "last_applied_year": int(target_year),
+        "anchor_year": int(base_year),
+        "anchor_policy": "latest_realized_cost",
+        "transition_draw_index": int(draw_index),
+        "current_regime": int(current_regime),
+        "p_slow_slow": p_slow_slow,
+        "p_fast_fast": p_fast_fast,
+        "technology_states": {
+            tech: {
+                "draw_index": int(param_cache[tech]["draw_index"]),
+                "last_log_capex": float(log_costs[tech]),
+                "alpha_slow": float(param_cache[tech]["alpha_slow"]),
+                "alpha_fast": float(param_cache[tech]["alpha_fast"]),
+                "sigma_slow": float(param_cache[tech]["sigma_slow"]),
+                "sigma_fast": float(param_cache[tech]["sigma_fast"]),
+            }
+            for tech in artifacts
+        },
+    }
+    return paths, next_state
+
+
+def _simulate_legacy_way_procurement(
+    artifacts,
+    state,
+    procurement_state,
+    base_year,
+    target_year,
+    rng,
+):
+    base_year = int(base_year)
+    target_year = int(target_year)
+    anchors = _procurement_anchor_log_costs(state, artifacts)
+    tech_states = procurement_state.get("technology_states", {}) or {}
+    paths = {tech: {} for tech in artifacts}
+    next_tech_states = {}
+    for tech, artifact in artifacts.items():
+        params = artifact.get("parameter_summary", {}) or {}
+        alpha = float(params["alpha"])
+        theta = float(params["theta_ma1"])
+        sigma = float(params["sigma"])
+        tech_state = tech_states.get(tech, {}) or {}
+        innovation = float(tech_state.get("last_innovation", params.get("last_innovation", 0.0)))
+        log_cost = float(anchors[tech])
+        for year in range(base_year + 1, target_year + 1):
+            innovation = float(theta * innovation + sigma * rng.standard_normal())
+            log_cost = float(log_cost + alpha + innovation)
+            paths[tech][year] = float(np.exp(log_cost) / 1000.0)
+        next_tech_states[tech] = {
+            "last_log_capex": float(log_cost),
+            "last_innovation": float(innovation),
+            "alpha": alpha,
+            "theta_ma1": theta,
+            "sigma": sigma,
+        }
+    next_state = {
+        "procurement_model": "way_fixed_rho_benchmark_035",
+        "last_applied_year": int(target_year),
+        "anchor_year": int(base_year),
+        "anchor_policy": "latest_realized_cost",
+        "technology_states": next_tech_states,
+    }
+    return paths, next_state
+
+
+def _merge_procurement_cost_history(existing, updates):
+    merged = {}
+    for tech, year_map in (existing or {}).items():
+        merged[str(tech)] = {
+            str(int(year)): float(value) for year, value in (year_map or {}).items()
+        }
+    for tech, year_map in (updates or {}).items():
+        merged.setdefault(str(tech), {})
+        for year, value in (year_map or {}).items():
+            merged[str(tech)][str(int(year))] = float(value)
+    return merged
+
+
+def _compute_procurement_imputation_paths(
+    artifacts,
+    state,
+    current_year,
+    selected_model,
+    learning_cfg,
+    target_year,
+):
+    cfg = get_procurement_imputation_cfg(learning_cfg)
+    if not cfg["enabled"]:
+        return None
+    procurement_model, procurement_artifacts, _ = load_procurement_imputation_artifacts(
+        learning_cfg,
+        selected_model,
+    )
+    if procurement_model == "none":
+        return None
+    missing = sorted(set(artifacts) - set(procurement_artifacts))
+    if missing:
+        raise ValueError(f"Procurement imputation artifacts are missing technologies: {missing}")
+    procurement_artifacts = {tech: procurement_artifacts[tech] for tech in artifacts}
+    base_year = int(state.get("last_applied_year", current_year))
+    target_year = max(int(target_year), base_year)
+    procurement_state = _existing_procurement_state(state, procurement_model)
+    rng = _procurement_imputation_rng(learning_cfg, state, current_year)
+    if procurement_model == "shared_state_bayesian_regime_wright":
+        paths, next_state = _simulate_legacy_ssbr_procurement(
+            procurement_artifacts,
+            state,
+            procurement_state,
+            base_year,
+            target_year,
+            rng,
+        )
+    elif procurement_model == "way_fixed_rho_benchmark_035":
+        paths, next_state = _simulate_legacy_way_procurement(
+            procurement_artifacts,
+            state,
+            procurement_state,
+            base_year,
+            target_year,
+            rng,
+        )
+    else:
+        raise ValueError(f"Unsupported procurement imputation model: {procurement_model}")
+    existing_history = state.get("procurement_cost_history", {}) or {}
+    merged_history = _merge_procurement_cost_history(existing_history, paths)
+    for tech, log_cost in _procurement_anchor_log_costs(state, artifacts).items():
+        merged_history.setdefault(tech, {})
+        merged_history[tech][str(base_year)] = float(np.exp(log_cost) / 1000.0)
+    state["procurement_expectation_state"] = next_state
+    state["procurement_cost_history"] = merged_history
+    return {
+        "model": procurement_model,
+        "state": next_state,
+        "history": merged_history,
+        "anchor_year": base_year,
+    }
+
+
 def _legacy_global_current_window_diagnostics(
     artifacts,
     state,
@@ -2997,6 +3329,70 @@ def _compute_block_average_expected_costs(
         or [int(current_year)]
     )
     max_expected_year = max(int(current_year), int(max_expected_year))
+    procurement_result = _compute_procurement_imputation_paths(
+        artifacts=artifacts,
+        state=state,
+        current_year=current_year,
+        selected_model=selected_model,
+        learning_cfg=learning_cfg,
+        target_year=max_expected_year,
+    )
+    if procurement_result is not None:
+        procurement_history = procurement_result["history"]
+        diagnostics = {}
+        for tech in artifacts:
+            kernel_years = kernel_years_by_tech[tech]
+            known_years, expected_years = split_kernel_years(kernel_years, committed_year)
+            kernel_costs = []
+            kernel_sources = []
+            for year in kernel_years:
+                if int(year) <= committed_year:
+                    kernel_costs.append(get_known_annual_cost_for_year(tech, year, state, learning_cfg))
+                    kernel_sources.append("known_realized_or_historical")
+                else:
+                    tech_history = procurement_history.get(tech, {}) or procurement_history.get(str(tech), {}) or {}
+                    history_key = str(int(year))
+                    if history_key not in tech_history:
+                        raise ValueError(f"Missing procurement-imputed cost for {tech} in {year}.")
+                    kernel_costs.append(float(tech_history[history_key]))
+                    kernel_sources.append("procurement_imputed")
+            terminal_history = procurement_history.get(tech, {}) or procurement_history.get(str(tech), {}) or {}
+            terminal_c_overnight = float(
+                terminal_history.get(
+                    str(int(current_year)),
+                    np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0,
+                )
+            )
+            applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+            cost_stats = _cost_statistics_from_levels(
+                applied_c_overnight=applied_c_overnight,
+                terminal_c_overnight=terminal_c_overnight,
+                learning_cfg=learning_cfg,
+                costs_file=costs_file,
+                tech=tech,
+                selected_model=selected_model,
+                runtime_metadata=runtime_metadata,
+            )
+            diagnostics[tech] = {
+                **cost_stats,
+                "kernel_year_start": int(kernel_years[0]),
+                "kernel_year_end": int(kernel_years[-1]),
+                "kernel_years_json": _serialize_year_list(kernel_years),
+                "known_kernel_years_json": _serialize_year_list(known_years),
+                "expected_kernel_years_json": _serialize_year_list(expected_years),
+                "raw_kernel_costs_json": _serialize_float_list(kernel_costs),
+                "applied_kernel_costs_json": _serialize_float_list(
+                    _apply_network_basis_to_kernel_costs(tech, kernel_costs, cost_stats)
+                ),
+                "kernel_cost_sources_json": json.dumps(kernel_sources),
+                "procurement_imputation_model": str(procurement_result["model"]),
+                "procurement_anchor_year": int(procurement_result["anchor_year"]),
+                "procurement_anchor_cost": float(
+                    np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0
+                ),
+                "procurement_state_year": int(procurement_result["state"].get("last_applied_year", committed_year)),
+            }
+        return diagnostics
     annual_paths = _simulate_frozen_block_expectation_annual_paths(
         artifacts=artifacts,
         state=state,
@@ -3367,7 +3763,13 @@ def update_stochastic_runtime_state(
     if state.get("learning_seed") not in (None, ""):
         runtime_metadata["learning_seed"] = str(state["learning_seed"])
     passthrough_fields = {}
-    for key in ("committed_from_network", "enabled", "fossil_price_states"):
+    for key in (
+        "committed_from_network",
+        "enabled",
+        "fossil_price_states",
+        "procurement_expectation_state",
+        "procurement_cost_history",
+    ):
         if key in state:
             passthrough_fields[key] = state[key]
     existing_annual_cost_history = _normalize_annual_cost_history(state)
@@ -4888,6 +5290,11 @@ def save_cost_log(learning_costs, output_file):
         "cost_expectation_kernel_mode",
         "cost_expectation_weights_json",
         "cost_expectation_lag_years_json",
+        "procurement_imputation_cfg_json",
+        "procurement_imputation_model",
+        "procurement_anchor_year",
+        "procurement_anchor_cost",
+        "procurement_state_year",
         "fossil_price_uncertainty_enabled",
         "fossil_price_bundle_path",
         "fossil_price_bundle_schema_version",
@@ -4948,6 +5355,7 @@ def save_cost_log(learning_costs, output_file):
         "expected_kernel_years_json",
         "raw_kernel_costs_json",
         "applied_kernel_costs_json",
+        "kernel_cost_sources_json",
         "raw_log_capex_runtime",
         "raw_log_capex_terminal_point",
         "log_capex_runtime",
