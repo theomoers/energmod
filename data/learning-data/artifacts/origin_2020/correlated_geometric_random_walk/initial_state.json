@@ -3,19 +3,19 @@
   "model_name": "correlated_geometric_random_walk",
   "technology_states": {
     "battery_energy": {
-      "last_dlog_capex": -0.1362648795192296,
+      "last_innovation": 0.11569768459869888,
       "last_log_capex": 11.695831133929119,
-      "state_type": "geometric_random_walk"
+      "state_type": "cgrw_ima11"
     },
     "onwind_power": {
-      "last_dlog_capex": -0.12389880074630355,
+      "last_innovation": -0.0758294149243619,
       "last_log_capex": 13.959269187066647,
-      "state_type": "geometric_random_walk"
+      "state_type": "cgrw_ima11"
     },
     "solar_power": {
-      "last_dlog_capex": -0.1292117314795238,
+      "last_innovation": 0.044408372991519854,
       "last_log_capex": 13.53436099289981,
-      "state_type": "geometric_random_walk"
+      "state_type": "cgrw_ima11"
     }
   }
 }

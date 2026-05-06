@@ -42,6 +42,41 @@ def test_build_lagged_kernel_years_and_split():
     assert expected == [2026, 2027]
 
 
+def test_ssbr_runtime_has_no_autonomous_drift_when_experience_and_shocks_are_zero():
+    artifacts = {
+        "battery_energy": {
+            "parameter_summary": {
+                "b_slow": 0.25,
+                "b_fast": 0.40,
+                "sigma_slow_mean": 0.0,
+                "sigma_fast_mean": 0.0,
+            },
+            "uncertainty_terms": {
+                "b_slow_draws": [0.25],
+                "b_fast_draws": [0.40],
+                "sigma_slow_draws": [0.0],
+                "sigma_fast_draws": [0.0],
+                "p_slow_slow_draws": [1.0],
+                "p_fast_fast_draws": [1.0],
+            },
+        }
+    }
+    state = {
+        "technology_states": {"battery_energy": {"last_log_capex": math.log(100.0)}},
+        "shared_regime_state": {"initial_regime_probs": [1.0, 0.0], "current_regime": 0},
+    }
+    result = alc.simulate_shared_state_runtime(
+        artifacts=artifacts,
+        state=state,
+        block_dlog_experience_by_tech={"battery_energy": 0.0},
+        elapsed_years=5,
+        rng=np.random.default_rng(123),
+        sample_mode="single_draw",
+        n_samples=1,
+    )
+    assert result["final_log_costs"]["battery_energy"] == pytest.approx(math.log(100.0))
+
+
 def test_historical_bootstrap_kernel_uses_lagged_years_and_weights(monkeypatch):
     loaded = []
 

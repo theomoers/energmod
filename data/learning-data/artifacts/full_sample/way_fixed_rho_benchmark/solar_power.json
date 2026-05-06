@@ -1,23 +1,23 @@
 {
   "family": "learning",
   "fit_summary": {
-    "aic": -100.2626843937814,
-    "b_learning_exponent": 0.3405497595745464,
+    "aic": -98.23667705389991,
+    "b_learning_exponent": 0.34401854448320557,
     "b_source": "fdwl_no_intercept_way_lafond",
-    "bic": -96.47904379756015,
+    "bic": -94.45303645767866,
     "converged": 1,
     "fit_fragile": 0,
-    "last_innovation": 0.013193441748193056,
+    "last_innovation": -0.006511560149675057,
     "last_log_capex": 13.121686048224701,
-    "learning_rate": 0.2102596873217103,
-    "llf": 52.1313421968907,
+    "learning_rate": 0.21215624100373398,
+    "llf": 51.118338526949955,
     "model_version": "way_fdwl_v3_no_intercept",
-    "rho_fixed": 0.4,
-    "sigma": 0.08350541796427363,
-    "sigma_u": 0.08350541796427363,
+    "rho_fixed": 0.19,
+    "sigma": 0.08524974429728316,
+    "sigma_u": 0.08524974429728316,
     "support_end": 2024,
     "support_start": 1976,
-    "theta_ma1": 0.4,
+    "theta_ma1": 0.19,
     "warning_count": 0
   },
   "metadata": {
@@ -31,24 +31,24 @@
     "sample_end_year": 2025,
     "training_window": "full_sample"
   },
-  "model_label": "Way-style fixed-rho benchmark (selected rho = 0.40)",
-  "model_name": "way_fixed_rho_benchmark_035",
+  "model_label": "Way-style fixed-rho benchmark",
+  "model_name": "way_fixed_rho_benchmark",
   "model_version": "way_fdwl_v3_no_intercept",
   "n_obs": 50,
   "origin_year": 2025,
   "parameter_summary": {
-    "b_learning_exponent": 0.3405497595745464,
+    "b_learning_exponent": 0.34401854448320557,
     "b_source": "fdwl_no_intercept_way_lafond",
-    "last_innovation": 0.013193441748193056,
+    "last_innovation": -0.006511560149675057,
     "last_log_capex": 13.121686048224701,
-    "learning_rate": 0.2102596873217103,
+    "learning_rate": 0.21215624100373398,
     "model_version": "way_fdwl_v3_no_intercept",
-    "rho_fixed": 0.4,
-    "sigma": 0.08350541796427363,
-    "sigma_u": 0.08350541796427363,
+    "rho_fixed": 0.19,
+    "sigma": 0.08524974429728316,
+    "sigma_u": 0.08524974429728316,
     "support_end": 2024,
     "support_start": 1976,
-    "theta_ma1": 0.4
+    "theta_ma1": 0.19
   },
   "sample_window": {
     "conditioning_mode": "conditional_realized_experience",
@@ -60,21 +60,21 @@
       5
     ],
     "forecast_origin_year": 2025,
-    "model_name": "way_fixed_rho_benchmark_035",
+    "model_name": "way_fixed_rho_benchmark",
     "n_train_diff_obs": 49,
     "n_train_obs": 50,
     "technology": "solar_power",
     "train_end_year": 2024,
     "train_start_year": 1975
   },
-  "schema_version": "annual-model-artifact-v3-way-style-wright-core",
+  "schema_version": "annual-model-artifact-v4-no-intercept-ssbr",
   "state_variables": {
-    "last_innovation": 0.013193441748193056,
+    "last_innovation": -0.006511560149675057,
     "last_log_capex": 13.121686048224701,
     "state_type": "ma1_wright_fixed_rho",
-    "theta_ma1": 0.4
+    "theta_ma1": 0.19
   },
   "technology": "solar_power",
   "uncertainty_terms": {},
-  "version_hash": "74d66baa9ab1fd372475bf0a7d65dda97717d17665780ecd9c7612148696163d"
+  "version_hash": "3c97ac7dc73eaee93938066500a86354a12fdfa89ddb9a04f0b57cb307e7d635"
 }

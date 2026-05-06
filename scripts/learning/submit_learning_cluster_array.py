@@ -30,7 +30,7 @@ DEFAULT_CONFIGFILES = [
 ]
 SUPPORTED_MODELS = [
     "shared_state_bayesian_regime_wright",
-    "way_fixed_rho_benchmark_035",
+    "way_fixed_rho_benchmark",
     "correlated_geometric_random_walk",
 ]
 SUPPORTED_COST_EXPECTATION_KERNEL_MODES = {

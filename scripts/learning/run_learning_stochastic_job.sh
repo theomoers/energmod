@@ -8,7 +8,7 @@ Usage:
 
 Supported models:
   - shared_state_bayesian_regime_wright
-  - way_fixed_rho_benchmark_035
+  - way_fixed_rho_benchmark
   - correlated_geometric_random_walk
 
 Environment variables:
@@ -66,7 +66,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODEL" in
-  shared_state_bayesian_regime_wright|way_fixed_rho_benchmark_035|correlated_geometric_random_walk)
+  shared_state_bayesian_regime_wright|way_fixed_rho_benchmark|correlated_geometric_random_walk)
     ;;
   *)
     echo "Unsupported stochastic learning model: $MODEL" >&2

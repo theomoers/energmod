@@ -58,7 +58,7 @@
     "solar_power": "artifacts/support/legacy_curve/historical/solar.csv"
   },
   "initial_year": 2020,
-  "learning_calibration_version": "learning_calibration_v3_way_style_wright_core",
+  "learning_calibration_version": "learning_calibration_v4_no_intercept_ssbr",
   "legacy_curve": {
     "note": "Updated deterministic Wright export from learning_estimation.",
     "supported_training_windows": [
@@ -83,15 +83,15 @@
       }
     }
   },
-  "runtime_cost_update_version": "runtime_cost_update_v3_monotone_wright_core",
-  "schema_version": "energymod-learning-bundle-v3-way-style-wright-core",
+  "runtime_cost_update_version": "runtime_cost_update_v4_no_intercept_ssbr",
+  "schema_version": "energymod-learning-bundle-v4-no-intercept-ssbr",
   "stochastic_forecast": {
     "initial_year": 2020,
-    "learning_calibration_version": "learning_calibration_v3_way_style_wright_core",
-    "runtime_cost_update_version": "runtime_cost_update_v3_monotone_wright_core",
+    "learning_calibration_version": "learning_calibration_v4_no_intercept_ssbr",
+    "runtime_cost_update_version": "runtime_cost_update_v4_no_intercept_ssbr",
     "supported_models": [
       "shared_state_bayesian_regime_wright",
-      "way_fixed_rho_benchmark_035",
+      "way_fixed_rho_benchmark",
       "correlated_geometric_random_walk"
     ],
     "supported_training_windows": [
@@ -119,9 +119,9 @@
               "battery_energy"
             ]
           },
-          "way_fixed_rho_benchmark_035": {
-            "artifact_dir": "artifacts/full_sample/way_fixed_rho_benchmark_035",
-            "initial_state": "artifacts/full_sample/way_fixed_rho_benchmark_035/initial_state.json",
+          "way_fixed_rho_benchmark": {
+            "artifact_dir": "artifacts/full_sample/way_fixed_rho_benchmark",
+            "initial_state": "artifacts/full_sample/way_fixed_rho_benchmark/initial_state.json",
             "technologies": [
               "solar_power",
               "onwind_power",
@@ -152,9 +152,9 @@
               "battery_energy"
             ]
           },
-          "way_fixed_rho_benchmark_035": {
-            "artifact_dir": "artifacts/origin_2020/way_fixed_rho_benchmark_035",
-            "initial_state": "artifacts/origin_2020/way_fixed_rho_benchmark_035/initial_state.json",
+          "way_fixed_rho_benchmark": {
+            "artifact_dir": "artifacts/origin_2020/way_fixed_rho_benchmark",
+            "initial_state": "artifacts/origin_2020/way_fixed_rho_benchmark/initial_state.json",
             "technologies": [
               "solar_power",
               "onwind_power",

@@ -1,24 +1,24 @@
 {
   "last_applied_year": 2025,
-  "model_name": "way_fixed_rho_benchmark_035",
+  "model_name": "way_fixed_rho_benchmark",
   "technology_states": {
     "battery_energy": {
-      "last_innovation": 0.013217576658656194,
+      "last_innovation": -0.007132966237246522,
       "last_log_capex": 11.241186680089882,
       "state_type": "ma1_wright_fixed_rho",
-      "theta_ma1": 0.4
+      "theta_ma1": 0.19
     },
     "onwind_power": {
-      "last_innovation": -0.11150523406076455,
+      "last_innovation": -0.12263376012699209,
       "last_log_capex": 13.53148329307132,
       "state_type": "ma1_wright_fixed_rho",
-      "theta_ma1": 0.4
+      "theta_ma1": 0.19
     },
     "solar_power": {
-      "last_innovation": 0.013193441748193056,
+      "last_innovation": -0.006511560149675057,
       "last_log_capex": 13.121686048224701,
       "state_type": "ma1_wright_fixed_rho",
-      "theta_ma1": 0.4
+      "theta_ma1": 0.19
     }
   }
 }

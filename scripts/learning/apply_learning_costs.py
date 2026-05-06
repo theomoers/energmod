@@ -94,7 +94,7 @@ DEFAULT_FINANCE = {
 SUPPORTED_LEARNING_ENGINES = {"legacy_curve", "stochastic_forecast", "exogenous_path"}
 SUPPORTED_STOCHASTIC_MODELS = {
     "shared_state_bayesian_regime_wright",
-    "way_fixed_rho_benchmark_035",
+    "way_fixed_rho_benchmark",
     "correlated_geometric_random_walk",
 }
 SUPPORTED_EXOGENOUS_MODELS = {"iea_weo_exogenous_path"}
@@ -1217,27 +1217,31 @@ def _serialize_stochastic_snapshot(snapshot):
 
 
 def _shared_runtime_snapshot(pars, current_regime, regime_probs, p_ss, p_ff, sample_mode):
-    alpha_slow = _single_or_median(pars["alpha_slow"], sample_mode)
-    alpha_fast = _single_or_median(pars["alpha_fast"], sample_mode)
-    b_learning_exponent = _single_or_median(pars["b_learning_exponent"], sample_mode)
-    sigma = _single_or_median(pars["sigma"], sample_mode)
+    b_slow = _single_or_median(pars["b_slow"], sample_mode)
+    b_fast = _single_or_median(pars["b_fast"], sample_mode)
+    sigma_slow = _single_or_median(pars["sigma_slow"], sample_mode)
+    sigma_fast = _single_or_median(pars["sigma_fast"], sample_mode)
     p_slow_slow = _single_or_median(p_ss, sample_mode)
     p_fast_fast = _single_or_median(p_ff, sample_mode)
     regime = int(round(_single_or_median(current_regime, sample_mode)))
+    active_b = b_slow if regime == 0 else b_fast
+    active_sigma = sigma_slow if regime == 0 else sigma_fast
 
     return {
         "family": "shared_state_bayesian_regime_wright",
-        "model_version": "ssbr_v3_wright_core_residual_regime",
+        "model_version": "ssbr_v4_no_intercept_regime_learning",
         "current_regime": regime,
         "regime_prob_slow": float(regime_probs[0]),
         "regime_prob_fast": float(regime_probs[1]),
         "p_slow_slow": p_slow_slow,
         "p_fast_fast": p_fast_fast,
-        "alpha_slow": alpha_slow,
-        "alpha_fast": alpha_fast,
-        "b_learning_exponent": b_learning_exponent,
-        "implied_learning_rate_runtime": _implied_lr_from_learning_exponent(b_learning_exponent),
-        "sigma": sigma,
+        "b_learning_exponent": active_b,
+        "b_slow": b_slow,
+        "b_fast": b_fast,
+        "implied_learning_rate_runtime": _implied_lr_from_learning_exponent(active_b),
+        "sigma_slow": sigma_slow,
+        "sigma_fast": sigma_fast,
+        "sigma": active_sigma,
     }
 
 
@@ -1245,7 +1249,7 @@ def _way_runtime_snapshot(artifact):
     params = artifact["parameter_summary"]
     learning_exponent = params.get("b_learning_exponent")
     return {
-        "family": "way_fixed_rho_benchmark_035",
+        "family": str(artifact.get("model_name", "way_fixed_rho_benchmark")),
         "model_version": str(params.get("model_version", "way_fdwl_v3_no_intercept")),
         "b_learning_exponent": None if learning_exponent is None else float(learning_exponent),
         "implied_learning_rate": _implied_lr_from_learning_exponent(learning_exponent),
@@ -1258,8 +1262,9 @@ def _cgrw_runtime_snapshot(artifact):
     params = artifact["parameter_summary"]
     return {
         "family": "correlated_geometric_random_walk",
-        "alpha": float(params["alpha"]),
-        "rho": float(params["rho"]),
+        "kappa": float(params["kappa"]),
+        "theta_ma1": float(params["theta_ma1"]),
+        "theta_source": str(params.get("theta_source", "farmer_lafond_matched_error_cgrw")),
         "sigma": float(params["sigma"]),
         "implied_learning_rate": None,
     }
@@ -2385,10 +2390,14 @@ def _validate_v3_learning_artifact(artifact, selected_model, tech):
     schema_version = str(artifact.get("schema_version", ""))
     params = artifact.get("parameter_summary", {}) or {}
     unc = artifact.get("uncertainty_terms", {}) or {}
-    if "v3" not in schema_version and "way-style-wright-core" not in schema_version:
+    if not (
+        "v4-no-intercept-ssbr" in schema_version
+        or "v3" in schema_version
+        or "way-style-wright-core" in schema_version
+    ):
         raise ValueError(
             f"{selected_model}/{tech} artifact uses schema_version={schema_version!r}; "
-            "regenerate v3 Way/Lafond Wright-core artifacts before runtime."
+            "regenerate current Way/Lafond Wright-core artifacts before runtime."
         )
     if selected_model.startswith("way_fixed_rho_benchmark"):
         if "b_learning_exponent" not in params:
@@ -2399,22 +2408,29 @@ def _validate_v3_learning_artifact(artifact, selected_model, tech):
         if str(params.get("model_version", "")) != "way_fdwl_v3_no_intercept":
             raise ValueError(f"{selected_model}/{tech} is not a way_fdwl_v3_no_intercept artifact")
     elif selected_model == "shared_state_bayesian_regime_wright":
-        if "b_learning_exponent" not in params:
-            raise ValueError(f"{selected_model}/{tech} is missing b_learning_exponent")
-        legacy = {"beta_slow_mean", "beta_fast_mean"} & set(params)
-        legacy_draws = {"beta_slow_draws", "beta_fast_draws"} & set(unc)
+        if "b_slow" not in params or "b_fast" not in params:
+            raise ValueError(f"{selected_model}/{tech} is missing regime-specific b_slow/b_fast")
+        legacy = {"alpha_slow_mean", "alpha_fast_mean", "beta_slow_mean", "beta_fast_mean"} & set(params)
+        legacy_draws = {"alpha_slow_draws", "alpha_fast_draws", "beta_slow_draws", "beta_fast_draws"} & set(unc)
         if legacy or legacy_draws:
-            raise ValueError(
-                f"{selected_model}/{tech} exposes legacy unrestricted beta fields: "
-                f"{sorted(legacy | legacy_draws)}"
-            )
-        if "b_learning_exponent_draws" not in unc:
-            raise ValueError(f"{selected_model}/{tech} is missing b_learning_exponent_draws")
-        if str(params.get("model_version", "")) != "ssbr_v3_wright_core_residual_regime":
-            raise ValueError(f"{selected_model}/{tech} is not an ssbr_v3_wright_core_residual_regime artifact")
+            raise ValueError(f"{selected_model}/{tech} exposes legacy drift/slope fields: {sorted(legacy | legacy_draws)}")
+        if "b_slow_draws" not in unc or "b_fast_draws" not in unc:
+            raise ValueError(f"{selected_model}/{tech} is missing regime-specific learning draws")
+        if "sigma_slow_draws" not in unc or "sigma_fast_draws" not in unc:
+            raise ValueError(f"{selected_model}/{tech} is missing regime-variance draws")
+        if str(params.get("model_version", "")) != "ssbr_v4_no_intercept_regime_learning":
+            raise ValueError(f"{selected_model}/{tech} is not an ssbr_v4_no_intercept_regime_learning artifact")
     elif selected_model == "correlated_geometric_random_walk":
-        if str(params.get("model_version", "")) != "cgrw_ar1_dlogcost_v2_common_support":
-            raise ValueError(f"{selected_model}/{tech} is not a cgrw_ar1_dlogcost_v2_common_support artifact")
+        required = {"kappa", "theta_ma1", "sigma"}
+        missing = required - set(params)
+        if missing:
+            raise ValueError(f"{selected_model}/{tech} is missing CGRW fields: {sorted(missing)}")
+        legacy = {"alpha", "rho", "last_dlog_capex"} & set(params)
+        legacy_state = {"last_dlog_capex"} & set(artifact.get("state_variables", {}) or {})
+        if legacy or legacy_state:
+            raise ValueError(f"{selected_model}/{tech} exposes legacy AR(1)-growth fields: {sorted(legacy | legacy_state)}")
+        if str(params.get("model_version", "")) != "cgrw_ima11_dlogcost_drift_theta063_v3_common_support":
+            raise ValueError(f"{selected_model}/{tech} is not a cgrw_ima11_dlogcost_drift_theta063_v3_common_support artifact")
 
 
 def load_runtime_state(prev_state_path, initial_state):
@@ -2571,11 +2587,11 @@ def validate_stochastic_runtime_state(state, selected_model, artifacts):
             raise ValueError(
                 f"Stochastic runtime state for {selected_model}/{tech} is missing last_log_capex"
             )
-        if selected_model == "correlated_geometric_random_walk" and "last_dlog_capex" not in state_tech:
+        if selected_model == "correlated_geometric_random_walk" and "last_innovation" not in state_tech:
             raise ValueError(
-                f"Stochastic runtime state for {selected_model}/{tech} is missing last_dlog_capex"
+                f"Stochastic runtime state for {selected_model}/{tech} is missing last_innovation"
             )
-        if selected_model == "way_fixed_rho_benchmark_035" and "last_innovation" not in state_tech:
+        if selected_model.startswith("way_fixed_rho_benchmark") and "last_innovation" not in state_tech:
             raise ValueError(
                 f"Stochastic runtime state for {selected_model}/{tech} is missing last_innovation"
             )
@@ -2653,7 +2669,7 @@ def _learning_costs_from_stochastic_state(
         point_c_overnight = float(np.exp(log_cost) / 1000.0)
         snapshot = state_tech.get("parameter_snapshot", None)
         if not snapshot:
-            if selected_model == "way_fixed_rho_benchmark_035":
+            if selected_model.startswith("way_fixed_rho_benchmark"):
                 snapshot = _way_runtime_snapshot(artifact)
             elif selected_model == "correlated_geometric_random_walk":
                 snapshot = _cgrw_runtime_snapshot(artifact)
@@ -2842,7 +2858,7 @@ def _simulate_frozen_block_expectation_annual_paths(
                 sample_mode="single_draw",
                 n_samples=BLOCK_EXPECTATION_DRAWS,
             )["annual_log_cost_paths"]
-        elif selected_model == "way_fixed_rho_benchmark_035":
+        elif selected_model.startswith("way_fixed_rho_benchmark"):
             annual_paths[tech] = simulate_way_runtime(
                 artifact=artifact,
                 state=state["technology_states"][tech],
@@ -3037,28 +3053,28 @@ def _compute_block_average_expected_costs(
 
 def simulate_cgrw_runtime(artifact, state, elapsed_years, rng, sample_mode, n_samples=None):
     params = artifact["parameter_summary"]
+    kappa = float(params["kappa"])
+    theta = float(params["theta_ma1"])
     sigma = float(params["sigma"])
-    alpha = float(params["alpha"])
-    rho = float(params["rho"])
     last_log = float(state["last_log_capex"])
-    last_dlog = float(state["last_dlog_capex"])
+    last_innovation = float(state["last_innovation"])
     n = _runtime_sample_count(sample_mode, n_samples=n_samples)
     log_cost = np.full(n, last_log, dtype=float)
-    dlog_prev = np.full(n, last_dlog, dtype=float)
+    innovation_prev = np.full(n, last_innovation, dtype=float)
     annual_log_cost_paths = _empty_annual_log_cost_paths(n, elapsed_years)
     for _ in range(int(elapsed_years)):
-        eps = sigma * rng.standard_normal(n)
-        dlog = alpha + rho * dlog_prev + eps
+        innovation = sigma * rng.standard_normal(n)
+        dlog = kappa + innovation + theta * innovation_prev
         log_cost = log_cost + dlog
-        dlog_prev = dlog
+        innovation_prev = innovation
         annual_log_cost_paths[:, _] = log_cost
     snapshot = _cgrw_runtime_snapshot(artifact)
     return {
         "final_log_cost": _single_or_median(log_cost, sample_mode),
         "state": {
             "last_log_capex": _single_or_median(log_cost, sample_mode),
-            "last_dlog_capex": _single_or_median(dlog_prev, sample_mode),
-            "state_type": state.get("state_type", "geometric_random_walk"),
+            "last_innovation": _single_or_median(innovation_prev, sample_mode),
+            "state_type": state.get("state_type", "cgrw_ima11"),
             "parameter_snapshot": snapshot,
         },
         "annual_log_cost_paths": annual_log_cost_paths,
@@ -3164,10 +3180,10 @@ def simulate_shared_state_runtime(
                 raise ValueError(f"Shared-state runtime artifacts for {tech} are missing {key}")
             return arr[draw_idx]
         param_cache[tech] = {
-            "alpha_slow": _draws("alpha_slow_draws", "alpha_slow_mean"),
-            "alpha_fast": _draws("alpha_fast_draws", "alpha_fast_mean"),
-            "b_learning_exponent": _draws("b_learning_exponent_draws", "b_learning_exponent"),
-            "sigma": _draws("sigma_draws", "sigma_mean"),
+            "b_slow": _draws("b_slow_draws", "b_slow"),
+            "b_fast": _draws("b_fast_draws", "b_fast"),
+            "sigma_slow": _draws("sigma_slow_draws", "sigma_slow_mean"),
+            "sigma_fast": _draws("sigma_fast_draws", "sigma_fast_mean"),
         }
 
     if horizons == 0:
@@ -3209,8 +3225,9 @@ def simulate_shared_state_runtime(
         for tech in techs:
             x_curr = x_step_by_tech[tech]
             pars = param_cache[tech]
-            alpha = np.where(current_regime == 0, pars["alpha_slow"], pars["alpha_fast"])
-            dlog = -pars["b_learning_exponent"] * x_curr + alpha + pars["sigma"] * rng.standard_normal(n)
+            sigma = np.where(current_regime == 0, pars["sigma_slow"], pars["sigma_fast"])
+            b_state = np.where(current_regime == 0, pars["b_slow"], pars["b_fast"])
+            dlog = -b_state * x_curr + sigma * rng.standard_normal(n)
             log_costs[tech] = log_costs[tech] + dlog
             annual_log_cost_paths[tech][:, step] = log_costs[tech]
 

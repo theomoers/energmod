@@ -1,21 +1,22 @@
 {
   "family": "benchmark",
   "fit_summary": {
-    "aic": -96.94170040097268,
+    "aic": -93.26395255763705,
     "b_learning_exponent": null,
     "b_source": null,
-    "bic": -91.328097368249,
+    "bic": -89.48031196141581,
     "converged": 1,
     "fit_fragile": 0,
-    "intercept_dlog": -0.04841718012825833,
-    "last_dlog_capex": -0.11601269641553102,
+    "innovation_initialization": "filtered_from_history_with_presample_zero",
+    "kappa": -0.11174766190641619,
+    "last_innovation": 0.06236405549919494,
     "last_log_capex": 13.121686048224701,
     "learning_rate": null,
-    "llf": 51.47085020048634,
-    "model_version": "cgrw_ar1_dlogcost_v2_common_support",
-    "mu": -0.10112228588373637,
-    "rho": 0.5212016846224663,
-    "sigma": 0.08280656663920088,
+    "llf": 48.63197627881853,
+    "model_version": "cgrw_ima11_dlogcost_drift_theta063_v3_common_support",
+    "sigma": 0.08968714376293518,
+    "theta_ma1": 0.63,
+    "theta_source": "farmer_lafond_matched_error_cgrw",
     "warning_count": 0
   },
   "metadata": {
@@ -31,19 +32,21 @@
   },
   "model_label": "Correlated geometric random walk",
   "model_name": "correlated_geometric_random_walk",
-  "model_version": "cgrw_ar1_dlogcost_v2_common_support",
+  "model_version": "cgrw_ima11_dlogcost_drift_theta063_v3_common_support",
   "n_obs": 50,
   "origin_year": 2025,
   "parameter_summary": {
-    "alpha": -0.04841718012825833,
     "b_learning_exponent": null,
     "b_source": null,
-    "last_dlog_capex": -0.11601269641553102,
+    "innovation_initialization": "filtered_from_history_with_presample_zero",
+    "kappa": -0.11174766190641619,
+    "last_innovation": 0.06236405549919494,
     "last_log_capex": 13.121686048224701,
     "learning_rate": null,
-    "model_version": "cgrw_ar1_dlogcost_v2_common_support",
-    "rho": 0.5212016846224663,
-    "sigma": 0.08280656663920088
+    "model_version": "cgrw_ima11_dlogcost_drift_theta063_v3_common_support",
+    "sigma": 0.08968714376293518,
+    "theta_ma1": 0.63,
+    "theta_source": "farmer_lafond_matched_error_cgrw"
   },
   "sample_window": {
     "conditioning_mode": "conditional_realized_experience",
@@ -62,13 +65,13 @@
     "train_end_year": 2024,
     "train_start_year": 1975
   },
-  "schema_version": "annual-model-artifact-v3-way-style-wright-core",
+  "schema_version": "annual-model-artifact-v4-no-intercept-ssbr",
   "state_variables": {
-    "last_dlog_capex": -0.11601269641553102,
+    "last_innovation": 0.06236405549919494,
     "last_log_capex": 13.121686048224701,
-    "state_type": "geometric_random_walk"
+    "state_type": "cgrw_ima11"
   },
   "technology": "solar_power",
   "uncertainty_terms": {},
-  "version_hash": "87382606789514c746acea952af93585b0d90711c641045ee47042e5d74b0082"
+  "version_hash": "046270969608dbac56912f7783d787a9ff32fe4655a8b9f70e172902a82e97e6"
 }

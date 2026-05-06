@@ -1,23 +1,23 @@
 {
   "family": "learning",
   "fit_summary": {
-    "aic": -101.50301574380566,
-    "b_learning_exponent": 0.12353434353711336,
+    "aic": -101.77295355460647,
+    "b_learning_exponent": 0.12081316686460715,
     "b_source": "fdwl_no_intercept_way_lafond",
-    "bic": -98.07587161039704,
+    "bic": -98.34580942119786,
     "converged": 1,
     "fit_fragile": 0,
-    "last_innovation": -0.11150523406076455,
+    "last_innovation": -0.12263376012699209,
     "last_log_capex": 13.53148329307132,
-    "learning_rate": 0.08206388466821957,
-    "llf": 52.75150787190283,
+    "learning_rate": 0.08033086177528681,
+    "llf": 52.88647677730324,
     "model_version": "way_fdwl_v3_no_intercept",
-    "rho_fixed": 0.4,
-    "sigma": 0.06683281389291058,
-    "sigma_u": 0.06683281389291058,
+    "rho_fixed": 0.19,
+    "sigma": 0.06661319142562258,
+    "sigma_u": 0.06661319142562258,
     "support_end": 2024,
     "support_start": 1984,
-    "theta_ma1": 0.4,
+    "theta_ma1": 0.19,
     "warning_count": 0
   },
   "metadata": {
@@ -31,24 +31,24 @@
     "sample_end_year": 2025,
     "training_window": "full_sample"
   },
-  "model_label": "Way-style fixed-rho benchmark (selected rho = 0.40)",
-  "model_name": "way_fixed_rho_benchmark_035",
+  "model_label": "Way-style fixed-rho benchmark",
+  "model_name": "way_fixed_rho_benchmark",
   "model_version": "way_fdwl_v3_no_intercept",
   "n_obs": 42,
   "origin_year": 2025,
   "parameter_summary": {
-    "b_learning_exponent": 0.12353434353711336,
+    "b_learning_exponent": 0.12081316686460715,
     "b_source": "fdwl_no_intercept_way_lafond",
-    "last_innovation": -0.11150523406076455,
+    "last_innovation": -0.12263376012699209,
     "last_log_capex": 13.53148329307132,
-    "learning_rate": 0.08206388466821957,
+    "learning_rate": 0.08033086177528681,
     "model_version": "way_fdwl_v3_no_intercept",
-    "rho_fixed": 0.4,
-    "sigma": 0.06683281389291058,
-    "sigma_u": 0.06683281389291058,
+    "rho_fixed": 0.19,
+    "sigma": 0.06661319142562258,
+    "sigma_u": 0.06661319142562258,
     "support_end": 2024,
     "support_start": 1984,
-    "theta_ma1": 0.4
+    "theta_ma1": 0.19
   },
   "sample_window": {
     "conditioning_mode": "conditional_realized_experience",
@@ -60,21 +60,21 @@
       5
     ],
     "forecast_origin_year": 2025,
-    "model_name": "way_fixed_rho_benchmark_035",
+    "model_name": "way_fixed_rho_benchmark",
     "n_train_diff_obs": 41,
     "n_train_obs": 42,
     "technology": "onwind_power",
     "train_end_year": 2024,
     "train_start_year": 1983
   },
-  "schema_version": "annual-model-artifact-v3-way-style-wright-core",
+  "schema_version": "annual-model-artifact-v4-no-intercept-ssbr",
   "state_variables": {
-    "last_innovation": -0.11150523406076455,
+    "last_innovation": -0.12263376012699209,
     "last_log_capex": 13.53148329307132,
     "state_type": "ma1_wright_fixed_rho",
-    "theta_ma1": 0.4
+    "theta_ma1": 0.19
   },
   "technology": "onwind_power",
   "uncertainty_terms": {},
-  "version_hash": "dc6e5551f43ae7aa8934c50cc8b378234e0ae77afa22b94173d06e1f628e2622"
+  "version_hash": "d38e743e3077c8907aa9d9655159ac20dee5a459c3f3cafc8c04b4dc2f341127"
 }
