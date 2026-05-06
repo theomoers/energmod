@@ -28,9 +28,9 @@ learning:
     kernel_mode: technology_specific_lagged_window   # global_current_window | technology_specific_lagged_window
     annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
     lag_years_by_tech:
-      solar_power: 2
-      onwind_power: 4
-      battery_energy: 2
+      solar_power: 1
+      onwind_power: 3
+      battery_energy: 1
     procurement_imputation:
       enabled: true
       anchor: latest_realized_cost
@@ -75,19 +75,27 @@ learning:
       reference_statistic: mean   # mean | median | max_mean_median
       battery_basis: local_energy
       b1_multiplier: 0.8
-      b2_multiplier: 1.6
+      b2_multiplier: 1.2
       phi2_pct_capex: 0.36 # calibrated on micro data IRENA (see notebook for details)
       phi3_pct_capex: 0.83 # calibrated on micro data IRENA (see notebook for details)
       irena_history_csv: "validation/data/IRENA_2025_capacity.csv"
       battery_history_csv: "data/energy_storage/battery_storage_capa_bycountry.csv"
+  battery_pipeline_anchor:
+    enabled: true
+    anchor_year: 2030
+    global_energy_gwh: 1900 # if annual additions 2025 continue but do not increase at all (significantly below announced pipeline numbers)
+    global_power_gw: 760 # if annual additions 2025 continue but do not increase at all (significantly below announced pipeline numbers)
+    applies_to: battery_energy
+    scope: global
+    active_only_until_anchor_year: true
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-      - correlated_geometric_random_walk
+      #- correlated_geometric_random_walk
       - way_fixed_rho_benchmark
-    draws: 25
+    draws: 20
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000

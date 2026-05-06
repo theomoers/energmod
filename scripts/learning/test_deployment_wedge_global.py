@@ -28,7 +28,7 @@ from learning.apply_learning_costs import load_config_learning, load_learning_ma
 from learning.export_postsolve_learning_costs import (  # noqa: E402
     _attach_applied_learning_costs_from_log,
 )
-from solve_network import add_learning_deployment_wedge  # noqa: E402
+from solve_network import add_battery_pipeline_anchor, add_learning_deployment_wedge  # noqa: E402
 
 
 class GlobalDeploymentWedgeTests(unittest.TestCase):
@@ -618,6 +618,86 @@ class GlobalDeploymentWedgeTests(unittest.TestCase):
         self.assertAlmostEqual(float(row["basis_cost_eur_per_unit_representative"]), 42000.0, places=9)
         self.assertAlmostEqual(float(row["b1_raw"]), 425.0, places=9)
         self.assertAlmostEqual(float(row["b2_raw"]), 850.0, places=9)
+
+    def test_battery_pipeline_anchor_uses_global_energy_and_power_only_in_2030(self):
+        stores = pd.DataFrame(
+            {
+                "carrier": ["battery", "battery", "battery"],
+                "bus": ["US 0", "BR 0", "US 0"],
+                "e_nom_extendable": [False, True, True],
+                "build_year": [2025, 2030, 2035],
+                "e_nom": [500000.0, 0.0, 0.0],
+            },
+            index=["battery-2025", "battery-2030", "battery-2035"],
+        )
+        links = pd.DataFrame(
+            {
+                "carrier": ["battery charger", "battery discharger"],
+                "p_nom_extendable": [True, True],
+                "build_year": [2030, 2030],
+                "p_nom": [0.0, 0.0],
+            },
+            index=["charger-2030", "discharger-2030"],
+        )
+        network = SimpleNamespace(stores=stores, links=links, meta={})
+        network.model = linopy.Model()
+        store_assets = pd.Index(["battery-2030", "battery-2035"], name="Store")
+        store_nom = network.model.add_variables(lower=0.0, coords=[store_assets], name="Store-e_nom")
+        link_assets = pd.Index(["charger-2030", "discharger-2030"], name="Link")
+        link_nom = network.model.add_variables(lower=0.0, coords=[link_assets], name="Link-p_nom")
+        network.model.add_objective(0 * store_nom.sum() + 0 * link_nom.sum())
+
+        config = {
+            "learning": {
+                "battery_pipeline_anchor": {
+                    "enabled": True,
+                    "anchor_year": 2030,
+                    "global_energy_gwh": 1900.0,
+                    "global_power_gw": 760.0,
+                    "applies_to": "battery_energy",
+                    "scope": "global",
+                    "active_only_until_anchor_year": True,
+                }
+            }
+        }
+        add_battery_pipeline_anchor(network, planning_year=2030, config=config)
+
+        self.assertNotIn("battery_pipeline_anchor_shortfall__2030", set(network.model.variables))
+        self.assertIn(
+            "battery_pipeline_anchor_global_energy_stock__2030",
+            set(network.model.constraints),
+        )
+        self.assertIn(
+            "battery_pipeline_anchor_global_charger_power__2030",
+            set(network.model.constraints),
+        )
+        self.assertIn(
+            "battery_pipeline_anchor_global_discharger_power__2030",
+            set(network.model.constraints),
+        )
+        self.assertNotIn("battery_pipeline_anchor_shortfall__2035", set(network.model.variables))
+        anchor_meta = network.meta["battery_pipeline_anchor"]
+        self.assertAlmostEqual(anchor_meta["fixed_battery_store_stock_gwh"], 500.0, places=9)
+        self.assertEqual(anchor_meta["variable_battery_store_asset_count"], 1)
+        self.assertAlmostEqual(anchor_meta["fixed_battery_charger_power_gw"], 0.0, places=9)
+        self.assertAlmostEqual(anchor_meta["fixed_battery_discharger_power_gw"], 0.0, places=9)
+        self.assertEqual(anchor_meta["variable_battery_charger_asset_count"], 1)
+        self.assertEqual(anchor_meta["variable_battery_discharger_asset_count"], 1)
+        self.assertAlmostEqual(anchor_meta["target_charger_power_gw"], 760.0, places=9)
+        self.assertAlmostEqual(anchor_meta["target_discharger_power_gw"], 760.0, places=9)
+        self.assertAlmostEqual(anchor_meta["reference_duration_hours"], 2.5, places=9)
+
+        later_network = SimpleNamespace(stores=stores, links=links, meta={})
+        later_network.model = linopy.Model()
+        later_store_nom = later_network.model.add_variables(
+            lower=0.0,
+            coords=[store_assets],
+            name="Store-e_nom",
+        )
+        later_network.model.add_objective(0 * later_store_nom.sum())
+        add_battery_pipeline_anchor(later_network, planning_year=2035, config=config)
+        self.assertNotIn("battery_pipeline_anchor_shortfall__2030", set(later_network.model.variables))
+        self.assertNotIn("battery_pipeline_anchor", later_network.meta)
 
     def test_global_wedge_skips_when_b1_exceeds_finite_asset_upper_bound(self):
         buses = pd.DataFrame(

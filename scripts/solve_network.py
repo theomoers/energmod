@@ -3426,6 +3426,199 @@ def _should_skip_nonbinding_deployment_wedge(
     return False
 
 
+def _battery_pipeline_anchor_cfg(learning_cfg):
+    cfg = (learning_cfg or {}).get("battery_pipeline_anchor", {}) or {}
+    if not bool(cfg.get("enabled", False)):
+        return None
+    applies_to = str(cfg.get("applies_to", "battery_energy")).strip()
+    scope = str(cfg.get("scope", "global")).strip()
+    if applies_to != "battery_energy":
+        raise ValueError(
+            "learning.battery_pipeline_anchor.applies_to must be 'battery_energy'; "
+            f"got {applies_to!r}."
+        )
+    if scope != "global":
+        raise ValueError(
+            "learning.battery_pipeline_anchor.scope must be 'global'; "
+            f"got {scope!r}."
+        )
+    return cfg
+
+
+def _battery_store_stock_expression_gwh(n, anchor_year):
+    stores = getattr(n, "stores", pd.DataFrame())
+    if stores.empty:
+        return None, 0.0, 0
+
+    subset = stores.loc[stores["carrier"].astype(str).eq("battery")].copy()
+    if subset.empty:
+        return None, 0.0, 0
+
+    if "build_year" in subset.columns:
+        build_year = pd.to_numeric(subset["build_year"], errors="coerce")
+        subset = subset.loc[build_year.fillna(anchor_year).astype(int).le(int(anchor_year))].copy()
+    if subset.empty:
+        return None, 0.0, 0
+
+    extendable = (
+        subset["e_nom_extendable"].fillna(False).astype(bool)
+        if "e_nom_extendable" in subset.columns
+        else pd.Series(False, index=subset.index)
+    )
+    variable_idx = pd.Index([], dtype=object)
+    if "Store-e_nom" in n.model.variables:
+        variable_idx = subset.index[extendable]
+    fixed_subset = subset.drop(index=variable_idx, errors="ignore")
+
+    fixed_col = "e_nom_opt" if "e_nom_opt" in fixed_subset.columns else "e_nom"
+    fixed_stock_gwh = 0.0
+    if fixed_col in fixed_subset.columns:
+        fixed_stock_gwh = float(
+            pd.to_numeric(fixed_subset[fixed_col], errors="coerce").fillna(0.0).sum()
+            / 1e3
+        )
+
+    stock_expr = fixed_stock_gwh
+    if len(variable_idx) > 0:
+        stock_expr = stock_expr + n.model["Store-e_nom"].loc[variable_idx].sum() / 1e3
+    return stock_expr, fixed_stock_gwh, int(len(variable_idx))
+
+
+def _battery_link_power_expression_gw(n, carrier, anchor_year):
+    links = getattr(n, "links", pd.DataFrame())
+    if links.empty:
+        return None, 0.0, 0
+
+    subset = links.loc[links["carrier"].astype(str).eq(carrier)].copy()
+    if subset.empty:
+        return None, 0.0, 0
+
+    if "build_year" in subset.columns:
+        build_year = pd.to_numeric(subset["build_year"], errors="coerce")
+        subset = subset.loc[build_year.fillna(anchor_year).astype(int).le(int(anchor_year))].copy()
+    if subset.empty:
+        return None, 0.0, 0
+
+    extendable = (
+        subset["p_nom_extendable"].fillna(False).astype(bool)
+        if "p_nom_extendable" in subset.columns
+        else pd.Series(False, index=subset.index)
+    )
+    variable_idx = pd.Index([], dtype=object)
+    if "Link-p_nom" in n.model.variables:
+        variable_idx = subset.index[extendable]
+    fixed_subset = subset.drop(index=variable_idx, errors="ignore")
+
+    fixed_col = "p_nom_opt" if "p_nom_opt" in fixed_subset.columns else "p_nom"
+    fixed_power_gw = 0.0
+    if fixed_col in fixed_subset.columns:
+        fixed_power_gw = float(
+            pd.to_numeric(fixed_subset[fixed_col], errors="coerce").fillna(0.0).sum()
+            / 1e3
+        )
+
+    power_expr = fixed_power_gw
+    if len(variable_idx) > 0:
+        power_expr = power_expr + n.model["Link-p_nom"].loc[variable_idx].sum() / 1e3
+    return power_expr, fixed_power_gw, int(len(variable_idx))
+
+
+def add_battery_pipeline_anchor(n, planning_year, config):
+    learning_cfg = (config or {}).get("learning", {}) or {}
+    anchor_cfg = _battery_pipeline_anchor_cfg(learning_cfg)
+    if anchor_cfg is None:
+        return
+
+    planning_year = int(planning_year)
+    anchor_year = int(anchor_cfg.get("anchor_year", 2030))
+    if planning_year != anchor_year:
+        return
+
+    target_gwh = float(anchor_cfg.get("global_energy_gwh", 1900.0))
+    if target_gwh <= 0.0:
+        return
+
+    stock_expr, fixed_stock_gwh, variable_asset_count = _battery_store_stock_expression_gwh(
+        n,
+        anchor_year=anchor_year,
+    )
+    if stock_expr is None:
+        logger.warning(
+            "Skipping 2030 battery pipeline anchor: no battery Store.e_nom stock or "
+            "extendable battery Store.e_nom assets were found."
+        )
+        return
+
+    n.model.add_constraints(
+        stock_expr >= target_gwh,
+        name=f"battery_pipeline_anchor_global_energy_stock__{anchor_year}",
+    )
+
+    target_power_gw = float(anchor_cfg.get("global_power_gw", 0.0))
+    power_meta = {}
+    if target_power_gw > 0.0:
+        for carrier, label in [
+            ("battery charger", "charger"),
+            ("battery discharger", "discharger"),
+        ]:
+            power_expr, fixed_power_gw, variable_power_asset_count = (
+                _battery_link_power_expression_gw(
+                    n,
+                    carrier=carrier,
+                    anchor_year=anchor_year,
+                )
+            )
+            if power_expr is None:
+                raise ValueError(
+                    "Cannot impose 2030 battery pipeline power anchor: no "
+                    f"{carrier!r} Link.p_nom stock or extendable Link.p_nom assets "
+                    "were found."
+                )
+            n.model.add_constraints(
+                power_expr >= target_power_gw,
+                name=f"battery_pipeline_anchor_global_{label}_power__{anchor_year}",
+            )
+            power_meta[f"fixed_battery_{label}_power_gw"] = fixed_power_gw
+            power_meta[f"variable_battery_{label}_asset_count"] = (
+                variable_power_asset_count
+            )
+
+    if not hasattr(n, "meta") or not isinstance(n.meta, dict):
+        n.meta = {}
+    duration_hours = (
+        target_gwh / target_power_gw
+        if np.isfinite(target_power_gw) and target_power_gw > 0.0
+        else np.nan
+    )
+    n.meta["battery_pipeline_anchor"] = {
+        "enabled": True,
+        "year": anchor_year,
+        "target_energy_gwh": target_gwh,
+        "target_charger_power_gw": target_power_gw,
+        "target_discharger_power_gw": target_power_gw,
+        "reference_duration_hours": duration_hours,
+        "fixed_battery_store_stock_gwh": fixed_stock_gwh,
+        "variable_battery_store_asset_count": variable_asset_count,
+        "scope": "global",
+        "applies_to": "battery_energy",
+    }
+    n.meta["battery_pipeline_anchor"].update(power_meta)
+    logger.info(
+        "Added one-time global 2030 battery Store.e_nom pipeline anchor: "
+        "stock >= %.3f GWh (fixed stock %.3f GWh, %d variable Store assets).",
+        target_gwh,
+        fixed_stock_gwh,
+        variable_asset_count,
+    )
+    if target_power_gw > 0.0:
+        logger.info(
+            "Added one-time global 2030 battery Link.p_nom pipeline anchors: "
+            "charger >= %.3f GW and discharger >= %.3f GW.",
+            target_power_gw,
+            target_power_gw,
+        )
+
+
 def add_learning_deployment_wedge(n, planning_year, config):
     learning_cfg = (config or {}).get("learning", {}) or {}
     deployment_cfg = (learning_cfg.get("deployment_constraints", {}) or {})
@@ -3783,6 +3976,8 @@ def add_learning_deployment_wedge(n, planning_year, config):
 
 def add_learning_deployment_constraints(n, planning_year, config):
     learning_cfg = (config or {}).get("learning", {}) or {}
+    add_battery_pipeline_anchor(n, planning_year=planning_year, config=config)
+
     deployment_cfg = (learning_cfg.get("deployment_constraints", {}) or {})
     if not bool(deployment_cfg.get("enabled", False)):
         return
