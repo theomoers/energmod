@@ -164,7 +164,7 @@ class GlobalDeploymentWedgeTests(unittest.TestCase):
         self.assertAlmostEqual(float(solar["b1"]), 49600.0, places=9)
         self.assertAlmostEqual(float(solar["b2"]), 99200.0, places=9)
 
-    def test_global_growth_projected_wedge_requires_positive_cagr_base(self):
+    def test_global_growth_projected_wedge_falls_back_on_nonpositive_cagr_base(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             learning_cfg = self.make_learning_cfg(
                 tmpdir,
@@ -197,12 +197,59 @@ class GlobalDeploymentWedgeTests(unittest.TestCase):
             learning_cfg["deployment_constraints"]["wedge"]["reference_method"] = "growth_projected"
             learning_cfg["deployment_constraints"]["wedge"]["growth_smoothing_years"] = 3
 
-            with self.assertRaises(ValueError):
-                build_deployment_wedge_table_from_history(
-                    learning_cfg,
-                    current_year=2030,
-                    technologies=["solar_power"],
-                )
+            table = build_deployment_wedge_table_from_history(
+                learning_cfg,
+                current_year=2030,
+                technologies=["solar_power"],
+            )
+
+        self.assertEqual(len(table), 1)
+        solar = table.iloc[0]
+        self.assertEqual(solar["reference_method"], "growth_projected_fallback_flat_recent")
+        self.assertAlmostEqual(float(solar["reference_annual_addition"]), 200.0, places=9)
+        self.assertAlmostEqual(float(solar["reference_block_addition"]), 1000.0, places=9)
+        self.assertTrue(pd.isna(solar["reference_growth_rate"]))
+
+    def test_global_growth_projected_wedge_skips_inactive_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            learning_cfg = self.make_learning_cfg(
+                tmpdir,
+                level="global",
+                technologies=["solar_power"],
+            )
+            irena_path = Path(tmpdir) / "irena_long.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "Region/area (ISO 3)": "GLO",
+                        "Region/area": "World",
+                        "Year": year,
+                        "Data Type": "Electrical Capacity",
+                        "Product Name": "Solar photovoltaic",
+                        "Grid Type": "OnGrid",
+                        "Unit": "Megawatt",
+                        " Value ": value,
+                    }
+                    for year, value in [
+                        (2021, "100,000"),
+                        (2022, "100,000"),
+                        (2023, "100,000"),
+                        (2024, "100,000"),
+                        (2025, "100,000"),
+                    ]
+                ]
+            ).to_csv(irena_path, index=False)
+            learning_cfg["deployment_constraints"]["wedge"]["irena_history_csv"] = str(irena_path)
+            learning_cfg["deployment_constraints"]["wedge"]["reference_method"] = "growth_projected"
+            learning_cfg["deployment_constraints"]["wedge"]["growth_smoothing_years"] = 3
+
+            table = build_deployment_wedge_table_from_history(
+                learning_cfg,
+                current_year=2030,
+                technologies=["solar_power"],
+            )
+
+        self.assertTrue(table.empty)
 
     def test_country_level_wedge_table_keeps_country_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -185,7 +185,7 @@ ATLITE_NPROCESSES = config["atlite"].get("nprocesses", 4)
 
 SUPPORTED_STOCHASTIC_LEARNING_MODELS = [
     "shared_state_bayesian_regime_wright",
-    "way_fixed_rho_benchmark_035",
+    "way_fixed_rho_benchmark",
     "correlated_geometric_random_walk",
 ]
 SUPPORTED_RUNTIME_LEARNING_MODELS = ["legacy_curve", "iea_weo_exogenous_path", *SUPPORTED_STOCHASTIC_LEARNING_MODELS]

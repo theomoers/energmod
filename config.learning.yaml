@@ -78,7 +78,7 @@ learning:
       - shared_state_bayesian_regime_wright
       - correlated_geometric_random_walk
       - way_fixed_rho_benchmark
-    draws: 1000
+    draws: 25
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000

@@ -567,7 +567,7 @@ def build_postsolve_cost_log(
         stochastic_runtime = runtime_model in {
             "shared_state_bayesian_regime_wright",
             "correlated_geometric_random_walk",
-            "way_fixed_rho_benchmark_035",
+            "way_fixed_rho_benchmark",
         }
         exogenous_runtime = runtime_model == "iea_weo_exogenous_path"
 

@@ -950,6 +950,45 @@ def _select_wedge_reference_annual_basis(recent, reference_statistic):
     return mean_recent
 
 
+def _flat_recent_wedge_reference(
+    group,
+    current_year,
+    smoothing_years,
+    reference_statistic,
+    reference_method="flat_recent",
+):
+    current_year = int(current_year)
+    smoothing_years = max(int(smoothing_years), 1)
+    annual = (
+        group.loc[:, ["year", "annual_basis"]]
+        .dropna(subset=["year", "annual_basis"])
+        .copy()
+    )
+    if annual.empty:
+        raise ValueError("Cannot compute flat-recent wedge reference from empty history.")
+    annual["year"] = annual["year"].astype(int)
+    annual["annual_basis"] = pd.to_numeric(annual["annual_basis"], errors="coerce")
+    annual = annual.dropna(subset=["annual_basis"]).sort_values("year")
+    if annual.empty:
+        raise ValueError("Cannot compute flat-recent wedge reference from nonnumeric history.")
+
+    recent = annual.tail(smoothing_years).copy()
+    annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
+    if not np.isfinite(annual_basis) or annual_basis <= 0.0:
+        raise ValueError(
+            "Cannot compute flat-recent deployment wedge reference: "
+            f"recent annual addition is nonpositive ({annual_basis!r})."
+        )
+    return {
+        "block_reference": float(annual_basis) * float(_block_year_count(current_year)),
+        "reference_annual_addition": annual_basis,
+        "history_year": int(recent["year"].max()),
+        "reference_growth_rate": np.nan,
+        "reference_latest_annual_addition": annual_basis,
+        "reference_method": str(reference_method),
+    }
+
+
 def _growth_projected_wedge_reference(group, current_year, growth_smoothing_years):
     current_year = int(current_year)
     growth_smoothing_years = max(int(growth_smoothing_years), 1)
@@ -1022,6 +1061,7 @@ def _growth_projected_wedge_reference(group, current_year, growth_smoothing_year
         "history_year": latest_year,
         "reference_growth_rate": growth_rate,
         "reference_latest_annual_addition": latest_addition,
+        "reference_method": "growth_projected",
     }
 
 
@@ -1566,23 +1606,47 @@ def build_deployment_wedge_table_from_history(
                         growth_smoothing_years=growth_smoothing_years,
                     )
             except ValueError as exc:
-                raise ValueError(
-                    "Could not compute growth_projected deployment wedge reference "
-                    f"for {technology} / {region} in {current_year}."
-                ) from exc
+                try:
+                    reference = _flat_recent_wedge_reference(
+                        smoothed,
+                        current_year=current_year,
+                        smoothing_years=smoothing_years,
+                        reference_statistic=reference_statistic,
+                        reference_method="growth_projected_fallback_flat_recent",
+                    )
+                except ValueError as fallback_exc:
+                    logger.warning(
+                        "Skipping growth_projected deployment wedge for %s / %s in %s: "
+                        "projection failed (%s) and flat-recent fallback was inactive (%s).",
+                        technology,
+                        region,
+                        current_year,
+                        exc,
+                        fallback_exc,
+                    )
+                    continue
             annual_basis = reference["reference_annual_addition"]
             block_reference = reference["block_reference"]
             history_year = reference["history_year"]
             reference_growth_rate = reference["reference_growth_rate"]
             reference_latest_annual_addition = reference["reference_latest_annual_addition"]
+            row_reference_method = reference.get("reference_method", row_reference_method)
         else:
-            annual_basis = _select_wedge_reference_annual_basis(recent, reference_statistic)
-            if not np.isfinite(annual_basis) or annual_basis <= 0.0:
+            try:
+                reference = _flat_recent_wedge_reference(
+                    smoothed,
+                    current_year=current_year,
+                    smoothing_years=smoothing_years,
+                    reference_statistic=reference_statistic,
+                    reference_method="flat_recent",
+                )
+            except ValueError:
                 continue
-            block_reference = float(annual_basis) * float(block_years)
-            history_year = recent["year"].max()
-            reference_growth_rate = np.nan
-            reference_latest_annual_addition = annual_basis
+            annual_basis = reference["reference_annual_addition"]
+            block_reference = reference["block_reference"]
+            history_year = reference["history_year"]
+            reference_growth_rate = reference["reference_growth_rate"]
+            reference_latest_annual_addition = reference["reference_latest_annual_addition"]
         wedge_row = _deployment_wedge_row(
             region=region,
             technology=technology,
