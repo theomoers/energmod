@@ -78,6 +78,7 @@ Details (and errors introduced through this heuristic) are discussed in the pape
     the rule :mod:`solve_network`.
 """
 import logging
+import hashlib
 import os
 import re
 import time
@@ -3445,6 +3446,108 @@ def _battery_pipeline_anchor_cfg(learning_cfg):
     return cfg
 
 
+def _battery_pipeline_seed_int(value):
+    if value is None:
+        return 0
+    text = str(value).strip()
+    if not text:
+        return 0
+    match = re.search(r"-?\d+", text)
+    if match:
+        return int(match.group(0))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16) % (2**32)
+
+
+def _battery_pipeline_anchor_targets(anchor_cfg, learning_cfg, anchor_year, learning_seed=None):
+    base_energy_gwh = float(anchor_cfg.get("global_energy_gwh", 1900.0))
+    base_power_gw = float(anchor_cfg.get("global_power_gw", 0.0))
+    uncertainty_cfg = anchor_cfg.get("uncertainty", {}) or {}
+    uncertainty_enabled = bool(uncertainty_cfg.get("enabled", False))
+    mode = str(uncertainty_cfg.get("mode", "truncated_lognormal_multiplier")).strip()
+    multiplier = 1.0
+    seed_value = None
+    sigma_log = 0.0
+    truncate_multipliers = None
+
+    if uncertainty_enabled:
+        if mode not in {"lognormal_multiplier", "truncated_lognormal_multiplier"}:
+            raise ValueError(
+                "learning.battery_pipeline_anchor.uncertainty.mode must be "
+                f"'truncated_lognormal_multiplier' or 'lognormal_multiplier'; got {mode!r}."
+            )
+        sigma_log = float(uncertainty_cfg.get("sigma_log", 0.0))
+        if sigma_log < 0.0:
+            raise ValueError(
+                "learning.battery_pipeline_anchor.uncertainty.sigma_log must be non-negative; "
+                f"got {sigma_log}."
+            )
+        seed_source = str(
+            uncertainty_cfg.get("random_seed_source", "learning_seed")
+        ).strip()
+        if seed_source == "learning_seed":
+            seed_value = learning_seed
+            if seed_value is None:
+                seed_value = learning_cfg.get("seed", 0)
+        elif seed_source in {"learning_config", "config_seed"}:
+            seed_value = learning_cfg.get("seed", 0)
+        else:
+            seed_value = seed_source
+
+        seed_int = _battery_pipeline_seed_int(seed_value)
+        payload = f"battery_pipeline_anchor|{int(anchor_year)}|{seed_int}"
+        digest = hashlib.sha256(payload.encode("utf-8")).digest()
+        rng_seed = int.from_bytes(digest[:8], byteorder="little", signed=False)
+        rng = np.random.default_rng(rng_seed)
+        raw_truncation = uncertainty_cfg.get("truncate_multipliers")
+        if raw_truncation is not None:
+            if len(raw_truncation) != 2:
+                raise ValueError(
+                    "learning.battery_pipeline_anchor.uncertainty.truncate_multipliers "
+                    "must contain exactly two values."
+                )
+            lower = float(raw_truncation[0])
+            upper = float(raw_truncation[1])
+            if lower <= 0.0 or upper <= 0.0 or lower > upper:
+                raise ValueError(
+                    "learning.battery_pipeline_anchor.uncertainty.truncate_multipliers "
+                    f"must be positive and ordered; got {raw_truncation!r}."
+                )
+            truncate_multipliers = [lower, upper]
+            if lower == upper:
+                multiplier = lower
+            elif mode == "truncated_lognormal_multiplier":
+                log_lower = float(np.log(lower))
+                log_upper = float(np.log(upper))
+                shock = None
+                for _ in range(10000):
+                    candidate = float(rng.normal(0.0, sigma_log))
+                    if log_lower <= candidate <= log_upper:
+                        shock = candidate
+                        break
+                if shock is None:
+                    shock = float(np.clip(rng.normal(0.0, sigma_log), log_lower, log_upper))
+                multiplier = float(np.exp(shock))
+            else:
+                multiplier = float(np.exp(rng.normal(0.0, sigma_log)))
+                multiplier = float(np.clip(multiplier, lower, upper))
+        else:
+            multiplier = float(np.exp(rng.normal(0.0, sigma_log)))
+
+    return {
+        "base_target_energy_gwh": base_energy_gwh,
+        "base_target_power_gw": base_power_gw,
+        "target_energy_gwh": base_energy_gwh * multiplier,
+        "target_power_gw": base_power_gw * multiplier,
+        "uncertainty_enabled": uncertainty_enabled,
+        "uncertainty_mode": mode if uncertainty_enabled else "none",
+        "uncertainty_sigma_log": sigma_log,
+        "uncertainty_multiplier": multiplier,
+        "uncertainty_truncate_multipliers": truncate_multipliers,
+        "uncertainty_seed_value": None if seed_value is None else str(seed_value),
+    }
+
+
 def _battery_store_stock_expression_gwh(n, anchor_year):
     stores = getattr(n, "stores", pd.DataFrame())
     if stores.empty:
@@ -3534,7 +3637,16 @@ def add_battery_pipeline_anchor(n, planning_year, config):
     if planning_year != anchor_year:
         return
 
-    target_gwh = float(anchor_cfg.get("global_energy_gwh", 1900.0))
+    snakemake_obj = globals().get("snakemake", None)
+    wildcards = getattr(snakemake_obj, "wildcards", None)
+    learning_seed = getattr(wildcards, "learning_seed", None)
+    target_info = _battery_pipeline_anchor_targets(
+        anchor_cfg,
+        learning_cfg,
+        anchor_year=anchor_year,
+        learning_seed=learning_seed,
+    )
+    target_gwh = float(target_info["target_energy_gwh"])
     if target_gwh <= 0.0:
         return
 
@@ -3554,7 +3666,7 @@ def add_battery_pipeline_anchor(n, planning_year, config):
         name=f"battery_pipeline_anchor_global_energy_stock__{anchor_year}",
     )
 
-    target_power_gw = float(anchor_cfg.get("global_power_gw", 0.0))
+    target_power_gw = float(target_info["target_power_gw"])
     power_meta = {}
     if target_power_gw > 0.0:
         for carrier, label in [
@@ -3593,10 +3705,20 @@ def add_battery_pipeline_anchor(n, planning_year, config):
     n.meta["battery_pipeline_anchor"] = {
         "enabled": True,
         "year": anchor_year,
+        "base_target_energy_gwh": target_info["base_target_energy_gwh"],
+        "base_target_power_gw": target_info["base_target_power_gw"],
         "target_energy_gwh": target_gwh,
         "target_charger_power_gw": target_power_gw,
         "target_discharger_power_gw": target_power_gw,
         "reference_duration_hours": duration_hours,
+        "uncertainty_enabled": target_info["uncertainty_enabled"],
+        "uncertainty_mode": target_info["uncertainty_mode"],
+        "uncertainty_sigma_log": target_info["uncertainty_sigma_log"],
+        "uncertainty_multiplier": target_info["uncertainty_multiplier"],
+        "uncertainty_truncate_multipliers": target_info[
+            "uncertainty_truncate_multipliers"
+        ],
+        "uncertainty_seed_value": target_info["uncertainty_seed_value"],
         "fixed_battery_store_stock_gwh": fixed_stock_gwh,
         "variable_battery_store_asset_count": variable_asset_count,
         "scope": "global",

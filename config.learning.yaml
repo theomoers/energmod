@@ -105,6 +105,12 @@ learning:
     applies_to: battery_energy
     scope: global
     active_only_until_anchor_year: true
+    uncertainty:
+      enabled: true
+      mode: truncated_lognormal_multiplier
+      sigma_log: 0.40 # calibrated from five-year grid-battery deployment surprise errors
+      truncate_multipliers: [0.55, 1.75]
+      random_seed_source: learning_seed
   monte_carlo:
     enable: true # if true, model above will be ignored and replaced by monte_carlo models below
     include_legacy_curve: false

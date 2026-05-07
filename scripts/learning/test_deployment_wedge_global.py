@@ -27,6 +27,7 @@ from learning.deployment_constraints import (  # noqa: E402
 from learning.apply_learning_costs import load_config_learning, load_learning_manifest  # noqa: E402
 from learning.export_postsolve_learning_costs import (  # noqa: E402
     _attach_applied_learning_costs_from_log,
+    _battery_pipeline_anchor_diagnostic_row,
 )
 from solve_network import add_battery_pipeline_anchor, add_learning_deployment_wedge  # noqa: E402
 
@@ -698,6 +699,119 @@ class GlobalDeploymentWedgeTests(unittest.TestCase):
         add_battery_pipeline_anchor(later_network, planning_year=2035, config=config)
         self.assertNotIn("battery_pipeline_anchor_shortfall__2030", set(later_network.model.variables))
         self.assertNotIn("battery_pipeline_anchor", later_network.meta)
+
+    def test_battery_pipeline_anchor_uncertainty_scales_energy_and_power_together(self):
+        stores = pd.DataFrame(
+            {
+                "carrier": ["battery"],
+                "bus": ["US 0"],
+                "e_nom_extendable": [True],
+                "build_year": [2030],
+                "e_nom": [0.0],
+            },
+            index=["battery-2030"],
+        )
+        links = pd.DataFrame(
+            {
+                "carrier": ["battery charger", "battery discharger"],
+                "p_nom_extendable": [True, True],
+                "build_year": [2030, 2030],
+                "p_nom": [0.0, 0.0],
+            },
+            index=["charger-2030", "discharger-2030"],
+        )
+        network = SimpleNamespace(stores=stores, links=links, meta={})
+        network.model = linopy.Model()
+        store_assets = pd.Index(["battery-2030"], name="Store")
+        store_nom = network.model.add_variables(lower=0.0, coords=[store_assets], name="Store-e_nom")
+        link_assets = pd.Index(["charger-2030", "discharger-2030"], name="Link")
+        link_nom = network.model.add_variables(lower=0.0, coords=[link_assets], name="Link-p_nom")
+        network.model.add_objective(0 * store_nom.sum() + 0 * link_nom.sum())
+
+        config = {
+            "learning": {
+                "seed": 17,
+                "battery_pipeline_anchor": {
+                    "enabled": True,
+                    "anchor_year": 2030,
+                    "global_energy_gwh": 3400.0,
+                    "global_power_gw": 850.0,
+                    "applies_to": "battery_energy",
+                    "scope": "global",
+                    "uncertainty": {
+                        "enabled": True,
+                        "mode": "truncated_lognormal_multiplier",
+                        "sigma_log": 1.0,
+                        "truncate_multipliers": [0.5, 0.5],
+                        "random_seed_source": "learning_config",
+                    },
+                }
+            }
+        }
+        add_battery_pipeline_anchor(network, planning_year=2030, config=config)
+
+        anchor_meta = network.meta["battery_pipeline_anchor"]
+        self.assertAlmostEqual(anchor_meta["base_target_energy_gwh"], 3400.0, places=9)
+        self.assertAlmostEqual(anchor_meta["base_target_power_gw"], 850.0, places=9)
+        self.assertAlmostEqual(anchor_meta["uncertainty_multiplier"], 0.5, places=9)
+        self.assertAlmostEqual(anchor_meta["target_energy_gwh"], 1700.0, places=9)
+        self.assertAlmostEqual(anchor_meta["target_charger_power_gw"], 425.0, places=9)
+        self.assertAlmostEqual(anchor_meta["target_discharger_power_gw"], 425.0, places=9)
+        self.assertAlmostEqual(anchor_meta["reference_duration_hours"], 4.0, places=9)
+        self.assertTrue(anchor_meta["uncertainty_enabled"])
+        self.assertEqual(anchor_meta["uncertainty_mode"], "truncated_lognormal_multiplier")
+        self.assertEqual(anchor_meta["uncertainty_seed_value"], "17")
+
+    def test_battery_pipeline_anchor_diagnostic_row_records_floor_and_binding(self):
+        stores = pd.DataFrame(
+            {
+                "carrier": ["battery", "battery"],
+                "build_year": [2025, 2030],
+                "e_nom_opt": [500000.0, 1200000.0],
+            },
+            index=["battery-2025", "battery-2030"],
+        )
+        links = pd.DataFrame(
+            {
+                "carrier": ["battery charger", "battery discharger"],
+                "build_year": [2030, 2030],
+                "p_nom_opt": [425000.0, 425000.0],
+            },
+            index=["charger-2030", "discharger-2030"],
+        )
+        network = SimpleNamespace(
+            stores=stores,
+            links=links,
+            meta={
+                "battery_pipeline_anchor": {
+                    "enabled": True,
+                    "year": 2030,
+                    "base_target_energy_gwh": 3400.0,
+                    "base_target_power_gw": 850.0,
+                    "target_energy_gwh": 1700.0,
+                    "target_charger_power_gw": 425.0,
+                    "target_discharger_power_gw": 425.0,
+                    "reference_duration_hours": 4.0,
+                    "uncertainty_enabled": True,
+                    "uncertainty_mode": "truncated_lognormal_multiplier",
+                    "uncertainty_sigma_log": 0.4,
+                    "uncertainty_multiplier": 0.5,
+                    "uncertainty_truncate_multipliers": [0.55, 1.75],
+                    "uncertainty_seed_value": "17",
+                }
+            },
+        )
+
+        row = _battery_pipeline_anchor_diagnostic_row(network, current_year=2030)
+
+        self.assertEqual(row["formulation"], "battery_pipeline_anchor")
+        self.assertAlmostEqual(row["battery_pipeline_target_energy_gwh"], 1700.0, places=9)
+        self.assertAlmostEqual(row["battery_pipeline_solved_energy_gwh"], 1700.0, places=9)
+        self.assertAlmostEqual(row["battery_pipeline_energy_slack_gwh"], 0.0, places=9)
+        self.assertTrue(row["battery_pipeline_energy_binding"])
+        self.assertTrue(row["battery_pipeline_charger_power_binding"])
+        self.assertTrue(row["battery_pipeline_discharger_power_binding"])
+        self.assertAlmostEqual(row["uncertainty_multiplier"], 0.5, places=9)
 
     def test_global_wedge_skips_when_b1_exceeds_finite_asset_upper_bound(self):
         buses = pd.DataFrame(

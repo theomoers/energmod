@@ -544,6 +544,123 @@ def _extract_network_capital_cost_summaries(network_path, tech_mapping):
     return summary
 
 
+def _sum_battery_store_stock_gwh(n, anchor_year):
+    stores = getattr(n, "stores", pd.DataFrame())
+    if stores.empty or "carrier" not in stores.columns:
+        return np.nan
+    subset = stores.loc[stores["carrier"].astype(str).eq("battery")].copy()
+    if subset.empty:
+        return 0.0
+    if "build_year" in subset.columns:
+        build_year = pd.to_numeric(subset["build_year"], errors="coerce")
+        subset = subset.loc[build_year.fillna(anchor_year).astype(int).le(int(anchor_year))]
+    if subset.empty:
+        return 0.0
+    value_col = "e_nom_opt" if "e_nom_opt" in subset.columns else "e_nom"
+    if value_col not in subset.columns:
+        return np.nan
+    return float(pd.to_numeric(subset[value_col], errors="coerce").fillna(0.0).sum() / 1e3)
+
+
+def _sum_battery_link_power_gw(n, carrier, anchor_year):
+    links = getattr(n, "links", pd.DataFrame())
+    if links.empty or "carrier" not in links.columns:
+        return np.nan
+    subset = links.loc[links["carrier"].astype(str).eq(carrier)].copy()
+    if subset.empty:
+        return 0.0
+    if "build_year" in subset.columns:
+        build_year = pd.to_numeric(subset["build_year"], errors="coerce")
+        subset = subset.loc[build_year.fillna(anchor_year).astype(int).le(int(anchor_year))]
+    if subset.empty:
+        return 0.0
+    value_col = "p_nom_opt" if "p_nom_opt" in subset.columns else "p_nom"
+    if value_col not in subset.columns:
+        return np.nan
+    return float(pd.to_numeric(subset[value_col], errors="coerce").fillna(0.0).sum() / 1e3)
+
+
+def _battery_pipeline_anchor_diagnostic_row(n, current_year):
+    meta = getattr(n, "meta", {}) or {}
+    anchor = meta.get("battery_pipeline_anchor", {}) or {}
+    if not anchor:
+        return None
+    anchor_year = int(anchor.get("year", current_year))
+    if int(current_year) != anchor_year:
+        return None
+
+    target_energy_gwh = float(anchor.get("target_energy_gwh", np.nan))
+    target_charger_power_gw = float(anchor.get("target_charger_power_gw", np.nan))
+    target_discharger_power_gw = float(anchor.get("target_discharger_power_gw", np.nan))
+    solved_energy_gwh = _sum_battery_store_stock_gwh(n, anchor_year)
+    solved_charger_power_gw = _sum_battery_link_power_gw(n, "battery charger", anchor_year)
+    solved_discharger_power_gw = _sum_battery_link_power_gw(n, "battery discharger", anchor_year)
+    energy_slack_gwh = solved_energy_gwh - target_energy_gwh
+    charger_slack_gw = solved_charger_power_gw - target_charger_power_gw
+    discharger_slack_gw = solved_discharger_power_gw - target_discharger_power_gw
+    tolerance = 1.0e-5
+
+    return {
+        "year": int(current_year),
+        "country": "",
+        "technology": "battery_energy",
+        "formulation": "battery_pipeline_anchor",
+        "constraint_enabled": True,
+        "mode": "floor",
+        "uncertainty_enabled": bool(anchor.get("uncertainty_enabled", False)),
+        "uncertainty_mode": str(anchor.get("uncertainty_mode", "")),
+        "uncertainty_sigma_log": float(anchor.get("uncertainty_sigma_log", np.nan)),
+        "uncertainty_multiplier": float(anchor.get("uncertainty_multiplier", np.nan)),
+        "uncertainty_truncate_multipliers": json.dumps(
+            anchor.get("uncertainty_truncate_multipliers", None)
+        ),
+        "uncertainty_seed_value": str(anchor.get("uncertainty_seed_value", "")),
+        "constraint_basis_unit": "GWh",
+        "penalty_basis": "",
+        "allowed_block_addition": np.nan,
+        "b1": np.nan,
+        "b2": np.nan,
+        "width1": np.nan,
+        "width2": np.nan,
+        "phi2": np.nan,
+        "phi3": np.nan,
+        "realized_block_addition_modeled": np.nan,
+        "realized_block_addition_constrained_basis": np.nan,
+        "realized_seg1": np.nan,
+        "realized_seg2": np.nan,
+        "realized_seg3": np.nan,
+        "realized_wedge_cost_eur": np.nan,
+        "binding_slack": energy_slack_gwh,
+        "binding": bool(np.isfinite(energy_slack_gwh) and abs(energy_slack_gwh) <= tolerance),
+        "battery_phi_block": np.nan,
+        "history_year": np.nan,
+        "reference_annual_addition": np.nan,
+        "battery_pipeline_base_energy_gwh": float(anchor.get("base_target_energy_gwh", np.nan)),
+        "battery_pipeline_base_power_gw": float(anchor.get("base_target_power_gw", np.nan)),
+        "battery_pipeline_target_energy_gwh": target_energy_gwh,
+        "battery_pipeline_target_charger_power_gw": target_charger_power_gw,
+        "battery_pipeline_target_discharger_power_gw": target_discharger_power_gw,
+        "battery_pipeline_solved_energy_gwh": solved_energy_gwh,
+        "battery_pipeline_solved_charger_power_gw": solved_charger_power_gw,
+        "battery_pipeline_solved_discharger_power_gw": solved_discharger_power_gw,
+        "battery_pipeline_energy_slack_gwh": energy_slack_gwh,
+        "battery_pipeline_charger_power_slack_gw": charger_slack_gw,
+        "battery_pipeline_discharger_power_slack_gw": discharger_slack_gw,
+        "battery_pipeline_energy_binding": bool(
+            np.isfinite(energy_slack_gwh) and abs(energy_slack_gwh) <= tolerance
+        ),
+        "battery_pipeline_charger_power_binding": bool(
+            np.isfinite(charger_slack_gw) and abs(charger_slack_gw) <= tolerance
+        ),
+        "battery_pipeline_discharger_power_binding": bool(
+            np.isfinite(discharger_slack_gw) and abs(discharger_slack_gw) <= tolerance
+        ),
+        "battery_pipeline_reference_duration_hours": float(
+            anchor.get("reference_duration_hours", np.nan)
+        ),
+    }
+
+
 def export_deployment_constraint_diagnostics(
     output_path,
     learning_cfg,
@@ -555,6 +672,18 @@ def export_deployment_constraint_diagnostics(
     base_cost_log_df=None,
 ):
     rows = []
+    if isinstance(solved_network, (str, Path)):
+        solved_network_obj = pypsa.Network(solved_network)
+    else:
+        solved_network_obj = solved_network
+
+    battery_anchor_row = _battery_pipeline_anchor_diagnostic_row(
+        solved_network_obj,
+        current_year=current_year,
+    )
+    if battery_anchor_row is not None:
+        rows.append(battery_anchor_row)
+
     cfg = get_deployment_constraint_cfg(learning_cfg)
     if cfg is not None:
         formulation = get_deployment_constraint_formulation(learning_cfg) or "hard_cap"
@@ -564,10 +693,6 @@ def export_deployment_constraint_diagnostics(
             learning_seed=learning_seed,
             config_file="config.learning.yaml",
         )
-        if isinstance(solved_network, (str, Path)):
-            solved_network_obj = pypsa.Network(solved_network)
-        else:
-            solved_network_obj = solved_network
         solved_network_obj = _attach_applied_learning_costs_from_log(
             solved_network_obj,
             base_cost_log_df,
