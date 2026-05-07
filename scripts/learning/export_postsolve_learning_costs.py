@@ -54,6 +54,14 @@ from learning.learning_data_io import load_historical_capacity
 logger = logging.getLogger(__name__)
 
 
+SUPPORTED_BATTERY_EXPERIENCE_ACCOUNTING_MODES = {
+    "legacy_phi_grid_only",
+    "max_phi_proxy_or_explicit_components",
+    "explicit_grid_plus_bev",
+    "additive_bev_to_phi_proxy",
+}
+
+
 def _cleanup_superseded_learning_inputs(base_cost_log, proposed_state, current_year):
     """Drop branch-only intermediates once solved outputs are written."""
     if int(current_year) <= 2025:
@@ -134,11 +142,175 @@ def _load_historical_cumulative(tech, year, learning_cfg):
     return value
 
 
-def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learning_cfg, current_year):
+def get_battery_experience_accounting_cfg(learning_cfg):
+    cfg = dict(learning_cfg.get("battery_experience", {}) or {})
+    mode = str(cfg.get("accounting_mode", "legacy_phi_grid_only")).strip()
+    if mode not in SUPPORTED_BATTERY_EXPERIENCE_ACCOUNTING_MODES:
+        raise ValueError(
+            "Unsupported learning.battery_experience.accounting_mode "
+            f"{mode!r}; expected one of {sorted(SUPPORTED_BATTERY_EXPERIENCE_ACCOUNTING_MODES)}."
+        )
+
+    bev_cfg = dict(cfg.get("exogenous_bev", {}) or {})
+    return {
+        "accounting_mode": mode,
+        "exogenous_bev": {
+            "enabled": bool(bev_cfg.get("enabled", False)),
+            "source": str(bev_cfg.get("source", "network_bev_chargers")).strip(),
+            "average_pack_size_mwh": float(bev_cfg.get("average_pack_size_mwh", 0.05)),
+            "charger_power_mw_per_vehicle": float(
+                bev_cfg.get("charger_power_mw_per_vehicle", 0.011)
+            ),
+            "modeled_region_scale_factor": float(bev_cfg.get("modeled_region_scale_factor", 1.0)),
+        },
+    }
+
+
+def _extract_bev_battery_stock_gwh_from_network(network_or_path, learning_cfg):
+    accounting_cfg = get_battery_experience_accounting_cfg(learning_cfg)
+    bev_cfg = accounting_cfg["exogenous_bev"]
+    if not bev_cfg["enabled"]:
+        return 0.0, {
+            "enabled": False,
+            "source": bev_cfg["source"],
+            "bev_charger_power_mw": 0.0,
+            "bev_vehicle_count": 0.0,
+            "modeled_stock_gwh": 0.0,
+            "global_stock_gwh": 0.0,
+        }
+    if bev_cfg["source"] != "network_bev_chargers":
+        raise ValueError(
+            "Unsupported learning.battery_experience.exogenous_bev.source "
+            f"{bev_cfg['source']!r}; currently only 'network_bev_chargers' is supported."
+        )
+
+    pack_size = float(bev_cfg["average_pack_size_mwh"])
+    charger_rate = float(bev_cfg["charger_power_mw_per_vehicle"])
+    scale_factor = float(bev_cfg["modeled_region_scale_factor"])
+    if pack_size <= 0.0:
+        raise ValueError("BEV average_pack_size_mwh must be > 0.")
+    if charger_rate <= 0.0:
+        raise ValueError("BEV charger_power_mw_per_vehicle must be > 0.")
+    if scale_factor <= 0.0:
+        raise ValueError("BEV modeled_region_scale_factor must be > 0.")
+
+    if hasattr(network_or_path, "links"):
+        n = network_or_path
+    else:
+        n = pypsa.Network(str(network_or_path))
+
+    if n.links.empty or "carrier" not in n.links.columns:
+        charger_power_mw = 0.0
+    else:
+        chargers = n.links[n.links["carrier"].astype(str).eq("BEV charger")]
+        if chargers.empty:
+            charger_power_mw = 0.0
+        else:
+            power_col = "p_nom"
+            if power_col not in chargers.columns:
+                power_col = "p_nom_opt"
+            charger_power_mw = float(pd.to_numeric(chargers[power_col], errors="coerce").fillna(0.0).sum())
+
+    vehicle_count = charger_power_mw / charger_rate
+    modeled_stock_gwh = vehicle_count * pack_size / 1000.0
+    global_stock_gwh = modeled_stock_gwh * scale_factor
+    return global_stock_gwh, {
+        "enabled": True,
+        "source": bev_cfg["source"],
+        "average_pack_size_mwh": pack_size,
+        "charger_power_mw_per_vehicle": charger_rate,
+        "modeled_region_scale_factor": scale_factor,
+        "bev_charger_power_mw": charger_power_mw,
+        "bev_vehicle_count": vehicle_count,
+        "modeled_stock_gwh": modeled_stock_gwh,
+        "global_stock_gwh": global_stock_gwh,
+    }
+
+
+def _battery_experience_increment_details(
+    payload,
+    learning_cfg,
+    prev_year,
+    current_year,
+    modeled_grid_additions_gwh,
+    solved_network,
+):
+    accounting_cfg = get_battery_experience_accounting_cfg(learning_cfg)
+    mode = accounting_cfg["accounting_mode"]
+    phi_block = get_battery_phi_for_block(learning_cfg, prev_year, current_year)
+    phi_proxy_increment = float(modeled_grid_additions_gwh) * phi_block
+
+    bev_stock_history = (
+        (payload.get("exogenous_battery_stock_history", {}) or {}).get("bev_battery", {})
+        or {}
+    )
+    current_bev_stock_gwh = 0.0
+    bev_stock_details = {
+        "enabled": False,
+        "source": accounting_cfg["exogenous_bev"]["source"],
+        "global_stock_gwh": 0.0,
+    }
+    if accounting_cfg["exogenous_bev"]["enabled"]:
+        if solved_network is None:
+            raise ValueError(
+                "BEV battery experience accounting is enabled, but no solved network was provided."
+            )
+        current_bev_stock_gwh, bev_stock_details = _extract_bev_battery_stock_gwh_from_network(
+            solved_network,
+            learning_cfg,
+        )
+
+    prev_bev_stock_gwh = float(bev_stock_history.get(str(int(prev_year)), 0.0))
+    bev_additions_gwh = max(float(current_bev_stock_gwh) - prev_bev_stock_gwh, 0.0)
+    explicit_component_increment = float(modeled_grid_additions_gwh) + bev_additions_gwh
+
+    if mode == "legacy_phi_grid_only":
+        experience_increment = phi_proxy_increment
+        selected_source = "phi_grid_proxy"
+    elif mode == "max_phi_proxy_or_explicit_components":
+        if explicit_component_increment > phi_proxy_increment:
+            experience_increment = explicit_component_increment
+            selected_source = "explicit_grid_plus_bev_components"
+        else:
+            experience_increment = phi_proxy_increment
+            selected_source = "phi_grid_proxy"
+    elif mode == "explicit_grid_plus_bev":
+        experience_increment = explicit_component_increment
+        selected_source = "explicit_grid_plus_bev_components"
+    elif mode == "additive_bev_to_phi_proxy":
+        experience_increment = phi_proxy_increment + bev_additions_gwh
+        selected_source = "phi_grid_proxy_plus_explicit_bev"
+    else:
+        raise ValueError(f"Unsupported battery experience accounting mode: {mode}")
+
+    return {
+        "mode": mode,
+        "phi": float(phi_block),
+        "experience_increment": float(experience_increment),
+        "selected_source": selected_source,
+        "phi_proxy_increment": float(phi_proxy_increment),
+        "explicit_component_increment": float(explicit_component_increment),
+        "modeled_grid_addition": float(modeled_grid_additions_gwh),
+        "bev_battery_stock": float(current_bev_stock_gwh),
+        "bev_battery_stock_previous": float(prev_bev_stock_gwh),
+        "bev_battery_addition": float(bev_additions_gwh),
+        "bev_stock_details": bev_stock_details,
+    }
+
+
+def _update_committed_capacity_histories(
+    payload,
+    solved_capacity_by_tech,
+    learning_cfg,
+    current_year,
+    solved_network=None,
+):
     cumulative_history = payload.get("capacity_history", {}) or {}
     modeled_history = payload.get("modeled_capacity_history", {}) or {}
     experience_increment_history = payload.get("experience_increment_history", {}) or {}
     experience_increment_details = payload.get("experience_increment_details", {}) or {}
+    exogenous_battery_stock_history = payload.get("exogenous_battery_stock_history", {}) or {}
+    bev_battery_stock_history = exogenous_battery_stock_history.get("bev_battery", {}) or {}
     tracked_techs = set((payload.get("technology_states", {}) or {}).keys())
     tracked_techs.update(cumulative_history.keys())
     tracked_techs.update(modeled_history.keys())
@@ -158,6 +330,7 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
                 f"Invalid solved capacity for {tech}: {solved_capacity}. Must be > 0."
             )
 
+        battery_accounting = {}
         prior_years = sorted(int(y) for y in tech_modeled.keys() if int(y) < int(current_year))
         if not prior_years:
             try:
@@ -186,15 +359,28 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
             prev_modeled = float(tech_modeled[prev_year_str])
             additions = max(solved_capacity - prev_modeled, 0.0)
             if tech == "battery_energy":
-                phi_block = get_battery_phi_for_block(learning_cfg, prev_year, current_year)
-                experience_increment = additions * phi_block
+                battery_accounting = _battery_experience_increment_details(
+                    payload=payload,
+                    learning_cfg=learning_cfg,
+                    prev_year=prev_year,
+                    current_year=current_year,
+                    modeled_grid_additions_gwh=additions,
+                    solved_network=solved_network,
+                )
+                phi_block = battery_accounting["phi"]
+                experience_increment = battery_accounting["experience_increment"]
                 cumulative_value = prev_cumulative + experience_increment
                 logger.info(
-                    "Battery mapping %s-%s: modeled additions %.3f GWh × phi %.3f = %.3f GWh global Li-ion additions",
+                    (
+                        "Battery mapping %s-%s: grid additions %.3f GWh, phi proxy %.3f GWh, "
+                        "BEV additions %.3f GWh, selected %s = %.3f GWh global Li-ion additions"
+                    ),
                     prev_year,
                     current_year,
                     additions,
-                    phi_block,
+                    battery_accounting["phi_proxy_increment"],
+                    battery_accounting["bev_battery_addition"],
+                    battery_accounting["selected_source"],
                     experience_increment,
                 )
             else:
@@ -212,11 +398,48 @@ def _update_committed_capacity_histories(payload, solved_capacity_by_tech, learn
             "cumulative_capacity": float(cumulative_value),
             "basis_unit": "GWh" if tech == "battery_energy" else "GW",
         }
+        if tech == "battery_energy":
+            if battery_accounting:
+                tech_experience_details[current_year_str].update(
+                    {
+                        "battery_experience_accounting_mode": battery_accounting["mode"],
+                        "battery_experience_selected_source": battery_accounting["selected_source"],
+                        "battery_phi_proxy_increment": battery_accounting["phi_proxy_increment"],
+                        "battery_explicit_component_increment": battery_accounting[
+                            "explicit_component_increment"
+                        ],
+                        "bev_battery_stock": battery_accounting["bev_battery_stock"],
+                        "bev_battery_stock_previous": battery_accounting[
+                            "bev_battery_stock_previous"
+                        ],
+                        "bev_battery_addition": battery_accounting["bev_battery_addition"],
+                        "bev_battery_stock_details": battery_accounting["bev_stock_details"],
+                    }
+                )
+                bev_battery_stock_history[current_year_str] = float(
+                    battery_accounting["bev_battery_stock"]
+                )
+            elif get_battery_experience_accounting_cfg(learning_cfg)["exogenous_bev"]["enabled"]:
+                current_bev_stock_gwh, bev_stock_details = _extract_bev_battery_stock_gwh_from_network(
+                    solved_network,
+                    learning_cfg,
+                )
+                bev_battery_stock_history[current_year_str] = float(current_bev_stock_gwh)
+                tech_experience_details[current_year_str].update(
+                    {
+                        "bev_battery_stock": float(current_bev_stock_gwh),
+                        "bev_battery_addition": 0.0,
+                        "bev_battery_stock_details": bev_stock_details,
+                    }
+                )
         cumulative_history[tech] = tech_cumulative
         modeled_history[tech] = tech_modeled
         experience_increment_history[tech] = tech_experience_increment
         experience_increment_details[tech] = tech_experience_details
 
+    if bev_battery_stock_history:
+        exogenous_battery_stock_history["bev_battery"] = bev_battery_stock_history
+        payload["exogenous_battery_stock_history"] = exogenous_battery_stock_history
     payload["capacity_history"] = cumulative_history
     payload["modeled_capacity_history"] = modeled_history
     payload["experience_increment_history"] = experience_increment_history
@@ -651,6 +874,7 @@ def build_postsolve_cost_log(
             "cost_expectation_mode": row.get("cost_expectation_mode", "point_cost"),
             "cost_expectation_kernel_mode": row.get("cost_expectation_kernel_mode", "global_current_window"),
             "cost_expectation_weights_json": row.get("cost_expectation_weights_json", ""),
+            "cost_expectation_weights_by_tech_json": row.get("cost_expectation_weights_by_tech_json", ""),
             "cost_expectation_lag_years_json": row.get("cost_expectation_lag_years_json", ""),
             "kernel_year_start": _to_int(row.get("kernel_year_start"), fallback=planning_horizon),
             "kernel_year_end": _to_int(row.get("kernel_year_end"), fallback=planning_horizon),
@@ -772,6 +996,7 @@ def main(snakemake):
         solved_capacity_by_tech,
         learning_cfg,
         current_year,
+        solved_network=solved_network,
     )
     learning_base_capacity_by_tech = build_learning_base_capacity_map(
         payload,

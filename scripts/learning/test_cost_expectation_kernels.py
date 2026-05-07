@@ -359,6 +359,108 @@ def test_committed_battery_state_records_experience_increment(monkeypatch):
     assert details["experience_increment"] == pytest.approx(110.0)
 
 
+def test_explicit_bev_batteries_can_set_global_liion_experience_floor(monkeypatch):
+    monkeypatch.setattr(ep, "get_battery_phi_for_block", lambda learning_cfg, prev_year, current_year: 2.0)
+    monkeypatch.setattr(
+        ep,
+        "_extract_bev_battery_stock_gwh_from_network",
+        lambda solved_network, learning_cfg: (
+            50.0,
+            {
+                "enabled": True,
+                "source": "network_bev_chargers",
+                "global_stock_gwh": 50.0,
+            },
+        ),
+    )
+    payload = {
+        "technology_states": {"battery_energy": {}},
+        "capacity_history": {"battery_energy": {"2025": 1000.0}},
+        "modeled_capacity_history": {"battery_energy": {"2025": 50.0}},
+        "exogenous_battery_stock_history": {"bev_battery": {"2025": 10.0}},
+    }
+    learning_cfg = {
+        "battery_experience": {
+            "accounting_mode": "max_phi_proxy_or_explicit_components",
+            "exogenous_bev": {"enabled": True},
+        }
+    }
+
+    updated = ep._update_committed_capacity_histories(
+        payload,
+        solved_capacity_by_tech={"battery_energy": 60.0},
+        learning_cfg=learning_cfg,
+        current_year=2030,
+        solved_network="network.nc",
+    )
+
+    details = updated["experience_increment_details"]["battery_energy"]["2030"]
+    assert details["battery_phi_proxy_increment"] == pytest.approx(20.0)
+    assert details["bev_battery_addition"] == pytest.approx(40.0)
+    assert details["battery_explicit_component_increment"] == pytest.approx(50.0)
+    assert details["battery_experience_selected_source"] == "explicit_grid_plus_bev_components"
+    assert details["experience_increment"] == pytest.approx(50.0)
+    assert updated["capacity_history"]["battery_energy"]["2030"] == pytest.approx(1050.0)
+    assert updated["exogenous_battery_stock_history"]["bev_battery"]["2030"] == pytest.approx(50.0)
+
+
+def test_extract_bev_battery_stock_from_bev_chargers():
+    class FakeNetwork:
+        pass
+
+    network = FakeNetwork()
+    network.links = pd.DataFrame(
+        {
+            "carrier": ["BEV charger", "BEV charger", "other"],
+            "p_nom": [11.0, 22.0, 100.0],
+        }
+    )
+    learning_cfg = {
+        "battery_experience": {
+            "accounting_mode": "max_phi_proxy_or_explicit_components",
+            "exogenous_bev": {
+                "enabled": True,
+                "average_pack_size_mwh": 0.05,
+                "charger_power_mw_per_vehicle": 0.011,
+                "modeled_region_scale_factor": 2.0,
+            },
+        }
+    }
+
+    stock_gwh, details = ep._extract_bev_battery_stock_gwh_from_network(network, learning_cfg)
+
+    assert stock_gwh == pytest.approx(0.3)
+    assert details["bev_charger_power_mw"] == pytest.approx(33.0)
+    assert details["bev_vehicle_count"] == pytest.approx(3000.0)
+    assert details["modeled_stock_gwh"] == pytest.approx(0.15)
+    assert details["global_stock_gwh"] == pytest.approx(0.3)
+
+
+def test_cost_expectation_weights_can_be_technology_specific():
+    learning_cfg = {
+        "cost_expectations": {
+            "annual_weights": [1, 1, 1, 1, 1],
+            "annual_weights_by_tech": {
+                "solar_power": [0.1, 0.1, 0.2, 0.3, 0.3],
+                "battery_energy": [0.0, 0.0, 1.0, 1.0, 2.0],
+            },
+        }
+    }
+
+    assert alc.get_cost_expectation_weights(learning_cfg, tech="solar_power") == pytest.approx(
+        [0.1, 0.1, 0.2, 0.3, 0.3]
+    )
+    assert alc.get_cost_expectation_weights(learning_cfg, tech="battery_energy") == pytest.approx(
+        [0.0, 0.0, 0.25, 0.25, 0.5]
+    )
+    assert alc.get_cost_expectation_weights(learning_cfg, tech="onwind_power") == pytest.approx(
+        [0.2, 0.2, 0.2, 0.2, 0.2]
+    )
+    by_tech = json.loads(alc.get_cost_expectation_weights_by_tech_json(learning_cfg))
+    assert by_tech["battery_energy"] == pytest.approx([0.0, 0.0, 0.25, 0.25, 0.5])
+    assert by_tech["solar_power"] == pytest.approx([0.1, 0.1, 0.2, 0.3, 0.3])
+
+
 def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeypatch):
     learning_cfg = {
         "seed": 0,
@@ -445,6 +547,61 @@ def test_block_average_expected_costs_use_kernel_split_and_level_weights(monkeyp
         52.0,
         62.0,
     ])
+
+
+def test_block_average_expected_costs_apply_technology_specific_weights(monkeypatch):
+    learning_cfg = {
+        "seed": 0,
+        "cost_expectations": {
+            "mode": "block_average_expected",
+            "kernel_mode": "technology_specific_lagged_window",
+            "annual_weights": [1, 1, 1, 1, 1],
+            "annual_weights_by_tech": {
+                "solar_power": [0, 0, 0, 0, 1],
+            },
+            "lag_years_by_tech": {
+                "solar_power": 5,
+                "onwind_power": 5,
+                "battery_energy": 5,
+            },
+        },
+    }
+    state = _make_state(2025, {"solar_power": 10.0, "onwind_power": 10.0})
+    artifacts = {"solar_power": {}, "onwind_power": {}}
+    known_map = {
+        "solar_power": {2021: 1.0, 2022: 2.0, 2023: 3.0, 2024: 4.0, 2025: 5.0},
+        "onwind_power": {2021: 1.0, 2022: 2.0, 2023: 3.0, 2024: 4.0, 2025: 5.0},
+    }
+
+    monkeypatch.setattr(alc, "convert_to_capital_cost", lambda value, *args, **kwargs: float(value))
+    monkeypatch.setattr(
+        alc,
+        "get_known_annual_cost_for_year",
+        lambda tech, year, state, cfg: known_map[tech][int(year)],
+    )
+    monkeypatch.setattr(
+        alc,
+        "_simulate_frozen_block_expectation_annual_paths",
+        lambda artifacts, state, selected_model, elapsed_years, rng: {
+            tech: np.empty((1, 0)) for tech in artifacts
+        },
+    )
+
+    diagnostics = alc._compute_block_average_expected_costs(
+        artifacts=artifacts,
+        state=state,
+        current_year=2030,
+        selected_model="shared_state_bayesian_regime_wright",
+        learning_cfg=learning_cfg,
+        costs_file="costs.csv",
+    )
+
+    assert diagnostics["solar_power"]["c_overnight"] == pytest.approx(5.0)
+    assert diagnostics["onwind_power"]["c_overnight"] == pytest.approx(3.0)
+    assert json.loads(diagnostics["solar_power"]["cost_expectation_weights_json"]) == [0, 0, 0, 0, 1]
+    assert json.loads(diagnostics["onwind_power"]["cost_expectation_weights_json"]) == pytest.approx(
+        [0.2, 0.2, 0.2, 0.2, 0.2]
+    )
 
 
 def test_legacy_ssbr_procurement_uses_state_dependent_sigma():

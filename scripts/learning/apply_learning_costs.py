@@ -974,48 +974,83 @@ def resolve_cost_expectation_mode(learning_cfg, selected_model):
     return requested_mode
 
 
-def get_cost_expectation_weights(learning_cfg):
-    cfg = learning_cfg.get("cost_expectations", {}) or {}
-    raw_weights = cfg.get("annual_weights", None)
+def _normalize_cost_expectation_weights(raw_weights, config_key):
     if raw_weights is None:
         weights = np.asarray(DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS, dtype=float)
     else:
         if not isinstance(raw_weights, (list, tuple)):
             raise ValueError(
-                "learning.cost_expectations.annual_weights must be a list of five non-negative numbers."
+                f"{config_key} must be a list of five non-negative numbers."
             )
         if len(raw_weights) != len(DEFAULT_BLOCK_EXPECTATION_ANNUAL_WEIGHTS):
             raise ValueError(
-                "learning.cost_expectations.annual_weights must have length 5 "
+                f"{config_key} must have length 5 "
                 f"(got {len(raw_weights)})."
             )
         try:
             weights = np.asarray([float(weight) for weight in raw_weights], dtype=float)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "learning.cost_expectations.annual_weights must contain only numeric values."
+                f"{config_key} must contain only numeric values."
             ) from exc
 
     if np.any(~np.isfinite(weights)):
         raise ValueError(
-            "learning.cost_expectations.annual_weights must contain only finite values."
+            f"{config_key} must contain only finite values."
         )
     if np.any(weights < 0.0):
         raise ValueError(
-            "learning.cost_expectations.annual_weights must be non-negative."
+            f"{config_key} must be non-negative."
         )
 
     total = float(np.sum(weights))
     if total <= 0.0:
         raise ValueError(
-            "learning.cost_expectations.annual_weights must sum to a positive value."
+            f"{config_key} must sum to a positive value."
         )
     return weights / total
 
 
-def get_cost_expectation_weights_json(learning_cfg):
-    weights = get_cost_expectation_weights(learning_cfg)
+def get_cost_expectation_weights(learning_cfg, tech=None):
+    cfg = learning_cfg.get("cost_expectations", {}) or {}
+    raw_weights = None
+    config_key = "learning.cost_expectations.annual_weights"
+    if tech is not None:
+        by_tech = cfg.get("annual_weights_by_tech", {}) or {}
+        if not isinstance(by_tech, dict):
+            raise ValueError(
+                "learning.cost_expectations.annual_weights_by_tech must be a mapping from "
+                "technology name to a five-element weight list."
+            )
+        tech_key = str(tech)
+        if tech_key in by_tech:
+            raw_weights = by_tech[tech_key]
+            config_key = f"learning.cost_expectations.annual_weights_by_tech.{tech_key}"
+    if raw_weights is None:
+        raw_weights = cfg.get("annual_weights", None)
+    return _normalize_cost_expectation_weights(raw_weights, config_key)
+
+
+def get_cost_expectation_weights_json(learning_cfg, tech=None):
+    weights = get_cost_expectation_weights(learning_cfg, tech=tech)
     return json.dumps([float(weight) for weight in weights.tolist()])
+
+
+def get_cost_expectation_weights_by_tech_json(learning_cfg):
+    cfg = learning_cfg.get("cost_expectations", {}) or {}
+    by_tech = cfg.get("annual_weights_by_tech", {}) or {}
+    if not by_tech:
+        return json.dumps({})
+    if not isinstance(by_tech, dict):
+        raise ValueError(
+            "learning.cost_expectations.annual_weights_by_tech must be a mapping from "
+            "technology name to a five-element weight list."
+        )
+    normalized = {
+        str(tech): [float(value) for value in get_cost_expectation_weights(learning_cfg, tech=tech).tolist()]
+        for tech in sorted(by_tech)
+    }
+    return json.dumps(normalized, sort_keys=True)
 
 
 def get_requested_cost_expectation_kernel_mode(learning_cfg):
@@ -1217,6 +1252,7 @@ def build_runtime_metadata(learning_cfg, learning_engine, selected_model, cost_e
         "cost_expectation_mode": str(cost_expectation_mode),
         "cost_expectation_kernel_mode": get_requested_cost_expectation_kernel_mode(learning_cfg),
         "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg),
+        "cost_expectation_weights_by_tech_json": get_cost_expectation_weights_by_tech_json(learning_cfg),
         "cost_expectation_lag_years_json": get_cost_expectation_lag_years_json(learning_cfg),
         "procurement_imputation_cfg_json": get_procurement_imputation_cfg_json(learning_cfg),
         "procurement_imputation_model": get_procurement_imputation_model_name(learning_cfg, selected_model),
@@ -1369,6 +1405,7 @@ def validate_runtime_contract(learning_cfg, learning_engine, selected_model):
     get_requested_cost_expectation_mode(learning_cfg)
     get_requested_cost_expectation_kernel_mode(learning_cfg)
     get_cost_expectation_weights(learning_cfg)
+    get_cost_expectation_weights_by_tech_json(learning_cfg)
     get_cost_expectation_lag_years_by_tech(learning_cfg)
     get_fossil_price_cfg(learning_cfg)
     get_requested_fossil_price_expectation_mode(learning_cfg)
@@ -1584,6 +1621,7 @@ def calculate_exogenous_learning_costs(
 
     learning_costs = {}
     for tech in ("solar_power", "onwind_power", "battery_energy"):
+        tech_weights = get_cost_expectation_weights(learning_cfg, tech=tech)
         point_cost = _lookup_exogenous_point_cost(exogenous_df, tech, current_year)
         if cost_expectation_mode == "block_average_expected":
             if kernel_mode == "technology_specific_lagged_window":
@@ -1595,7 +1633,7 @@ def calculate_exogenous_learning_costs(
                 kernel_costs = [
                     _lookup_exogenous_annual_cost(exogenous_df, tech, year) for year in kernel_years
                 ]
-                applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+                applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), tech_weights))
                 terminal_c_overnight = float(point_cost)
                 kernel_diag = {
                     "kernel_year_start": int(kernel_years[0]),
@@ -1604,6 +1642,7 @@ def calculate_exogenous_learning_costs(
                     "known_kernel_years_json": _serialize_year_list([]),
                     "expected_kernel_years_json": _serialize_year_list(kernel_years),
                     "applied_kernel_costs_json": _serialize_float_list(kernel_costs),
+                    "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg, tech=tech),
                 }
             else:
                 future_costs = _lookup_exogenous_future_costs(
@@ -1612,9 +1651,11 @@ def calculate_exogenous_learning_costs(
                     int(current_year) + 1,
                     horizon_years,
                 )
-                applied_c_overnight = float(np.dot(future_costs, weights))
+                applied_c_overnight = float(np.dot(future_costs, tech_weights))
                 terminal_c_overnight = float(future_costs[-1])
-                kernel_diag = {}
+                kernel_diag = {
+                    "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg, tech=tech),
+                }
         else:
             applied_c_overnight = float(point_cost)
             terminal_c_overnight = float(point_cost)
@@ -3236,6 +3277,7 @@ def _legacy_global_current_window_diagnostics(
     base_year = int(state.get("last_applied_year", 0))
     kernel_years = [int(base_year + offset) for offset in range(expectation_years)]
     for tech, path in annual_paths.items():
+        tech_weights = get_cost_expectation_weights(learning_cfg, tech=tech)
         if path.shape[1] != expectation_years:
             raise ValueError(
                 f"Expected {expectation_years} annual path steps for legacy block expectations "
@@ -3250,7 +3292,7 @@ def _legacy_global_current_window_diagnostics(
             ],
             axis=1,
         )
-        weighted_costs = expectation_sequence @ weights
+        weighted_costs = expectation_sequence @ tech_weights
         applied_c_overnight = float(np.mean(weighted_costs))
         terminal_c_overnight = float(np.mean(level_costs[:, -1]))
         raw_kernel_costs = [endpoint_level] + [
@@ -3276,6 +3318,7 @@ def _legacy_global_current_window_diagnostics(
             "applied_kernel_costs_json": _serialize_float_list(
                 _apply_network_basis_to_kernel_costs(tech, raw_kernel_costs, cost_stats)
             ),
+            "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg, tech=tech),
         }
     return diagnostics
 
@@ -3363,7 +3406,8 @@ def _compute_block_average_expected_costs(
                     np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0,
                 )
             )
-            applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+            tech_weights = get_cost_expectation_weights(learning_cfg, tech=tech)
+            applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), tech_weights))
             cost_stats = _cost_statistics_from_levels(
                 applied_c_overnight=applied_c_overnight,
                 terminal_c_overnight=terminal_c_overnight,
@@ -3385,6 +3429,7 @@ def _compute_block_average_expected_costs(
                     _apply_network_basis_to_kernel_costs(tech, kernel_costs, cost_stats)
                 ),
                 "kernel_cost_sources_json": json.dumps(kernel_sources),
+                "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg, tech=tech),
                 "procurement_imputation_model": str(procurement_result["model"]),
                 "procurement_anchor_year": int(procurement_result["anchor_year"]),
                 "procurement_anchor_cost": float(
@@ -3404,6 +3449,7 @@ def _compute_block_average_expected_costs(
 
     diagnostics = {}
     for tech in artifacts:
+        tech_weights = get_cost_expectation_weights(learning_cfg, tech=tech)
         kernel_years = kernel_years_by_tech[tech]
         known_years, expected_years = split_kernel_years(kernel_years, committed_year)
         kernel_costs = []
@@ -3422,7 +3468,7 @@ def _compute_block_average_expected_costs(
             int(current_year),
             float(np.exp(state["technology_states"][tech]["last_log_capex"]) / 1000.0),
         )
-        applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), weights))
+        applied_c_overnight = float(np.dot(np.asarray(kernel_costs, dtype=float), tech_weights))
         cost_stats = _cost_statistics_from_levels(
             applied_c_overnight=applied_c_overnight,
             terminal_c_overnight=terminal_c_overnight,
@@ -3443,6 +3489,7 @@ def _compute_block_average_expected_costs(
             "applied_kernel_costs_json": _serialize_float_list(
                 _apply_network_basis_to_kernel_costs(tech, kernel_costs, cost_stats)
             ),
+            "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg, tech=tech),
         }
     return diagnostics
 
@@ -4185,7 +4232,6 @@ def calculate_learning_costs(
     
     learning_costs = {}
     battery_energy_bos_adder_eur_per_kwh = get_battery_energy_bos_adder(learning_cfg, costs_file)
-    bootstrap_kernel_weights = get_cost_expectation_weights(learning_cfg)
     bootstrap_lag_years_by_tech = get_cost_expectation_lag_years_by_tech(learning_cfg)
     
     for tech in params.index:
@@ -4257,6 +4303,7 @@ def calculate_learning_costs(
         
         kernel_diag = {}
         if current_year in COST_HISTORICAL_CAPACITY_YEARS:
+            bootstrap_kernel_weights = get_cost_expectation_weights(learning_cfg, tech=tech)
             kernel_years = build_lagged_kernel_years(
                 current_year,
                 bootstrap_lag_years_by_tech[tech],
@@ -4295,6 +4342,7 @@ def calculate_learning_costs(
                 "known_kernel_years_json": _serialize_year_list(kernel_years),
                 "expected_kernel_years_json": _serialize_year_list([]),
                 "applied_kernel_costs_json": _serialize_float_list(kernel_costs),
+                "cost_expectation_weights_json": get_cost_expectation_weights_json(learning_cfg, tech=tech),
             }
             logger.info(
                 f"    Using historical procurement kernel for bootstrap: "
@@ -5289,6 +5337,7 @@ def save_cost_log(learning_costs, output_file):
         "cost_expectation_mode",
         "cost_expectation_kernel_mode",
         "cost_expectation_weights_json",
+        "cost_expectation_weights_by_tech_json",
         "cost_expectation_lag_years_json",
         "procurement_imputation_cfg_json",
         "procurement_imputation_model",

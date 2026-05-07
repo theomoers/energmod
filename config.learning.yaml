@@ -9,8 +9,9 @@
 #   - way_fixed_rho_benchmark
 #   - correlated_geometric_random_walk
 # - `battery_power` remains on the default `costs_{year}.csv` path for now.
-# - `battery_energy` learning uses the manifest-bundled phi_t mapping from
-#   modeled grid-battery additions to global Li-ion additions.
+# - `battery_energy` learning is estimated on global Li-ion experience. Runtime
+#   accounting keeps grid-storage additions, the manifest-bundled phi_t proxy,
+#   and exogenous BEV pack deployment explicit.
 
 learning:
   #execution_mode: branch
@@ -26,7 +27,11 @@ learning:
   cost_expectations:
     mode: block_average_expected         # point_cost | block_average_expected
     kernel_mode: technology_specific_lagged_window   # global_current_window | technology_specific_lagged_window
-    annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # relative 5-year procurement weights; normalized internally, zeros allowed, must sum > 0
+    annual_weights: [0.118, 0.141, 0.168, 0.237, 0.335]  # pooled fallback; normalized internally, zeros allowed, must sum > 0
+    annual_weights_by_tech:
+      solar_power: [0.134, 0.154, 0.176, 0.228, 0.308]
+      onwind_power: [0.162, 0.179, 0.198, 0.235, 0.226]
+      battery_energy: [0.059, 0.091, 0.132, 0.247, 0.471]
     lag_years_by_tech:
       solar_power: 1
       onwind_power: 3
@@ -40,6 +45,18 @@ learning:
         shared_state_bayesian_regime_wright: shared_state_bayesian_regime_wright
         way_fixed_rho_benchmark: way_fixed_rho_benchmark_035
         correlated_geometric_random_walk: none
+  battery_experience:
+    # Conservative global Li-ion accounting: keep the historical phi_t proxy,
+    # but explicitly count modeled BEV pack additions when they exceed what the
+    # grid-storage proxy already implies. This avoids double-counting EVs in
+    # phi_t while preventing exogenous BEV deployment from being invisible.
+    accounting_mode: max_phi_proxy_or_explicit_components   # legacy_phi_grid_only | max_phi_proxy_or_explicit_components | explicit_grid_plus_bev | additive_bev_to_phi_proxy
+    exogenous_bev:
+      enabled: true
+      source: network_bev_chargers
+      average_pack_size_mwh: 0.05
+      charger_power_mw_per_vehicle: 0.011
+      modeled_region_scale_factor: 1.0
   deployment_constraints: 
     enabled: true
     formulation: three_segment_wedge   # hard_cap | three_segment_wedge

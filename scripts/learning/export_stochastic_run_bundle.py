@@ -43,6 +43,7 @@ OUTPUT_TABLE_SPECS = {
         "cost_expectation_mode",
         "cost_expectation_kernel_mode",
         "cost_expectation_weights_json",
+        "cost_expectation_weights_by_tech_json",
         "cost_expectation_lag_years_json",
         "kernel_year_start",
         "kernel_year_end",
