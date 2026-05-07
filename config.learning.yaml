@@ -27,15 +27,15 @@ learning:
   cost_expectations:
     mode: block_average_expected         # point_cost | block_average_expected
     kernel_mode: technology_specific_lagged_window   # global_current_window | technology_specific_lagged_window
-    annual_weights: [0.118, 0.141, 0.168, 0.237, 0.335]  # pooled fallback; normalized internally, zeros allowed, must sum > 0
+    annual_weights: [0.118, 0.141, 0.168, 0.237, 0.335]  # pooled fallback, calibrated May 7 
     annual_weights_by_tech:
-      solar_power: [0.134, 0.154, 0.176, 0.228, 0.308]
-      onwind_power: [0.162, 0.179, 0.198, 0.235, 0.226]
-      battery_energy: [0.059, 0.091, 0.132, 0.247, 0.471]
+      solar_power: [0.134, 0.154, 0.176, 0.228, 0.308] # calibrated May 7
+      onwind_power: [0.162, 0.179, 0.198, 0.235, 0.226] # calibrated May 7
+      battery_energy: [0.059, 0.091, 0.132, 0.247, 0.471] # calibrated May 7
     lag_years_by_tech:
-      solar_power: 1
-      onwind_power: 3
-      battery_energy: 1
+      solar_power: 1 # from literature
+      onwind_power: 3 # from literature
+      battery_energy: 1 # from literature
     procurement_imputation:
       enabled: true
       anchor: latest_realized_cost
@@ -91,10 +91,10 @@ learning:
       growth_smoothing_years: 5
       reference_statistic: mean   # mean | median | max_mean_median
       battery_basis: local_energy
-      b1_multiplier: 0.668
-      b2_multiplier: 1.43
-      phi2_pct_capex: 0.341 # calibrated on micro data IRENA (see notebook for details)
-      phi3_pct_capex: 0.671 # calibrated on micro data IRENA (see notebook for details)
+      b1_multiplier: 0.668 # calibrated May 6
+      b2_multiplier: 1.43 # calibrated May 6
+      phi2_pct_capex: 0.341 # calibrated May 6
+      phi3_pct_capex: 0.671 # calibrated May 6
       irena_history_csv: "validation/data/IRENA_2025_capacity.csv"
       battery_history_csv: "scripts/learning/data/battery_mapping_factors.txt"
   battery_pipeline_anchor:
@@ -111,8 +111,8 @@ learning:
     stochastic_models:
       - shared_state_bayesian_regime_wright
       #- correlated_geometric_random_walk
-      - way_fixed_rho_benchmark
-    draws: 30
+      #- way_fixed_rho_benchmark
+    draws: 80
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000
