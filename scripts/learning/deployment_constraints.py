@@ -1332,6 +1332,32 @@ def _battery_capacity_history_to_country_annual_additions(battery_csv, current_y
     return pd.concat(rows, ignore_index=True)
 
 
+def _battery_mapping_history_to_global_annual_additions(battery_csv, current_year):
+    frame = pd.read_csv(battery_csv)
+    required = {"year", "annual_grid_battery_additions_mwh"}
+    if not required.issubset(frame.columns):
+        return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+
+    subset = frame.loc[:, ["year", "annual_grid_battery_additions_mwh"]].copy()
+    subset["year"] = pd.to_numeric(subset["year"], errors="coerce")
+    subset["annual_addition"] = pd.to_numeric(
+        subset["annual_grid_battery_additions_mwh"],
+        errors="coerce",
+    )
+    subset = subset.dropna(subset=["year", "annual_addition"])
+    subset = subset.loc[subset["year"].le(int(current_year))].copy()
+    subset = subset.loc[subset["annual_addition"].ge(0.0)].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
+
+    subset["year"] = subset["year"].astype(int)
+    return subset.assign(
+        region=GLOBAL_DEPLOYMENT_WEDGE_REGION,
+        technology="battery_energy",
+        basis_unit="MWh",
+    ).loc[:, ["region", "technology", "year", "annual_addition", "basis_unit"]]
+
+
 def _state_cumulative_history_to_annual_additions(history_map, current_year, basis_unit):
     if not isinstance(history_map, dict) or not history_map:
         return pd.DataFrame(columns=["region", "technology", "year", "annual_addition", "basis_unit"])
@@ -1453,13 +1479,17 @@ def load_deployment_country_history(
             )
         ]
         if "battery_energy" in techs:
-            frames.append(
-                _battery_system_history_to_annual_additions(
+            battery_history = _battery_mapping_history_to_global_annual_additions(
+                battery_csv,
+                current_year=current_year,
+            )
+            if battery_history.empty:
+                battery_history = _battery_system_history_to_annual_additions(
                     learning_cfg,
                     current_year=current_year,
                     runtime_state_payload=runtime_state_payload,
                 )
-            )
+            frames.append(battery_history)
         frames = [frame for frame in frames if frame is not None and not frame.empty]
         if frames:
             history = pd.concat(frames, ignore_index=True)

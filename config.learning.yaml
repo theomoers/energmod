@@ -79,7 +79,7 @@ learning:
       phi2_pct_capex: 0.341 # calibrated on micro data IRENA (see notebook for details)
       phi3_pct_capex: 0.671 # calibrated on micro data IRENA (see notebook for details)
       irena_history_csv: "validation/data/IRENA_2025_capacity.csv"
-      battery_history_csv: "data/energy_storage/battery_storage_capa_bycountry.csv"
+      battery_history_csv: "scripts/learning/data/battery_mapping_factors.txt"
   battery_pipeline_anchor:
     enabled: true
     anchor_year: 2030
