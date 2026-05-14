@@ -2609,6 +2609,78 @@ def add_SAFE_constraints(n, config):
     n.model.add_constraints(lhs >= rhs, name="safe_mintotalcap")
 
 
+def _year_value(mapping, year):
+    if not isinstance(mapping, dict):
+        return None
+    for key in (year, str(year)):
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def add_myopic_co2_cap_trajectory(n, config, planning_year):
+    """Add a year-specific annual CO2 cap for myopic sensitivity runs.
+
+    The legacy ``Co2L`` wildcard is attached to the prepared network before
+    the myopic planning horizon is known, so it cannot express a trajectory.
+    This config hook keeps 2025 historical solves unchanged and applies a
+    per-horizon CO2Limit only where explicitly requested.
+    """
+
+    cap_cfg = (
+        (config.get("electricity", {}) or {})
+        .get("myopic_co2_cap_trajectory", {})
+        or {}
+    )
+    if not cap_cfg.get("enable", False):
+        return
+
+    year = int(planning_year)
+    skip_years = {int(value) for value in cap_cfg.get("skip_years", []) or []}
+    start_year = cap_cfg.get("start_year")
+    if year in skip_years or (start_year is not None and year < int(start_year)):
+        return
+
+    annual_emissions = _year_value(cap_cfg.get("annual_emissions_by_year"), year)
+    if annual_emissions is None:
+        fraction = _year_value(cap_cfg.get("fractions_by_year"), year)
+        if fraction is None:
+            if cap_cfg.get("strict", True):
+                raise ValueError(
+                    "Missing CO2 cap trajectory value for planning horizon "
+                    f"{year}. Add annual_emissions_by_year or fractions_by_year."
+                )
+            return
+        base_annual_emissions = float(
+            cap_cfg.get(
+                "base_annual_emissions",
+                (config.get("electricity", {}) or {}).get("co2base", 0.0),
+            )
+        )
+        annual_emissions = base_annual_emissions * float(fraction)
+
+    constraint_name = str(cap_cfg.get("constraint_name", "CO2Limit"))
+    if constraint_name in n.global_constraints.index:
+        n.global_constraints.drop(index=constraint_name, inplace=True)
+
+    n_years = n.snapshot_weightings.objective.sum() / 8760.0
+    n.add(
+        "GlobalConstraint",
+        constraint_name,
+        carrier_attribute=str(cap_cfg.get("carrier_attribute", "co2_emissions")),
+        sense="<=",
+        constant=float(annual_emissions) * n_years,
+    )
+    logger.info(
+        "Added %s for planning horizon %s: annual_emissions=%s, Nyears=%s, constant=%s",
+        constraint_name,
+        year,
+        float(annual_emissions),
+        float(n_years),
+        float(annual_emissions) * float(n_years),
+    )
+
+
 def add_operational_reserve_margin_constraint(n, sns, config):
     """
     Build reserve margin constraints based on the formulation
@@ -4795,6 +4867,11 @@ if __name__ == "__main__":
     # We set it again just before solve, after we have the final 'n'.
 
     n = prepare_network(n, solve_opts)
+    add_myopic_co2_cap_trajectory(
+        n,
+        snakemake.config,
+        int(snakemake.wildcards.planning_horizons),
+    )
     # ensure monthly constraints can access reference network if present
     n.n_ref = n_ref
 

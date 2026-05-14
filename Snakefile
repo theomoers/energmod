@@ -361,6 +361,11 @@ def should_cleanup_learning_compact_raws():
     return bool(cfg.get("enable", False)) and bool(cfg.get("cleanup_heavy_raws", True))
 
 
+def get_learning_compact_output_format():
+    cfg = get_learning_compact_outputs_config()
+    return str(cfg.get("format", "csv"))
+
+
 def sanitize_learning_compact_token(value, fallback="default"):
     raw = str(value or "").strip()
     if not raw:
@@ -3994,6 +3999,7 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             bundle_dir=RESDIR
             + f"learning-compact/{LEARNING_COMPACT_SCENARIO_TAG}/{{learning_model}}/seed_{{learning_seed}}",
             scenario_tag=LEARNING_COMPACT_SCENARIO_TAG,
+            output_format=get_learning_compact_output_format(),
         threads: 1
         resources:
             mem_mb=6000,

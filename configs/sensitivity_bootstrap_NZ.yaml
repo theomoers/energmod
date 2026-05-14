@@ -1,0 +1,3 @@
+# Shared-branch prerequisite overlay for the high-demand sensitivity.
+scenario:
+  demand: ["NZ"]

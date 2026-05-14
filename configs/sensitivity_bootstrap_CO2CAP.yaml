@@ -1,0 +1,15 @@
+# Shared-branch prerequisite overlay for P1_BINDING_CO2_CAP.
+electricity:
+  myopic_co2_cap_trajectory:
+    enable: true
+    constraint_name: CO2Limit
+    carrier_attribute: co2_emissions
+    start_year: 2030
+    skip_years: [2020, 2025]
+    base_annual_emissions: 13863695658.856319
+    fractions_by_year:
+      2030: 0.55
+      2035: 0.20
+      2040: 0.08
+      2045: 0.02
+      2050: 0.00

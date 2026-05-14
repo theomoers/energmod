@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_branch_prereqs_job.sh [--scenario-name NAME] [--save-bootstrap-state PATH] [--dry-run]
+  bash scripts/learning/run_learning_branch_prereqs_job.sh [--scenario-name NAME] [--overlay-config PATH] [--save-bootstrap-state PATH] [--dry-run]
 
 Environment variables:
   JOBS                 Snakemake parallelism override
@@ -20,6 +20,7 @@ USAGE
 DRY_RUN=0
 SCENARIO_NAME=""
 SAVE_BOOTSTRAP_STATE=""
+EXTRA_CONFIGFILES=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
@@ -32,6 +33,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       SCENARIO_NAME="$2"
+      shift 2
+      ;;
+    --overlay-config)
+      if [[ $# -lt 2 ]]; then
+        echo "--overlay-config requires an argument" >&2
+        exit 1
+      fi
+      EXTRA_CONFIGFILES+=("$2")
       shift 2
       ;;
     --save-bootstrap-state)
@@ -112,6 +121,7 @@ CMD=(
   config.learning.yaml
   validation/config.iteration_common.yaml
   "$OVERLAY_FILE"
+  "${EXTRA_CONFIGFILES[@]}"
   --rerun-trigger
   mtime
 )
@@ -124,6 +134,9 @@ echo "Running shared stochastic branch prerequisites:"
 echo "  sector_name=$JOB_SECTOR_NAME"
 echo "  jobs=$SNAKEMAKE_JOBS"
 echo "  overlay=$OVERLAY_FILE"
+if [[ "${#EXTRA_CONFIGFILES[@]}" -gt 0 ]]; then
+  echo "  extra_configfiles=${EXTRA_CONFIGFILES[*]}"
+fi
 if [[ -n "$SAVE_BOOTSTRAP_STATE" ]]; then
   echo "  save_bootstrap_state=$SAVE_BOOTSTRAP_STATE"
 fi

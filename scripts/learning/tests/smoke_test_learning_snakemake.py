@@ -81,6 +81,7 @@ def build_synthetic_config(output_root, mode, single_model, mc_models, mc_seeds)
     cfg["learning"]["monte_carlo"]["random_seed"] = 0
     cfg["learning"]["monte_carlo"]["seed_upper_bound"] = 1000000
     cfg["learning"]["compact_outputs"]["enable"] = False
+    cfg["learning"]["compact_outputs"]["format"] = "csv"
     cfg["learning"]["compact_outputs"]["cleanup_heavy_raws"] = True
     cfg["learning"]["compact_outputs"]["price_shadow_resolution"] = "annual_summary"
 
@@ -124,6 +125,7 @@ def write_workspace_learning_config(workspace_root, seed):
     source = ENERGYMOD_ROOT / "config.learning.yaml"
     payload = yaml.safe_load(source.read_text(encoding="utf-8"))
     payload["learning"]["seed"] = int(seed)
+    payload["learning"]["compact_outputs"]["format"] = "csv"
     target = workspace_root / "config.learning.yaml"
     target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return target

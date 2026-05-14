@@ -1,0 +1,412 @@
+# Nature Energy supplementary sensitivity ensemble.
+#
+# Accounting:
+#   Already completed and not rerun here:
+#     BASE baseline SSBR:                         1000
+#     L2_WAY_RHO035:                              1000
+#     L1_CGRW:                                    1000
+#
+#   New sensitivities in this file:               6200
+#   Total suite after completion:                 9200
+#
+# The baseline block below is the inheritance/reference configuration.
+# Do not resubmit BASE if the 1000-draw baseline has already completed.
+
+ensemble:
+  name: stochastic_learning_sensitivity_ensemble_ne_si_6200
+  scenario_prefix: sens
+  base_seed: 20260504
+  seed_mode: sequential
+  seed_upper_bound: 1000000000
+  use_common_random_numbers: true
+  default_budget: secondary
+  submit_baseline: false
+
+draw_budgets:
+  light: 200
+  secondary: 300
+  joint_lag: 350
+  core: 400
+  architecture: 500
+  completed_headline: 1000
+
+baseline:
+  run_id: BASE
+  group: baseline
+  description: Main SSBR stochastic learning specification; already completed at 1000 draws
+  budget: completed_headline
+  model: shared_state_bayesian_regime_wright
+  run_mode: branch
+  bootstrap_group: AB
+  config_overrides:
+    scenario:
+      demand: ["AB"]
+      opts: ["1h"]
+      sopts: ["1h"]
+      learning_rate: ["base"]
+
+    learning:
+      enabled: true
+      execution_mode: branch
+      engine: stochastic_forecast
+      selected_model: shared_state_bayesian_regime_wright
+      training_window: full_sample
+      training_window_origin_year: 2020
+      artifact_manifest: "data/learning-data/manifest.json"
+      sample_mode: single_draw
+
+      cost_expectations:
+        mode: block_average_expected
+        kernel_mode: technology_specific_lagged_window
+        annual_weights: [0.118, 0.141, 0.168, 0.237, 0.335]
+        annual_weights_by_tech:
+          solar_power: [0.134, 0.154, 0.176, 0.228, 0.308]
+          onwind_power: [0.162, 0.179, 0.198, 0.235, 0.226]
+          battery_energy: [0.059, 0.091, 0.132, 0.247, 0.471]
+        lag_years_by_tech:
+          solar_power: 1
+          onwind_power: 3
+          battery_energy: 1
+        procurement_imputation:
+          enabled: true
+          anchor: latest_realized_cost
+          shock_mode: seeded_stochastic
+          persist_state: true
+          model_by_selected_model:
+            shared_state_bayesian_regime_wright: shared_state_bayesian_regime_wright
+            way_fixed_rho_benchmark: way_fixed_rho_benchmark_035
+            correlated_geometric_random_walk: none
+
+      battery_experience:
+        accounting_mode: max_phi_proxy_or_explicit_components
+        exogenous_bev:
+          enabled: true
+          source: network_bev_chargers
+          average_pack_size_mwh: 0.05
+          charger_power_mw_per_vehicle: 0.011
+          modeled_region_scale_factor: 1.0
+
+      deployment_constraints:
+        enabled: true
+        formulation: three_segment_wedge
+        mode: first_order
+        apply_from_year: 2030
+        technologies: [solar_power, onwind_power, battery_energy]
+        calibration:
+          window_start_year: 2014
+          window_end_year: 2024
+          anchor_smoothing_years: 3
+          quantile: 0.9
+          difference_space: log_annual_additions
+        battery_basis: phi_mapped_global_liion
+        uncertainty:
+          enabled: true
+          mode: stochastic_draw
+          shock_structure: persistent_level_plus_annual
+          persistent_scale_source: historical_residual_std
+          annual_scale_source: calibrated_residual_innovation
+          annual_scale_shrinkage: 0.25
+          random_seed_source: learning_seed
+        wedge:
+          level: global
+          cost_granularity: applied_learning_cost
+          uncertainty:
+            enabled: true
+            threshold_source: stochastic_growth_projected
+          table_csv:
+          threshold_basis: country_history
+          reference_method: growth_projected
+          anchor_smoothing_years: 5
+          growth_smoothing_years: 5
+          reference_statistic: mean
+          battery_basis: local_energy
+          b1_multiplier: 0.668
+          b2_multiplier: 1.43
+          phi2_pct_capex: 0.341
+          phi3_pct_capex: 0.671
+          irena_history_csv: "validation/data/IRENA_2025_capacity.csv"
+          battery_history_csv: "scripts/learning/data/battery_mapping_factors.txt"
+
+      battery_pipeline_anchor:
+        enabled: true
+        anchor_year: 2030
+        global_energy_gwh: 3400
+        global_power_gw: 850
+        applies_to: battery_energy
+        scope: global
+        active_only_until_anchor_year: true
+        uncertainty:
+          enabled: true
+          mode: truncated_lognormal_multiplier
+          sigma_log: 0.40
+          truncate_multipliers: [0.55, 1.75]
+          random_seed_source: learning_seed
+
+      # Important for sensitivity execution:
+      # the ensemble runner controls draws/seeds externally.
+      monte_carlo:
+        enable: false
+
+      compact_outputs:
+        enable: true
+        cleanup_heavy_raws: true
+        price_shadow_resolution: annual_summary
+
+      fossil_price_uncertainty:
+        enabled: true
+        bundle_root: "data/fuel-price-data"
+        fallback_to_static_prices: false
+        annual_step: 1
+        fuels: ["oil", "gas", "coal"]
+        expectation_mode: block_average_expected
+        annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
+
+runs:
+  # ---------------------------------------------------------------------------
+  # Learning-channel check.
+  # Way and CGRW are already complete at 1000 each, so they are intentionally
+  # omitted from the runnable sensitivity list.
+  # ---------------------------------------------------------------------------
+
+  - run_id: L4_DETERMINISTIC_LEARNING
+    group: learning_model
+    description: Median stochastic-learning draw while preserving other stochastic channels
+    budget: secondary
+    model: shared_state_bayesian_regime_wright
+    config_overrides:
+      learning:
+        sample_mode: median
+
+  # ---------------------------------------------------------------------------
+  # Deployment wedge and threshold uncertainty.
+  # ---------------------------------------------------------------------------
+
+  - run_id: W0_NO_WEDGE
+    group: deployment_wedge
+    description: Remove deployment wedge
+    budget: core
+    config_overrides:
+      learning:
+        deployment_constraints:
+          enabled: false
+
+  - run_id: JW1_TIGHT_WEDGE
+    group: joint_wedge
+    description: Tight deployment-friction case with earlier thresholds and higher high-growth premium
+    budget: core
+    config_overrides:
+      learning:
+        deployment_constraints:
+          wedge:
+            b1_multiplier: 0.50
+            b2_multiplier: 1.20
+            phi2_pct_capex: 0.40
+            phi3_pct_capex: 0.80
+
+  - run_id: JW2_LOOSE_WEDGE
+    group: joint_wedge
+    description: Loose deployment-friction case with later thresholds and lower high-growth premium
+    budget: core
+    config_overrides:
+      learning:
+        deployment_constraints:
+          wedge:
+            b1_multiplier: 0.90
+            b2_multiplier: 2.00
+            phi2_pct_capex: 0.20
+            phi3_pct_capex: 0.45
+
+  - run_id: WU0_DETERMINISTIC_THRESHOLDS
+    group: deployment_threshold_uncertainty
+    description: Disable stochastic deployment-threshold shocks while keeping mean wedge calibration
+    budget: secondary
+    config_overrides:
+      learning:
+        deployment_constraints:
+          uncertainty:
+            enabled: false
+            mode: deterministic
+          wedge:
+            uncertainty:
+              enabled: false
+
+  # ---------------------------------------------------------------------------
+  # Exogenous demand uncertainty.
+  # ---------------------------------------------------------------------------
+
+  - run_id: D1_LOW_DEMAND
+    group: demand
+    description: Fossil-era/low-electrification demand scenario
+    budget: architecture
+    run_mode: branch
+    bootstrap_group: DF
+    config_overrides:
+      scenario:
+        demand: ["DF"]
+
+  - run_id: D2_HIGH_DEMAND
+    group: demand
+    description: Fast-electrification/high-demand scenario
+    budget: architecture
+    run_mode: branch
+    bootstrap_group: NZ
+    config_overrides:
+      scenario:
+        demand: ["NZ"]
+
+  # ---------------------------------------------------------------------------
+  # Fossil fuel price uncertainty.
+  # ---------------------------------------------------------------------------
+
+  - run_id: F0_DETERMINISTIC_FOSSIL
+    group: fossil_prices
+    description: Deterministic fossil fuel prices from static cost inputs
+    budget: secondary
+    config_overrides:
+      learning:
+        fossil_price_uncertainty:
+          enabled: false
+          fallback_to_static_prices: true 
+
+  # ---------------------------------------------------------------------------
+  # Learning artifact / training-window check.
+  # ---------------------------------------------------------------------------
+
+  - run_id: TW1_ORIGIN_2020
+    group: learning_artifacts
+    description: Use stochastic learning artifacts trained only to the 2020 origin cutoff
+    budget: secondary
+    config_overrides:
+      learning:
+        training_window: origin_cutoff
+        training_window_origin_year: 2020
+
+  # ---------------------------------------------------------------------------
+  # Cost expectation and procurement-lag checks.
+  # ---------------------------------------------------------------------------
+
+  - run_id: K0_POINT_COST
+    group: cost_kernel_lags
+    description: Use point costs instead of block-average expected costs
+    budget: secondary
+    config_overrides:
+      learning:
+        cost_expectations:
+          mode: point_cost
+
+  - run_id: K1_GLOBAL_CURRENT_WINDOW
+    group: cost_kernel_lags
+    description: Use the same current 5-year expectation window for all learning technologies
+    budget: light
+    config_overrides:
+      learning:
+        cost_expectations:
+          mode: block_average_expected
+          kernel_mode: global_current_window
+
+  - run_id: K2_UNIFORM_KERNEL_WEIGHTS
+    group: cost_kernel_lags
+    description: Use uniform 5-year cost-expectation kernel weights for all learning technologies
+    budget: light
+    config_overrides:
+      learning:
+        cost_expectations:
+          mode: block_average_expected
+          annual_weights: [0.2, 0.2, 0.2, 0.2, 0.2]
+          annual_weights_by_tech:
+            solar_power: [0.2, 0.2, 0.2, 0.2, 0.2]
+            onwind_power: [0.2, 0.2, 0.2, 0.2, 0.2]
+            battery_energy: [0.2, 0.2, 0.2, 0.2, 0.2]
+
+  - run_id: JK1_ALL_SHORT_LAGS
+    group: joint_kernel_lags
+    description: All procurement lags shortened
+    budget: joint_lag
+    config_overrides:
+      learning:
+        cost_expectations:
+          lag_years_by_tech:
+            solar_power: 0
+            onwind_power: 2
+            battery_energy: 0
+
+  - run_id: JK2_ALL_LONG_LAGS
+    group: joint_kernel_lags
+    description: All procurement lags lengthened
+    budget: joint_lag
+    config_overrides:
+      learning:
+        cost_expectations:
+          lag_years_by_tech:
+            solar_power: 4
+            onwind_power: 6
+            battery_energy: 4
+
+  # ---------------------------------------------------------------------------
+  # Policy-boundary case.
+  # ---------------------------------------------------------------------------
+
+  - run_id: P1_BINDING_CO2_CAP
+    group: policy_boundary
+    description: Year-specific CO2Limit that leaves 2025 historical outcomes unchanged and reaches zero annual power-sector emissions by 2050
+    budget: secondary
+    run_mode: branch
+    bootstrap_group: CO2CAP
+    config_overrides:
+      electricity:
+        myopic_co2_cap_trajectory:
+          enable: true
+          constraint_name: CO2Limit
+          carrier_attribute: co2_emissions
+          start_year: 2030
+          skip_years: [2020, 2025]
+          # Model 2025 Power emissions from endogenous-complete-v1 compact
+          # outputs: 13,863.695658856 MtCO2, identical across the checked
+          # first 10 seeds/models because 2025 is historically constrained.
+          base_annual_emissions: 13863695658.856319
+          # Remaining annual-emissions fractions. This is front-loaded: the
+          # annual emissions path falls fastest over 2025-2035, then tapers
+          # toward exact zero by 2050.
+          fractions_by_year:
+            2030: 0.55
+            2035: 0.20
+            2040: 0.08
+            2045: 0.02
+            2050: 0.00
+
+  # ---------------------------------------------------------------------------
+  # Battery/storage anchor checks.
+  # These are the most important additions relative to the previous suite,
+  # because the paper's branching-architecture story depends on storage.
+  # ---------------------------------------------------------------------------
+
+  - run_id: BA0_NO_STORAGE_ANCHOR
+    group: battery_anchor
+    description: Remove one-time 2030 battery pipeline anchor
+    budget: secondary
+    config_overrides:
+      learning:
+        battery_pipeline_anchor:
+          enabled: false
+
+  - run_id: BA1_LOW_STORAGE_ANCHOR
+    group: battery_anchor
+    description: 50 percent of baseline 2030 battery pipeline anchor
+    budget: architecture
+    config_overrides:
+      learning:
+        battery_pipeline_anchor:
+          enabled: true
+          global_energy_gwh: 1700
+          global_power_gw: 425
+
+  - run_id: BA2_HIGH_STORAGE_ANCHOR
+    group: battery_anchor
+    description: 150 percent of baseline 2030 battery pipeline anchor
+    budget: secondary
+    config_overrides:
+      learning:
+        battery_pipeline_anchor:
+          enabled: true
+          global_energy_gwh: 5100
+          global_power_gw: 1275

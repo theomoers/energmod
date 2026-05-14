@@ -1,16 +1,69 @@
 #!/usr/bin/env python3
-"""Export compact CSV outputs for one stochastic model x seed run."""
+"""Export compact outputs for one stochastic model x seed run."""
 
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pypsa
+
+
+COMPACT_OUTPUT_FORMAT_CSV = "csv"
+COMPACT_OUTPUT_FORMAT_XARRAY = "xarray_netcdf"
+COMPACT_OUTPUT_FORMAT_ALIASES = {
+    "csv": COMPACT_OUTPUT_FORMAT_CSV,
+    "legacy_csv": COMPACT_OUTPUT_FORMAT_CSV,
+    "xarray": COMPACT_OUTPUT_FORMAT_XARRAY,
+    "xarray_netcdf": COMPACT_OUTPUT_FORMAT_XARRAY,
+    "netcdf": COMPACT_OUTPUT_FORMAT_XARRAY,
+    "nc": COMPACT_OUTPUT_FORMAT_XARRAY,
+}
+XARRAY_BUNDLE_FILENAME = "run_bundle.nc"
+XARRAY_LAYOUT_VERSION = "long-table-v1"
+XARRAY_COORDINATE_COLUMNS = {
+    "year",
+    "previous_year",
+    "learning_seed",
+    "technology",
+    "fuel_type",
+    "market",
+    "country",
+    "component",
+    "carrier",
+    "sector",
+    "demand_origin",
+    "capacity_unit",
+    "bus",
+    "asset",
+    "constraint_name",
+    "sense",
+    "carrier_attribute",
+    "formulation",
+    "mode",
+    "uncertainty_mode",
+    "constraint_basis_unit",
+    "penalty_basis",
+    "cost_granularity",
+    "basis_cost_source",
+    "cost_basis_conversion_method",
+    "selected_model",
+    "training_window",
+    "cost_expectation_mode",
+    "cost_expectation_kernel_mode",
+    "fossil_price_expectation_mode",
+    "postsolve_state_year",
+    "history_year",
+    "last_state_year",
+    "source_state_year",
+    "kernel_year_start",
+    "kernel_year_end",
+}
 
 
 OUTPUT_TABLE_SPECS = {
@@ -1848,6 +1901,192 @@ def _write_csv(df: pd.DataFrame, path: Path):
     df.to_csv(path, index=False)
 
 
+def _normalize_compact_output_format(value: str | None) -> str:
+    key = str(value or COMPACT_OUTPUT_FORMAT_CSV).strip().lower().replace("-", "_")
+    if key not in COMPACT_OUTPUT_FORMAT_ALIASES:
+        valid = sorted(set(COMPACT_OUTPUT_FORMAT_ALIASES.values()))
+        raise ValueError(f"Unsupported learning compact output format '{value}'. Supported formats: {valid}")
+    return COMPACT_OUTPUT_FORMAT_ALIASES[key]
+
+
+def _sanitize_netcdf_name(value: str, fallback: str = "value") -> str:
+    name = re.sub(r"[^0-9A-Za-z_]+", "_", str(value)).strip("_")
+    if not name:
+        name = fallback
+    if name[0].isdigit():
+        name = f"_{name}"
+    return name
+
+
+def _table_group_name(table_name: str) -> str:
+    path = Path(table_name)
+    parts = [path.with_suffix("").name] if len(path.parts) == 1 else [*path.parent.parts, path.stem]
+    return "/".join(_sanitize_netcdf_name(part, fallback="table") for part in parts)
+
+
+def _dataframe_to_xarray_long_table(df: pd.DataFrame, table_name: str):
+    import xarray as xr
+
+    table_token = _sanitize_netcdf_name(_table_group_name(table_name).replace("/", "__"), fallback="table")
+    row_dim = f"{table_token}_row"
+    coords = {row_dim: np.arange(len(df), dtype=np.int64)}
+    data_vars = {}
+    encoding = {}
+    used_names = {row_dim}
+    column_map = {}
+    string_columns = {}
+    missing_masks = {}
+    coordinate_columns = []
+    variable_attrs = {}
+
+    def unique_name(raw_name: str) -> str:
+        base = _sanitize_netcdf_name(raw_name, fallback="column")
+        candidate = base
+        suffix = 2
+        while candidate in used_names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used_names.add(candidate)
+        return candidate
+
+    for column in df.columns:
+        variable_name = unique_name(column)
+        column_map[str(column)] = variable_name
+        series = df[column]
+        is_coordinate = str(column) in XARRAY_COORDINATE_COLUMNS or not pd.api.types.is_numeric_dtype(series)
+        target = coords if is_coordinate else data_vars
+        if is_coordinate:
+            coordinate_columns.append(str(column))
+
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            missing = series.isna().to_numpy(dtype=bool)
+            values = series.where(~missing, "").astype(str).to_numpy(dtype=object)
+            target[variable_name] = (row_dim, values)
+            string_columns[str(column)] = {"variable": variable_name, "missing_value": ""}
+            variable_attrs[variable_name] = {
+                "original_column": str(column),
+                "logical_dtype": "string",
+                "missing_value": "",
+            }
+            encoding[variable_name] = {
+                "zlib": True,
+                "complevel": 5,
+                "shuffle": True,
+                "dtype": "S1",
+            }
+            if missing.any():
+                missing_name = unique_name(f"{column}_is_missing")
+                data_vars[missing_name] = (row_dim, missing)
+                missing_masks[str(column)] = missing_name
+                variable_attrs[variable_name]["missing_mask_variable"] = missing_name
+                variable_attrs[missing_name] = {
+                    "original_column": str(column),
+                    "logical_dtype": "missing_mask",
+                    "masked_variable": variable_name,
+                }
+                encoding[missing_name] = {"zlib": True, "complevel": 5, "shuffle": True}
+            continue
+
+        values = series.to_numpy()
+        target[variable_name] = (row_dim, values)
+        variable_attrs[variable_name] = {"original_column": str(column), "logical_dtype": str(series.dtype)}
+        if pd.api.types.is_bool_dtype(series):
+            encoding[variable_name] = {"zlib": True, "complevel": 5, "shuffle": True}
+        elif pd.api.types.is_numeric_dtype(series):
+            encoding[variable_name] = {"zlib": True, "complevel": 5, "shuffle": True}
+
+    ds = xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "table_name": table_name,
+            "storage_layout": "long_table",
+            "layout_version": XARRAY_LAYOUT_VERSION,
+            "row_dimension": row_dim,
+            "row_count": int(len(df)),
+            "source_columns_json": json.dumps([str(column) for column in df.columns]),
+            "column_variable_map_json": json.dumps(column_map, sort_keys=True),
+            "coordinate_columns_json": json.dumps(coordinate_columns, sort_keys=True),
+            "string_columns_json": json.dumps(string_columns, sort_keys=True),
+            "missing_masks_json": json.dumps(missing_masks, sort_keys=True),
+        },
+    )
+    for variable_name, attrs in variable_attrs.items():
+        if variable_name in ds:
+            ds[variable_name].attrs.update(attrs)
+        elif variable_name in ds.coords:
+            ds.coords[variable_name].attrs.update(attrs)
+    return ds, encoding
+
+
+def _write_xarray_run_bundle(
+    tables: dict[str, pd.DataFrame],
+    run_manifest: dict,
+    statistics_paths: dict[int, Path],
+    bundle_dir: Path,
+) -> tuple[dict[str, str], dict[str, int]]:
+    import xarray as xr
+
+    bundle_path = bundle_dir / XARRAY_BUNDLE_FILENAME
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    if bundle_path.exists():
+        bundle_path.unlink()
+
+    table_groups = {}
+    row_counts = {}
+    root_ds = xr.Dataset(
+        attrs={
+            "bundle_format": COMPACT_OUTPUT_FORMAT_XARRAY,
+            "layout_version": XARRAY_LAYOUT_VERSION,
+            "run_manifest_json": json.dumps(_sanitize_json(run_manifest), sort_keys=True),
+        }
+    )
+    root_ds.to_netcdf(bundle_path, mode="w", engine="netcdf4")
+
+    for filename, df in tables.items():
+        group_name = _table_group_name(filename)
+        ds, encoding = _dataframe_to_xarray_long_table(df, filename)
+        ds.to_netcdf(
+            bundle_path,
+            mode="a",
+            group=f"tables/{group_name}",
+            engine="netcdf4",
+            encoding=encoding,
+        )
+        table_groups[filename] = f"tables/{group_name}"
+        row_counts[filename] = int(len(df))
+
+    for year, path in sorted(statistics_paths.items()):
+        table_name = f"statistics_raw/statistics_{year}.csv"
+        df = pd.read_csv(path)
+        group_name = _table_group_name(table_name)
+        ds, encoding = _dataframe_to_xarray_long_table(df, table_name)
+        ds.attrs["source_path"] = str(path)
+        ds.to_netcdf(
+            bundle_path,
+            mode="a",
+            group=f"tables/{group_name}",
+            engine="netcdf4",
+            encoding=encoding,
+        )
+        table_groups[table_name] = f"tables/{group_name}"
+        row_counts[table_name] = int(len(df))
+
+    # Reopen root at the end so table metadata reflects every group written.
+    root_ds = xr.Dataset(
+        attrs={
+            "bundle_format": COMPACT_OUTPUT_FORMAT_XARRAY,
+            "layout_version": XARRAY_LAYOUT_VERSION,
+            "run_manifest_json": json.dumps(_sanitize_json(run_manifest), sort_keys=True),
+            "table_groups_json": json.dumps(table_groups, sort_keys=True),
+            "row_counts_json": json.dumps(row_counts, sort_keys=True),
+        }
+    )
+    root_ds.to_netcdf(bundle_path, mode="a", engine="netcdf4")
+
+    return {XARRAY_BUNDLE_FILENAME: _sha256(bundle_path)}, row_counts
+
+
 def _sha256(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1867,6 +2106,7 @@ def _extract_bundle(
     deployment_constraint_paths: dict[int, Path],
     statistics_paths: dict[int, Path],
     metadata: dict,
+    output_format: str = COMPACT_OUTPUT_FORMAT_CSV,
 ):
     tables = {name: _empty_frame(name) for name in OUTPUT_TABLE_SPECS}
     learning_costs = _prepare_learning_costs(cost_log_paths)
@@ -2095,25 +2335,36 @@ def _extract_bundle(
         "deployment_constraint_sources": {str(year): str(path) for year, path in deployment_constraint_paths.items()},
         "statistics_sources": {str(year): str(path) for year, path in statistics_paths.items()},
     }
-    (bundle_dir / "run_manifest.json").write_text(
-        json.dumps(_sanitize_json(run_manifest), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-    checksums = {"run_manifest.json": _sha256(bundle_dir / "run_manifest.json")}
+    output_format = _normalize_compact_output_format(output_format)
     row_counts = {}
-    for filename, df in tables.items():
-        output_path = bundle_dir / filename
-        _write_csv(df, output_path)
-        checksums[filename] = _sha256(output_path)
-        row_counts[filename] = int(len(df))
+    if output_format == COMPACT_OUTPUT_FORMAT_CSV:
+        (bundle_dir / "run_manifest.json").write_text(
+            json.dumps(_sanitize_json(run_manifest), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
-    statistics_dir = bundle_dir / "statistics_raw"
-    statistics_dir.mkdir(parents=True, exist_ok=True)
-    for year, path in sorted(statistics_paths.items()):
-        copied_path = statistics_dir / f"statistics_{year}.csv"
-        shutil.copy2(path, copied_path)
-        checksums[str(copied_path.relative_to(bundle_dir))] = _sha256(copied_path)
+        checksums = {"run_manifest.json": _sha256(bundle_dir / "run_manifest.json")}
+        for filename, df in tables.items():
+            output_path = bundle_dir / filename
+            _write_csv(df, output_path)
+            checksums[filename] = _sha256(output_path)
+            row_counts[filename] = int(len(df))
+
+        statistics_dir = bundle_dir / "statistics_raw"
+        statistics_dir.mkdir(parents=True, exist_ok=True)
+        for year, path in sorted(statistics_paths.items()):
+            copied_path = statistics_dir / f"statistics_{year}.csv"
+            shutil.copy2(path, copied_path)
+            checksums[str(copied_path.relative_to(bundle_dir))] = _sha256(copied_path)
+    elif output_format == COMPACT_OUTPUT_FORMAT_XARRAY:
+        checksums, row_counts = _write_xarray_run_bundle(
+            tables=tables,
+            run_manifest=run_manifest,
+            statistics_paths=statistics_paths,
+            bundle_dir=bundle_dir,
+        )
+    else:
+        raise AssertionError(f"Unhandled compact output format: {output_format}")
 
     if os.environ.get("LEARNING_COMPACT_FORCE_FAIL") == "1":
         raise RuntimeError("Forced compact-output failure for test coverage.")
@@ -2123,6 +2374,8 @@ def _extract_bundle(
         "learning_model": metadata["learning_model"],
         "learning_seed": metadata["learning_seed"],
         "planning_horizons": years,
+        "output_format": output_format,
+        "bundle_file": XARRAY_BUNDLE_FILENAME if output_format == COMPACT_OUTPUT_FORMAT_XARRAY else "",
         "row_counts": row_counts,
         "checksums": checksums,
     }
@@ -2153,6 +2406,9 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
         "learning_model": str(snakemake.wildcards.learning_model),
         "learning_seed": str(snakemake.wildcards.learning_seed),
     }
+    output_format = _normalize_compact_output_format(
+        getattr(snakemake.params, "output_format", COMPACT_OUTPUT_FORMAT_CSV)
+    )
 
     try:
         _extract_bundle(
@@ -2166,6 +2422,7 @@ def main(snakemake):  # pragma: no cover - Snakemake entrypoint
             deployment_constraint_paths,
             statistics_paths,
             metadata,
+            output_format=output_format,
         )
         if bundle_dir.exists():
             shutil.rmtree(bundle_dir)

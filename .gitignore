@@ -81,6 +81,8 @@ permstorage/*
 
 # Specific configuration files
 configs/*
+!configs/sensitivity_ensemble.yaml
+!configs/sensitivity_bootstrap_*.yaml
 
 # VS Code-related files
 .vscode
