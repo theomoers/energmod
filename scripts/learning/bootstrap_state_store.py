@@ -20,6 +20,9 @@ DEFAULT_REQUIRED_PATTERNS = (
     "learning/bootstrap_complete_elec_s*.txt",
     "prenetworks/elec_s*export.nc",
 )
+PREREQ_REQUIRED_PATTERNS = (
+    "prenetworks/elec_s*export.nc",
+)
 DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS = {
     "benchmarks",
     "configs",
@@ -245,9 +248,10 @@ def write_state_manifest(
 def save_bootstrap_state(
     source_sector_dir: Path,
     target_dir: Path,
+    required_patterns: tuple[str, ...] = DEFAULT_REQUIRED_PATTERNS,
 ) -> dict[str, object]:
     source_sector_dir = _require_directory(source_sector_dir, "Bootstrap source sector directory")
-    required_counts = validate_state_source(source_sector_dir)
+    required_counts = validate_state_source(source_sector_dir, required_patterns=required_patterns)
     results_excluder = _build_nested_scenario_excluder(
         source_sector_dir,
         shared_dir_names=DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS,
@@ -389,6 +393,11 @@ def main() -> int:
     save_parser = subparsers.add_parser("save", help="Save bootstrap/prereq state from a results sector")
     save_parser.add_argument("--source-sector-dir", required=True)
     save_parser.add_argument("--target-dir", required=True)
+    save_parser.add_argument(
+        "--prereq-only",
+        action="store_true",
+        help="Require only exported branch prerequisite prenetworks, not full bootstrap markers.",
+    )
 
     restore_parser = subparsers.add_parser("restore", help="Restore bootstrap/prereq state into a results sector")
     restore_parser.add_argument("--source-dir", required=True)
@@ -399,6 +408,7 @@ def main() -> int:
         result = save_bootstrap_state(
             Path(os.path.expandvars(args.source_sector_dir)),
             Path(os.path.expandvars(args.target_dir)),
+            required_patterns=PREREQ_REQUIRED_PATTERNS if args.prereq_only else DEFAULT_REQUIRED_PATTERNS,
         )
     else:
         result = restore_bootstrap_state(

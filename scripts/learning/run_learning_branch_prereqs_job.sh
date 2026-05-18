@@ -11,6 +11,9 @@ Environment variables:
   NSLOTS               Cluster slot count fallback when JOBS is unset
   LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
   LEARNING_CONDA_ENV   Conda env to activate when snakemake is not already on PATH
+  LEARNING_SNAKEMAKE_LOCK
+                       auto|on|off; auto disables the lock only when
+                       --scenario-name creates a separate result dir
 
 This builds the shared 2030+ prenetwork export inputs once before launching the
 seed-specific stochastic branch array.
@@ -89,6 +92,25 @@ fi
 
 SNAKEMAKE_JOBS="${JOBS:-${NSLOTS:-4}}"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
+SNAKEMAKE_LOCK_MODE="${LEARNING_SNAKEMAKE_LOCK:-auto}"
+SNAKEMAKE_LOCK_ARGS=()
+
+case "$SNAKEMAKE_LOCK_MODE" in
+  auto)
+    if [[ -n "$SCENARIO_NAME" && -z "${LEARNING_SECTOR_NAME:-}" ]]; then
+      SNAKEMAKE_LOCK_ARGS+=(--nolock)
+    fi
+    ;;
+  on)
+    ;;
+  off)
+    SNAKEMAKE_LOCK_ARGS+=(--nolock)
+    ;;
+  *)
+    echo "LEARNING_SNAKEMAKE_LOCK must be one of: auto, on, off" >&2
+    exit 1
+    ;;
+esac
 
 if ! command -v snakemake >/dev/null 2>&1; then
   source /apps/anaconda3/etc/profile.d/conda.sh
@@ -122,6 +144,8 @@ CMD=(
   validation/config.iteration_common.yaml
   "$OVERLAY_FILE"
   "${EXTRA_CONFIGFILES[@]}"
+  "${SNAKEMAKE_LOCK_ARGS[@]}"
+  --rerun-incomplete
   --rerun-trigger
   mtime
 )
@@ -133,6 +157,11 @@ fi
 echo "Running shared stochastic branch prerequisites:"
 echo "  sector_name=$JOB_SECTOR_NAME"
 echo "  jobs=$SNAKEMAKE_JOBS"
+if [[ "${#SNAKEMAKE_LOCK_ARGS[@]}" -gt 0 ]]; then
+  echo "  snakemake_lock=$SNAKEMAKE_LOCK_MODE (--nolock)"
+else
+  echo "  snakemake_lock=$SNAKEMAKE_LOCK_MODE"
+fi
 echo "  overlay=$OVERLAY_FILE"
 if [[ "${#EXTRA_CONFIGFILES[@]}" -gt 0 ]]; then
   echo "  extra_configfiles=${EXTRA_CONFIGFILES[*]}"
@@ -151,5 +180,6 @@ fi
 if [[ "$DRY_RUN" -eq 0 && -n "$SAVE_BOOTSTRAP_STATE" ]]; then
   python scripts/learning/bootstrap_state_store.py save \
     --source-sector-dir "$ROOT_DIR/results/$JOB_SECTOR_NAME" \
-    --target-dir "$SAVE_BOOTSTRAP_STATE"
+    --target-dir "$SAVE_BOOTSTRAP_STATE" \
+    --prereq-only
 fi

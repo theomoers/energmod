@@ -4,11 +4,15 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_bootstrap_job.sh [--scenario-name NAME] [--save-bootstrap-state PATH] [--dry-run]
+  bash scripts/learning/run_learning_bootstrap_job.sh [--scenario-name NAME] [--overlay-config PATH] [--save-bootstrap-state PATH] [--dry-run]
 
 Environment variables:
   Bootstrap always runs with Snakemake parallelism fixed to 100 jobs
   LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
+  LEARNING_CONDA_ENV   Conda env to activate when snakemake is not already on PATH
+  LEARNING_SNAKEMAKE_LOCK
+                       auto|on|off; auto disables the lock only when
+                       --scenario-name creates a separate result dir
 
 This runs the shared deterministic learning bootstrap through the first two
 planning horizons for the stochastic model list configured in config.learning.yaml.
@@ -18,6 +22,7 @@ USAGE
 DRY_RUN=0
 SCENARIO_NAME=""
 SAVE_BOOTSTRAP_STATE=""
+EXTRA_CONFIGFILES=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
@@ -30,6 +35,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       SCENARIO_NAME="$2"
+      shift 2
+      ;;
+    --overlay-config)
+      if [[ $# -lt 2 ]]; then
+        echo "--overlay-config requires an argument" >&2
+        exit 1
+      fi
+      EXTRA_CONFIGFILES+=("$2")
       shift 2
       ;;
     --save-bootstrap-state)
@@ -78,6 +91,25 @@ fi
 
 SNAKEMAKE_JOBS="100"
 CONDA_ENV_NAME="${LEARNING_CONDA_ENV:-/shared/share_cki25/envs/sh-pypsa-earth-main}"
+SNAKEMAKE_LOCK_MODE="${LEARNING_SNAKEMAKE_LOCK:-auto}"
+SNAKEMAKE_LOCK_ARGS=()
+
+case "$SNAKEMAKE_LOCK_MODE" in
+  auto)
+    if [[ -n "$SCENARIO_NAME" && -z "${LEARNING_SECTOR_NAME:-}" ]]; then
+      SNAKEMAKE_LOCK_ARGS+=(--nolock)
+    fi
+    ;;
+  on)
+    ;;
+  off)
+    SNAKEMAKE_LOCK_ARGS+=(--nolock)
+    ;;
+  *)
+    echo "LEARNING_SNAKEMAKE_LOCK must be one of: auto, on, off" >&2
+    exit 1
+    ;;
+esac
 
 if ! command -v snakemake >/dev/null 2>&1; then
   source /apps/anaconda3/etc/profile.d/conda.sh
@@ -110,6 +142,9 @@ CMD=(
   config.learning.yaml
   validation/config.iteration_common.yaml
   "$OVERLAY_FILE"
+  "${EXTRA_CONFIGFILES[@]}"
+  "${SNAKEMAKE_LOCK_ARGS[@]}"
+  --rerun-incomplete
   --rerun-trigger
   mtime
 )
@@ -121,7 +156,15 @@ fi
 echo "Running shared learning bootstrap:"
 echo "  sector_name=$JOB_SECTOR_NAME"
 echo "  jobs=$SNAKEMAKE_JOBS"
+if [[ "${#SNAKEMAKE_LOCK_ARGS[@]}" -gt 0 ]]; then
+  echo "  snakemake_lock=$SNAKEMAKE_LOCK_MODE (--nolock)"
+else
+  echo "  snakemake_lock=$SNAKEMAKE_LOCK_MODE"
+fi
 echo "  overlay=$OVERLAY_FILE"
+if [[ "${#EXTRA_CONFIGFILES[@]}" -gt 0 ]]; then
+  echo "  extra_configfiles=${EXTRA_CONFIGFILES[*]}"
+fi
 if [[ -n "$SAVE_BOOTSTRAP_STATE" ]]; then
   echo "  save_bootstrap_state=$SAVE_BOOTSTRAP_STATE"
 fi

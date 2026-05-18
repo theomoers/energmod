@@ -185,6 +185,17 @@ sector:
     
   industry_electrification:
     default_scenario: "AB"
+    efficiency_factors:
+      electricity:
+        iron and steel: 1.1818181818181819
+        non-metallic minerals: 1.1333333333333333
+        chemical and petrochemical: 1.142857142857143
+        other: 1.0588235294117647
+      hydrogen:
+        iron and steel: 1.2727272727272725
+        non-metallic minerals: 1.0
+        chemical and petrochemical: 1.2142857142857144
+        other: 0.9411764705882354
     # ============ IRON AND STEEL ============
     # Electric Arc Furnace (EAF) share - electricity-based steelmaking
     steel_electric_share:

@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from bootstrap_state_store import (
+    resolve_resources_sector_dir,
     resolve_results_sector_dir,
     resolve_scenario_sector_name,
     restore_bootstrap_state,
@@ -145,6 +146,15 @@ def seed_token(model: str, seed: int) -> str:
     return f"s{int(seed):04d}"
 
 
+def task_archive_sector_name(task: dict) -> str:
+    return str(task.get("archive_sector_name") or task["sector_name"])
+
+
+def task_working_sector_name(base_sector_name: str, model: str, seed: int) -> str:
+    draw_token = f"{sanitize_token(model)}_{seed_token(model, seed)}"
+    return f"{str(base_sector_name).rstrip('/')}/draws/{draw_token}"
+
+
 def normalize_run_entry(raw_run: dict, baseline: dict, config: dict) -> dict:
     baseline_run = deepcopy(baseline)
     run = deepcopy(raw_run)
@@ -246,7 +256,7 @@ def build_tasks(config: dict, args: argparse.Namespace) -> list[dict]:
     seed_upper_bound = int(ensemble.get("seed_upper_bound", 1000000000) or 1000000000)
     base_seed = resolve_base_seed(args, config)
     common_random_numbers = resolve_common_random_numbers(args, config)
-    tasks: list[dict] = []
+    tasks_by_run: list[list[dict]] = []
 
     for run in runs:
         n_draws = draw_count_for_run(run, args, config)
@@ -258,18 +268,24 @@ def build_tasks(config: dict, args: argparse.Namespace) -> list[dict]:
             seed_upper_bound=seed_upper_bound,
             common_random_numbers=common_random_numbers,
         )
+        run_tasks: list[dict] = []
         for draw_index, seed in enumerate(seeds):
+            archive_sector_name = str(run["sector_name"])
+            working_sector_name = task_working_sector_name(archive_sector_name, run["model"], int(seed))
             overlay = deepcopy(run["config_overrides"])
             deep_update(
                 overlay,
                 {
+                    "run": {
+                        "sector_name": working_sector_name,
+                    },
                     "learning": {
                         "execution_mode": run["run_mode"],
                         "seed": int(seed),
-                    }
+                    },
                 },
             )
-            tasks.append(
+            run_tasks.append(
                 {
                     "ensemble_name": str(ensemble.get("name", "sensitivity_ensemble")),
                     "run_id": run["run_id"],
@@ -279,7 +295,8 @@ def build_tasks(config: dict, args: argparse.Namespace) -> list[dict]:
                     "learning_seed": int(seed),
                     "model": run["model"],
                     "scenario_name": run["scenario_name"],
-                    "sector_name": run["sector_name"],
+                    "sector_name": working_sector_name,
+                    "archive_sector_name": archive_sector_name,
                     "run_mode": run["run_mode"],
                     "bootstrap_group": run["bootstrap_group"],
                     "budget": run["budget"],
@@ -289,19 +306,37 @@ def build_tasks(config: dict, args: argparse.Namespace) -> list[dict]:
                     "status": "pending",
                 }
             )
+        tasks_by_run.append(run_tasks)
+
+    # Draw-first ordering keeps early smoke-test feedback broad across specs.
+    # Per-draw working sectors below make this safe even with high array concurrency.
+    tasks: list[dict] = []
+    max_draws = max((len(run_tasks) for run_tasks in tasks_by_run), default=0)
+    for draw_index in range(max_draws):
+        for run_tasks in tasks_by_run:
+            if draw_index < len(run_tasks):
+                tasks.append(run_tasks[draw_index])
     return tasks
 
 
-def compact_complete(task: dict) -> bool:
-    results_dir = ROOT_DIR / "results" / Path(str(task["sector_name"]))
-    compact_dir = (
-        results_dir
+def compact_bundle_dir_for_sector(task: dict, root_dir: Path, sector_name: str) -> Path:
+    return (
+        root_dir
+        / "results"
+        / Path(str(sector_name))
         / "learning-compact"
         / str(task["scenario_name"])
         / str(task["model"])
         / f"seed_{seed_token(str(task['model']), int(task['learning_seed']))}"
     )
-    return bool(list(compact_dir.glob("raw_cleanup_complete*.txt")) or list(compact_dir.glob("compact_complete*.json")))
+
+
+def compact_complete(task: dict) -> bool:
+    for sector_name in (task_archive_sector_name(task), str(task["sector_name"])):
+        compact_dir = compact_bundle_dir_for_sector(task, ROOT_DIR, sector_name)
+        if list(compact_dir.glob("raw_cleanup_complete*.txt")) or list(compact_dir.glob("compact_complete*.json")):
+            return True
+    return False
 
 
 def filter_resume_tasks(tasks: list[dict], resume: bool) -> list[dict]:
@@ -321,10 +356,16 @@ def resolve_task_sector_names(tasks: list[dict]) -> list[str]:
     return sorted({str(task["sector_name"]) for task in tasks})
 
 
-def build_grid_run_cmd(args: argparse.Namespace, manifest_path: Path, task_count: int) -> list[str]:
+def resolve_archive_sector_names(tasks: list[dict]) -> list[str]:
+    return sorted({task_archive_sector_name(task) for task in tasks})
+
+
+def build_grid_run_cmd(args: argparse.Namespace, manifest_path: Path, tasks: list[dict]) -> list[str]:
+    task_count = len(tasks)
     grid_array = f"1-{task_count}"
-    if task_count > DEFAULT_GRID_ARRAY_CONCURRENCY:
-        grid_array = f"{grid_array}/{DEFAULT_GRID_ARRAY_CONCURRENCY}"
+    array_concurrency = int(args.grid_array_concurrency or DEFAULT_GRID_ARRAY_CONCURRENCY)
+    if task_count > array_concurrency:
+        grid_array = f"{grid_array}/{array_concurrency}"
     worker_script = str((SCRIPT_DIR / "run_learning_sensitivity_ensemble_array_task.sh").resolve())
     return [
         "grid_run",
@@ -364,6 +405,7 @@ def write_csv_manifest(path: Path, tasks: list[dict]) -> None:
         "model",
         "scenario_name",
         "sector_name",
+        "archive_sector_name",
         "run_mode",
         "bootstrap_group",
         "status",
@@ -388,6 +430,7 @@ def write_submission_metadata(
         "selected_task_count_before_resume": selected_task_count_before_resume,
         "run_ids": sorted({task["run_id"] for task in tasks}),
         "resolved_sector_names": resolve_task_sector_names(tasks),
+        "resolved_archive_sector_names": resolve_archive_sector_names(tasks),
         "bootstrap_groups": sorted({str(task.get("bootstrap_group", "AB")) for task in tasks}),
         "common_random_numbers": bool(tasks[0]["common_random_numbers"]) if tasks else None,
         "job_root": str(Path(os.path.expandvars(args.job_root)).resolve()),
@@ -446,6 +489,13 @@ def missing_bootstrap_groups(tasks: list[dict], resolved_sources: dict[str, Path
     return [group for group in groups if group not in resolved_sources]
 
 
+def clear_archive_sectors(tasks: list[dict]) -> None:
+    for sector_name in resolve_archive_sector_names(tasks):
+        shutil.rmtree(resolve_results_sector_dir(ROOT_DIR, sector_name), ignore_errors=True)
+        shutil.rmtree(resolve_resources_sector_dir(ROOT_DIR, sector_name), ignore_errors=True)
+        print("ARCHIVE_SECTOR_CLEARED", sector_name)
+
+
 def restore_bootstrap_state_for_runs(tasks: list[dict], bootstrap_sources: dict[str, Path]) -> None:
     tasks = tasks_needing_bootstrap_restore(tasks)
     if not tasks:
@@ -460,6 +510,9 @@ def restore_bootstrap_state_for_runs(tasks: list[dict], bootstrap_sources: dict[
         print("BOOTSTRAP_STATE_VALIDATED", group, json.dumps(required_counts, sort_keys=True))
         for sector_name in resolve_task_sector_names(group_tasks):
             target_dir = resolve_results_sector_dir(ROOT_DIR, sector_name)
+            if getattr(restore_bootstrap_state_for_runs, "overwrite", False):
+                shutil.rmtree(target_dir, ignore_errors=True)
+                shutil.rmtree(resolve_resources_sector_dir(ROOT_DIR, sector_name), ignore_errors=True)
             restore_summary = restore_bootstrap_state(bootstrap_source, target_dir)
             print("BOOTSTRAP_STATE_RESTORED", group, sector_name, json.dumps(restore_summary, sort_keys=True))
 
@@ -492,7 +545,7 @@ def submit_array(args: argparse.Namespace) -> None:
     )
     logs_dir = submit_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    grid_run_cmd = build_grid_run_cmd(args, manifest_path, len(tasks))
+    grid_run_cmd = build_grid_run_cmd(args, manifest_path, tasks)
 
     bootstrap_sources = resolve_bootstrap_sources_for_tasks(tasks, args.bootstrap_state_source)
     missing_groups = missing_bootstrap_groups(tasks, bootstrap_sources)
@@ -520,6 +573,9 @@ def submit_array(args: argparse.Namespace) -> None:
                     "Missing bootstrap sources for selected bootstrap groups: "
                     f"{missing_groups}. Pass --bootstrap-state-source GROUP=/path for each group."
                 )
+            if args.overwrite:
+                clear_archive_sectors(tasks)
+            restore_bootstrap_state_for_runs.overwrite = bool(args.overwrite)
             restore_bootstrap_state_for_runs(tasks, bootstrap_sources)
 
     if args.print_only:
@@ -530,6 +586,7 @@ def submit_array(args: argparse.Namespace) -> None:
         print("SELECTED_TASKS_BEFORE_RESUME", len(all_selected_tasks))
         print("RUN_IDS", ",".join(sorted({task["run_id"] for task in tasks})))
         print("RESOLVED_SECTOR_NAMES", json.dumps(resolve_task_sector_names(tasks), sort_keys=True))
+        print("RESOLVED_ARCHIVE_SECTOR_NAMES", json.dumps(resolve_archive_sector_names(tasks), sort_keys=True))
         print("LOG_DIR", logs_dir)
         print("GRID_RUN_CMD", " ".join(shlex.quote(part) for part in grid_run_cmd))
         return
@@ -539,6 +596,8 @@ def submit_array(args: argparse.Namespace) -> None:
     print("CSV_MANIFEST", submit_dir / "manifest.csv")
     print("SUBMISSION_METADATA", metadata_path)
     print("ARRAY_SIZE", len(tasks))
+    print("RESOLVED_SECTOR_NAMES", json.dumps(resolve_task_sector_names(tasks), sort_keys=True))
+    print("RESOLVED_ARCHIVE_SECTOR_NAMES", json.dumps(resolve_archive_sector_names(tasks), sort_keys=True))
     print("LOG_DIR", logs_dir)
 
 
@@ -575,20 +634,40 @@ def _write_overlay(task: dict, output_dir: Path) -> Path:
     return path
 
 
-def _compact_bundle_dir(task: dict, job_dir: Path) -> Path:
-    return (
-        job_dir
-        / "results"
-        / Path(str(task["sector_name"]))
-        / "learning-compact"
-        / str(task["scenario_name"])
-        / str(task["model"])
-        / f"seed_{seed_token(str(task['model']), int(task['learning_seed']))}"
-    )
+def _compact_bundle_dir(task: dict, job_dir: Path, sector_name: str | None = None) -> Path:
+    return compact_bundle_dir_for_sector(task, job_dir, sector_name or str(task["sector_name"]))
+
+
+def _copy_compact_bundle_to_archive(task: dict, job_dir: Path) -> None:
+    archive_sector = task_archive_sector_name(task)
+    working_sector = str(task["sector_name"])
+    if archive_sector == working_sector:
+        return
+    source = _compact_bundle_dir(task, job_dir, working_sector)
+    if not source.exists():
+        return
+    target = _compact_bundle_dir(task, job_dir, archive_sector)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    shutil.copytree(source, tmp, symlinks=True)
+    if target.exists():
+        shutil.rmtree(target)
+    tmp.rename(target)
+
+
+def _cleanup_working_sector(task: dict, job_dir: Path) -> None:
+    archive_sector = task_archive_sector_name(task)
+    working_sector = str(task["sector_name"])
+    if archive_sector == working_sector:
+        return
+    shutil.rmtree(job_dir / "results" / Path(working_sector), ignore_errors=True)
+    shutil.rmtree(job_dir / "resources" / Path(working_sector), ignore_errors=True)
 
 
 def _write_draw_complete(task: dict, job_dir: Path) -> None:
-    bundle_dir = _compact_bundle_dir(task, job_dir)
+    bundle_dir = _compact_bundle_dir(task, job_dir, task_archive_sector_name(task))
     bundle_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "ensemble_name": task["ensemble_name"],
@@ -599,6 +678,7 @@ def _write_draw_complete(task: dict, job_dir: Path) -> None:
         "model": task["model"],
         "scenario_name": task["scenario_name"],
         "sector_name": task["sector_name"],
+        "archive_sector_name": task_archive_sector_name(task),
         "completed": True,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "model_status": "snakemake_complete",
@@ -630,7 +710,9 @@ def build_snakemake_cmd(
         *DEFAULT_BASE_CONFIGFILES,
         str(overlay_path),
         "--rerun-trigger",
-        "mtime",
+        "code",
+        "params",
+        "input",
     ]
     if dry_run:
         cmd.append("-n")
@@ -682,7 +764,9 @@ def run_worker(args: argparse.Namespace) -> None:
     try:
         subprocess.run(cmd, check=True, cwd=job_dir, env=env)
         if not args.dry_run:
+            _copy_compact_bundle_to_archive(task, job_dir)
             _write_draw_complete(task, job_dir)
+            _cleanup_working_sector(task, job_dir)
     finally:
         overlay_path.unlink(missing_ok=True)
 
@@ -721,6 +805,14 @@ def main() -> None:
     parser.add_argument("--grid-mem", default=DEFAULT_GRID_MEM)
     parser.add_argument("--grid-ncpus", default=DEFAULT_GRID_NCPUS)
     parser.add_argument("--grid-submit", default=DEFAULT_GRID_SUBMIT)
+    parser.add_argument(
+        "--grid-array-concurrency",
+        type=int,
+        help=(
+            f"Maximum concurrent SGE array tasks. Defaults to {DEFAULT_GRID_ARRAY_CONCURRENCY}; "
+            "draws are isolated into per-task working sectors so same-spec draws can run concurrently."
+        ),
+    )
     parser.add_argument(
         "--bootstrap-state-source",
         action="append",

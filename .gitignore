@@ -78,6 +78,8 @@ cluster_workdirs/
 tests/
 permstorage/bootstrap_snapshots/*
 permstorage/*
+# Local bootstrap state snapshots can be large; do not sync the generated tree.
+bootstrap-states/
 
 # Specific configuration files
 configs/*
