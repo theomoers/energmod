@@ -104,6 +104,16 @@ global_specific:
     physical_balance_relative_tolerance: 0.02
   
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
+  baseyear_capacity_distribution:
+    enable: true
+    year: 2020
+    owid_csv: validation/data/owid-energy-data.csv
+    carriers: [solar, onwind]
+    min_reference_twh: 1.0
+    min_share_multiplier: 0.25
+    max_share_multiplier: 2.0
+    fallback_to_load_shares: true
+
   baseyear_generation:
     baseyear_generation_constraint: true # 2020 country-level electricity generation constrained to OWID historical values
     year: 2020
@@ -167,6 +177,15 @@ global_specific:
     absolute_tolerance_mw: 0.0
     add_missing_fixed_generators: true
     missing_fixed_generator_constraints: [solar, onwind, offshore_wind]
+    materialize_historical_capacity_by_2020_shares: true
+    historical_capacity_distribution_constraints: [solar, onwind]
+    freeze_endogenous_2025_capacity_after_materialization: true
+    energy_calibrated_historical_capacity_distribution: true
+    energy_calibration_owid_csv: validation/data/owid-elecbalance2025.csv
+    energy_calibration_carriers: [solar, onwind]
+    energy_calibration_min_reference_twh: 1.0
+    energy_calibration_min_share_multiplier: 0.25
+    energy_calibration_max_share_multiplier: 2.0
     fixed_capacity_overshoot_policy: constrain_additions_only
     irena_technology_by_constraint:
       solar: ["Solar photovoltaic"] # excludes CSP / solar thermal

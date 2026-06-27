@@ -1515,7 +1515,14 @@ def _price_country_year(n: pypsa.Network) -> pd.DataFrame:
 def _system_constraint_shadows(n: pypsa.Network) -> pd.DataFrame:
     if n.global_constraints.empty:
         return _empty_frame("constraint_shadow_system_year.csv")
-    result = n.global_constraints.copy().reset_index().rename(columns={"index": "constraint_name"})
+    result = n.global_constraints.copy().reset_index()
+    if "constraint_name" not in result.columns:
+        if "index" in result.columns:
+            result = result.rename(columns={"index": "constraint_name"})
+        elif len(result.columns) > 0:
+            result = result.rename(columns={result.columns[0]: "constraint_name"})
+    if "constraint_name" not in result.columns:
+        result["constraint_name"] = np.nan
     for column in ("type", "sense", "carrier_attribute", "constant", "mu"):
         if column not in result.columns:
             result[column] = np.nan
@@ -1861,7 +1868,10 @@ def _prepare_system_costs(system_cost_paths: dict[int, Path]) -> pd.DataFrame:
 def _prepare_deployment_constraints(paths: dict[int, Path]) -> pd.DataFrame:
     frames = []
     for year, path in sorted(paths.items()):
-        frame = pd.read_csv(path)
+        try:
+            frame = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            continue
         if frame.empty:
             continue
         for column in OUTPUT_TABLE_SPECS["deployment_constraints.csv"]:

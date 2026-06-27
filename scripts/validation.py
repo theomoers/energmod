@@ -2953,6 +2953,747 @@ def _pick_country_ac_bus(n, country, bus_country, preferred_gens=None):
     return str(ac_buses.sort_values()[0])
 
 
+
+def _country_ac_bus_load_shares(n, country, bus_country, candidate_buses=None):
+    """Return AC-load shares for buses in a country, with equal-share fallback."""
+    country = str(country).strip().upper()
+    bus_country = bus_country.astype(str).str.strip().str.upper()
+    bus_carrier = (
+        n.buses["carrier"].astype(str)
+        if "carrier" in n.buses.columns
+        else pd.Series("", index=n.buses.index)
+    )
+    if candidate_buses is None:
+        buses = pd.Index(n.buses.index[bus_country.eq(country) & bus_carrier.eq("AC")])
+    else:
+        candidate_buses = pd.Index(candidate_buses).astype(str)
+        buses = pd.Index(
+            [
+                bus
+                for bus in candidate_buses
+                if bus in n.buses.index
+                and bus_country.reindex([bus]).iloc[0] == country
+                and bus_carrier.reindex([bus]).iloc[0] == "AC"
+            ]
+        )
+    if len(buses) == 0:
+        return pd.Series(dtype=float)
+
+    load_by_bus = pd.Series(0.0, index=buses, dtype=float)
+    if not n.loads.empty and hasattr(n, "loads_t") and "p_set" in n.loads_t:
+        load_bus = n.loads["bus"].astype(str)
+        country_loads = n.loads.index[load_bus.isin(buses)]
+        if len(country_loads) > 0:
+            load_ts = n.loads_t.p_set.reindex(columns=country_loads).fillna(0.0)
+            if "generators" in n.snapshot_weightings:
+                weighted = load_ts.mul(n.snapshot_weightings["generators"], axis=0)
+                totals = weighted.sum(axis=0)
+            else:
+                totals = load_ts.sum(axis=0)
+            load_by_bus = load_by_bus.add(
+                totals.groupby(load_bus.loc[country_loads]).sum(), fill_value=0.0
+            ).reindex(buses, fill_value=0.0)
+
+    load_by_bus = load_by_bus.clip(lower=0.0)
+    if load_by_bus.sum() > 0.0:
+        return load_by_bus / load_by_bus.sum()
+    return pd.Series(1.0 / len(buses), index=buses, dtype=float)
+
+
+def _capacity_share_from_committed_or_load(n, group, country, bus_country):
+    """Use committed nodal capacity shares, falling back to AC-load shares."""
+    if group is not None and not group.empty:
+        committed = pd.concat([group["p_nom"], group["p_nom_min"]], axis=1).max(axis=1)
+        committed_by_bus = committed.groupby(group["bus"].astype(str)).sum().clip(lower=0.0)
+        committed_by_bus = committed_by_bus.loc[committed_by_bus > 1e-9]
+        if committed_by_bus.sum() > 0.0:
+            return committed_by_bus / committed_by_bus.sum()
+
+    return _country_ac_bus_load_shares(n, country, bus_country)
+
+
+
+def _generator_snapshot_weights(n):
+    if hasattr(n, "snapshot_weightings"):
+        for column in ("generators", "objective"):
+            if column in n.snapshot_weightings:
+                weights = pd.to_numeric(
+                    n.snapshot_weightings[column], errors="coerce"
+                ).fillna(0.0)
+                return weights.reindex(n.snapshots).fillna(0.0)
+    return pd.Series(1.0, index=n.snapshots, dtype=float)
+
+
+def _generator_profile_full_load_hours(
+    n,
+    gen_name=None,
+    bus=None,
+    carrier=None,
+    current_year=None,
+):
+    if not hasattr(n, "generators_t") or "p_max_pu" not in n.generators_t:
+        return np.nan
+
+    if gen_name is not None and gen_name in n.generators_t.p_max_pu.columns:
+        profile = pd.to_numeric(
+            n.generators_t.p_max_pu[gen_name], errors="coerce"
+        ).fillna(0.0)
+    elif bus is not None and carrier is not None and current_year is not None:
+        probe_name = f"{bus} {carrier}-{current_year}-energy-calibration"
+        profile = _fixed_generator_profile(
+            n,
+            gen_name=probe_name,
+            bus=str(bus),
+            carrier=str(carrier),
+            current_year=int(current_year),
+        )
+        if profile is None:
+            return np.nan
+    else:
+        return np.nan
+
+    profile = pd.to_numeric(profile, errors="coerce").fillna(0.0).clip(
+        lower=0.0,
+        upper=1.0,
+    )
+    if profile.empty or profile.abs().sum() <= 1e-12:
+        return np.nan
+    if np.isclose(float(profile.min()), 1.0) and np.isclose(float(profile.max()), 1.0):
+        return np.nan
+
+    weights = _generator_snapshot_weights(n)
+    return float(profile.reindex(n.snapshots).fillna(0.0).mul(weights, axis=0).sum())
+
+
+def _expected_generation_mwh_from_committed_generators(n, generators):
+    if generators is None or generators.empty:
+        return 0.0
+
+    total = 0.0
+    for gen_name, row in generators.iterrows():
+        p_nom = pd.to_numeric(
+            pd.Series([row.get("p_nom", 0.0), row.get("p_nom_min", 0.0)]),
+            errors="coerce",
+        ).fillna(0.0).max()
+        if p_nom <= 0.0:
+            continue
+        flh = _generator_profile_full_load_hours(n, gen_name=gen_name)
+        if not np.isfinite(flh):
+            continue
+        total += float(p_nom) * float(flh)
+    return float(total)
+
+
+def _bounded_share_average_range(lower, upper, values):
+    values = pd.Series(values, dtype=float).dropna()
+    if values.empty:
+        return np.nan, np.nan
+
+    lower = pd.Series(lower, index=values.index, dtype=float).clip(lower=0.0)
+    upper = pd.Series(upper, index=values.index, dtype=float).clip(lower=0.0)
+    upper = upper.where(upper >= lower, lower)
+
+    def extreme_average(descending):
+        shares = lower.copy()
+        remaining = max(1.0 - float(shares.sum()), 0.0)
+        order = values.sort_values(ascending=not descending).index
+        for idx in order:
+            room = float(upper.loc[idx] - shares.loc[idx])
+            add = min(room, remaining)
+            if add > 0.0:
+                shares.loc[idx] += add
+                remaining -= add
+            if remaining <= 1e-12:
+                break
+        if shares.sum() <= 0.0:
+            return np.nan
+        shares = shares / shares.sum()
+        return float((shares * values).sum())
+
+    return extreme_average(False), extreme_average(True)
+
+
+def _shift_bounded_shares_to_target_average(
+    shares,
+    values,
+    target_average,
+    min_multiplier=0.25,
+    max_multiplier=3.0,
+):
+    """Use a tiny LP to choose bounded shares closest to a target weighted average.
+
+    Primary objective: minimize absolute error in ``sum(shares * values)``.
+    Secondary objective: among equally good energy matches, stay close to the
+    input shares so calibration does not concentrate capacity unnecessarily.
+    """
+    shares = pd.Series(shares, dtype=float).clip(lower=0.0)
+    values = pd.Series(values, dtype=float).reindex(shares.index)
+    valid = values.replace([np.inf, -np.inf], np.nan).notna() & shares.gt(0.0)
+    shares = shares.loc[valid]
+    values = values.loc[valid]
+    if shares.empty or shares.sum() <= 0.0 or not np.isfinite(target_average):
+        return shares
+
+    shares = shares / shares.sum()
+    lower = shares * max(float(min_multiplier), 0.0)
+    upper = shares * max(float(max_multiplier), float(min_multiplier))
+    if lower.sum() > 1.0:
+        lower = lower / lower.sum()
+    if upper.sum() < 1.0:
+        upper = upper + (1.0 - upper.sum()) * shares
+
+    target = float(target_average)
+    min_average, max_average = _bounded_share_average_range(lower, upper, values)
+    if np.isfinite(min_average):
+        target = max(target, min_average)
+    if np.isfinite(max_average):
+        target = min(target, max_average)
+
+    try:
+        from scipy.optimize import linprog
+    except Exception as exc:
+        logger.warning(
+            "Falling back to uncalibrated shares because scipy.optimize.linprog is unavailable: %s",
+            exc,
+        )
+        return shares
+
+    n = len(shares)
+    # Variables: x[0:n] calibrated shares, t absolute average error,
+    # d_plus/d_minus absolute deviation from the input shares.
+    t_idx = n
+    d_plus_start = n + 1
+    d_minus_start = n + 1 + n
+    n_vars = n + 1 + 2 * n
+
+    c = np.zeros(n_vars, dtype=float)
+    c[t_idx] = 1.0
+    # Small tie-breaker: prefer shares close to the load/committed baseline.
+    c[d_plus_start:d_plus_start + n] = 1e-6
+    c[d_minus_start:d_minus_start + n] = 1e-6
+
+    value_arr = values.to_numpy(dtype=float)
+    share_arr = shares.to_numpy(dtype=float)
+
+    a_eq = []
+    b_eq = []
+    row = np.zeros(n_vars, dtype=float)
+    row[:n] = 1.0
+    a_eq.append(row)
+    b_eq.append(1.0)
+
+    for i in range(n):
+        row = np.zeros(n_vars, dtype=float)
+        row[i] = 1.0
+        row[d_plus_start + i] = -1.0
+        row[d_minus_start + i] = 1.0
+        a_eq.append(row)
+        b_eq.append(share_arr[i])
+
+    a_ub = []
+    b_ub = []
+    row = np.zeros(n_vars, dtype=float)
+    row[:n] = value_arr
+    row[t_idx] = -1.0
+    a_ub.append(row)
+    b_ub.append(target)
+
+    row = np.zeros(n_vars, dtype=float)
+    row[:n] = -value_arr
+    row[t_idx] = -1.0
+    a_ub.append(row)
+    b_ub.append(-target)
+
+    bounds = [(float(lower.iloc[i]), float(upper.iloc[i])) for i in range(n)]
+    bounds.append((0.0, None))
+    bounds.extend([(0.0, None)] * (2 * n))
+
+    result = linprog(
+        c,
+        A_ub=np.vstack(a_ub),
+        b_ub=np.asarray(b_ub, dtype=float),
+        A_eq=np.vstack(a_eq),
+        b_eq=np.asarray(b_eq, dtype=float),
+        bounds=bounds,
+        method="highs",
+    )
+    if not result.success:
+        logger.warning(
+            "Tiny LP share calibration failed (%s); using input shares.",
+            result.message,
+        )
+        return shares
+
+    calibrated = pd.Series(result.x[:n], index=shares.index, dtype=float).clip(lower=0.0)
+    if calibrated.sum() > 0.0:
+        calibrated = calibrated / calibrated.sum()
+    return calibrated
+
+
+def _energy_calibrated_historical_capacity_shares(
+    n,
+    country,
+    constraint_carrier,
+    carrier,
+    shares,
+    gap_mw,
+    gen,
+    current_year,
+    energy_reference_twh,
+    min_reference_twh=1.0,
+    min_share_multiplier=0.25,
+    max_share_multiplier=3.0,
+    bound_shares=None,
+):
+    metric = MODEL_CARRIER_TO_OWID_METRIC.get(str(carrier).lower())
+    if metric is None:
+        metric = MODEL_CARRIER_TO_OWID_METRIC.get(str(constraint_carrier).lower())
+    if metric is None or energy_reference_twh is None:
+        return shares, None
+
+    reference_twh = energy_reference_twh.get((str(country).upper(), metric))
+    if reference_twh is None or not np.isfinite(reference_twh):
+        return shares, None
+    if float(reference_twh) < float(min_reference_twh):
+        return shares, None
+
+    metric_carriers = {
+        carrier_name
+        for carrier_name, mapped_metric in MODEL_CARRIER_TO_OWID_METRIC.items()
+        if mapped_metric == metric
+    }
+    country_gen = gen.loc[
+        gen["country"].eq(str(country).upper())
+        & gen["carrier"].astype(str).str.lower().isin(metric_carriers)
+    ].copy()
+    committed_metric_mwh = _expected_generation_mwh_from_committed_generators(
+        n,
+        country_gen,
+    )
+    target_added_mwh = max(float(reference_twh) * 1e6 - committed_metric_mwh, 0.0)
+    if gap_mw <= 1e-9 or target_added_mwh <= 0.0:
+        return shares, None
+
+    flh = pd.Series(
+        {
+            bus: _generator_profile_full_load_hours(
+                n,
+                bus=str(bus),
+                carrier=str(carrier),
+                current_year=int(current_year),
+            )
+            for bus in shares.index
+        },
+        dtype=float,
+    ).replace([np.inf, -np.inf], np.nan)
+    flh = flh.dropna()
+    if flh.empty:
+        logger.warning(
+            "Skipping 2025 energy calibration for %s %s: no valid node-specific %s profiles.",
+            country,
+            constraint_carrier,
+            carrier,
+        )
+        return shares, None
+
+    shares = shares.reindex(flh.index).fillna(0.0)
+    shares = shares.loc[shares > 0.0]
+    flh = flh.reindex(shares.index)
+    if shares.empty or shares.sum() <= 0.0:
+        return shares, None
+    shares = shares / shares.sum()
+
+    if bound_shares is None:
+        calibration_base = shares.copy()
+    else:
+        calibration_base = pd.Series(bound_shares, dtype=float).reindex(shares.index).fillna(0.0).clip(lower=0.0)
+        if calibration_base.sum() <= 0.0:
+            logger.warning(
+                "Using committed-share bounds for 2025 energy calibration for %s %s: no positive load-share baseline available.",
+                country,
+                constraint_carrier,
+            )
+            calibration_base = shares.copy()
+        else:
+            calibration_base = calibration_base / calibration_base.sum()
+
+    target_flh = target_added_mwh / float(gap_mw)
+    initial_flh = float((shares * flh).sum())
+    calibrated = _shift_bounded_shares_to_target_average(
+        shares=calibration_base,
+        values=flh,
+        target_average=target_flh,
+        min_multiplier=min_share_multiplier,
+        max_multiplier=max_share_multiplier,
+    )
+    calibrated = calibrated.reindex(shares.index).fillna(0.0)
+    if calibrated.sum() > 0.0:
+        calibrated = calibrated / calibrated.sum()
+    final_flh = float((calibrated * flh).sum())
+
+    info = {
+        "metric": metric,
+        "reference_twh": float(reference_twh),
+        "committed_metric_twh": committed_metric_mwh / 1e6,
+        "target_added_twh": target_added_mwh / 1e6,
+        "initial_added_twh": float(gap_mw) * initial_flh / 1e6,
+        "final_added_twh": float(gap_mw) * final_flh / 1e6,
+        "target_flh": float(target_flh),
+        "initial_flh": float(initial_flh),
+        "final_flh": float(final_flh),
+        "min_flh": float(flh.min()),
+        "max_flh": float(flh.max()),
+    }
+    return calibrated, info
+
+
+def add_year2025_irena_historical_capacity_distribution(n, planning_year, config):
+    """
+    Materialize 2025 historical renewable capacity additions before optimization.
+
+    The country-level IRENA capacity band should verify total installed capacity,
+    not decide nodal siting. For configured carriers, add the gap between the
+    committed capacity and the IRENA 2025 reference as fixed 2025 generators.
+    The energy-calibrated nodal shares are bounded relative to in-country
+    AC-load shares, with committed 2020 shares only used as the initial stock
+    signal where available.
+    """
+    global_cfg = config.get("global_specific", {})
+    cfg = global_cfg.get("year2025_capacity", {})
+    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+        return
+    if not bool(cfg.get("materialize_historical_capacity_by_2020_shares", False)):
+        return
+
+    try:
+        current_year = int(float(planning_year))
+    except Exception:
+        logger.warning(
+            "Could not parse planning year '%s' for 2025 historical capacity materialization",
+            planning_year,
+        )
+        return
+
+    target_year = int(cfg.get("year", 2025))
+    if current_year != target_year:
+        return
+
+    materialize_constraints = set(
+        str(c)
+        for c in cfg.get(
+            "historical_capacity_distribution_constraints",
+            ["solar", "onwind"],
+        )
+    )
+    if not materialize_constraints:
+        return
+
+    irena_csv = _repo_path(
+        cfg.get("irena_csv", "validation/data/irena_capacity_by_technology.csv")
+    )
+    if not os.path.exists(irena_csv):
+        logger.warning(
+            "2025 historical capacity materialization skipped: file not found at %s",
+            irena_csv,
+        )
+        return
+
+    min_reference_mw = float(cfg.get("min_reference_mw", 0.0))
+    reference_year = int(cfg.get("reference_year", target_year))
+    fallback_to_latest = bool(cfg.get("fallback_to_latest_available", True))
+    freeze_endogenous = bool(
+        cfg.get("freeze_endogenous_2025_capacity_after_materialization", True)
+    )
+    constraint_technology_map = cfg.get(
+        "irena_technology_by_constraint",
+        cfg.get("irena_technology_by_carrier", {}),
+    )
+    model_carriers_by_constraint = cfg.get(
+        "model_carriers_by_constraint",
+        {key: [key] for key in (constraint_technology_map or {}).keys()},
+    )
+
+    energy_calibration_enabled = bool(
+        cfg.get("energy_calibrated_historical_capacity_distribution", False)
+    )
+    energy_calibration_constraints = set(
+        str(c)
+        for c in cfg.get(
+            "energy_calibration_carriers",
+            list(materialize_constraints),
+        )
+    )
+    energy_reference_twh = None
+    if energy_calibration_enabled:
+        year2025_gen_cfg = global_cfg.get("year2025_generation", {}) or {}
+        owid_csv = _repo_path(
+            cfg.get(
+                "energy_calibration_owid_csv",
+                year2025_gen_cfg.get(
+                    "owid_csv",
+                    "validation/data/owid-elecbalance2025.csv",
+                ),
+            )
+        )
+        try:
+            energy_ref = _owid_country_metric_reference(
+                owid_csv=owid_csv,
+                year=int(cfg.get("energy_calibration_reference_year", target_year)),
+                metrics=["solar_electricity", "wind_electricity"],
+            )
+            energy_reference_twh = {
+                (str(row.country).upper(), str(row.metric)): float(row.reference_twh)
+                for row in energy_ref.itertuples(index=False)
+                if pd.notna(row.reference_twh)
+            }
+            logger.info(
+                "Loaded %d OWID 2025 energy references for historical capacity share calibration from %s.",
+                len(energy_reference_twh),
+                owid_csv,
+            )
+        except Exception as exc:
+            energy_reference_twh = None
+            logger.warning(
+                "2025 historical capacity energy calibration disabled: could not load OWID references from %s: %s",
+                owid_csv,
+                exc,
+            )
+
+    try:
+        ref, used_reference_year = _irena_country_capacity_reference(
+            irena_csv=irena_csv,
+            year=reference_year,
+            carrier_technology_map=constraint_technology_map,
+            fallback_to_latest=fallback_to_latest,
+        )
+    except Exception as exc:
+        logger.warning("2025 historical capacity materialization skipped: %s", exc)
+        return
+
+    ref = ref.loc[ref["carrier"].astype(str).isin(materialize_constraints)].copy()
+    if ref.empty or n.generators.empty:
+        return
+
+    bus_country = _get_bus_country_for_clustering(n).astype(str).str.strip().str.upper()
+    gen = n.generators.copy()
+    gen["country"] = (
+        gen["bus"].map(bus_country).fillna("").astype(str).str.strip().str.upper()
+    )
+    gen["carrier"] = gen["carrier"].astype(str)
+    gen["p_nom"] = pd.to_numeric(gen.get("p_nom", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_min"] = pd.to_numeric(gen.get("p_nom_min", 0.0), errors="coerce").fillna(0.0)
+    gen["p_nom_extendable"] = gen.get("p_nom_extendable", False).fillna(False).astype(bool)
+    if "build_year" in gen.columns:
+        gen["build_year"] = pd.to_numeric(gen["build_year"], errors="coerce")
+    else:
+        gen["build_year"] = np.nan
+
+    model_carrier_to_constraint = {}
+    for constraint_name, carriers in (model_carriers_by_constraint or {}).items():
+        if isinstance(carriers, str):
+            carriers = [carriers]
+        for carrier in carriers or []:
+            model_carrier_to_constraint[str(carrier)] = str(constraint_name)
+    gen["constraint_carrier"] = gen["carrier"].map(model_carrier_to_constraint)
+    gen = gen.loc[
+        gen["country"].str.match(r"^[A-Z]{2}$", na=False)
+        & gen["constraint_carrier"].notna()
+    ].copy()
+
+    added = 0
+    added_capacity_mw = 0.0
+    frozen = 0
+    skipped_no_bus_share = 0
+    skipped_no_model_carrier = 0
+    skipped_no_gap = 0
+
+    for row in ref.itertuples(index=False):
+        country = str(row.country).upper()
+        constraint_carrier = str(row.carrier)
+        target_mw = float(row.reference_mw)
+        if target_mw < min_reference_mw:
+            continue
+
+        carriers = model_carriers_by_constraint.get(constraint_carrier, [])
+        if isinstance(carriers, str):
+            carriers = [carriers]
+        carriers = [str(c) for c in carriers]
+        if not carriers:
+            skipped_no_model_carrier += 1
+            continue
+
+        group = gen.loc[
+            gen["country"].eq(country)
+            & gen["constraint_carrier"].eq(constraint_carrier)
+        ].copy()
+        committed = 0.0
+        if not group.empty:
+            committed = float(
+                pd.concat([group["p_nom"], group["p_nom_min"]], axis=1).max(axis=1).sum()
+            )
+
+        gap_mw = max(target_mw - committed, 0.0)
+        if gap_mw <= 1e-6:
+            skipped_no_gap += 1
+        else:
+            shares = _capacity_share_from_committed_or_load(
+                n=n,
+                group=group,
+                country=country,
+                bus_country=bus_country,
+            )
+            shares = shares.loc[shares > 1e-12]
+            if shares.empty:
+                skipped_no_bus_share += 1
+                logger.warning(
+                    "Skipping 2025 historical %s materialization for %s: no committed-capacity or AC-load bus share available.",
+                    constraint_carrier,
+                    country,
+                )
+            else:
+                carrier = carriers[0]
+                if (
+                    energy_calibration_enabled
+                    and energy_reference_twh is not None
+                    and constraint_carrier in energy_calibration_constraints
+                ):
+                    load_bound_shares = _country_ac_bus_load_shares(
+                        n=n,
+                        country=country,
+                        bus_country=bus_country,
+                        candidate_buses=shares.index,
+                    )
+                    shares, calibration_info = _energy_calibrated_historical_capacity_shares(
+                        n=n,
+                        country=country,
+                        constraint_carrier=constraint_carrier,
+                        carrier=carrier,
+                        shares=shares,
+                        gap_mw=gap_mw,
+                        gen=gen,
+                        current_year=current_year,
+                        energy_reference_twh=energy_reference_twh,
+                        min_reference_twh=float(
+                            cfg.get("energy_calibration_min_reference_twh", 1.0)
+                        ),
+                        min_share_multiplier=float(
+                            cfg.get("energy_calibration_min_share_multiplier", 0.25)
+                        ),
+                        max_share_multiplier=float(
+                            cfg.get("energy_calibration_max_share_multiplier", 3.0)
+                        ),
+                        bound_shares=load_bound_shares,
+                    )
+                    shares = shares.loc[shares > 1e-12]
+                    if calibration_info is not None:
+                        logger.info(
+                            "Energy-calibrated 2025 historical %s capacity for %s: OWID %.2f TWh, committed_%s %.2f TWh, target_added %.2f TWh, added %.2f -> %.2f TWh, FLH %.1f -> %.1f h (target %.1f h, node range %.1f-%.1f h).",
+                            constraint_carrier,
+                            country,
+                            calibration_info["reference_twh"],
+                            calibration_info["metric"],
+                            calibration_info["committed_metric_twh"],
+                            calibration_info["target_added_twh"],
+                            calibration_info["initial_added_twh"],
+                            calibration_info["final_added_twh"],
+                            calibration_info["initial_flh"],
+                            calibration_info["final_flh"],
+                            calibration_info["target_flh"],
+                            calibration_info["min_flh"],
+                            calibration_info["max_flh"],
+                        )
+                    if shares.empty:
+                        skipped_no_bus_share += 1
+                        logger.warning(
+                            "Skipping 2025 historical %s materialization for %s after energy calibration: no valid bus shares remain.",
+                            constraint_carrier,
+                            country,
+                        )
+                        continue
+
+                if carrier not in n.carriers.index:
+                    n.add("Carrier", carrier)
+                template = _generator_template_from_network(n, carrier)
+
+                for bus, share in shares.items():
+                    cap_mw = float(gap_mw * share)
+                    if cap_mw <= 1e-6:
+                        continue
+                    base_name = f"{bus} {carrier}-{current_year}-irena-historical"
+                    gen_name = base_name
+                    suffix = 2
+                    while gen_name in n.generators.index:
+                        gen_name = f"{base_name}-{suffix}"
+                        suffix += 1
+
+                    n.add(
+                        "Generator",
+                        gen_name,
+                        bus=str(bus),
+                        carrier=carrier,
+                        p_nom=cap_mw,
+                        p_nom_min=cap_mw,
+                        p_nom_max=cap_mw,
+                        p_nom_extendable=False,
+                        marginal_cost=template["marginal_cost"],
+                        capital_cost=template["capital_cost"],
+                        efficiency=template["efficiency"],
+                        build_year=current_year,
+                        lifetime=template["lifetime"],
+                    )
+                    profile = _fixed_generator_profile(
+                        n,
+                        gen_name=gen_name,
+                        bus=str(bus),
+                        carrier=carrier,
+                        current_year=current_year,
+                    )
+                    if profile is not None:
+                        n.generators_t.p_max_pu[gen_name] = profile.values
+                    added += 1
+                    added_capacity_mw += cap_mw
+
+                logger.info(
+                    "Materialized 2025 historical %s capacity for %s: added %.2f MW across %d buses (target=%.2f MW, committed_before=%.2f MW, reference_year=%s).",
+                    constraint_carrier,
+                    country,
+                    gap_mw,
+                    len(shares),
+                    target_mw,
+                    committed,
+                    used_reference_year,
+                )
+
+        if freeze_endogenous:
+            current = n.generators.copy()
+            current_country = current["bus"].map(bus_country).fillna("").astype(str).str.strip().str.upper()
+            current_build_year = pd.to_numeric(current.get("build_year", np.nan), errors="coerce")
+            current_extendable = current.get("p_nom_extendable", False).fillna(False).astype(bool)
+            freeze_idx = current.index[
+                current_country.eq(country)
+                & current["carrier"].astype(str).isin(carriers)
+                & current_extendable
+                & current_build_year.eq(current_year)
+            ]
+            if len(freeze_idx) > 0:
+                mins = pd.to_numeric(
+                    n.generators.loc[freeze_idx, "p_nom_min"], errors="coerce"
+                ).fillna(0.0)
+                n.generators.loc[freeze_idx, "p_nom"] = mins.values
+                n.generators.loc[freeze_idx, "p_nom_max"] = mins.values
+                n.generators.loc[freeze_idx, "p_nom_extendable"] = False
+                frozen += len(freeze_idx)
+
+    logger.info(
+        "2025 historical capacity materialization summary: added_generators=%d, added_capacity=%.2f MW, frozen_endogenous_candidates=%d, skipped_no_gap=%d, skipped_no_bus_share=%d, skipped_no_model_carrier=%d",
+        added,
+        added_capacity_mw,
+        frozen,
+        skipped_no_gap,
+        skipped_no_bus_share,
+        skipped_no_model_carrier,
+    )
+
 def _carrier_profile_name_parts(carrier):
     carrier = str(carrier)
     if carrier == "offwind-ac":
@@ -2992,24 +3733,13 @@ def _fixed_generator_profile(n, gen_name, bus, carrier, current_year):
         pool = n.generators_t.p_max_pu[pool_cols].fillna(0.0)
         nonzero = pool.columns[pool.sum(axis=0).abs() > 1e-12]
         if len(nonzero) > 0:
-            logger.warning(
-                "Using generic non-zero %s profile %s for fixed 2025 IRENA generator %s.",
-                carrier,
-                nonzero[0],
-                gen_name,
-            )
-            return pd.to_numeric(pool[nonzero[0]], errors="coerce").fillna(0.0).clip(
-                lower=0.0,
-                upper=1.0,
+            raise ValueError(
+                f"No node-specific {carrier} p_max_pu profile found for fixed 2025 IRENA generator {gen_name} on {bus}; refusing generic profile {nonzero[0]}."
             )
 
-    logger.warning(
-        "No %s p_max_pu fallback profile found for fixed 2025 IRENA generator %s on %s; using p_max_pu=1.0.",
-        carrier,
-        gen_name,
-        bus,
+    raise ValueError(
+        f"No node-specific {carrier} p_max_pu profile found for fixed 2025 IRENA generator {gen_name} on {bus}; refusing p_max_pu=1.0 fallback."
     )
-    return pd.Series(1.0, index=n.snapshots, name=gen_name)
 
 
 def add_year2025_irena_missing_fixed_generators(n, planning_year, config):

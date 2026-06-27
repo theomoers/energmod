@@ -124,7 +124,7 @@ learning:
     seed_upper_bound: 1000000000
   compact_outputs:
     enable: true
-    format: xarray_netcdf   # csv | xarray_netcdf
+    format: csv             # csv | xarray_netcdf
     cleanup_heavy_raws: true
     price_shadow_resolution: annual_summary
   fossil_price_uncertainty:

@@ -2618,28 +2618,20 @@ def _year_value(mapping, year):
     return None
 
 
-def add_myopic_co2_cap_trajectory(n, config, planning_year):
-    """Add a year-specific annual CO2 cap for myopic sensitivity runs.
-
-    The legacy ``Co2L`` wildcard is attached to the prepared network before
-    the myopic planning horizon is known, so it cannot express a trajectory.
-    This config hook keeps 2025 historical solves unchanged and applies a
-    per-horizon CO2Limit only where explicitly requested.
-    """
-
+def _myopic_co2_cap_config_and_annual_emissions(config, planning_year):
     cap_cfg = (
         (config.get("electricity", {}) or {})
         .get("myopic_co2_cap_trajectory", {})
         or {}
     )
     if not cap_cfg.get("enable", False):
-        return
+        return cap_cfg, None
 
     year = int(planning_year)
     skip_years = {int(value) for value in cap_cfg.get("skip_years", []) or []}
     start_year = cap_cfg.get("start_year")
     if year in skip_years or (start_year is not None and year < int(start_year)):
-        return
+        return cap_cfg, None
 
     annual_emissions = _year_value(cap_cfg.get("annual_emissions_by_year"), year)
     if annual_emissions is None:
@@ -2650,7 +2642,7 @@ def add_myopic_co2_cap_trajectory(n, config, planning_year):
                     "Missing CO2 cap trajectory value for planning horizon "
                     f"{year}. Add annual_emissions_by_year or fractions_by_year."
                 )
-            return
+            return cap_cfg, None
         base_annual_emissions = float(
             cap_cfg.get(
                 "base_annual_emissions",
@@ -2658,6 +2650,19 @@ def add_myopic_co2_cap_trajectory(n, config, planning_year):
             )
         )
         annual_emissions = base_annual_emissions * float(fraction)
+
+    return cap_cfg, float(annual_emissions)
+
+
+def add_myopic_co2_cap_trajectory(n, config, planning_year):
+    """Add a year-specific PyPSA primary-energy CO2 cap for myopic runs."""
+
+    cap_cfg, annual_emissions = _myopic_co2_cap_config_and_annual_emissions(
+        config,
+        planning_year,
+    )
+    if annual_emissions is None or not cap_cfg.get("pypsa_primary_energy_constraint", True):
+        return
 
     constraint_name = str(cap_cfg.get("constraint_name", "CO2Limit"))
     if constraint_name in n.global_constraints.index:
@@ -2672,12 +2677,78 @@ def add_myopic_co2_cap_trajectory(n, config, planning_year):
         constant=float(annual_emissions) * n_years,
     )
     logger.info(
-        "Added %s for planning horizon %s: annual_emissions=%s, Nyears=%s, constant=%s",
+        "Added PyPSA primary-energy %s for planning horizon %s: annual_emissions=%s, Nyears=%s, constant=%s",
         constraint_name,
-        year,
+        int(planning_year),
         float(annual_emissions),
         float(n_years),
         float(annual_emissions) * float(n_years),
+    )
+
+
+def add_myopic_power_link_co2_cap(n, config, planning_year):
+    """Cap explicit power-sector CO2-atmosphere link flows.
+
+    Sector-coupled emissions in this model are represented as link outputs to
+    the ``co2 atmosphere`` bus. PyPSA's built-in primary-energy
+    GlobalConstraint does not cover those flows, so the policy-boundary
+    sensitivity needs this explicit constraint to match the compact-exported
+    power-emissions table.
+    """
+
+    cap_cfg, annual_emissions = _myopic_co2_cap_config_and_annual_emissions(
+        config,
+        planning_year,
+    )
+    if annual_emissions is None or not cap_cfg.get("explicit_power_emissions_constraint", False):
+        return
+    if "Link-p" not in n.model.variables or n.links.empty:
+        return
+
+    link_names = []
+    emission_factors = []
+    for idx, row in n.links.iterrows():
+        has_ac_output = False
+        co2_factor = None
+        for port in (1, 2, 3, 4):
+            bus_col = f"bus{port}"
+            eff_col = "efficiency" if port == 1 else f"efficiency{port}"
+            if bus_col not in row.index or eff_col not in row.index:
+                continue
+            bus_name = row[bus_col]
+            if (
+                isinstance(bus_name, str)
+                and bus_name in n.buses.index
+                and n.buses.at[bus_name, "carrier"] == "AC"
+            ):
+                has_ac_output = True
+            if bus_name == "co2 atmosphere" and pd.notna(row[eff_col]):
+                co2_factor = abs(float(row[eff_col]))
+        if has_ac_output and co2_factor is not None and co2_factor > 0.0:
+            link_names.append(idx)
+            emission_factors.append(co2_factor)
+
+    if not link_names:
+        logger.warning(
+            "No power-sector links with co2 atmosphere outputs found for explicit CO2 cap in %s",
+            planning_year,
+        )
+        return
+
+    weights = xr.DataArray(n.snapshot_weightings["objective"], dims=["snapshot"])
+    factors = xr.DataArray(emission_factors, coords=[link_names], dims=["Link"])
+    lhs = (n.model["Link-p"].loc[:, link_names] * weights * factors).sum()
+    n_years = n.snapshot_weightings.objective.sum() / 8760.0
+    rhs = float(annual_emissions) * float(n_years)
+    name = str(cap_cfg.get("constraint_name", "CO2Limit"))
+    n.model.add_constraints(lhs <= rhs, name=f"GlobalConstraint-{name}_power_link_emissions")
+    logger.info(
+        "Added explicit power-link CO2 cap for planning horizon %s: links=%s, annual_emissions=%s, Nyears=%s, constant=%s",
+        int(planning_year),
+        len(link_names),
+        float(annual_emissions),
+        float(n_years),
+        rhs,
     )
 
 
@@ -4427,6 +4498,7 @@ def extra_functionality(n, snapshots):
     add_co2_sequestration_limit(n, snapshots)
     if planning_year is not None:
         add_learning_deployment_constraints(n, planning_year=planning_year, config=config)
+        add_myopic_power_link_co2_cap(n, config=config, planning_year=planning_year)
     
     # Add build rate constraints (if build_rate_limits attached to network)
     #add_build_rate_constraints(n, snapshots)
@@ -4464,14 +4536,6 @@ def solve_network(n, config, solving, **kwargs):
     n = apply_optional_sector_clustering(n, config)
 
     planning_year = _infer_planning_year(n)
-    if planning_year is not None and hasattr(
-        _validation_hooks, "add_year2025_irena_missing_fixed_generators"
-    ):
-        _validation_hooks.add_year2025_irena_missing_fixed_generators(
-            n,
-            planning_year=planning_year,
-            config=config,
-        )
 
     if planning_year is not None and hasattr(
         _validation_hooks, "add_year2025_geothermal_extendable_fallback"

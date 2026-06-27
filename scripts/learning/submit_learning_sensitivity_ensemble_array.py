@@ -11,7 +11,9 @@ import random
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,11 @@ DEFAULT_GRID_MEM = "90G"
 DEFAULT_GRID_NCPUS = "12"
 DEFAULT_GRID_SUBMIT = "batch"
 DEFAULT_GRID_ARRAY_CONCURRENCY = 200
+DEFAULT_TASK_MAX_SECONDS = 28800
+DEFAULT_TASK_RESERVE_SECONDS = 900
+DEFAULT_RETRY_MIN_SECONDS = 3600
+DEFAULT_TIMEOUT_GRACE_SECONDS = 300
+DEFAULT_TIMEOUT_BIN = "/usr/bin/timeout"
 DEFAULT_BASE_CONFIGFILES = [
     "config.myopic.yaml",
     "config.learning.yaml",
@@ -377,6 +384,11 @@ def build_grid_run_cmd(args: argparse.Namespace, manifest_path: Path, tasks: lis
         str(manifest_path),
         f"SENSITIVITY_JOB_ROOT={Path(os.path.expandvars(args.job_root)).resolve()}",
         f"SENSITIVITY_CONDA_ENV={args.conda_env}",
+        f"SENSITIVITY_TASK_MAX_SECONDS={int(args.task_max_seconds)}",
+        f"SENSITIVITY_TASK_RESERVE_SECONDS={int(args.task_reserve_seconds)}",
+        f"SENSITIVITY_RETRY_MIN_SECONDS={int(args.retry_min_seconds)}",
+        f"SENSITIVITY_TIMEOUT_GRACE_SECONDS={int(args.timeout_grace_seconds)}",
+        f"SENSITIVITY_TIMEOUT_BIN={args.timeout_bin}",
     ] + (
         ["SENSITIVITY_DRY_RUN=1"] if args.dry_run else []
     ) + (
@@ -438,10 +450,18 @@ def write_submission_metadata(
         "grid_mem": args.grid_mem,
         "grid_ncpus": args.grid_ncpus,
         "grid_submit": args.grid_submit,
+        "task_runtime_budget": {
+            "max_seconds": int(args.task_max_seconds),
+            "reserve_seconds": int(args.task_reserve_seconds),
+            "retry_min_seconds": int(args.retry_min_seconds),
+            "timeout_grace_seconds": int(args.timeout_grace_seconds),
+            "timeout_bin": args.timeout_bin,
+        },
         "resume": bool(args.resume),
         "overwrite": bool(args.overwrite),
         "dry_run": bool(args.dry_run),
         "assume_bootstrap_state_present": bool(args.assume_bootstrap_state_present),
+        "defer_bootstrap_state_restore": bool(args.defer_bootstrap_state_restore),
     }
     path = submit_dir / "submission_metadata.json"
     path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
@@ -517,6 +537,28 @@ def restore_bootstrap_state_for_runs(tasks: list[dict], bootstrap_sources: dict[
             print("BOOTSTRAP_STATE_RESTORED", group, sector_name, json.dumps(restore_summary, sort_keys=True))
 
 
+def attach_bootstrap_sources_to_tasks(tasks: list[dict], bootstrap_sources: dict[str, Path]) -> None:
+    for task in tasks_needing_bootstrap_restore(tasks):
+        group = str(task.get("bootstrap_group", "AB"))
+        source = bootstrap_sources.get(group)
+        if source is not None:
+            task["bootstrap_state_source"] = str(source.resolve())
+
+
+def restore_bootstrap_state_for_task(task: dict, overwrite: bool = False) -> None:
+    source = task.get("bootstrap_state_source")
+    if not source or str(task.get("run_mode", "branch")) != "branch":
+        return
+    group = str(task.get("bootstrap_group", "AB"))
+    sector_name = str(task["sector_name"])
+    target_dir = resolve_results_sector_dir(ROOT_DIR, sector_name)
+    if overwrite:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.rmtree(resolve_resources_sector_dir(ROOT_DIR, sector_name), ignore_errors=True)
+    restore_summary = restore_bootstrap_state(Path(source), target_dir)
+    print("BOOTSTRAP_STATE_RESTORED", group, sector_name, json.dumps(restore_summary, sort_keys=True))
+
+
 def submit_array(args: argparse.Namespace) -> None:
     config_path = Path(args.config).resolve()
     config = load_ensemble_config(config_path)
@@ -526,6 +568,19 @@ def submit_array(args: argparse.Namespace) -> None:
         print("SENSITIVITY_STATUS no_tasks_to_submit")
         print("SELECTED_TASKS_BEFORE_RESUME", len(all_selected_tasks))
         return
+
+    bootstrap_sources = resolve_bootstrap_sources_for_tasks(tasks, args.bootstrap_state_source)
+    missing_groups = missing_bootstrap_groups(tasks, bootstrap_sources)
+    if missing_groups:
+        print("BOOTSTRAP_STATE_MISSING_GROUPS", ",".join(missing_groups))
+    if missing_groups and not args.print_only and not args.assume_bootstrap_state_present:
+        raise ValueError(
+            "Missing bootstrap sources for selected bootstrap groups: "
+            f"{missing_groups}. Pass --bootstrap-state-source GROUP=/path for each group, "
+            "or pass --assume-bootstrap-state-present if these sector prerequisites are already staged."
+        )
+    if args.defer_bootstrap_state_restore and bootstrap_sources:
+        attach_bootstrap_sources_to_tasks(tasks, bootstrap_sources)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     ensemble_name = sanitize_token(str((config.get("ensemble", {}) or {}).get("name", "sensitivity_ensemble")))
@@ -547,16 +602,6 @@ def submit_array(args: argparse.Namespace) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     grid_run_cmd = build_grid_run_cmd(args, manifest_path, tasks)
 
-    bootstrap_sources = resolve_bootstrap_sources_for_tasks(tasks, args.bootstrap_state_source)
-    missing_groups = missing_bootstrap_groups(tasks, bootstrap_sources)
-    if missing_groups:
-        print("BOOTSTRAP_STATE_MISSING_GROUPS", ",".join(missing_groups))
-    if missing_groups and not args.print_only and not args.assume_bootstrap_state_present:
-        raise ValueError(
-            "Missing bootstrap sources for selected bootstrap groups: "
-            f"{missing_groups}. Pass --bootstrap-state-source GROUP=/path for each group, "
-            "or pass --assume-bootstrap-state-present if these sector prerequisites are already staged."
-        )
     if bootstrap_sources:
         bootstrap_tasks = tasks_needing_bootstrap_restore(tasks)
         if args.print_only:
@@ -567,6 +612,17 @@ def submit_array(args: argparse.Namespace) -> None:
                 group_tasks = [task for task in bootstrap_tasks if str(task.get("bootstrap_group", "AB")) == group]
                 for sector_name in resolve_task_sector_names(group_tasks):
                     print("BOOTSTRAP_STATE_TARGET", group, resolve_results_sector_dir(ROOT_DIR, sector_name))
+            if args.defer_bootstrap_state_restore:
+                print("BOOTSTRAP_STATE_RESTORE_MODE", "worker")
+        elif args.defer_bootstrap_state_restore:
+            if missing_groups:
+                raise ValueError(
+                    "Missing bootstrap sources for selected bootstrap groups: "
+                    f"{missing_groups}. Pass --bootstrap-state-source GROUP=/path for each group."
+                )
+            if args.overwrite:
+                clear_archive_sectors(tasks)
+            print("BOOTSTRAP_STATE_RESTORE_MODE", "worker")
         else:
             if missing_groups:
                 raise ValueError(
@@ -616,6 +672,8 @@ def _stage_job_dir(task: dict, job_root: Path) -> Path:
         if target.is_symlink():
             continue
         if target.exists():
+            if child.name == "config.learning.yaml":
+                continue
             raise RuntimeError(f"Existing non-symlink path blocks staged job entry: {target}")
         target.symlink_to(child)
     return job_dir
@@ -632,6 +690,19 @@ def _write_overlay(task: dict, output_dir: Path) -> Path:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         yaml.safe_dump(task["config_overrides"], handle, sort_keys=False)
     return path
+
+
+def _materialize_learning_config(task: dict, job_dir: Path) -> Path:
+    payload = yaml.safe_load((ROOT_DIR / "config.learning.yaml").read_text(encoding="utf-8")) or {}
+    learning_overrides = (task.get("config_overrides") or {}).get("learning") or {}
+    deep_update(payload, {"learning": learning_overrides})
+
+    target = job_dir / "config.learning.yaml"
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    with target.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+    return target
 
 
 def _compact_bundle_dir(task: dict, job_dir: Path, sector_name: str | None = None) -> Path:
@@ -689,6 +760,40 @@ def _write_draw_complete(task: dict, job_dir: Path) -> None:
     )
 
 
+def _sensitivity_runtime_settings(env: dict[str, str]) -> dict[str, int | str]:
+    return {
+        "max_seconds": int(env.get("SENSITIVITY_TASK_MAX_SECONDS", DEFAULT_TASK_MAX_SECONDS)),
+        "reserve_seconds": int(env.get("SENSITIVITY_TASK_RESERVE_SECONDS", DEFAULT_TASK_RESERVE_SECONDS)),
+        "retry_min_seconds": int(env.get("SENSITIVITY_RETRY_MIN_SECONDS", DEFAULT_RETRY_MIN_SECONDS)),
+        "timeout_grace_seconds": int(env.get("SENSITIVITY_TIMEOUT_GRACE_SECONDS", DEFAULT_TIMEOUT_GRACE_SECONDS)),
+        "timeout_bin": env.get("SENSITIVITY_TIMEOUT_BIN", DEFAULT_TIMEOUT_BIN),
+    }
+
+
+def _with_timeout(cmd: list[str], runtime: dict[str, int | str], dry_run: bool) -> list[str]:
+    max_seconds = int(runtime["max_seconds"])
+    timeout_bin = str(runtime["timeout_bin"])
+    if dry_run or max_seconds <= 0 or not Path(timeout_bin).exists():
+        return cmd
+    return [
+        timeout_bin,
+        "--signal=TERM",
+        f"--kill-after={int(runtime['timeout_grace_seconds'])}s",
+        f"{max_seconds}s",
+        *cmd,
+    ]
+
+
+def build_snakemake_unlock_cmd(overlay_path: Path) -> list[str]:
+    return [
+        "snakemake",
+        "--unlock",
+        "--configfile",
+        *DEFAULT_BASE_CONFIGFILES,
+        str(overlay_path),
+    ]
+
+
 def build_snakemake_cmd(
     task: dict,
     overlay_path: Path,
@@ -731,16 +836,25 @@ def run_worker(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Task index {task_id} outside manifest range 1-{len(tasks)}")
 
     task = tasks[task_index]
+    restore_bootstrap_state_for_task(task, overwrite=bool(args.overwrite))
     job_root = Path(os.path.expandvars(args.job_root)).resolve()
     job_dir = _stage_job_dir(task, job_root)
+    learning_config_path = _materialize_learning_config(task, job_dir)
     overlay_path = _write_overlay(task, job_dir)
     if args.overwrite:
         shutil.rmtree(_compact_bundle_dir(task, job_dir), ignore_errors=True)
 
     snakemake_jobs = os.environ.get("JOBS") or os.environ.get("NSLOTS") or "4"
+    unlock_cmd = build_snakemake_unlock_cmd(overlay_path)
     cmd = build_snakemake_cmd(task, overlay_path, snakemake_jobs, dry_run=args.dry_run)
     env = os.environ.copy()
+    runtime = _sensitivity_runtime_settings(env)
     env["LEARNING_SCENARIO_NAME"] = str(task["scenario_name"])
+    env["LEARNING_TASK_START_EPOCH"] = env.get("LEARNING_TASK_START_EPOCH", str(int(time.time())))
+    env["LEARNING_TASK_MAX_SECONDS"] = str(runtime["max_seconds"])
+    env["LEARNING_TASK_RESERVE_SECONDS"] = str(runtime["reserve_seconds"])
+    env["LEARNING_RETRY_MIN_SECONDS"] = str(runtime["retry_min_seconds"])
+    env["LEARNING_TIMEOUT_GRACE_SECONDS"] = str(runtime["timeout_grace_seconds"])
     env["XDG_CACHE_HOME"] = env.get("XDG_CACHE_HOME", "/tmp/energymod_sensitivity_cache")
     env["MPLCONFIGDIR"] = env.get("MPLCONFIGDIR", "/tmp/energymod_sensitivity_matplotlib")
     if "Library/Caches" in env["XDG_CACHE_HOME"]:
@@ -759,10 +873,29 @@ def run_worker(args: argparse.Namespace) -> None:
     print(f"  sector_name={task['sector_name']}")
     print(f"  run_mode={task['run_mode']}")
     print(f"  job_dir={job_dir}")
+    print(f"  learning_config={learning_config_path}")
     print(f"  overlay={overlay_path}")
+    print(
+        "  runtime_budget="
+        f"max={runtime['max_seconds']}s reserve={runtime['reserve_seconds']}s "
+        f"retry_min={runtime['retry_min_seconds']}s grace={runtime['timeout_grace_seconds']}s"
+    )
 
+    if not args.dry_run:
+        subprocess.run(unlock_cmd, check=True, cwd=job_dir, env=env)
+
+    run_cmd = _with_timeout(cmd, runtime, args.dry_run)
     try:
-        subprocess.run(cmd, check=True, cwd=job_dir, env=env)
+        try:
+            subprocess.run(run_cmd, check=True, cwd=job_dir, env=env)
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode == 124:
+                print(
+                    "Task exceeded hard wallclock limit of "
+                    f"{runtime['max_seconds']}s and was terminated by timeout",
+                    file=sys.stderr,
+                )
+            raise
         if not args.dry_run:
             _copy_compact_bundle_to_archive(task, job_dir)
             _write_draw_complete(task, job_dir)
@@ -805,6 +938,11 @@ def main() -> None:
     parser.add_argument("--grid-mem", default=DEFAULT_GRID_MEM)
     parser.add_argument("--grid-ncpus", default=DEFAULT_GRID_NCPUS)
     parser.add_argument("--grid-submit", default=DEFAULT_GRID_SUBMIT)
+    parser.add_argument("--task-max-seconds", type=int, default=DEFAULT_TASK_MAX_SECONDS)
+    parser.add_argument("--task-reserve-seconds", type=int, default=DEFAULT_TASK_RESERVE_SECONDS)
+    parser.add_argument("--retry-min-seconds", type=int, default=DEFAULT_RETRY_MIN_SECONDS)
+    parser.add_argument("--timeout-grace-seconds", type=int, default=DEFAULT_TIMEOUT_GRACE_SECONDS)
+    parser.add_argument("--timeout-bin", default=DEFAULT_TIMEOUT_BIN)
     parser.add_argument(
         "--grid-array-concurrency",
         type=int,
@@ -827,6 +965,14 @@ def main() -> None:
         help=(
             "Submit without copying bootstrap state. Use only when every selected branch "
             "sector already has its demand/opts-specific shared prerequisites staged."
+        ),
+    )
+    parser.add_argument(
+        "--defer-bootstrap-state-restore",
+        action="store_true",
+        help=(
+            "Validate bootstrap sources during submission, but restore each per-draw bootstrap "
+            "state inside its array worker instead of serially before grid submission."
         ),
     )
     parser.add_argument("--print-only", action="store_true")

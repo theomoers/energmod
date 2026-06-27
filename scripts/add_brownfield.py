@@ -15,6 +15,7 @@ import xarray as xr
 from add_existing_baseyear import add_build_year_to_new_assets
 from solve_network import apply_optional_sector_clustering
 import solve_network as solve_network_module
+import validation as _validation_hooks
 
 # from pypsa.clustering.spatial import normed_or_uniform
 
@@ -431,6 +432,26 @@ def adjust_battery_capacity_2025(n, year):
     logger.info(f"Total battery capacity adjusted for {year}: {total_e_adjusted:.1f} MWh energy, {total_p_adjusted:.1f} MW power")
 
 
+def materialize_year2025_irena_fixed_renewables(n, year, config):
+    """Add 2025 historical renewable capacity in brownfield preprocessing only."""
+    if int(year) != 2025:
+        return
+
+    if hasattr(_validation_hooks, "add_year2025_irena_historical_capacity_distribution"):
+        _validation_hooks.add_year2025_irena_historical_capacity_distribution(
+            n,
+            planning_year=year,
+            config=config,
+        )
+
+    if hasattr(_validation_hooks, "add_year2025_irena_missing_fixed_generators"):
+        _validation_hooks.add_year2025_irena_missing_fixed_generators(
+            n,
+            planning_year=year,
+            config=config,
+        )
+
+
 # def adjust_renewable_profiles(n, input_profiles, params, year):
 #     """
 #     Adjusts renewable profiles according to the renewable technology specified,
@@ -574,6 +595,8 @@ if __name__ == "__main__":
     #if not nuclear_gens.empty:
     #    n.generators.loc[nuclear_gens, "p_nom_extendable"] = True
     #    logger.info(f"Set {len(nuclear_gens)} nuclear generators to p_nom_extendable=True")
+
+    materialize_year2025_irena_fixed_renewables(n, year, snakemake.config)
 
     for carrier in ['coal', 'gas', 'oil']:
         fuel_gens = n.generators.index[n.generators.carrier == carrier]

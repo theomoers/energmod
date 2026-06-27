@@ -6,14 +6,14 @@
 #     L2_WAY_RHO035:                              1000
 #     L1_CGRW:                                    1000
 #
-#   New sensitivities in this file:               6200
-#   Total suite after completion:                 9200
+#   New sensitivities in this file:               5100
+#   Total suite after completion:                 8100
 #
 # The baseline block below is the inheritance/reference configuration.
 # Do not resubmit BASE if the 1000-draw baseline has already completed.
 
 ensemble:
-  name: stochastic_learning_sensitivity_ensemble_ne_si_6200
+  name: stochastic_learning_sensitivity_ensemble_ne_si_5100
   scenario_prefix: sens
   base_seed: 20260504
   seed_mode: sequential
@@ -23,11 +23,11 @@ ensemble:
   submit_baseline: false
 
 draw_budgets:
-  light: 200
+  light: 300
   secondary: 300
-  joint_lag: 350
-  core: 400
-  architecture: 500
+  joint_lag: 300
+  core: 300
+  architecture: 300
   completed_headline: 1000
 
 baseline:
@@ -275,6 +275,8 @@ runs:
   - run_id: TW1_ORIGIN_2020
     group: learning_artifacts
     description: Use stochastic learning artifacts trained only to the 2020 origin cutoff
+    enabled: false
+    disabled_reason: Not used in the revised sensitivity suite; not informative for the paper.
     budget: secondary
     config_overrides:
       learning:
@@ -358,6 +360,11 @@ runs:
           enable: true
           constraint_name: CO2Limit
           carrier_attribute: co2_emissions
+          # Sector-coupled emissions are explicit flows into the co2 atmosphere
+          # bus. Cap the same power-link emissions exported in the compact
+          # bundle, rather than PyPSA's built-in primary-energy constraint.
+          pypsa_primary_energy_constraint: false
+          explicit_power_emissions_constraint: true
           start_year: 2030
           skip_years: [2020, 2025]
           # Model 2025 Power emissions from endogenous-complete-v1 compact

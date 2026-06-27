@@ -165,6 +165,157 @@ def add_build_year_to_new_assets(n, baseyear):
             c.pnl[attr] = c.pnl[attr].rename(columns=rename)
 
 
+
+def _baseyear_capacity_distribution_config():
+    global_cfg = snakemake.config.get("global_specific", {}) or {}
+    cfg = global_cfg.get("baseyear_capacity_distribution", {}) or {}
+    return cfg
+
+
+def _historical_capacity_distribution_enabled(carrier_key, baseyear):
+    cfg = _baseyear_capacity_distribution_config()
+    if not bool(cfg.get("enable", False)):
+        return False
+    target_year = int(cfg.get("year", baseyear))
+    if int(baseyear) != target_year:
+        return False
+    carriers = cfg.get("carriers", ["solar", "onwind"])
+    return str(carrier_key) in {str(c) for c in carriers}
+
+
+def _load_owid_energy_reference_for_baseyear(baseyear):
+    cfg = _baseyear_capacity_distribution_config()
+    owid_csv = cfg.get("owid_csv", "validation/data/owid-energy-data.csv")
+    metrics = ["solar_electricity", "wind_electricity"]
+    ref = _validation_hooks._owid_country_metric_reference(
+        owid_csv,
+        int(cfg.get("reference_year", baseyear)),
+        metrics,
+    )
+    return {
+        (str(row.country).upper(), str(row.metric)): float(row.reference_twh)
+        for row in ref.itertuples(index=False)
+        if pd.notna(row.reference_twh)
+    }
+
+
+def _renewable_owid_metric(carrier_key, carrier_label):
+    metric_map = getattr(_validation_hooks, "MODEL_CARRIER_TO_OWID_METRIC", {})
+    metric = metric_map.get(str(carrier_label).lower())
+    if metric is None:
+        metric = metric_map.get(str(carrier_key).lower())
+    return metric
+
+
+def _baseyear_profile_full_load_hours(n, bus, carrier_label, baseyear):
+    if not hasattr(_validation_hooks, "_fixed_generator_profile"):
+        raise RuntimeError("validation._fixed_generator_profile is required for OWID-calibrated baseyear capacity distribution")
+    probe_name = f"{bus} {carrier_label}-{baseyear}-baseyear-calibration"
+    profile = _validation_hooks._fixed_generator_profile(
+        n,
+        gen_name=probe_name,
+        bus=str(bus),
+        carrier=str(carrier_label),
+        current_year=int(baseyear),
+    )
+    profile = pd.to_numeric(profile, errors="coerce").fillna(0.0).clip(
+        lower=0.0,
+        upper=1.0,
+    )
+    if profile.empty or profile.abs().sum() <= 1e-12:
+        raise ValueError(
+            f"No valid node-specific {carrier_label} profile found for baseyear capacity calibration on {bus}."
+        )
+    weights = _validation_hooks._generator_snapshot_weights(n)
+    return float(profile.reindex(n.snapshots).fillna(0.0).mul(weights, axis=0).sum())
+
+
+def _calibrate_baseyear_country_shares(
+    n,
+    country,
+    carrier_key,
+    carrier_label,
+    base_shares,
+    terminal_capacity_mw,
+    baseyear,
+    energy_reference_twh,
+):
+    cfg = _baseyear_capacity_distribution_config()
+    metric = _renewable_owid_metric(carrier_key, carrier_label)
+    if metric is None:
+        return base_shares, None
+
+    reference_twh = energy_reference_twh.get((str(country).upper(), metric))
+    if reference_twh is None or not np.isfinite(reference_twh):
+        if bool(cfg.get("fallback_to_load_shares", True)):
+            logger.warning(
+                "Using load-share historical %s distribution for %s: no OWID %s reference for %s.",
+                carrier_key,
+                country,
+                metric,
+                baseyear,
+            )
+            return base_shares, None
+        raise ValueError(f"Missing OWID {metric} reference for {country} in {baseyear}")
+
+    if float(reference_twh) < float(cfg.get("min_reference_twh", 1.0)):
+        return base_shares, None
+    if terminal_capacity_mw <= 1e-9:
+        return base_shares, None
+
+    flh = pd.Series(
+        {
+            bus: _baseyear_profile_full_load_hours(
+                n=n,
+                bus=str(bus),
+                carrier_label=carrier_label,
+                baseyear=baseyear,
+            )
+            for bus in base_shares.index
+        },
+        dtype=float,
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    shares = base_shares.reindex(flh.index).fillna(0.0)
+    shares = shares.loc[shares > 0.0]
+    flh = flh.reindex(shares.index)
+    if shares.empty or shares.sum() <= 0.0:
+        if bool(cfg.get("fallback_to_load_shares", True)):
+            logger.warning(
+                "Using load-share historical %s distribution for %s: no positive shares with valid profiles.",
+                carrier_key,
+                country,
+            )
+            return base_shares, None
+        raise ValueError(f"No valid {carrier_key} shares/profiles for {country} in {baseyear}")
+
+    shares = shares / shares.sum()
+    target_flh = float(reference_twh) * 1e6 / float(terminal_capacity_mw)
+    initial_flh = float((shares * flh).sum())
+    calibrated = _validation_hooks._shift_bounded_shares_to_target_average(
+        shares=shares,
+        values=flh,
+        target_average=target_flh,
+        min_multiplier=float(cfg.get("min_share_multiplier", 0.25)),
+        max_multiplier=float(cfg.get("max_share_multiplier", 3.0)),
+    )
+    calibrated = calibrated.reindex(shares.index).fillna(0.0)
+    if calibrated.sum() > 0.0:
+        calibrated = calibrated / calibrated.sum()
+    final_flh = float((calibrated * flh).sum())
+    info = {
+        "metric": metric,
+        "reference_twh": float(reference_twh),
+        "initial_twh": float(terminal_capacity_mw) * initial_flh / 1e6,
+        "final_twh": float(terminal_capacity_mw) * final_flh / 1e6,
+        "target_flh": target_flh,
+        "initial_flh": initial_flh,
+        "final_flh": final_flh,
+        "min_flh": float(flh.min()),
+        "max_flh": float(flh.max()),
+    }
+    return calibrated, info
+
+
 def add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears):
     """
     Append existing renewables to the df_agg pd.DataFrame with the conventional
@@ -181,31 +332,69 @@ def add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears):
 
     irena = irena.unstack().reset_index()
     
-    # Create country-to-cluster mapping from busmap
-    # This ensures capacities from merged countries are preserved
+    baseyear = int(snakemake.params.baseyear)
+    energy_reference_twh = {}
+    baseyear_distribution_cfg = _baseyear_capacity_distribution_config()
+    if bool(baseyear_distribution_cfg.get("enable", False)):
+        try:
+            energy_reference_twh = _load_owid_energy_reference_for_baseyear(baseyear)
+            logger.info(
+                "Loaded %d OWID %s energy references for historical renewable siting calibration.",
+                len(energy_reference_twh),
+                baseyear,
+            )
+        except Exception as exc:
+            if bool(baseyear_distribution_cfg.get("fallback_to_load_shares", True)):
+                logger.warning(
+                    "OWID-calibrated historical renewable siting disabled: could not load OWID references for %s: %s",
+                    baseyear,
+                    exc,
+                )
+                energy_reference_twh = {}
+            else:
+                raise
+
+    # Map each original country to all clustered AC buses that belong to it.
+    # IRENA only provides country totals, so historical renewable capacity starts
+    # from in-country AC load shares and can be calibrated to OWID energy.
     n_pre_cluster = pypsa.Network(snakemake.input.n_pre_cluster)
     bm = pd.read_csv(snakemake.input.busmap)
-    # ensure comparable types: convert busmap Bus ids to strings to match n.buses.index (which are strings)
-    bm['Bus'] = bm['Bus'].astype(str)
+    bm["Bus"] = bm["Bus"].astype(str)
 
-    clustered = bm.set_index('Bus').reindex(n_pre_cluster.buses.index)['busmap'].values
+    clustered = bm.set_index("Bus").reindex(n_pre_cluster.buses.index)["busmap"]
+    busmapping = pd.DataFrame(
+        {
+            "bus": n_pre_cluster.buses.index,
+            "country_before_clustering": n_pre_cluster.buses["country"].values,
+            "clustered_bus": clustered.values,
+        }
+    ).dropna(subset=["country_before_clustering", "clustered_bus"])
 
-    busmapping = pd.DataFrame({
-        "bus": n_pre_cluster.buses.index,
-        "country_before_clustering": n_pre_cluster.buses['country'].values,
-        "clustered_country": clustered
-    })
-
-    country_to_cluster = busmapping.groupby('country_before_clustering')['clustered_country'].first().to_dict()
-    
-    # Also create a mapping from cluster bus to all buses that belong to it in the clustered network
-    # We'll use this to distribute capacity
-    cluster_to_buses = busmapping.groupby('clustered_country')['bus'].apply(set).to_dict()
-    
-    # Get AC/DC buses from the network
-    elec_buses = n.buses.index[n.buses.carrier == "AC"].union(
-        n.buses.index[n.buses.carrier == "DC"]
+    ac_buses = pd.Index(n.buses.index[n.buses.carrier == "AC"])
+    busmapping["country_before_clustering"] = (
+        busmapping["country_before_clustering"].astype(str).str.strip().str.upper()
     )
+    busmapping["clustered_bus"] = busmapping["clustered_bus"].astype(str)
+    busmapping = busmapping.loc[busmapping["clustered_bus"].isin(ac_buses)]
+    country_to_clustered_buses = {
+        country: pd.Index(pd.unique(rows["clustered_bus"]))
+        for country, rows in busmapping.groupby("country_before_clustering", sort=False)
+    }
+
+    ac_load_by_bus = pd.Series(0.0, index=ac_buses, dtype=float)
+    if not n.loads.empty and hasattr(n, "loads_t") and "p_set" in n.loads_t:
+        load_bus = n.loads["bus"].astype(str)
+        ac_loads = n.loads.index[load_bus.isin(ac_buses)]
+        if len(ac_loads) > 0:
+            load_ts = n.loads_t.p_set.reindex(columns=ac_loads).fillna(0.0)
+            if "generators" in n.snapshot_weightings:
+                weights = n.snapshot_weightings["generators"]
+                load_totals = load_ts.mul(weights, axis=0).sum(axis=0)
+            else:
+                load_totals = load_ts.sum(axis=0)
+            ac_load_by_bus = ac_load_by_bus.add(
+                load_totals.groupby(load_bus.loc[ac_loads]).sum(), fill_value=0.0
+            ).reindex(ac_buses, fill_value=0.0)
 
     for carrier_key, (tech, carrier_label) in tech_map.items():
         df = (
@@ -220,92 +409,82 @@ def add_existing_renewables(df_agg, n, costs, wacc_dict, Nyears):
         # calculate yearly differences
         df.insert(loc=0, value=0.0, column="1999")
         df = df.diff(axis=1).drop("1999", axis=1).clip(lower=0)
-        
-        # Aggregate capacity by cluster country (this preserves capacity from merged countries)
-        df['cluster_country'] = df.index.map(country_to_cluster)
-        
+
         # Check for countries in IRENA data but not in network
-        missing_countries = df[df['cluster_country'].isna()].index.tolist()
+        missing_countries = [
+            country for country in df.index if country not in country_to_clustered_buses
+        ]
         if missing_countries:
-            missing_capacities = df.loc[missing_countries].drop(columns=['cluster_country'])
-            total_missing = missing_capacities.sum(axis=1)
-            logger.warning(f"Found {len(missing_countries)} countries in IRENA {carrier_key} data not in network mapping:")
+            total_missing = df.loc[missing_countries].sum(axis=1)
+            logger.warning(
+                f"Found {len(missing_countries)} countries in IRENA {carrier_key} data not in network mapping:"
+            )
             for country in missing_countries:
                 total_cap = total_missing[country]
                 if total_cap > 0:
                     logger.warning(f"  {country}: {total_cap:.1f} MW total capacity")
-        
-        # Drop countries not in mapping before grouping, and exclude cluster_country column from sum
-        df_to_cluster = df[df['cluster_country'].notna()].copy()
-        df_clustered = df_to_cluster.drop(columns=['cluster_country']).groupby(df_to_cluster['cluster_country']).sum()
-        df_clustered = df_clustered.fillna(0.0)
 
-        # distribute capacities among nodes according to capacity factor
-        # weighting with nodal_fraction
-        nodal_fraction = pd.Series(0.0, elec_buses)
+        nodal_df = pd.DataFrame(0.0, index=ac_buses, columns=df.columns)
+        distributed_countries = set()
 
-        for country in n.buses.loc[elec_buses, "country"].unique():
-            gens = n.generators.index[
-                (n.generators.index.str[:2] == country)
-                & (n.generators.carrier == carrier_label)
-            ]
-            if len(gens) == 0:
+        for country, country_capacity in df.iterrows():
+            country_buses = country_to_clustered_buses.get(country)
+            if country_buses is None or country_buses.empty:
                 continue
-            cfs = n.generators_t.p_max_pu[gens].mean()
-            if cfs.sum() <= 0:
-                continue
-            cfs_key = cfs / cfs.sum()
-            nodal_fraction.loc[n.generators.loc[gens, "bus"]] = cfs_key.groupby(
-                n.generators.loc[gens, "bus"]
-            ).sum()
 
-        # Use clustered capacity dataframe
-        # For each bus, look up its country's cluster country to get total capacity
-        # Then distribute among all buses of that country weighted by nodal_fraction
-        nodal_df = pd.DataFrame(0.0, index=elec_buses, columns=df_clustered.columns)
-        
-        # Track which cluster countries have been distributed
-        distributed_clusters = set()
-        
-        # Iterate over all cluster countries that have capacity, then find which buses belong to that cluster
-        for cluster_country in df_clustered.index:
-            # The cluster_country (e.g., "AE 0") IS a bus in the post-cluster network
-            # Check if it exists as an elec bus
-            if cluster_country in elec_buses:
-                # This cluster country is itself a bus in the post-cluster network
-                country_buses = [cluster_country]
+            distributed_countries.add(country)
+            country_load = ac_load_by_bus.reindex(country_buses, fill_value=0.0).clip(lower=0.0)
+            if country_load.sum() > 0.0:
+                country_share = country_load / country_load.sum()
             else:
-                countries_for_cluster = [c for c, cc in country_to_cluster.items() if cc == cluster_country]
-                raise ValueError(f"Cluster country {cluster_country} not found in post-cluster elec buses. Original countries mapping to it: {countries_for_cluster}")
-            
-            distributed_clusters.add(cluster_country)
-            
-            # Get nodal fractions for these buses and normalize them to sum to 1 within the country
-            country_nodal_fraction = nodal_fraction.loc[country_buses]
-            total_fraction = country_nodal_fraction.sum()
-            
-            # If total fraction is 0, distribute equally; otherwise normalize
-            if total_fraction > 0:
-                country_nodal_fraction = country_nodal_fraction / total_fraction
-            else:
-                country_nodal_fraction = pd.Series(1.0 / len(country_buses), index=country_buses)
-            
-            # Distribute cluster country capacity among country buses weighted by normalized nodal_fraction
-            for bus in country_buses:
-                nodal_df.loc[bus] = df_clustered.loc[cluster_country] * country_nodal_fraction.loc[bus]
+                country_share = pd.Series(1.0 / len(country_buses), index=country_buses)
+
+            if _historical_capacity_distribution_enabled(carrier_key, baseyear):
+                terminal_years = [year for year in country_capacity.index if int(year) <= baseyear]
+                terminal_capacity_mw = float(country_capacity.loc[terminal_years].sum())
+                country_share, calibration_info = _calibrate_baseyear_country_shares(
+                    n=n,
+                    country=country,
+                    carrier_key=carrier_key,
+                    carrier_label=carrier_label,
+                    base_shares=country_share,
+                    terminal_capacity_mw=terminal_capacity_mw,
+                    baseyear=baseyear,
+                    energy_reference_twh=energy_reference_twh,
+                )
+                if calibration_info is not None:
+                    logger.info(
+                        "OWID-calibrated %s historical siting for %s in %s: OWID %.2f TWh, expected %.2f -> %.2f TWh, FLH %.1f -> %.1f h (target %.1f h, node range %.1f-%.1f h).",
+                        carrier_key,
+                        country,
+                        baseyear,
+                        calibration_info["reference_twh"],
+                        calibration_info["initial_twh"],
+                        calibration_info["final_twh"],
+                        calibration_info["initial_flh"],
+                        calibration_info["final_flh"],
+                        calibration_info["target_flh"],
+                        calibration_info["min_flh"],
+                        calibration_info["max_flh"],
+                    )
+
+            for bus in country_share.index:
+                nodal_df.loc[bus] += country_capacity * country_share.loc[bus]
 
         nodal_df = nodal_df.fillna(0.0)
-        
-        # Verify all cluster countries were distributed
-        undistributed_clusters = set(df_clustered.index) - distributed_clusters
-        if undistributed_clusters:
-            undistributed_capacity = df_clustered.loc[list(undistributed_clusters)].sum().sum()
-            error_msg = f"Found {len(undistributed_clusters)} cluster countries in IRENA {carrier_key} data not distributed to any network buses (total: {undistributed_capacity:.1f} MW):\n"
-            for cluster in undistributed_clusters:
-                total_cap = df_clustered.loc[cluster].sum()
-                if total_cap > 0:
-                    error_msg += f"  {cluster}: {total_cap:.1f} MW\n"
-            raise ValueError(error_msg)
+
+        # Verify all countries with positive capacity were distributed.
+        undistributed_countries = set(df.index) - distributed_countries
+        if undistributed_countries:
+            undistributed_capacity = df.loc[list(undistributed_countries)].sum(axis=1)
+            positive_undistributed = undistributed_capacity.loc[
+                undistributed_capacity > 0.0
+            ]
+            if not positive_undistributed.empty:
+                error_msg = f"Found {len(positive_undistributed)} countries in IRENA {carrier_key} data not distributed to any network buses (total: {positive_undistributed.sum():.1f} MW):\n"
+                for country, total_cap in positive_undistributed.items():
+                    error_msg += f"  {country}: {total_cap:.1f} MW\n"
+                raise ValueError(error_msg)
 
         for year in nodal_df.columns:
             for node in nodal_df.index:
