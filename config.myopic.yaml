@@ -1,6 +1,6 @@
 run:
-  name: "Earth_200_v2" # use this to keep track of runs with different settings
-  sector_name: "Global_200" # use this to keep track of sector scenario runs
+  name: "Earth_200_v7" # use this to keep track of runs with different settings
+  sector_name: "Global_200_v7" # use this to keep track of sector scenario runs
   shared_cutouts: true # set to true to share the default cutout(s) across runs
   allow_scenario_failure: true # If True, the workflow will continue even if a scenario in run_scenario fails
 
@@ -88,11 +88,12 @@ global_specific:
   remove_faulty_offshore_shapes: true # for offwind profiles, remove faulty shapes that cause crashes
   global_clustering: true # must be true to apply minimum clustering per country
   minimum_clustering_per_countries:
-    US: 2
-    BR: 2
-    RU: 2
-    CN: 3
+    US: 5
+    BR: 3
+    RU: 5
+    CN: 4
     IN: 2
+    AU: 2
   post2020_structural_biomass:
     enable: true
     start_year: 2025
@@ -103,22 +104,101 @@ global_specific:
     strict_physical_balance: false
     physical_balance_relative_tolerance: 0.02
   
+  electricity_demand_alignment:
+    enable: true
+    audit_dir: validation/results
+    carry_forward_anchor_year: 2025
+    anchors:
+      2020:
+        year: 2020
+        csv: validation/data/owid-energy-data.csv
+        schema: owid_energy
+        target_column: electricity_demand
+        electricity_demand_baseline_network: results/Global_200_v7/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+        electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
+      2025:
+        year: 2025
+        csv: validation/data/owid-elecbalance2025.csv
+        schema: ember_generation_balance
+        fallback_references:
+          - year: 2024
+            csv: validation/data/owid-elecbalance2025.csv
+            schema: ember_generation_balance
+          - year: 2024
+            csv: validation/data/owid-energy-data.csv
+            schema: owid_energy
+            target_column: electricity_demand
+        electricity_demand_baseline_network: results/Global_200_v7/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+        electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
+
+  transmission_capacity_limits:
+    enable: true
+    audit_dir: validation/results
+    existing_csv: validation/data/transmission/GTD-v1.1_regional_existing.csv
+    planned_csv: validation/data/transmission/GTD-v1.1_regional_planned.csv
+    planned_policy: by_year
+    missing_year_planned_default: 2025
+    missing_pair_policy: zero_capacity
+    fallback_ratio: 0.115
+    explicit_zero_policy: zero_capacity
+    capacity_multiplier_by_year: # max possible transmission expansion relative to 2025 capacities. 
+      2020: 1.0
+      2025: 1.0
+      2030: 1.15
+      2035: 1.30
+      2040: 1.45
+      2045: 1.60
+      2050: 1.75
+
+  fossil_capacity_alignment:
+    enable: true
+    year: 2020
+    audit_dir: validation/results
+    coal_csv: validation/data/Global-Coal-Plant-Tracker-January-2026.csv
+    oil_gas_csv: validation/data/Global-Oil-and-Gas-Plant-Tracker-GOGPT-August-2025.csv
+    carriers: [coal, gas, oil]
+    min_reference_mw: 1.0
+    min_model_mw: 1.0
+    scale_min: 0.0
+    scale_max: null
+    scale_down_existing: true
+    # null means GEM fixes the historical installed level/minimum, but does not impose a hard upper cap.
+    capacity_cap_headroom: null
+    # Aggregate country/fuel ceiling applied in solve; keeps regional siting flexible.
+    country_fuel_capacity_ceiling:
+      enable: true
+      multiplier: 1.2
+      tolerance_mw: 1.0
+      skip_if_min_exceeds_cap: true
+    make_baseyear_fossil_links_extendable: true
+    extendable_baseyear_carriers: [coal, lignite, CCGT, OCGT, oil]
+    materialize_2025:
+      enable: true
+      year: 2025
+      carriers: [coal, gas, oil]
+      min_reference_mw: 1.0
+      min_model_mw: 1.0
+      scale_existing: true
+      scale_down_existing: true
+      add_missing: true
+      make_links_extendable_after_materialization: true
+
   baseyear_nonextendable: true # If true, all existing capacities in the baseyear (first planning horizon) are set to non-extendable
   baseyear_capacity_distribution:
     enable: true
     year: 2020
     owid_csv: validation/data/owid-energy-data.csv
-    carriers: [solar, onwind]
+    carriers: [solar, onwind, offwind]
     min_reference_twh: 1.0
-    min_share_multiplier: 0.25
-    max_share_multiplier: 2.0
+    min_share_multiplier: 0.1
+    max_share_multiplier: 3.0
     fallback_to_load_shares: true
 
   baseyear_generation:
-    baseyear_generation_constraint: true # 2020 country-level electricity generation constrained to OWID historical values
+    baseyear_generation_constraint: false # 2020 country-level electricity generation constrained to OWID historical values
     year: 2020
     owid_csv: validation/data/owid-energy-data.csv
-    electricity_demand_baseline_network: results/Global_200/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+    electricity_demand_baseline_network: results/Global_200_v7/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
     electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
     tolerance: 0.02
     absolute_tolerance_twh: 0.25
@@ -141,7 +221,7 @@ global_specific:
       - electricity_generation
 
   year2025_generation: 
-    year2025_generation_constraint: true
+    year2025_generation_constraint: false
     year: 2025
     owid_csv: validation/data/owid-elecbalance2025.csv
     tolerance: 0.02
@@ -178,14 +258,14 @@ global_specific:
     add_missing_fixed_generators: true
     missing_fixed_generator_constraints: [solar, onwind, offshore_wind]
     materialize_historical_capacity_by_2020_shares: true
-    historical_capacity_distribution_constraints: [solar, onwind]
+    historical_capacity_distribution_constraints: [solar, onwind, offshore_wind]
     freeze_endogenous_2025_capacity_after_materialization: true
     energy_calibrated_historical_capacity_distribution: true
     energy_calibration_owid_csv: validation/data/owid-elecbalance2025.csv
-    energy_calibration_carriers: [solar, onwind]
+    energy_calibration_carriers: [solar, onwind, offshore_wind]
     energy_calibration_min_reference_twh: 1.0
-    energy_calibration_min_share_multiplier: 0.25
-    energy_calibration_max_share_multiplier: 2.0
+    energy_calibration_min_share_multiplier: 0.1
+    energy_calibration_max_share_multiplier: 3.0
     fixed_capacity_overshoot_policy: constrain_additions_only
     irena_technology_by_constraint:
       solar: ["Solar photovoltaic"] # excludes CSP / solar thermal
@@ -229,7 +309,7 @@ permstore:
     gas_network: false
     industry_distribution: false # adjusted for gadm clustering
     elec_prepared: false
-    renewable_profiles: false
+    renewable_profiles: true
     solar_thermal_profile: false
     costs: true
     raw_osm: true
@@ -258,6 +338,19 @@ electricity:
       Offshore: [offwind-ac, offwind-dc]
       Onshore: [onwind]
       PV: [solar]
+
+clean_osm_data_options: # osm = OpenStreetMap
+  names_by_shapes: true # Set the country name based on the extended country shapes
+  threshold_voltage: 51000 # [V] minimum voltage threshold to keep the asset (cable, line, generator, etc.) [V]
+  tag_substation: "transmission" # Filters only substations with 'transmission' tag, ('distribution' also available)
+  add_line_endings: true # When "True", then line endings are added to the dataset of the substations
+  generator_name_method: OSM # Methodology to specify the name to the generator. Options: OSM (name as by OSM dataset), closest_city (name by the closest city)
+  use_custom_lines: "OSM_only" # Use OSM (OSM_only), customized (custom_only), both data sets (add_custom) or none (none)
+  path_custom_lines: false # If exists, provide the specific absolute path of the custom file e.g. (...\data\custom_lines.geojson)
+  use_custom_substations: "OSM_only" # Ignore standalone OSM substations; keep line-end substations from add_line_endings
+  path_custom_substations: false # If exists, provide the specific absolute path of the custom file e.g. (...\data\custom_substations.geojson)
+  use_custom_cables: "OSM_only" # Use OSM (OSM_only), customized (custom_only), both data sets (add_custom) or none (none)
+  path_custom_cables: false # If exists, provide the specific absolute path of the custom file e.g. (...\data\custom_cables.geojson)
 
 build_osm_network:
   group_tolerance_buses: 20000 # [m] (default 5000) Tolerance in meters of the close buses to merge
@@ -465,9 +558,9 @@ cluster_options:
     exclude_carriers: []
     remove_stubs: true
     remove_stubs_across_borders: false
-    p_threshold_drop_isolated: 20 # [MW] isolated buses are being discarded if bus mean power is below the specified threshold
-    p_threshold_merge_isolated: 300 # [MW] isolated buses are being merged into a single isolated bus if a bus mean power is below the specified threshold
-    s_threshold_fetch_isolated: false # [-] a share of the national load for merging an isolated network into a backbone network
+    p_threshold_drop_isolated: 0 # [MW] isolated buses are being discarded if bus mean power is below the specified threshold
+    p_threshold_merge_isolated: 0 # [MW] isolated buses are being merged into a single isolated bus if a bus mean power is below the specified threshold
+    s_threshold_fetch_isolated: 0.05 # [-] a share of the national load for merging an isolated network into a backbone network
   cluster_network:
     algorithm: kmeans
     feature: solar+onwind-time

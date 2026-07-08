@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, Iterable, Mapping
 
@@ -16,6 +17,7 @@ logger = create_logger(__name__)
 FOSSIL_FUELS = ("oil", "gas", "coal")
 DEFAULT_FUEL_PRICE_BUNDLE_ROOT = "data/fuel-price-data"
 FUEL_PRICE_BUNDLE_MANIFEST = "manifest.json"
+HISTORICAL_AVERAGE_WINDOW_YEARS = 5
 GAS_MAPPING_TRANSLATOR = {
     "TTF": "Netherlands_TTF",
     "Henry Hub": "Henry_Hub",
@@ -66,6 +68,316 @@ def build_country_fuel_price_dict(price_frame: pd.DataFrame) -> Dict[str, Dict[s
     return fuel_price_dict
 
 
+def _resolve_default_bundle_root(fuelprices_path) -> Path:
+    """Resolve the default fuel-price bundle relative to the repo root if possible."""
+    path = Path(fuelprices_path)
+    candidates = []
+    if path.is_absolute():
+        candidates.extend(parent / DEFAULT_FUEL_PRICE_BUNDLE_ROOT for parent in path.parents)
+    candidates.append(Path.cwd() / DEFAULT_FUEL_PRICE_BUNDLE_ROOT)
+    for candidate in candidates:
+        if (candidate / FUEL_PRICE_BUNDLE_MANIFEST).exists():
+            return candidate.resolve()
+    return (Path.cwd() / DEFAULT_FUEL_PRICE_BUNDLE_ROOT).resolve()
+
+
+def load_historical_average_country_fuel_prices_frame(
+    fuelprices_path,
+    investment_year,
+    window_years: int = HISTORICAL_AVERAGE_WINDOW_YEARS,
+) -> pd.DataFrame:
+    """Build country fuel prices from a fixed historical/forecast market window."""
+    bundle_root = _resolve_default_bundle_root(fuelprices_path)
+    manifest_path = bundle_root / FUEL_PRICE_BUNDLE_MANIFEST
+    if not manifest_path.exists():
+        logger.info(
+            "Fuel-price bundle not found at %s; using static country fuel prices.",
+            bundle_root,
+        )
+        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
+
+    try:
+        manifest, resolved_root = load_fuel_price_bundle_manifest(
+            str(bundle_root),
+            str(Path.cwd() / "config.yaml"),
+        )
+        country_map_path = resolve_manifest_artifact(
+            manifest,
+            resolved_root,
+            "country_market_map_csv",
+        )
+        historical_path = resolve_manifest_artifact(
+            manifest,
+            resolved_root,
+            "historical_market_prices_csv",
+        )
+        ar1_path = None
+        if "ar1_parameters_csv" in manifest.get("artifacts", {}):
+            ar1_path = resolve_manifest_artifact(
+                manifest,
+                resolved_root,
+                "ar1_parameters_csv",
+            )
+        country_map = pd.read_csv(country_map_path, keep_default_na=False)
+        historical = pd.read_csv(historical_path)
+        ar1_parameters = pd.read_csv(ar1_path) if ar1_path is not None else pd.DataFrame()
+        static_prices = pd.read_csv(fuelprices_path)
+    except Exception as exc:
+        logger.warning(
+            "Could not load historical fuel-price bundle from %s (%s); using static country fuel prices.",
+            bundle_root,
+            exc,
+        )
+        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
+
+    required_map = {"fuel_type", "country", "market"}
+    required_hist = {"fuel_type", "market", "year", "price_eur_mwh"}
+    required_static = {"fuel_type", "market", "year", "price_eur_mwh"}
+    required_ar1 = {
+        "fuel_type",
+        "market",
+        "phi",
+        "mu",
+        "last_observed_year",
+        "last_observed_log_price",
+    }
+    if (
+        required_map.difference(country_map.columns)
+        or required_hist.difference(historical.columns)
+        or required_static.difference(static_prices.columns)
+        or (not ar1_parameters.empty and required_ar1.difference(ar1_parameters.columns))
+    ):
+        logger.warning(
+            "Fuel-price inputs are missing required columns; using static country fuel prices."
+        )
+        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
+
+    country_map["fuel_type"] = country_map["fuel_type"].astype(str).str.lower()
+    country_map["country"] = country_map["country"].astype(str).str.upper().str.strip()
+    country_map["market"] = country_map.apply(
+        lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+        axis=1,
+    )
+
+    historical["fuel_type"] = historical["fuel_type"].astype(str).str.lower()
+    historical["market"] = historical.apply(
+        lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+        axis=1,
+    )
+    historical["year"] = pd.to_numeric(historical["year"], errors="coerce")
+    historical["price_eur_mwh"] = pd.to_numeric(historical["price_eur_mwh"], errors="coerce")
+
+    static_prices["fuel_type"] = static_prices["fuel_type"].astype(str).str.lower()
+    static_prices["market"] = static_prices.apply(
+        lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+        axis=1,
+    )
+    static_prices["year"] = pd.to_numeric(static_prices["year"], errors="coerce")
+    static_prices["price_eur_mwh"] = pd.to_numeric(
+        static_prices["price_eur_mwh"],
+        errors="coerce",
+    )
+
+    if not ar1_parameters.empty:
+        ar1_parameters["fuel_type"] = ar1_parameters["fuel_type"].astype(str).str.lower()
+        ar1_parameters["market"] = ar1_parameters.apply(
+            lambda row: normalize_market_name(row["fuel_type"], row["market"]),
+            axis=1,
+        )
+        for column in [
+            "phi",
+            "mu",
+            "last_observed_year",
+            "last_observed_log_price",
+        ]:
+            ar1_parameters[column] = pd.to_numeric(ar1_parameters[column], errors="coerce")
+
+    investment_year = int(investment_year)
+    first_year = investment_year - int(window_years) + 1
+    target_years = set(range(first_year, investment_year + 1))
+
+    historical_window = historical.loc[
+        historical["fuel_type"].isin(FOSSIL_FUELS)
+        & historical["year"].isin(target_years)
+        & historical["price_eur_mwh"].notna(),
+        ["fuel_type", "market", "year", "price_eur_mwh"],
+    ].copy()
+    historical_window["_priority"] = 1
+    historical_window["source"] = "historical"
+
+    forecast_window = (
+        static_prices.loc[
+            static_prices["fuel_type"].isin(FOSSIL_FUELS)
+            & static_prices["year"].isin(target_years)
+            & static_prices["price_eur_mwh"].notna(),
+            ["fuel_type", "market", "year", "price_eur_mwh"],
+        ]
+        .groupby(["fuel_type", "market", "year"], as_index=False)
+        .agg(price_eur_mwh=("price_eur_mwh", "mean"))
+    )
+    forecast_window["_priority"] = 0
+    forecast_window["source"] = "forecast"
+
+    ar1_window = pd.DataFrame(columns=["fuel_type", "market", "year", "price_eur_mwh"])
+    if not ar1_parameters.empty:
+        rows = []
+        for row in ar1_parameters.itertuples(index=False):
+            if row.fuel_type not in FOSSIL_FUELS:
+                continue
+            if pd.isna(row.phi) or pd.isna(row.mu) or pd.isna(row.last_observed_year):
+                continue
+            if pd.isna(row.last_observed_log_price):
+                continue
+            for year in sorted(target_years):
+                if year <= int(row.last_observed_year):
+                    continue
+                steps = int(year - int(row.last_observed_year))
+                log_price = row.mu + (row.phi ** steps) * (row.last_observed_log_price - row.mu)
+                rows.append((row.fuel_type, row.market, year, math.exp(log_price)))
+        ar1_window = pd.DataFrame(
+            rows,
+            columns=["fuel_type", "market", "year", "price_eur_mwh"],
+        )
+    ar1_window["_priority"] = -1
+    ar1_window["source"] = "ar1_expected_forecast"
+
+    window_frames = [
+        frame
+        for frame in [ar1_window, forecast_window, historical_window]
+        if not frame.empty
+    ]
+    window = pd.concat(window_frames, ignore_index=True, sort=False) if window_frames else pd.DataFrame()
+    if window.empty:
+        logger.info(
+            "No historical or forecast fuel prices available for %s-%s; using static country fuel prices.",
+            first_year,
+            investment_year,
+        )
+        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
+
+    window = (
+        window.sort_values(["fuel_type", "market", "year", "_priority"])
+        .drop_duplicates(["fuel_type", "market", "year"], keep="last")
+    )
+
+    market_years = pd.MultiIndex.from_product(
+        [
+            sorted(country_map.loc[country_map["fuel_type"].isin(FOSSIL_FUELS), "fuel_type"].unique()),
+            sorted(country_map.loc[country_map["fuel_type"].isin(FOSSIL_FUELS), "market"].unique()),
+            sorted(target_years),
+        ],
+        names=["fuel_type", "market", "year"],
+    ).to_frame(index=False)
+    valid_market_years = country_map.loc[
+        country_map["fuel_type"].isin(FOSSIL_FUELS),
+        ["fuel_type", "market"],
+    ].drop_duplicates()
+    market_years = market_years.merge(valid_market_years, on=["fuel_type", "market"], how="inner")
+    global_forecast = (
+        static_prices.loc[
+            static_prices["fuel_type"].isin(FOSSIL_FUELS)
+            & static_prices["year"].isin(target_years)
+            & static_prices["price_eur_mwh"].notna(),
+            ["fuel_type", "year", "price_eur_mwh"],
+        ]
+        .groupby(["fuel_type", "year"], as_index=False)
+        .agg(global_forecast_price_eur_mwh=("price_eur_mwh", "mean"))
+    )
+    window = market_years.merge(
+        window.drop(columns=["_priority"], errors="ignore"),
+        on=["fuel_type", "market", "year"],
+        how="left",
+    ).merge(global_forecast, on=["fuel_type", "year"], how="left")
+    if "source" not in window.columns:
+        window["source"] = pd.Series(dtype="object")
+    else:
+        window["source"] = window["source"].astype("object")
+    ar1_market_forecast = ar1_window.loc[
+        :,
+        ["fuel_type", "market", "year", "price_eur_mwh"],
+    ].rename(columns={"price_eur_mwh": "ar1_forecast_price_eur_mwh"})
+    window = window.merge(
+        ar1_market_forecast,
+        on=["fuel_type", "market", "year"],
+        how="left",
+    )
+    ar1_filled = window["price_eur_mwh"].isna() & window["ar1_forecast_price_eur_mwh"].notna()
+    if ar1_filled.any():
+        window.loc[ar1_filled, "price_eur_mwh"] = window.loc[
+            ar1_filled,
+            "ar1_forecast_price_eur_mwh",
+        ]
+        window.loc[ar1_filled, "source"] = "ar1_expected_forecast"
+
+    filled = window["price_eur_mwh"].isna() & window["global_forecast_price_eur_mwh"].notna()
+    if filled.any():
+        window.loc[filled, "price_eur_mwh"] = window.loc[filled, "global_forecast_price_eur_mwh"]
+        window.loc[filled, "source"] = "forecast_fuel_average"
+
+    window = window.sort_values(["fuel_type", "market", "year"])
+    nearest = window.groupby(["fuel_type", "market"])["price_eur_mwh"].transform(
+        lambda s: s.infer_objects(copy=False).ffill().bfill()
+    )
+    nearest_filled = window["price_eur_mwh"].isna() & nearest.notna()
+    if nearest_filled.any():
+        window.loc[nearest_filled, "price_eur_mwh"] = nearest.loc[nearest_filled]
+        window.loc[nearest_filled, "source"] = "nearest_market_fill"
+    window = window.loc[window["price_eur_mwh"].notna()].copy()
+
+    market_average = (
+        window.groupby(["fuel_type", "market"], as_index=False)
+        .agg(
+            price_eur_mwh=("price_eur_mwh", "mean"),
+            first_window_year=("year", "min"),
+            last_window_year=("year", "max"),
+            window_year_count=("year", "nunique"),
+            forecast_year_count=("source", lambda s: int(s.astype(str).str.startswith("forecast").sum())),
+        )
+    )
+    averaged = country_map.merge(market_average, on=["fuel_type", "market"], how="inner")
+    averaged = averaged.loc[
+        averaged["fuel_type"].isin(FOSSIL_FUELS)
+        & averaged["country"].str.len().eq(2)
+    ].copy()
+    if averaged.empty:
+        logger.info(
+            "No country mappings matched fuel prices for %s-%s; using static country fuel prices.",
+            first_year,
+            investment_year,
+        )
+        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
+
+    averaged["year"] = investment_year
+    averaged["source"] = f"historical_forecast_average_{first_year}_{investment_year}"
+    short = int((averaged["window_year_count"] < int(window_years)).sum())
+    forecast = int((averaged["forecast_year_count"] > 0).sum())
+    logger.info(
+        "Using fixed %d-year historical/forecast average fossil prices for %s (%s-%s): %d country/fuel rows, %d with forecast-filled years, %d with fewer observations.",
+        window_years,
+        investment_year,
+        first_year,
+        investment_year,
+        len(averaged),
+        forecast,
+        short,
+    )
+    return averaged.loc[
+        :,
+        [
+            "country",
+            "fuel_type",
+            "year",
+            "price_eur_mwh",
+            "market",
+            "first_window_year",
+            "last_window_year",
+            "window_year_count",
+            "forecast_year_count",
+            "source",
+        ],
+    ]
+
+
 def load_country_fuel_prices_frame(fuelprices_path, investment_year, costs) -> pd.DataFrame:
     """Load country fuel prices for a given year as a normalized frame."""
     try:
@@ -74,7 +386,7 @@ def load_country_fuel_prices_frame(fuelprices_path, investment_year, costs) -> p
         logger.warning(
             "Fuel prices file not found at %s. Using global defaults.", fuelprices_path
         )
-        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
+        fuel_prices_df = pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh", "year"])
 
     if "year" not in fuel_prices_df.columns:
         raise ValueError(
@@ -86,22 +398,38 @@ def load_country_fuel_prices_frame(fuelprices_path, investment_year, costs) -> p
     ].copy()
     if year_data.empty:
         logger.warning(
-            "No fuel price data for year %s in %s. Using global defaults.",
+            "No static fuel price data for year %s in %s. Historical averages or global defaults will apply.",
             investment_year,
             fuelprices_path,
         )
-        return pd.DataFrame(columns=["fuel_type", "country", "price_eur_mwh"])
 
-    if "market" in year_data.columns:
+    if not year_data.empty and "market" in year_data.columns:
         year_data["market"] = year_data.apply(
             lambda row: normalize_market_name(row["fuel_type"], row["market"]),
             axis=1,
         )
 
+    averaged = load_historical_average_country_fuel_prices_frame(
+        fuelprices_path,
+        investment_year,
+    )
+    if not averaged.empty:
+        if year_data.empty:
+            year_data = averaged
+        else:
+            year_data["_priority"] = 0
+            averaged["_priority"] = 1
+            year_data = (
+                pd.concat([year_data, averaged], ignore_index=True, sort=False)
+                .sort_values(["country", "fuel_type", "_priority"])
+                .drop_duplicates(["country", "fuel_type"], keep="last")
+                .drop(columns=["_priority"])
+            )
+
     for fuel in FOSSIL_FUELS:
-        if fuel not in set(year_data["fuel_type"].astype(str).str.lower()):
+        if year_data.empty or fuel not in set(year_data["fuel_type"].astype(str).str.lower()):
             logger.info(
-                "Static fuel prices for %s/%s missing from %s; defaults will apply where needed.",
+                "Fuel prices for %s/%s missing from historical averages and %s; defaults will apply where needed.",
                 investment_year,
                 fuel,
                 fuelprices_path,

@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import os
+from pathlib import Path
 
 import country_converter as coco
 import pandas as pd
@@ -63,9 +64,40 @@ def download_urban_percent():
         os.remove(csv_filename)
 
     else:
-        print(f"Failed to download file: Status code {response.status_code}")
+        raise RuntimeError(f"Failed to download urban percent file: status code {response.status_code}")
 
     return urban_percent_orig
+
+
+def cached_urban_percent_paths():
+    """Return local processed urban-percent files suitable as offline fallbacks."""
+    repo_root = Path(__file__).resolve().parents[1]
+    return [
+        repo_root / "resources" / "Global_200" / "urban_percent.csv",
+        repo_root / "permstorage" / "Global_200" / "resources" / "urban_percent.csv",
+    ]
+
+
+def load_cached_urban_percent():
+    required_columns = {
+        "country",
+        "Year",
+        "Urban population as percentage of total population",
+    }
+    for path in cached_urban_percent_paths():
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        if required_columns.issubset(df.columns):
+            print(f"Using cached urban percent data from {path}")
+            return df
+        print(f"Ignoring cached urban percent file with unexpected columns: {path}")
+
+    candidates = ", ".join(str(path) for path in cached_urban_percent_paths())
+    raise FileNotFoundError(
+        "Could not download urban percent data and no processed local cache was found. "
+        f"Checked: {candidates}"
+    )
 
 
 if __name__ == "__main__":
@@ -74,7 +106,13 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake("prepare_urban_percent")
 
-    df = download_urban_percent().copy()
+    try:
+        df = download_urban_percent().copy()
+    except Exception as exc:
+        print(f"Urban percent download failed: {exc}")
+        df = load_cached_urban_percent().copy()
+        df.to_csv(snakemake.output[0], sep=",", encoding="utf-8", index=False)
+        raise SystemExit(0)
 
     # Select the columns that we need to keep
     df = df[

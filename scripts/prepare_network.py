@@ -67,6 +67,7 @@ import pypsa
 import requests
 from _helpers import BASE_DIR, configure_logging, create_logger
 from add_electricity import load_costs, update_transmission_costs
+import validation as _validation_hooks
 
 idx = pd.IndexSlice
 
@@ -184,6 +185,31 @@ def set_line_s_max_pu(n, s_max_pu):
     logger.info(f"N-1 security margin of lines set to {s_max_pu}")
 
 
+def _planning_year_from_snakemake(snakemake):
+    wildcards = getattr(snakemake, "wildcards", None)
+    value = getattr(wildcards, "planning_horizons", None) if wildcards is not None else None
+    if value is not None:
+        return int(value)
+
+    input_obj = getattr(snakemake, "input", None)
+    candidates = []
+    if input_obj is not None:
+        for attr in ["tech_costs", 0]:
+            try:
+                candidates.append(input_obj[attr] if isinstance(attr, int) else getattr(input_obj, attr))
+            except Exception:
+                pass
+    for candidate in candidates:
+        match = re.search(r"(?:costs_|_|-)(20\d{2}|21\d{2})(?:\D|$)", str(candidate))
+        if match is not None:
+            return int(match.group(1))
+
+    costs_cfg = getattr(snakemake.params, "costs", {})
+    if isinstance(costs_cfg, dict) and costs_cfg.get("year") is not None:
+        return int(costs_cfg.get("year"))
+    return int(snakemake.config.get("costs", {}).get("year", 2020))
+
+
 def set_transmission_limit(n, ll_type, factor, costs, Nyears=1):
     links_dc_b = n.links.carrier == "DC" if not n.links.empty else pd.Series()
 
@@ -194,6 +220,8 @@ def set_transmission_limit(n, ll_type, factor, costs, Nyears=1):
         * n.lines.bus0.map(n.buses.v_nom)
     )
     lines_s_nom = n.lines.s_nom.where(n.lines.type == "", _lines_s_nom)
+    if "s_nom_max" in n.lines.columns:
+        lines_s_nom = lines_s_nom.clip(upper=n.lines.s_nom_max.fillna(np.inf))
 
     col = "capital_cost" if ll_type == "c" else "length"
     ref = (
@@ -341,8 +369,16 @@ if __name__ == "__main__":
         Nyears,
     )
     s_max_pu = snakemake.params.lines["s_max_pu"]
+    planning_year = _planning_year_from_snakemake(snakemake)
 
     set_line_s_max_pu(n, s_max_pu)
+    if hasattr(_validation_hooks, "apply_gtd_transmission_capacity_limits"):
+        n = _validation_hooks.apply_gtd_transmission_capacity_limits(
+            n,
+            planning_year,
+            snakemake.config,
+            s_max_pu=s_max_pu,
+        )
 
     for o in opts:
         m = re.match(r"^\d+h$", o, re.IGNORECASE)
@@ -429,8 +465,8 @@ if __name__ == "__main__":
 
     set_line_nom_max(
         n,
-        s_nom_max_set=snakemake.params.lines.get("s_nom_max,", np.inf),
-        p_nom_max_set=snakemake.params.links.get("p_nom_max,", np.inf),
+        s_nom_max_set=snakemake.params.lines.get("s_nom_max", np.inf),
+        p_nom_max_set=snakemake.params.links.get("p_nom_max", np.inf),
     )
 
     if "ATK" in opts:

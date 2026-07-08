@@ -3485,6 +3485,344 @@ def add_year2025_capacity_targets(n, planning_year, config):
         n.model.add_constraints(lhs <= upper, name=f"year2025_capacity_max__{carrier}")
 
 
+def _fossil_capacity_expression_mw(n, assets):
+    """Return fossil capacity expression plus fixed/minimum electric capacity."""
+    expr = 0.0
+    fixed_capacity_mw = 0.0
+    fixed_or_min_mw = 0.0
+    variable_count = 0
+
+    link_vars = n.model["Link-p_nom"] if "Link-p_nom" in n.model.variables else None
+    gen_vars = n.model["Generator-p_nom"] if "Generator-p_nom" in n.model.variables else None
+    link_ext = set(link_vars.indexes["Link-ext"]) if link_vars is not None else set()
+    gen_ext = set(gen_vars.indexes["Generator-ext"]) if gen_vars is not None else set()
+
+    for asset in assets.itertuples(index=False):
+        name = asset.asset
+        component = asset.component
+        efficiency = max(float(asset.efficiency), 0.0)
+
+        if component == "Link" and link_vars is not None and name in link_ext:
+            expr = expr + link_vars.loc[[name]].sum() * efficiency
+            min_nom = 0.0
+            if "p_nom_min" in n.links.columns and name in n.links.index:
+                min_nom = float(pd.to_numeric(n.links.at[name, "p_nom_min"], errors="coerce") or 0.0)
+            fixed_or_min_mw += min_nom * efficiency
+            variable_count += 1
+            continue
+        if component == "Generator" and gen_vars is not None and name in gen_ext:
+            expr = expr + gen_vars.loc[[name]].sum() * efficiency
+            min_nom = 0.0
+            if "p_nom_min" in n.generators.columns and name in n.generators.index:
+                min_nom = float(pd.to_numeric(n.generators.at[name, "p_nom_min"], errors="coerce") or 0.0)
+            fixed_or_min_mw += min_nom * efficiency
+            variable_count += 1
+            continue
+
+        fixed_mw = float(asset.nominal_mw) * efficiency
+        fixed_capacity_mw += fixed_mw
+        fixed_or_min_mw += fixed_mw
+
+    return expr, fixed_capacity_mw, fixed_or_min_mw, variable_count
+
+
+def add_country_fossil_capacity_ceiling(n, planning_year, config):
+    """
+    Cap aggregate country/fuel fossil electric capacity while preserving siting freedom.
+
+    The GEM capacity alignment fixes historical p_nom/p_nom_min levels. This
+    solve-time constraint adds a country/fuel ceiling on total optimized electric
+    capacity, avoiding per-asset p_nom_max caps that would prevent new capacity
+    in regions with zero existing OCGT/CCGT/coal/oil links.
+    """
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    parent_cfg = global_cfg.get("fossil_capacity_alignment", {})
+    if not isinstance(parent_cfg, dict) or not bool(parent_cfg.get("enable", False)):
+        return
+
+    ceiling_cfg = parent_cfg.get("country_fuel_capacity_ceiling", {}) or {}
+    if not isinstance(ceiling_cfg, dict) or not bool(ceiling_cfg.get("enable", False)):
+        return
+
+    year = int(planning_year)
+    base_year = int(parent_cfg.get("year", 2020))
+    materialize_cfg = parent_cfg.get("materialize_2025", {}) or {}
+    materialize_year = int(materialize_cfg.get("year", 2025))
+    if year not in {base_year, materialize_year}:
+        return
+
+    merged_cfg = dict(parent_cfg)
+    if year == materialize_year and isinstance(materialize_cfg, dict):
+        merged_cfg.update(materialize_cfg)
+    merged_cfg.update(ceiling_cfg)
+
+    multiplier = float(ceiling_cfg.get("multiplier", 1.2))
+    if not np.isfinite(multiplier) or multiplier <= 0.0:
+        logger.warning(
+            "Skipping country fossil capacity ceiling for %s: invalid multiplier=%s",
+            year,
+            ceiling_cfg.get("multiplier"),
+        )
+        return
+
+    carriers = set(str(c) for c in merged_cfg.get("carriers", ["coal", "gas", "oil"]))
+    min_reference_mw = float(merged_cfg.get("min_reference_mw", 1.0))
+    tolerance_mw = float(ceiling_cfg.get("tolerance_mw", 1.0))
+    skip_if_min_exceeds_cap = bool(ceiling_cfg.get("skip_if_min_exceeds_cap", True))
+
+    try:
+        ref = _validation_hooks._load_gem_fossil_capacity_reference(merged_cfg, year)
+        assets = _validation_hooks._fossil_electric_capacity_assets(n)
+    except Exception as exc:
+        logger.warning("Country fossil capacity ceiling skipped for %s: %s", year, exc)
+        return
+
+    ref = ref.loc[
+        ref["validation_tech"].isin(carriers) & ref["reference_mw"].ge(min_reference_mw)
+    ].copy()
+    if ref.empty or assets.empty:
+        logger.info("Skipping country fossil capacity ceiling for %s: no reference/assets.", year)
+        return
+
+    added = skipped = 0
+    audit_rows = []
+    for row in ref.itertuples(index=False):
+        country = str(row.country).upper()
+        tech = str(row.validation_tech)
+        reference_mw = float(row.reference_mw)
+        cap_mw = reference_mw * multiplier
+        group_assets = assets.loc[
+            assets["country"].eq(country) & assets["validation_tech"].eq(tech)
+        ].copy()
+        if group_assets.empty:
+            skipped += 1
+            audit_rows.append(
+                {
+                    "year": year,
+                    "country": country,
+                    "validation_tech": tech,
+                    "reference_mw": reference_mw,
+                    "cap_mw": cap_mw,
+                    "fixed_or_min_mw": 0.0,
+                    "variable_assets": 0,
+                    "policy": "skipped_no_assets",
+                }
+            )
+            continue
+
+        expr, fixed_capacity_mw, fixed_or_min_mw, variable_count = _fossil_capacity_expression_mw(n, group_assets)
+        if variable_count == 0:
+            policy = "skipped_no_variable_fixed_within_cap"
+            if fixed_or_min_mw > cap_mw + tolerance_mw:
+                policy = "skipped_no_variable_fixed_exceeds_cap"
+                logger.warning(
+                    "Skipping %s %s fossil capacity ceiling for %s: all assets are fixed and fixed %.1f MW exceeds cap %.1f MW.",
+                    country,
+                    tech,
+                    year,
+                    fixed_or_min_mw,
+                    cap_mw,
+                )
+            skipped += 1
+            audit_rows.append(
+                {
+                    "year": year,
+                    "country": country,
+                    "validation_tech": tech,
+                    "reference_mw": reference_mw,
+                    "cap_mw": cap_mw,
+                    "fixed_or_min_mw": fixed_or_min_mw,
+                    "variable_assets": variable_count,
+                    "policy": policy,
+                }
+            )
+            continue
+
+        if fixed_or_min_mw > cap_mw + tolerance_mw and skip_if_min_exceeds_cap:
+            skipped += 1
+            audit_rows.append(
+                {
+                    "year": year,
+                    "country": country,
+                    "validation_tech": tech,
+                    "reference_mw": reference_mw,
+                    "cap_mw": cap_mw,
+                    "fixed_or_min_mw": fixed_or_min_mw,
+                    "variable_assets": variable_count,
+                    "policy": "skipped_fixed_exceeds_cap",
+                }
+            )
+            logger.warning(
+                "Skipping %s %s fossil capacity ceiling for %s: fixed/min %.1f MW exceeds cap %.1f MW.",
+                country,
+                tech,
+                year,
+                fixed_or_min_mw,
+                cap_mw,
+            )
+            continue
+
+        lhs = expr + fixed_capacity_mw
+        n.model.add_constraints(
+            lhs <= cap_mw,
+            name=f"country_fossil_capacity_ceiling__{country}__{tech}__{year}",
+        )
+        added += 1
+        audit_rows.append(
+            {
+                "year": year,
+                "country": country,
+                "validation_tech": tech,
+                "reference_mw": reference_mw,
+                "cap_mw": cap_mw,
+                "fixed_or_min_mw": fixed_or_min_mw,
+                "variable_assets": variable_count,
+                "policy": "added",
+            }
+        )
+
+    audit_path = None
+    if audit_rows:
+        audit_dir = _repo_path(merged_cfg.get("audit_dir", "validation/results"))
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / f"country_fossil_capacity_ceiling_{year}.csv"
+        pd.DataFrame(audit_rows).sort_values(["validation_tech", "country"]).to_csv(
+            audit_path,
+            index=False,
+        )
+
+    logger.info(
+        "Added country fossil capacity ceilings for %s: added=%d skipped=%d multiplier=%.3f audit=%s",
+        year,
+        added,
+        skipped,
+        multiplier,
+        audit_path,
+    )
+
+
+def _bioenergy_capacity_expression_mw(n, carriers):
+    expr_by_country = {}
+    fixed_by_country = {}
+    variable_by_country = {}
+    if not hasattr(n, "links") or n.links.empty:
+        return expr_by_country, fixed_by_country, variable_by_country
+
+    link_vars = n.model["Link-p_nom"] if "Link-p_nom" in n.model.variables else None
+    link_ext = set(link_vars.indexes["Link-ext"]) if link_vars is not None else set()
+    bus_country = _validation_hooks._bus_country_lookup(n).astype(str).str.strip().str.upper()
+    idx = n.links.index[n.links.carrier.astype(str).isin(set(carriers))]
+
+    for name, row in n.links.loc[idx].iterrows():
+        bus_col, eff_col = _validation_hooks._link_ac_output_port(row, n)
+        if bus_col is None:
+            continue
+        country = str(bus_country.get(row[bus_col], "")).upper()
+        if len(country) != 2:
+            continue
+        eff = pd.to_numeric(row.get(eff_col, 0.0), errors="coerce")
+        if pd.isna(eff) or float(eff) <= 0.0:
+            continue
+        eff = abs(float(eff))
+        if link_vars is not None and name in link_ext:
+            expr_by_country[country] = expr_by_country.get(country, 0.0) + link_vars.loc[[name]].sum() * eff
+            variable_by_country[country] = variable_by_country.get(country, 0) + 1
+        else:
+            p_nom = pd.to_numeric(row.get("p_nom", 0.0), errors="coerce")
+            if pd.isna(p_nom):
+                p_nom = 0.0
+            fixed_by_country[country] = fixed_by_country.get(country, 0.0) + float(p_nom) * eff
+
+    return expr_by_country, fixed_by_country, variable_by_country
+
+
+def add_ember_bioenergy_capacity_balance(n, planning_year, config):
+    """Constrain dedicated biomass + solid-biomass CHP electric capacity to Ember Bioenergy."""
+    if planning_year is None:
+        return
+    year = int(planning_year)
+    if year < 2020:
+        return
+    reference_year = 2020 if year < 2025 else 2025
+    ember_csv = _repo_path("validation/data/ember_yearly_full_release_long_format.csv")
+    if not ember_csv.exists():
+        logger.warning("Skipping Ember bioenergy capacity balance: file not found at %s", ember_csv)
+        return
+
+    ref = _validation_hooks._load_ember_bioenergy_capacity_reference(ember_csv, reference_year)
+    if ref.empty:
+        logger.warning("Skipping Ember bioenergy capacity balance: no reference rows for %s", reference_year)
+        return
+
+    cfg = ((config.get("global_specific", {}) if isinstance(config, dict) else {})
+           .get("bioenergy_capacity_alignment", {}) or {})
+    tolerance_mw = float(cfg.get("tolerance_mw", 1.0))
+    carriers = ["biomass", "urban central solid biomass CHP", "urban central solid biomass CHP CC"]
+    expr_by_country, fixed_by_country, variable_by_country = _bioenergy_capacity_expression_mw(n, carriers)
+    model_countries = sorted(set(ref.index).intersection(set(expr_by_country) | set(fixed_by_country)))
+    if not model_countries:
+        logger.info("Skipping Ember bioenergy capacity balance for %s: no matching model countries.", year)
+        return
+
+    exact_historical = year <= 2025
+    added = skipped = 0
+    audit_rows = []
+    for country in model_countries:
+        target = float(ref.get(country, 0.0))
+        fixed = float(fixed_by_country.get(country, 0.0))
+        variables = int(variable_by_country.get(country, 0))
+        expr = expr_by_country.get(country, 0.0)
+        if variables == 0:
+            policy = "skipped_no_variables_within_target"
+            if fixed > target + tolerance_mw or (exact_historical and fixed < target - tolerance_mw):
+                policy = "skipped_no_variables_outside_target"
+                logger.warning(
+                    "Skipping Ember bioenergy capacity balance for %s %s: fixed %.1f MW, target %.1f MW, no variables.",
+                    country,
+                    year,
+                    fixed,
+                    target,
+                )
+            skipped += 1
+            audit_rows.append({"year": year, "country": country, "reference_mw": target, "fixed_mw": fixed, "variable_assets": variables, "policy": policy})
+            continue
+
+        lhs = expr + fixed
+        if exact_historical:
+            n.model.add_constraints(
+                lhs >= target - tolerance_mw,
+                name=f"ember_bioenergy_capacity_min__{country}__{year}",
+            )
+            n.model.add_constraints(
+                lhs <= target + tolerance_mw,
+                name=f"ember_bioenergy_capacity_max__{country}__{year}",
+            )
+            policy = "added_band"
+        else:
+            n.model.add_constraints(
+                lhs >= target - tolerance_mw,
+                name=f"ember_bioenergy_capacity_min__{country}__{year}",
+            )
+            policy = "added_minimum"
+        added += 1
+        audit_rows.append({"year": year, "country": country, "reference_mw": target, "fixed_mw": fixed, "variable_assets": variables, "policy": policy})
+
+    audit_path = None
+    if audit_rows:
+        audit_dir = _repo_path("validation/results")
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / f"ember_bioenergy_capacity_balance_{year}.csv"
+        pd.DataFrame(audit_rows).sort_values("country").to_csv(audit_path, index=False)
+    logger.info(
+        "Added Ember bioenergy capacity balance for %s: added=%d skipped=%d reference_year=%s audit=%s",
+        year,
+        added,
+        skipped,
+        reference_year,
+        audit_path,
+    )
+
+
 def _finite_wedge_basis_costs(values):
     return pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -4494,6 +4832,18 @@ def extra_functionality(n, snapshots):
                 planning_year=planning_year,
                 config=config,
             )
+
+        add_country_fossil_capacity_ceiling(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
+
+        add_ember_bioenergy_capacity_balance(
+            n,
+            planning_year=planning_year,
+            config=config,
+        )
 
     add_co2_sequestration_limit(n, snapshots)
     if planning_year is not None:

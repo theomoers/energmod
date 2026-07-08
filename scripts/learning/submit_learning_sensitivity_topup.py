@@ -222,6 +222,7 @@ def write_topup_submission(
         "grid_mem": args.grid_mem,
         "grid_ncpus": args.grid_ncpus,
         "grid_submit": args.grid_submit,
+        "grid_array_concurrency": int(args.grid_array_concurrency) if args.grid_array_concurrency else None,
         "overwrite": bool(args.overwrite),
         "task_runtime_budget": {
             "max_seconds": int(args.task_max_seconds),
@@ -294,7 +295,14 @@ def main() -> int:
     parser.add_argument("--grid-mem")
     parser.add_argument("--grid-ncpus")
     parser.add_argument("--grid-submit")
-    parser.add_argument("--grid-array-concurrency", type=int)
+    parser.add_argument(
+        "--grid-array-concurrency",
+        type=int,
+        help=(
+            "Maximum concurrent SGE array tasks for this top-up. "
+            "Defaults to the sensitivity ensemble default when omitted."
+        ),
+    )
     parser.add_argument("--task-max-seconds", type=int)
     parser.add_argument("--task-reserve-seconds", type=int)
     parser.add_argument("--retry-min-seconds", type=int)

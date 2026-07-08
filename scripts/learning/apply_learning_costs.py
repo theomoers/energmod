@@ -42,6 +42,7 @@ from learning.fuel_price_io import (
     ensure_unique_mapping_rows,
     extract_country_code_from_bus,
     load_fuel_price_bundle_manifest,
+    load_historical_average_country_fuel_prices_frame,
     normalize_market_name,
     resolve_manifest_artifact,
 )
@@ -4791,6 +4792,19 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
                 )
             next_states.setdefault(fuel_type, {})[market] = resolved
 
+    historical_average_prices = {}
+    if expectation_mode == "block_average_expected" and int(current_year) in COST_HISTORICAL_CAPACITY_YEARS:
+        averaged_prices = load_historical_average_country_fuel_prices_frame(
+            "data/fuels/all_fuels_prices_by_country.csv",
+            current_year,
+            window_years=len(expectation_weights),
+        )
+        if not averaged_prices.empty:
+            historical_average_prices = {
+                (str(row["fuel_type"]), str(row["country"])): float(row["price_eur_mwh"])
+                for row in averaged_prices.to_dict(orient="records")
+            }
+
     country_rows = []
     for fuel_type in cfg["fuels"]:
         mapping_rows = bundle["country_map_df"].loc[
@@ -4812,20 +4826,9 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
             if expectation_mode == "block_average_expected":
                 start_state = (input_states.get(fuel_type, {}) or {}).get(market)
                 params_row = bundle["params_by_key"][(fuel_type, market)]
-                if int(current_year) == 2020 and int(current_year) in COST_HISTORICAL_CAPACITY_YEARS:
-                    applied_price, row_expectation_weights_json = _compute_fossil_bootstrap_current_year_price(
-                        params_row=params_row,
-                        current_year=current_year,
-                        historical_by_key=bundle["historical_by_key"],
-                        weight_count=len(expectation_weights),
-                    )
-                elif int(current_year) == 2025 and int(current_year) in COST_HISTORICAL_CAPACITY_YEARS:
-                    applied_price, row_expectation_weights_json = _compute_fossil_bootstrap_historical_average_price(
-                        params_row=params_row,
-                        current_year=current_year,
-                        historical_by_key=bundle["historical_by_key"],
-                        expectation_weights=expectation_weights,
-                    )
+                historical_average_price = historical_average_prices.get((fuel_type, country))
+                if historical_average_price is not None:
+                    applied_price = historical_average_price
                 else:
                     applied_price, row_expectation_weights_json = _compute_fossil_block_average_expected_price(
                         params_row=params_row,

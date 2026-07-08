@@ -147,7 +147,7 @@ from pypsa.clustering.spatial import (
     busmap_by_kmeans,
     get_clustering_from_busmap,
 )
-from shapely.geometry import Point
+from shapely.geometry import MultiPolygon, Point
 
 idx = pd.IndexSlice
 
@@ -763,6 +763,131 @@ def clustering_for_n_clusters(
     return clustering
 
 
+
+def _geometry_parts(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return list(geom.geoms)
+    if hasattr(geom, "geoms"):
+        return [g for g in geom.geoms if g.geom_type == "Polygon"]
+    return []
+
+
+def _largest_polygon(geom):
+    parts = _geometry_parts(geom)
+    return max(parts, key=lambda p: p.area) if parts else None
+
+
+def _wrapped_lon_delta(lon0, lon1):
+    delta = abs(float(lon0) - float(lon1))
+    return min(delta, 360.0 - delta)
+
+
+def _wrapped_centroid_distance2(point0, point1):
+    dx = _wrapped_lon_delta(point0.x, point1.x)
+    dy = float(point0.y) - float(point1.y)
+    return dx * dx + dy * dy
+
+
+def _parts_to_geometry(parts):
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return MultiPolygon(parts)
+
+
+def _update_region_representative_points(regions_c):
+    for idx, row in regions_c.iterrows():
+        largest_polygon = _largest_polygon(row["geometry"])
+        if largest_polygon is not None:
+            representative_point = largest_polygon.representative_point()
+        else:
+            logger.warning(
+                "Region %s: could not find polygon geometry, using centroid for representative point.",
+                row.get("name", idx),
+            )
+            representative_point = row["geometry"].centroid
+        regions_c.at[idx, "x"] = representative_point.x
+        regions_c.at[idx, "y"] = representative_point.y
+    return regions_c
+
+
+def _reassign_disconnected_region_parts_to_nearest_same_country_cluster(regions_c):
+    """Move detached polygon parts to the nearest same-country cluster anchor.
+
+    Dissolving bus regions preserves all disconnected input country-shape pieces.
+    For large countries crossing the dateline this can leave, for example, a far
+    eastern polygon attached to a western Russia cluster.  The largest polygon of
+    each cluster is kept as the anchor; all smaller detached parts are assigned to
+    the nearest anchor in the same country, using wrapped longitude distance.
+    """
+    if regions_c.empty or "geometry" not in regions_c.columns:
+        return regions_c
+
+    out = regions_c.copy()
+    if "country" not in out.columns:
+        out["country"] = out["name"].astype(str).str.extract(r"^([A-Z]{2})")[0]
+
+    anchors = {}
+    largest_part_ids = {}
+    for idx, row in out.iterrows():
+        country = row.get("country")
+        if pd.isna(country) or str(country) == "Unknown":
+            continue
+        parts = _geometry_parts(row["geometry"])
+        if not parts:
+            continue
+        largest_idx = max(range(len(parts)), key=lambda i: parts[i].area)
+        largest = parts[largest_idx]
+        anchors.setdefault(country, []).append((idx, largest.representative_point()))
+        largest_part_ids[idx] = largest_idx
+
+    assigned_parts = {idx: [] for idx in out.index}
+    moved_parts = 0
+    moved_area = 0.0
+
+    for idx, row in out.iterrows():
+        country = row.get("country")
+        parts = _geometry_parts(row["geometry"])
+        if not parts:
+            continue
+        country_anchors = anchors.get(country, [])
+        if len(country_anchors) <= 1:
+            assigned_parts[idx].extend(parts)
+            continue
+
+        own_largest_idx = largest_part_ids.get(idx)
+        for part_idx, part in enumerate(parts):
+            if part_idx == own_largest_idx:
+                assigned_parts[idx].append(part)
+                continue
+            point = part.representative_point()
+            target_idx = min(
+                country_anchors,
+                key=lambda item: _wrapped_centroid_distance2(point, item[1]),
+            )[0]
+            assigned_parts[target_idx].append(part)
+            if target_idx != idx:
+                moved_parts += 1
+                moved_area += float(part.area)
+
+    for idx, parts in assigned_parts.items():
+        geom = _parts_to_geometry(parts)
+        if geom is not None:
+            out.at[idx, "geometry"] = geom
+
+    if moved_parts:
+        logger.info(
+            "Reassigned %d detached region polygon parts to nearest same-country cluster anchors (area %.3f deg2).",
+            moved_parts,
+            moved_area,
+        )
+    return out
+
 def cluster_regions(busmaps, inputs, output, alternative_clustering=False, global_clustering=False):
     # Handle single busmap case (normal case)
     if len(busmaps) == 1:
@@ -869,7 +994,12 @@ def cluster_regions(busmaps, inputs, output, alternative_clustering=False, globa
                 return "Unknown"
         
         regions_c['country'] = regions_c['name'].apply(get_majority_country_from_original)
-        
+
+        if which == "regions_onshore":
+            regions_c = _reassign_disconnected_region_parts_to_nearest_same_country_cluster(regions_c)
+            if global_clustering or alternative_clustering:
+                regions_c = _update_region_representative_points(regions_c)
+
         regions_c.to_file(getattr(output, which))
 
 

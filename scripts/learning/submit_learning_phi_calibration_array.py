@@ -401,7 +401,7 @@ def _write_overlay(task: dict, output_dir: Path) -> Path:
                     "  baseyear_generation:",
                     "    wind_iteration_scaling_enabled: false",
                     "    solar_iteration_scaling_enabled: false",
-                    "    fossil_price_tuning_enabled: true",
+                    "    fossil_price_tuning_enabled: false",
                     "    fossil_price_override_csv: validation/data/fossil_price_tuning_overrides.csv",
                     "    fossil_price_tuning_apply_years:",
                     "      - 2020",

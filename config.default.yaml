@@ -105,6 +105,82 @@ global_specific:
     history_metric: biofuel_electricity
     freeze_last_historical_value: true
     strict_physical_balance: true
+  electricity_demand_alignment:
+    enable: false
+    audit_dir: validation/results
+    carry_forward_anchor_year: 2025
+    anchors:
+      2020:
+        year: 2020
+        csv: validation/data/owid-energy-data.csv
+        schema: owid_energy
+        target_column: electricity_demand
+        electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
+      2025:
+        year: 2025
+        csv: validation/data/owid-elecbalance2025.csv
+        schema: ember_generation_balance
+        fallback_references:
+          - year: 2024
+            csv: validation/data/owid-elecbalance2025.csv
+            schema: ember_generation_balance
+          - year: 2024
+            csv: validation/data/owid-energy-data.csv
+            schema: owid_energy
+            target_column: electricity_demand
+        electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
+  transmission_capacity_limits:
+    enable: false
+    audit_dir: validation/results
+    existing_csv: validation/data/transmission/GTD-v1.1_regional_existing.csv
+    planned_csv: validation/data/transmission/GTD-v1.1_regional_planned.csv
+    planned_policy: by_year
+    missing_year_planned_default: 2025
+    missing_pair_policy: zero_capacity
+    fallback_ratio: 0.115
+    explicit_zero_policy: zero_capacity
+    capacity_multiplier_by_year:
+      2020: 1.0
+      2025: 1.0
+      2030: 1.15
+      2035: 1.30
+      2040: 1.45
+      2045: 1.60
+      2050: 1.75
+  fossil_capacity_alignment:
+    enable: false
+    year: 2020
+    audit_dir: validation/results
+    coal_csv: validation/data/Global-Coal-Plant-Tracker-January-2026.csv
+    oil_gas_csv: validation/data/Global-Oil-and-Gas-Plant-Tracker-GOGPT-August-2025.csv
+    carriers: [coal, gas, oil]
+    min_reference_mw: 1.0
+    min_model_mw: 1.0
+    # Optional clipping for extreme country/fuel corrections. Set scale_max to null for no upper cap.
+    scale_min: 0.0
+    scale_max: null
+    scale_down_existing: true
+    # null means GEM fixes the historical installed level/minimum, but does not impose a hard upper cap.
+    # Set e.g. 0.25 to enforce a finite cap at 125% of GEM capacity.
+    capacity_cap_headroom: null
+    # Aggregate country/fuel ceiling applied in solve; keeps regional siting flexible.
+    country_fuel_capacity_ceiling:
+      enable: false
+      multiplier: 1.2
+      tolerance_mw: 1.0
+      skip_if_min_exceeds_cap: true
+    make_baseyear_fossil_links_extendable: false
+    extendable_baseyear_carriers: [coal, lignite, CCGT, OCGT, oil]
+    materialize_2025:
+      enable: false
+      year: 2025
+      carriers: [coal, gas, oil]
+      min_reference_mw: 1.0
+      min_model_mw: 1.0
+      scale_existing: true
+      scale_down_existing: true
+      add_missing: true
+      make_links_extendable_after_materialization: false
   baseyear_generation:
     baseyear_generation_constraint: true # If true, 2020 electrictiy generation is constrained by historical values +- x% in the baseyear (first planning horizon) -- values are scaled proportionally to elec demand
     # Optional solved baseyear network used to estimate non-Load electric end-use
@@ -216,11 +292,11 @@ clean_osm_data_options: # osm = OpenStreetMap
   tag_substation: "transmission" # Filters only substations with 'transmission' tag, ('distribution' also available)
   add_line_endings: true # When "True", then line endings are added to the dataset of the substations
   generator_name_method: OSM # Methodology to specify the name to the generator. Options: OSM (name as by OSM dataset), closest_city (name by the closest city)
-  use_custom_lines: "OSM_only" # Use OSM (OSM_only), customized (custom_only), or both data sets (add_custom)
+  use_custom_lines: "OSM_only" # Use OSM (OSM_only), customized (custom_only), both data sets (add_custom) or none (none)
   path_custom_lines: false # If exists, provide the specific absolute path of the custom file e.g. (...\data\custom_lines.geojson)
-  use_custom_substations: "OSM_only" # Use OSM (OSM_only), customized (custom_only), or both data sets (add_custom)
+  use_custom_substations: "OSM_only" # Use OSM (OSM_only), customized (custom_only), both data sets (add_custom) or none (none)
   path_custom_substations: false # If exists, provide the specific absolute path of the custom file e.g. (...\data\custom_substations.geojson)
-  use_custom_cables: "OSM_only" # Use OSM (OSM_only), customized (custom_only), or both data sets (add_custom)
+  use_custom_cables: "OSM_only" # Use OSM (OSM_only), customized (custom_only), both data sets (add_custom) or none (none)
   path_custom_cables: false # If exists, provide the specific absolute path of the custom file e.g. (...\data\custom_cables.geojson)
 
 build_osm_network: # Options of the build_osm_network script; osm = OpenStreetMap

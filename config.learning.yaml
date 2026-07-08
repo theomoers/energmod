@@ -116,9 +116,9 @@ learning:
     include_legacy_curve: false
     stochastic_models:
       - shared_state_bayesian_regime_wright
-      - way_fixed_rho_benchmark
-      - correlated_geometric_random_walk
-    draws: 1000
+      #- way_fixed_rho_benchmark
+      #- correlated_geometric_random_walk
+    draws: 200
     seed_mode: sequential      # random | sequential
     random_seed: 12345         # makes the random seed draw generation reproducible
     seed_upper_bound: 1000000000

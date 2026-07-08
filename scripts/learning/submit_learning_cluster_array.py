@@ -13,6 +13,7 @@ from pathlib import Path
 
 import yaml
 from bootstrap_state_store import (
+    DEFAULT_SECTOR_ROOT,
     resolve_results_sector_dir,
     resolve_scenario_sector_name,
     restore_bootstrap_state,
@@ -45,13 +46,33 @@ def expand_and_resolve(pathlike):
     return Path(os.path.expandvars(str(pathlike))).resolve()
 
 
-def resolve_task_sector_names(tasks):
+def resolve_task_sector_names(tasks, sector_root=DEFAULT_SECTOR_ROOT):
     return sorted(
         {
-            resolve_scenario_sector_name(str(task["scenario_name"]))
+            task.get("resolved_sector_name")
+            or resolve_scenario_sector_name(str(task["scenario_name"]), sector_root=sector_root)
             for task in tasks
         }
     )
+
+
+def resolve_sector_root(merged_config, override=None):
+    if override:
+        return str(override).strip().strip("/")
+    run_cfg = (merged_config or {}).get("run", {}) or {}
+    sector_name = run_cfg.get("sector_name")
+    if sector_name:
+        return str(sector_name).strip().strip("/")
+    return DEFAULT_SECTOR_ROOT
+
+
+def attach_sector_names(tasks, sector_root):
+    for task in tasks:
+        task["sector_root"] = sector_root
+        task["resolved_sector_name"] = resolve_scenario_sector_name(
+            str(task["scenario_name"]), sector_root=sector_root
+        )
+    return tasks
 
 
 
@@ -266,9 +287,12 @@ def build_tasks(configfiles, scenario_name, override_models=None, override_draws
 
 
 def build_grid_run_cmd(args, manifest_path, task_count, worker_script):
+    concurrency = int(args.grid_array_concurrency or DEFAULT_GRID_ARRAY_CONCURRENCY)
+    if concurrency <= 0:
+        raise ValueError("--grid-array-concurrency must be a positive integer")
     grid_array = f"1-{task_count}"
-    if task_count > DEFAULT_GRID_ARRAY_CONCURRENCY:
-        grid_array = f"{grid_array}/{DEFAULT_GRID_ARRAY_CONCURRENCY}"
+    if task_count > concurrency:
+        grid_array = f"{grid_array}/{concurrency}"
     cmd = [
         "grid_run",
         f"--grid_mem={args.grid_mem}",
@@ -296,6 +320,7 @@ def write_submission_metadata(
     resolved_sector_name=None,
     resolved_sector_names=None,
     bootstrap_state_source=None,
+    sector_root=None,
 ):
     if merged_config is None:
         merged_config = load_merged_config(configfiles)
@@ -309,6 +334,7 @@ def write_submission_metadata(
         "grid_mem": args.grid_mem,
         "grid_ncpus": args.grid_ncpus,
         "grid_submit": args.grid_submit,
+        "grid_array_concurrency": int(args.grid_array_concurrency or DEFAULT_GRID_ARRAY_CONCURRENCY),
         "job_root": str(Path(os.path.expandvars(args.job_root)).resolve()),
         "conda_env": args.conda_env,
         "task_count": len(tasks),
@@ -321,6 +347,7 @@ def write_submission_metadata(
         },
         "scenario_variants": scenario_variants or [],
         "models_override": override_models or None,
+        "sector_root": sector_root,
         "resolved_sector_name": resolved_sector_name,
         "resolved_sector_names": resolved_sector_names or ([] if resolved_sector_name is None else [resolved_sector_name]),
         "bootstrap_state_source": bootstrap_state_source,
@@ -335,6 +362,7 @@ def submit_array(args):
     configfiles.extend(args.configfiles)
     merged_config = load_merged_config(configfiles)
 
+    sector_root = resolve_sector_root(merged_config, args.sector_root)
     scenario_variants = load_cost_expectation_scenarios(args.cost_expectation_scenarios)
     override_models = parse_models_arg(args.models)
     tasks = build_tasks(
@@ -344,8 +372,9 @@ def submit_array(args):
         override_draws=args.draws,
         scenario_variants=scenario_variants,
     )
-    resolved_sector_name = resolve_scenario_sector_name(args.scenario_name)
-    resolved_sector_names = resolve_task_sector_names(tasks)
+    tasks = attach_sector_names(tasks, sector_root)
+    resolved_sector_name = resolve_scenario_sector_name(args.scenario_name, sector_root=sector_root)
+    resolved_sector_names = resolve_task_sector_names(tasks, sector_root=sector_root)
     bootstrap_state_source = (
         str(expand_and_resolve(args.bootstrap_state_source))
         if args.bootstrap_state_source
@@ -371,6 +400,7 @@ def submit_array(args):
         resolved_sector_name=resolved_sector_name,
         resolved_sector_names=resolved_sector_names,
         bootstrap_state_source=bootstrap_state_source,
+        sector_root=sector_root,
     )
 
     logs_dir = submit_dir / "logs"
@@ -435,7 +465,9 @@ def run_worker(args):
     ]
     env = os.environ.copy()
     env["LEARNING_SCENARIO_NAME"] = str(task["scenario_name"])
-    env["LEARNING_SECTOR_NAME"] = resolve_scenario_sector_name(str(task["scenario_name"]))
+    env["LEARNING_SECTOR_NAME"] = task.get("resolved_sector_name") or resolve_scenario_sector_name(
+        str(task["scenario_name"]), sector_root=str(task.get("sector_root", DEFAULT_SECTOR_ROOT))
+    )
     if "cost_expectation_mode" in task:
         env["LEARNING_COST_EXPECTATION_MODE"] = str(task["cost_expectation_mode"])
     if "cost_expectation_weights" in task and task["cost_expectation_weights"] is not None:
@@ -459,12 +491,22 @@ def main():
     parser.add_argument("--job-root", default=str(DEFAULT_JOB_ROOT))
     parser.add_argument("--submit-root", default="cluster_submissions")
     parser.add_argument("--scenario-name", default="learning_mc")
+    parser.add_argument(
+        "--sector-root",
+        help="Base results sector for scenario branches; defaults to run.sector_name from the merged config",
+    )
     parser.add_argument("--job-name", default="learnmc")
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV)
     parser.add_argument("--run-mode", choices=["branch", "full"], default="branch")
     parser.add_argument("--grid-mem", default="90G")
     parser.add_argument("--grid-ncpus", default="12")
     parser.add_argument("--grid-submit", default="batch")
+    parser.add_argument(
+        "--grid-array-concurrency",
+        type=int,
+        default=DEFAULT_GRID_ARRAY_CONCURRENCY,
+        help="Maximum simultaneous SGE array tasks; emitted as grid_array=1-N/C",
+    )
     parser.add_argument("--print-only", action="store_true")
     parser.add_argument("--models", action="append", help="Override stochastic models (comma-separated or repeatable)")
     parser.add_argument("--draws", type=int, help="Override learning.monte_carlo.draws")

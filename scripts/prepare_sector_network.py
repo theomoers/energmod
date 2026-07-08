@@ -57,7 +57,11 @@ if hasattr(_validation_hooks, "align_country_electricity_demand_to_owid"):
     apply_country_wind_iteration_scaling = _validation_hooks.apply_country_wind_iteration_scaling
     apply_country_solar_iteration_scaling = _validation_hooks.apply_country_solar_iteration_scaling
     apply_country_hydro_iteration_scaling = _validation_hooks.apply_country_hydro_iteration_scaling
-    apply_country_nuclear_iteration_scaling = _validation_hooks.apply_country_nuclear_iteration_scaling
+    apply_pris_nuclear_capacity_and_availability = (
+        _validation_hooks.apply_pris_nuclear_capacity_and_availability
+    )
+    apply_gogpt_oil_capacity_fix = _validation_hooks.apply_gogpt_oil_capacity_fix
+    apply_ember_bioenergy_capacity_fix = _validation_hooks.apply_ember_bioenergy_capacity_fix
     logger.info("Using centralized validation/tuning hooks from scripts/validation.py")
 if hasattr(_validation_hooks, "apply_country_fuel_price_overrides"):
     apply_country_fuel_price_overrides = _validation_hooks.apply_country_fuel_price_overrides
@@ -4322,8 +4326,8 @@ if __name__ == "__main__":
     apply_country_wind_iteration_scaling(n, investment_year, snakemake.config)
     # Optional per-country iterative solar overrides written by calibration wrapper.
     apply_country_solar_iteration_scaling(n, investment_year, snakemake.config)
-    # Optional per-country iterative nuclear availability overrides.
-    apply_country_nuclear_iteration_scaling(n, investment_year, snakemake.config)
+    # Historical capacity validation for nuclear, oil, and bioenergy is applied
+    # after add_existing_baseyear/add_brownfield so downstream stock edits cannot undo it.
     # Clip within-country onwind availability outliers before capacity constraints.
     apply_country_onwind_mean_cf_caps(n, investment_year)
     # Legacy compatibility hook; the actual nodal_distribution_limit is now enforced

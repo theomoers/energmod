@@ -217,6 +217,71 @@ COPERNICUS_CRS = "EPSG:4326"
 GEBCO_CRS = "EPSG:4326"
 PPL_CRS = "EPSG:4326"
 
+def _append_drop_reason(reasons, mask, label):
+    if not mask.any():
+        return
+    previous = reasons.loc[mask].fillna("")
+    reasons.loc[mask] = np.where(previous == "", label, previous + ";" + label)
+
+
+def remove_faulty_offshore_regions(regions):
+    """Drop offshore regions known to break atlite/rasterio masking.
+
+    Some tiny offshore polygons around polar areas or the antimeridian have
+    finite lon/lat bounds but produce NaN projected bounds inside rasterio.
+    They are negligible for this global run and can otherwise stop all offshore
+    profile generation.
+    """
+    reasons = pd.Series("", index=regions.index, dtype=object)
+
+    known_bad_positions = [545, 1343]
+    known_bad_indices = [
+        regions.index[position]
+        for position in known_bad_positions
+        if position < len(regions)
+    ]
+    if known_bad_indices:
+        _append_drop_reason(
+            reasons,
+            pd.Series(reasons.index.isin(known_bad_indices), index=regions.index),
+            "known_faulty_offshore_shape",
+        )
+
+    geometry = regions.geometry
+    _append_drop_reason(reasons, geometry.isna(), "missing_geometry")
+    _append_drop_reason(reasons, geometry.is_empty.fillna(False), "empty_geometry")
+    _append_drop_reason(reasons, (~geometry.is_valid).fillna(True), "invalid_geometry")
+
+    bounds = geometry.bounds
+    finite_bounds = np.isfinite(bounds.to_numpy(dtype=float)).all(axis=1)
+    _append_drop_reason(
+        reasons,
+        pd.Series(~finite_bounds, index=regions.index),
+        "nonfinite_bounds",
+    )
+
+    antimeridian = (bounds["minx"] <= -179.999) | (bounds["maxx"] >= 179.999)
+    _append_drop_reason(
+        reasons,
+        antimeridian.fillna(False),
+        "touches_antimeridian",
+    )
+
+    to_drop = reasons[reasons != ""].index
+    if len(to_drop) == 0:
+        return regions
+
+    drop_info = regions.loc[to_drop, ["name"]].copy()
+    drop_info["drop_reason"] = reasons.loc[to_drop]
+    drop_info = drop_info.join(bounds.loc[to_drop])
+    logger.info(
+        "Removing %d faulty offshore regions before availability calculation:\n%s",
+        len(to_drop),
+        drop_info.to_string(max_rows=80),
+    )
+
+    return regions.drop(index=to_drop).reset_index(drop=True)
+
 
 def check_cutout_match(cutout, geodf):
     cutout_box = box(*cutout.bounds)
@@ -534,10 +599,7 @@ if __name__ == "__main__":
     # Remove faulty offshore shapes before availability matrix calculation
     if snakemake.wildcards.technology.startswith("offwind") and snakemake.params.global_specific.get("remove_faulty_offshore_shapes", False):
         logger.info(f"Original regions length: {len(regions)}")
-        to_remove = [545, 1343]
-        logger.info(f"Removing faulty offshore shapes with indices: {to_remove}. Not relevant for energy model (polar regions)")
-        logger.info(f"Removing regions: {regions.iloc[to_remove][['name', 'geometry']]}")
-        regions = regions.drop(to_remove).reset_index(drop=True)
+        regions = remove_faulty_offshore_regions(regions)
         logger.info(f"New regions length: {len(regions)}")
 
     # do not pull up, set_index does not work if geo dataframe is empty

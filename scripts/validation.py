@@ -15,7 +15,7 @@ import pandas as pd
 import pypsa
 import xarray as xr
 
-from _helpers import BASE_DIR, three_2_two_digits_country
+from _helpers import BASE_DIR, country_name_2_two_digits, three_2_two_digits_country
 
 logger = logging.getLogger(__name__)
 
@@ -570,6 +570,78 @@ def _bus_country_lookup(n):
         n.buses.index.astype(str).to_series(index=n.buses.index).str.extract(r"^([A-Z]{2})\b")[0]
     )
     return country.fillna(location_iso2).fillna(index_iso2).fillna("")
+
+
+def _snapshot_weight_sum_for_load_energy(n):
+    if "generators" in n.snapshot_weightings:
+        weights = n.snapshot_weightings["generators"]
+    elif "objective" in n.snapshot_weightings:
+        weights = n.snapshot_weightings["objective"]
+    else:
+        weights = pd.Series(1.0, index=n.snapshots)
+    weights = pd.to_numeric(weights, errors="coerce").reindex(n.snapshots).fillna(0.0)
+    return float(weights.sum())
+
+
+def _add_missing_direct_electricity_loads(
+    n,
+    comp_before,
+    investment_year,
+    min_reference_twh=0.1,
+):
+    if comp_before.empty:
+        return []
+
+    weight_sum = _snapshot_weight_sum_for_load_energy(n)
+    if weight_sum <= 0.0:
+        logger.warning(
+            "Cannot add missing direct electricity loads for %s: non-positive snapshot weight sum.",
+            investment_year,
+        )
+        return []
+
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+    added = []
+    missing = comp_before.loc[
+        comp_before["direct_model_twh_before"].fillna(0.0).le(1e-9)
+        & comp_before["direct_reference_twh"].fillna(0.0).gt(float(min_reference_twh))
+    ]
+
+    for country, row in missing.iterrows():
+        country = str(country).upper()
+        ac_bus = _pick_country_ac_bus(n, country, bus_country)
+        if ac_bus is None:
+            logger.warning(
+                "Skipping missing direct electricity load for %s in %s: no AC bus.",
+                country,
+                investment_year,
+            )
+            continue
+
+        direct_reference_twh = float(row["direct_reference_twh"])
+        annual_mwh = direct_reference_twh * 1e6
+        p_set = annual_mwh / weight_sum
+        base_name = f"{ac_bus} validation electricity demand-{int(investment_year)}"
+        name = base_name
+        suffix = 2
+        while name in n.loads.index:
+            name = f"{base_name}-{suffix}"
+            suffix += 1
+
+        n.add("Load", name, bus=ac_bus, carrier="electricity")
+        n.loads_t.p_set[name] = p_set
+        added.append((country, name, ac_bus, direct_reference_twh))
+
+    if added:
+        logger.info(
+            "Added missing direct electricity loads for %s: %s",
+            investment_year,
+            ", ".join(
+                f"{country}={direct_reference_twh:.3f} TWh on {bus}"
+                for country, _name, bus, direct_reference_twh in added
+            ),
+        )
+    return added
 
 
 def _effective_p_nom_mw(df):
@@ -1395,102 +1467,228 @@ def _country_ac_end_use_link_withdrawal_twh(
     return energy_mwh.groupby(link_country).sum() / 1e6
 
 
-def align_country_electricity_demand_to_owid(n, investment_year, config):
-    global_cfg = config.get("global_specific", {})
+
+EMBER_ELECTRICITY_BALANCE_COLUMNS = [
+    "Other renewables",
+    "Bioenergy",
+    "Solar",
+    "Wind",
+    "Hydropower",
+    "Nuclear",
+    "Oil",
+    "Gas",
+    "Coal",
+]
+
+
+def _electricity_demand_alignment_config(config):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("electricity_demand_alignment")
+    if isinstance(cfg, dict):
+        return cfg if bool(cfg.get("enable", False)) else None
+
     base_cfg = global_cfg.get("baseyear_generation", {})
+    if not isinstance(base_cfg, dict) or not base_cfg.get("baseyear_generation_constraint", False):
+        return None
+
     baseyear = int(base_cfg.get("year", 2020))
-    if int(investment_year) != baseyear:
-        logger.info(
-            "Skipping OWID electricity-demand alignment for %s (configured baseyear is %s).",
-            investment_year,
-            baseyear,
-        )
-        return
+    return {
+        "enable": True,
+        "audit_dir": "validation/results",
+        "anchors": {
+            str(baseyear): {
+                "year": baseyear,
+                "csv": base_cfg.get("owid_csv", "validation/data/owid-energy-data.csv"),
+                "schema": "owid_energy",
+                "target_column": "electricity_demand",
+                "electricity_demand_baseline_network": base_cfg.get(
+                    "electricity_demand_baseline_network"
+                ),
+                "electricity_demand_end_use_link_output_bus_carrier_substrings": base_cfg.get(
+                    "electricity_demand_end_use_link_output_bus_carrier_substrings",
+                    ["heat"],
+                ),
+            }
+        },
+    }
 
-    owid_csv = _repo_path(base_cfg.get("owid_csv", "validation/data/owid-energy-data.csv"))
-    if not os.path.exists(owid_csv):
-        logger.warning(
-            "OWID electricity-demand alignment skipped: file not found at %s", owid_csv
-        )
-        return
 
-    usecols = {"year", "iso_code", "electricity_demand"}
-    owid = pd.read_csv(owid_csv, usecols=lambda c: c in usecols)
-    if "electricity_demand" not in owid.columns:
-        logger.warning(
-            "OWID electricity-demand alignment skipped: column 'electricity_demand' not found in %s",
-            owid_csv,
-        )
-        return
+def _alignment_anchors(cfg):
+    anchors = cfg.get("anchors", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(anchors, dict):
+        return {}
+    out = {}
+    for key, value in anchors.items():
+        if not isinstance(value, dict):
+            continue
+        year = int(value.get("year", key))
+        anchor = dict(value)
+        anchor["year"] = year
+        out[year] = anchor
+    return out
 
-    owid = owid.loc[owid["year"] == int(baseyear)].copy()
-    owid["country"] = owid["iso_code"].apply(_safe_iso3_to_iso2)
-    owid = owid.loc[owid["country"].notna()].copy()
-    owid["electricity_demand"] = pd.to_numeric(owid["electricity_demand"], errors="coerce").fillna(0.0)
-    ref_twh = owid.groupby("country")["electricity_demand"].sum(min_count=1)
-    if ref_twh.empty:
-        logger.warning(
-            "OWID electricity-demand alignment skipped: no reference values for year %s in %s",
-            baseyear,
-            owid_csv,
-        )
-        return
 
-    elec_loads, load_country = _electric_load_index_and_country(n)
-    if len(elec_loads) == 0:
-        logger.warning("OWID electricity-demand alignment skipped: no electricity loads found on AC/low voltage buses.")
-        return
+def _load_single_electricity_demand_reference_twh(anchor_cfg):
+    schema = str(anchor_cfg.get("schema", "owid_energy")).strip().lower()
+    year = int(anchor_cfg["year"])
+    csv_path = _repo_path(anchor_cfg.get("csv", anchor_cfg.get("owid_csv", "")))
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"electricity demand reference not found: {csv_path}")
 
-    energy_mwh_by_load = _electric_load_energy_by_load_mwh(n, elec_loads)
-    model_twh_before = energy_mwh_by_load.groupby(load_country).sum() / 1e6
+    if schema == "owid_energy":
+        target_col = anchor_cfg.get("target_column", "electricity_demand")
+        usecols = {"year", "iso_code", target_col}
+        ref = pd.read_csv(csv_path, usecols=lambda c: c in usecols)
+        missing = {"year", "iso_code", target_col}.difference(ref.columns)
+        if missing:
+            raise ValueError(f"missing OWID demand columns in {csv_path}: {sorted(missing)}")
+        ref = ref.loc[ref["year"] == year].copy()
+        ref["country"] = ref["iso_code"].apply(_safe_iso3_to_iso2)
+        ref[target_col] = pd.to_numeric(ref[target_col], errors="coerce")
+        ref = ref.loc[ref["country"].notna() & ref[target_col].notna() & ref[target_col].gt(0.0)]
+        return ref.groupby("country")[target_col].sum(min_count=1).astype(float)
 
-    estimated_end_use_link_twh = pd.Series(dtype=float)
-    baseline_network = None
-    baseline_path = _baseline_electricity_demand_network_path(base_cfg)
-    if baseline_path is not None:
-        if os.path.exists(baseline_path):
-            try:
-                n_baseline = pypsa.Network(baseline_path)
-                estimated_end_use_link_twh = _country_ac_end_use_link_withdrawal_twh(
-                    n_baseline,
-                    output_bus_carrier_substrings=base_cfg.get(
-                        "electricity_demand_end_use_link_output_bus_carrier_substrings",
-                        ["heat"],
-                    ),
-                )
-                baseline_network = baseline_path
-            except Exception as exc:
-                logger.warning(
-                    "OWID electricity-demand alignment: failed to load baseline network %s (%s); falling back to direct-load-only alignment.",
-                    baseline_path,
-                    exc,
-                )
-        else:
+    if schema == "ember_generation_balance":
+        usecols = {"Year", "Code", *EMBER_ELECTRICITY_BALANCE_COLUMNS}
+        ref = pd.read_csv(csv_path, usecols=lambda c: c in usecols)
+        missing = {"Year", "Code", *EMBER_ELECTRICITY_BALANCE_COLUMNS}.difference(ref.columns)
+        if missing:
+            raise ValueError(f"missing Ember balance columns in {csv_path}: {sorted(missing)}")
+        ref = ref.loc[ref["Year"] == year].copy()
+        ref["country"] = ref["Code"].apply(_safe_iso3_to_iso2)
+        for col in EMBER_ELECTRICITY_BALANCE_COLUMNS:
+            ref[col] = pd.to_numeric(ref[col], errors="coerce").fillna(0.0)
+        ref["electricity_demand_reference_twh"] = ref[EMBER_ELECTRICITY_BALANCE_COLUMNS].sum(axis=1)
+        ref = ref.loc[
+            ref["country"].notna()
+            & ref["electricity_demand_reference_twh"].notna()
+            & ref["electricity_demand_reference_twh"].gt(0.0)
+        ]
+        return ref.groupby("country")["electricity_demand_reference_twh"].sum(min_count=1).astype(float)
+
+    raise ValueError(f"unknown electricity demand reference schema: {schema}")
+
+
+def _normalise_electricity_demand_fallback_references(anchor_cfg):
+    fallback_refs = []
+    for fallback in anchor_cfg.get("fallback_references", []) or []:
+        if isinstance(fallback, dict):
+            fallback_ref = dict(anchor_cfg)
+            fallback_ref.pop("fallback_references", None)
+            fallback_ref.pop("fallback_years", None)
+            fallback_ref.update(fallback)
+            fallback_refs.append(fallback_ref)
+
+    for fallback_year in anchor_cfg.get("fallback_years", []) or []:
+        fallback_ref = dict(anchor_cfg)
+        fallback_ref.pop("fallback_references", None)
+        fallback_ref.pop("fallback_years", None)
+        fallback_ref["year"] = int(fallback_year)
+        fallback_refs.append(fallback_ref)
+
+    return fallback_refs
+
+
+def _load_electricity_demand_reference_twh(anchor_cfg):
+    references = []
+    primary_cfg = dict(anchor_cfg)
+    primary_cfg.pop("fallback_references", None)
+    primary_cfg.pop("fallback_years", None)
+    references.append(_load_single_electricity_demand_reference_twh(primary_cfg))
+
+    for fallback_cfg in _normalise_electricity_demand_fallback_references(anchor_cfg):
+        try:
+            references.append(_load_single_electricity_demand_reference_twh(fallback_cfg))
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
             logger.warning(
-                "OWID electricity-demand alignment: baseline network not found at %s; falling back to direct-load-only alignment.",
-                baseline_path,
+                "Ignoring electricity demand fallback reference for year %s from %s: %s",
+                fallback_cfg.get("year"),
+                fallback_cfg.get("csv", fallback_cfg.get("owid_csv", "")),
+                exc,
             )
 
-    effective_ref_twh = ref_twh.sub(estimated_end_use_link_twh, fill_value=0.0).clip(lower=0.0)
+    if not references:
+        return pd.Series(dtype=float)
 
-    comp_before = pd.DataFrame(
-        {
-            "model_twh": model_twh_before,
-            "reference_twh": effective_ref_twh.reindex(model_twh_before.index),
-            "owid_reference_twh": ref_twh.reindex(model_twh_before.index),
-            "estimated_end_use_link_twh": estimated_end_use_link_twh.reindex(model_twh_before.index).fillna(0.0),
-        }
-    ).dropna(subset=["reference_twh"])
-    eligible = comp_before["model_twh"].gt(0.0) & comp_before["reference_twh"].ge(0.0)
-    factors_by_country = (
-        comp_before.loc[eligible, "reference_twh"] / comp_before.loc[eligible, "model_twh"]
+    combined = references[0].copy()
+    for fallback in references[1:]:
+        missing = fallback.index.difference(combined.index)
+        if len(missing):
+            combined = pd.concat([combined, fallback.loc[missing]])
+    return combined.sort_index().astype(float)
+
+
+def _alignment_audit_dir(cfg):
+    audit_dir = cfg.get("audit_dir", "validation/results") if isinstance(cfg, dict) else "validation/results"
+    return Path(_repo_path(audit_dir))
+
+
+def _alignment_factor_path(cfg, anchor_year):
+    return _alignment_audit_dir(cfg) / f"electricity_demand_alignment_factors_{anchor_year}.csv"
+
+
+def _load_alignment_factors(cfg, anchor_year):
+    path = _alignment_factor_path(cfg, anchor_year)
+    if not path.exists():
+        return pd.Series(dtype=float), path
+    df = pd.read_csv(path)
+    if "country" not in df.columns or "factor" not in df.columns:
+        raise ValueError(f"invalid electricity demand factor file: {path}")
+    factors = pd.to_numeric(df["factor"], errors="coerce")
+    return pd.Series(factors.values, index=df["country"].astype(str).str.upper()).dropna(), path
+
+
+def _load_alignment_direct_after_twh(cfg, anchor_year):
+    path = _alignment_audit_dir(cfg) / f"electricity_demand_alignment_{int(anchor_year)}.csv"
+    if not path.exists():
+        return pd.Series(dtype=float), path
+    df = pd.read_csv(path)
+    if "country" not in df.columns or "direct_model_twh_after" not in df.columns:
+        logger.warning("Invalid electricity demand alignment audit for carry-forward loads: %s", path)
+        return pd.Series(dtype=float), path
+    countries = df["country"].astype(str).str.upper()
+    direct_after = pd.to_numeric(df["direct_model_twh_after"], errors="coerce")
+    series = pd.Series(direct_after.values, index=countries).replace([np.inf, -np.inf], np.nan).dropna()
+    return series.loc[series.gt(0.0)], path
+
+
+def _load_fallback_alignment_direct_after_twh(cfg, primary_anchor_year):
+    direct_after, path = _load_alignment_direct_after_twh(cfg, primary_anchor_year)
+    anchors = _alignment_anchors(cfg)
+    for year in sorted(anchors):
+        if int(year) == int(primary_anchor_year):
+            continue
+        fallback, _fallback_path = _load_alignment_direct_after_twh(cfg, year)
+        if fallback.empty:
+            continue
+        missing = fallback.index.difference(direct_after.index)
+        if len(missing):
+            direct_after = pd.concat([direct_after, fallback.loc[missing]])
+    return direct_after.sort_index(), path
+
+
+def _frame_with_country_index(df_or_series):
+    out = df_or_series.reset_index()
+    out = out.rename(columns={out.columns[0]: "country"})
+    return out
+
+
+def _write_electricity_demand_alignment_audit(cfg, year, audit, factors):
+    audit_dir = _alignment_audit_dir(cfg)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    _frame_with_country_index(audit.sort_index()).to_csv(
+        audit_dir / f"electricity_demand_alignment_{year}.csv",
+        index=False,
     )
-    if factors_by_country.empty:
-        logger.warning(
-            "OWID electricity-demand alignment skipped: no countries with positive modeled and reference demand."
-        )
-        return
+    _frame_with_country_index(factors.rename("factor")).to_csv(
+        _alignment_factor_path(cfg, year),
+        index=False,
+    )
 
+
+def _apply_electricity_load_factors(n, elec_loads, load_country, factors_by_country):
     load_factors = load_country.map(factors_by_country).fillna(1.0)
     time_cols = n.loads_t.p_set.columns.intersection(elec_loads)
     if len(time_cols) > 0:
@@ -1506,40 +1704,1458 @@ def align_country_electricity_demand_to_owid(n, investment_year, config):
             .mul(load_factors.reindex(static_cols).fillna(1.0))
         )
 
+
+def _estimated_end_use_link_withdrawal_twh(n, anchor_cfg):
+    baseline_network = None
+    estimated_end_use_link_twh = pd.Series(dtype=float)
+    baseline_path = _baseline_electricity_demand_network_path(anchor_cfg)
+    substrings = anchor_cfg.get(
+        "electricity_demand_end_use_link_output_bus_carrier_substrings",
+        ["heat"],
+    )
+
+    if baseline_path is not None:
+        if os.path.exists(baseline_path):
+            try:
+                n_baseline = pypsa.Network(baseline_path)
+                estimated_end_use_link_twh = _country_ac_end_use_link_withdrawal_twh(
+                    n_baseline,
+                    output_bus_carrier_substrings=substrings,
+                )
+                baseline_network = baseline_path
+            except Exception as exc:
+                logger.warning(
+                    "Electricity demand alignment: failed to load baseline network %s (%s); using current network link withdrawals.",
+                    baseline_path,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "Electricity demand alignment: baseline network not found at %s; using current network link withdrawals.",
+                baseline_path,
+            )
+
+    if estimated_end_use_link_twh.empty:
+        estimated_end_use_link_twh = _country_ac_end_use_link_withdrawal_twh(
+            n,
+            output_bus_carrier_substrings=substrings,
+        )
+
+    return estimated_end_use_link_twh, baseline_network
+
+
+def align_country_electricity_demand_to_owid(n, investment_year, config):
+    cfg = _electricity_demand_alignment_config(config)
+    if cfg is None:
+        return
+
+    investment_year = int(investment_year)
+    anchors = _alignment_anchors(cfg)
+    anchor_cfg = anchors.get(investment_year)
+    carry_forward_anchor_year = cfg.get("carry_forward_anchor_year")
+    carry_forward = False
+    if anchor_cfg is None and carry_forward_anchor_year is not None:
+        carry_forward_anchor_year = int(carry_forward_anchor_year)
+        if investment_year > carry_forward_anchor_year and carry_forward_anchor_year in anchors:
+            anchor_cfg = anchors[carry_forward_anchor_year]
+            carry_forward = True
+
+    if anchor_cfg is None:
+        logger.info(
+            "Skipping electricity demand alignment for %s; no anchor or carry-forward factor configured.",
+            investment_year,
+        )
+        return
+
+    elec_loads, load_country = _electric_load_index_and_country(n)
+    if len(elec_loads) == 0:
+        logger.warning(
+            "Electricity demand alignment skipped: no electricity loads found on AC/low voltage buses."
+        )
+        return
+
+    energy_mwh_by_load = _electric_load_energy_by_load_mwh(n, elec_loads)
+    model_twh_before = energy_mwh_by_load.groupby(load_country).sum() / 1e6
+
+    if carry_forward:
+        factors_by_country, factor_path = _load_alignment_factors(cfg, anchor_cfg["year"])
+        if factors_by_country.empty:
+            logger.warning(
+                "Electricity demand alignment skipped for %s: carry-forward factor file missing or empty at %s.",
+                investment_year,
+                factor_path,
+            )
+            return
+
+        anchor_direct_after, anchor_audit_path = _load_fallback_alignment_direct_after_twh(
+            cfg,
+            anchor_cfg["year"],
+        )
+        missing_countries = anchor_direct_after.index.difference(model_twh_before.index)
+        if len(missing_countries):
+            divisor = factors_by_country.reindex(missing_countries).fillna(1.0).replace(0.0, np.nan)
+            direct_before_target = anchor_direct_after.reindex(missing_countries).div(divisor).replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            comp_missing = pd.DataFrame(
+                {
+                    "direct_model_twh_before": 0.0,
+                    "direct_reference_twh": direct_before_target,
+                }
+            )
+            added_missing_loads = _add_missing_direct_electricity_loads(
+                n,
+                comp_missing,
+                investment_year,
+                min_reference_twh=float(cfg.get("missing_load_min_reference_twh", 0.1)),
+            )
+            if added_missing_loads:
+                elec_loads, load_country = _electric_load_index_and_country(n)
+                energy_mwh_by_load = _electric_load_energy_by_load_mwh(n, elec_loads)
+                model_twh_before = energy_mwh_by_load.groupby(load_country).sum() / 1e6
+                logger.info(
+                    "Added carry-forward electricity loads for %s using anchor audit %s.",
+                    investment_year,
+                    anchor_audit_path,
+                )
+
+        _apply_electricity_load_factors(n, elec_loads, load_country, factors_by_country)
+        model_twh_after = (
+            _electric_load_energy_by_load_mwh(n, elec_loads).groupby(load_country).sum() / 1e6
+        )
+        audit = pd.DataFrame(
+            {
+                "direct_model_twh_before": model_twh_before,
+                "direct_model_twh_after": model_twh_after,
+                "factor": factors_by_country.reindex(model_twh_after.index).fillna(1.0),
+                "source_anchor_year": int(anchor_cfg["year"]),
+                "carry_forward": True,
+            }
+        )
+        audit_dir = _alignment_audit_dir(cfg)
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        _frame_with_country_index(audit.sort_index()).to_csv(
+            audit_dir / f"electricity_demand_alignment_{investment_year}.csv",
+            index=False,
+        )
+        logger.info(
+            "Applied carry-forward electricity demand alignment for %s using %s factors from %s: countries_scaled=%d, global_direct_before=%.1f TWh, global_direct_after=%.1f TWh",
+            investment_year,
+            anchor_cfg["year"],
+            factor_path,
+            int((factors_by_country != 1.0).sum()),
+            model_twh_before.sum(),
+            model_twh_after.sum(),
+        )
+        return
+
+    try:
+        ref_twh = _load_electricity_demand_reference_twh(anchor_cfg)
+    except Exception as exc:
+        logger.warning("Electricity demand alignment skipped for %s: %s", investment_year, exc)
+        return
+
+    if ref_twh.empty:
+        logger.warning("Electricity demand alignment skipped: no reference values for %s.", investment_year)
+        return
+
+    estimated_end_use_link_twh, baseline_network = _estimated_end_use_link_withdrawal_twh(n, anchor_cfg)
+    effective_ref_twh = ref_twh.sub(estimated_end_use_link_twh.reindex(ref_twh.index).fillna(0.0)).clip(lower=0.0)
+
+    country_index = model_twh_before.index.union(ref_twh.index).union(effective_ref_twh.index)
+    comp_before = pd.DataFrame(
+        {
+            "direct_model_twh_before": model_twh_before.reindex(country_index).fillna(0.0),
+            "direct_reference_twh": effective_ref_twh.reindex(country_index),
+            "total_reference_twh": ref_twh.reindex(country_index),
+            "eligible_link_withdrawal_twh": estimated_end_use_link_twh.reindex(country_index).fillna(0.0),
+        }
+    ).dropna(subset=["direct_reference_twh"])
+
+    min_missing_load_twh = float(cfg.get("missing_load_min_reference_twh", 0.1))
+    added_missing_loads = _add_missing_direct_electricity_loads(
+        n,
+        comp_before,
+        investment_year,
+        min_reference_twh=min_missing_load_twh,
+    )
+    if added_missing_loads:
+        elec_loads, load_country = _electric_load_index_and_country(n)
+        energy_mwh_by_load = _electric_load_energy_by_load_mwh(n, elec_loads)
+        model_twh_before = energy_mwh_by_load.groupby(load_country).sum() / 1e6
+        country_index = model_twh_before.index.union(ref_twh.index).union(effective_ref_twh.index)
+        comp_before = pd.DataFrame(
+            {
+                "direct_model_twh_before": model_twh_before.reindex(country_index).fillna(0.0),
+                "direct_reference_twh": effective_ref_twh.reindex(country_index),
+                "total_reference_twh": ref_twh.reindex(country_index),
+                "eligible_link_withdrawal_twh": estimated_end_use_link_twh.reindex(country_index).fillna(0.0),
+            }
+        ).dropna(subset=["direct_reference_twh"])
+
+    eligible = comp_before["direct_model_twh_before"].gt(0.0) & comp_before["direct_reference_twh"].ge(0.0)
+    factors_by_country = (
+        comp_before.loc[eligible, "direct_reference_twh"]
+        / comp_before.loc[eligible, "direct_model_twh_before"]
+    )
+    if factors_by_country.empty:
+        logger.warning(
+            "Electricity demand alignment skipped: no countries with positive modeled and reference demand."
+        )
+        return
+
+    _apply_electricity_load_factors(n, elec_loads, load_country, factors_by_country)
+
     model_twh_after = (
         _electric_load_energy_by_load_mwh(n, elec_loads).groupby(load_country).sum() / 1e6
     )
-    comp_after = pd.DataFrame(
-        {
-            "model_twh": model_twh_after,
-            "reference_twh": effective_ref_twh.reindex(model_twh_after.index),
-            "owid_reference_twh": ref_twh.reindex(model_twh_after.index),
-            "estimated_end_use_link_twh": estimated_end_use_link_twh.reindex(model_twh_after.index).fillna(0.0),
-        }
-    ).dropna(subset=["reference_twh"])
+    comp_after = comp_before.join(
+        model_twh_after.rename("direct_model_twh_after"),
+        how="left",
+    )
+    comp_after["factor"] = factors_by_country.reindex(comp_after.index).fillna(1.0)
+    comp_after["source_anchor_year"] = investment_year
+    comp_after["carry_forward"] = False
 
-    before_total_twh = comp_before["model_twh"] + comp_before["estimated_end_use_link_twh"]
-    after_total_twh = comp_after["model_twh"] + comp_after["estimated_end_use_link_twh"]
-    before_abs_err = (before_total_twh - comp_before["owid_reference_twh"]).abs().sum()
-    after_abs_err = (after_total_twh - comp_after["owid_reference_twh"]).abs().sum()
-    ref_sum = comp_after["owid_reference_twh"].sum()
+    before_total_twh = comp_after["direct_model_twh_before"] + comp_after["eligible_link_withdrawal_twh"]
+    after_total_twh = comp_after["direct_model_twh_after"] + comp_after["eligible_link_withdrawal_twh"]
+    comp_after["total_model_twh_before"] = before_total_twh
+    comp_after["total_model_twh_after"] = after_total_twh
+    denom = comp_after["total_reference_twh"].replace(0.0, np.nan)
+    comp_after["pct_error_before"] = 100.0 * (before_total_twh - comp_after["total_reference_twh"]) / denom
+    comp_after["pct_error_after"] = 100.0 * (after_total_twh - comp_after["total_reference_twh"]) / denom
+    before_abs_err = (before_total_twh - comp_after["total_reference_twh"]).abs().sum()
+    after_abs_err = (after_total_twh - comp_after["total_reference_twh"]).abs().sum()
+    ref_sum = comp_after["total_reference_twh"].sum()
     before_wape = 100.0 * before_abs_err / ref_sum if ref_sum > 0 else np.nan
     after_wape = 100.0 * after_abs_err / ref_sum if ref_sum > 0 else np.nan
 
+    _write_electricity_demand_alignment_audit(cfg, investment_year, comp_after, factors_by_country)
+
     logger.info(
-        "Aligned country electricity demand to OWID for %s: countries_scaled=%d, global_direct_before=%.1f TWh, global_direct_after=%.1f TWh, baseline_end_use_links=%.1f TWh, global_total_before=%.1f TWh, global_total_after=%.1f TWh, global_reference=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%, baseline_network=%s",
-        baseyear,
+        "Aligned country electricity demand for %s: countries_scaled=%d, global_direct_before=%.1f TWh, global_direct_after=%.1f TWh, eligible_end_use_links=%.1f TWh, global_total_before=%.1f TWh, global_total_after=%.1f TWh, global_reference=%.1f TWh, WAPE_before=%.2f%%, WAPE_after=%.2f%%, baseline_network=%s",
+        investment_year,
         len(factors_by_country),
-        comp_before["model_twh"].sum(),
-        comp_after["model_twh"].sum(),
-        comp_after["estimated_end_use_link_twh"].sum(),
+        comp_after["direct_model_twh_before"].sum(),
+        comp_after["direct_model_twh_after"].sum(),
+        comp_after["eligible_link_withdrawal_twh"].sum(),
         before_total_twh.sum(),
         after_total_twh.sum(),
-        comp_after["owid_reference_twh"].sum(),
+        comp_after["total_reference_twh"].sum(),
         before_wape,
         after_wape,
         baseline_network if baseline_network is not None else "None",
     )
+
+    largest = factors_by_country.sub(1.0).abs().sort_values(ascending=False).head(10)
+    if not largest.empty:
+        logger.info(
+            "Largest electricity demand alignment factors for %s: %s",
+            investment_year,
+            ", ".join(f"{country}={factors_by_country.at[country]:.3f}" for country in largest.index),
+        )
+
+
+_TRANSMISSION_ISO3_TO_ISO2_CACHE = {}
+
+
+def _iso3_to_iso2_for_transmission(code):
+    if not isinstance(code, str):
+        return np.nan
+    code = code.strip().upper()
+    if code in _TRANSMISSION_ISO3_TO_ISO2_CACHE:
+        return _TRANSMISSION_ISO3_TO_ISO2_CACHE[code]
+    if code == "KOS":
+        iso2 = "XK"
+    else:
+        iso2 = _safe_iso3_to_iso2(code)
+    _TRANSMISSION_ISO3_TO_ISO2_CACHE[code] = iso2
+    return iso2
+
+
+FOSSIL_CAPACITY_TECH_CARRIERS = {
+    "coal": ["coal", "lignite"],
+    "gas": ["OCGT", "CCGT"],
+    "oil": ["oil"],
+}
+FOSSIL_CAPACITY_CARRIER_TO_TECH = {
+    carrier: tech
+    for tech, carriers in FOSSIL_CAPACITY_TECH_CARRIERS.items()
+    for carrier in carriers
+}
+FOSSIL_CHP_POWER_CARRIERS = ("urban central gas CHP", "urban central gas CHP CC")
+_FOSSIL_GEM_COUNTRY_CACHE = {}
+
+
+def _parse_gem_year(value):
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip()
+    if not text:
+        return np.nan
+    return pd.to_numeric(text[:4], errors="coerce")
+
+
+def _gem_operating_mask(df, year):
+    status = df["Status"].astype(str).str.strip().str.lower()
+    start_year = df["Start year"].apply(_parse_gem_year)
+    retired_year = df["Retired year"].apply(_parse_gem_year)
+    return (
+        status.eq("operating")
+        & start_year.fillna(-np.inf).le(int(year))
+        & (retired_year.isna() | retired_year.gt(int(year)))
+    )
+
+
+def _gem_country_to_iso2(country):
+    country = str(country).strip()
+    if not country:
+        return np.nan
+    if country in _FOSSIL_GEM_COUNTRY_CACHE:
+        return _FOSSIL_GEM_COUNTRY_CACHE[country]
+    special = {
+        "Kosovo": "XK",
+        "Türkiye": "TR",
+        "Turkey": "TR",
+        "Russia": "RU",
+        "Vietnam": "VN",
+        "Iran": "IR",
+        "Syria": "SY",
+        "Laos": "LA",
+        "Bolivia": "BO",
+        "Venezuela": "VE",
+        "Tanzania": "TZ",
+        "Moldova": "MD",
+        "South Korea": "KR",
+        "North Korea": "KP",
+        "Taiwan": "TW",
+    }
+    if country in special:
+        iso2 = special[country]
+    else:
+        iso2 = country_name_2_two_digits(country)
+        if not isinstance(iso2, str) or iso2.upper() in {"NOT FOUND", "NAN"}:
+            iso2 = np.nan
+        else:
+            iso2 = iso2.upper()
+    _FOSSIL_GEM_COUNTRY_CACHE[country] = iso2
+    return iso2
+
+
+def _load_gem_coal_capacity_reference(path, year):
+    coal = pd.read_csv(path, encoding="utf-8-sig")
+    required = {"Country/Area", "Capacity (MW)", "Status", "Start year", "Retired year"}
+    missing = required.difference(coal.columns)
+    if missing:
+        raise ValueError(f"Missing required GEM coal columns in {path}: {sorted(missing)}")
+    coal = coal.loc[_gem_operating_mask(coal, year)].copy()
+    lookup = {c: _gem_country_to_iso2(c) for c in coal["Country/Area"].dropna().unique()}
+    coal["country"] = coal["Country/Area"].map(lookup)
+    coal["reference_mw"] = pd.to_numeric(
+        coal["Capacity (MW)"].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    ).fillna(0.0)
+    coal["validation_tech"] = "coal"
+    return (
+        coal.loc[coal["country"].notna()]
+        .groupby(["country", "validation_tech"], as_index=False)["reference_mw"]
+        .sum()
+    )
+
+
+def _load_gem_oil_gas_capacity_reference(path, year):
+    gogpt = pd.read_csv(path, encoding="utf-8-sig")
+    required = {
+        "Country/Area",
+        "Fuel",
+        "Fuel classification?",
+        "Capacity (MW)",
+        "Status",
+        "Start year",
+        "Retired year",
+    }
+    missing = required.difference(gogpt.columns)
+    if missing:
+        raise ValueError(f"Missing required GEM oil/gas columns in {path}: {sorted(missing)}")
+    gogpt = gogpt.loc[_gem_operating_mask(gogpt, year)].copy()
+    classification = gogpt["Fuel classification?"].astype(str).str.lower()
+    fuel = gogpt["Fuel"].astype(str).str.lower()
+    gas = classification.str.contains("gas", na=False) | fuel.str.contains(
+        "fossil gas|natural gas|lng", na=False, regex=True
+    )
+    oil = (
+        classification.str.contains("oil only|liquid only", na=False)
+        | fuel.str.contains("diesel|fuel oil", na=False, regex=True)
+    ) & ~gas
+    gogpt["validation_tech"] = pd.Series(pd.NA, index=gogpt.index, dtype="object")
+    gogpt.loc[gas, "validation_tech"] = "gas"
+    gogpt.loc[oil, "validation_tech"] = "oil"
+    gogpt = gogpt.loc[gogpt["validation_tech"].notna()].copy()
+    lookup = {c: _gem_country_to_iso2(c) for c in gogpt["Country/Area"].dropna().unique()}
+    gogpt["country"] = gogpt["Country/Area"].map(lookup)
+    gogpt["reference_mw"] = pd.to_numeric(
+        gogpt["Capacity (MW)"].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    ).fillna(0.0)
+    return (
+        gogpt.loc[gogpt["country"].notna()]
+        .groupby(["country", "validation_tech"], as_index=False)["reference_mw"]
+        .sum()
+    )
+
+
+def _load_gem_fossil_capacity_reference(cfg, year):
+    coal_csv = _repo_path(cfg.get("coal_csv", "validation/data/Global-Coal-Plant-Tracker-January-2026.csv"))
+    oil_gas_csv = _repo_path(cfg.get("oil_gas_csv", "validation/data/Global-Oil-and-Gas-Plant-Tracker-GOGPT-August-2025.csv"))
+    ref = pd.concat(
+        [
+            _load_gem_coal_capacity_reference(coal_csv, year),
+            _load_gem_oil_gas_capacity_reference(oil_gas_csv, year),
+        ],
+        ignore_index=True,
+    )
+    carriers = set(str(c) for c in cfg.get("carriers", ["coal", "gas", "oil"]))
+    ref = ref.loc[ref["validation_tech"].isin(carriers)].copy()
+    return ref.groupby(["country", "validation_tech"], as_index=False)["reference_mw"].sum()
+
+
+def _link_ac_output_port(link_row, n):
+    for port in [1, 2, 3, 4]:
+        bus_col = f"bus{port}"
+        if bus_col not in link_row.index:
+            continue
+        bus = link_row.get(bus_col)
+        if pd.isna(bus) or str(bus) == "" or bus not in n.buses.index:
+            continue
+        if str(n.buses.at[bus, "carrier"]) == "AC":
+            eff_col = "efficiency" if port == 1 else f"efficiency{port}"
+            return bus_col, eff_col
+    return None, None
+
+
+def _repair_fossil_link_fuel_buses(n, carrier_to_tech=None):
+    carrier_to_tech = carrier_to_tech or FOSSIL_CAPACITY_CARRIER_TO_TECH
+    fuel_by_tech = {"gas": "gas", "coal": "coal", "oil": "oil"}
+    if n.links.empty:
+        return 0
+
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+    repaired = 0
+    for asset, row in n.links.iterrows():
+        carrier = str(row.get("carrier", ""))
+        tech = carrier_to_tech.get(carrier)
+        if tech is None:
+            continue
+        bus0 = row.get("bus0", "")
+        if isinstance(bus0, str) and bus0 in n.buses.index:
+            continue
+        bus_col, _eff_col = _link_ac_output_port(row, n)
+        if bus_col is None:
+            continue
+        ac_bus = row.get(bus_col)
+        country = bus_country.get(ac_bus, "")
+        if not re.match(r"^[A-Z]{2}$", str(country)):
+            continue
+        fuel_bus = _ensure_fossil_fuel_bus_and_store(
+            n,
+            str(ac_bus),
+            fuel_by_tech[str(tech)],
+            str(country),
+        )
+        if fuel_bus is None:
+            continue
+        n.links.at[asset, "bus0"] = fuel_bus
+        repaired += 1
+
+    if repaired:
+        logger.info("Repaired missing fossil fuel buses for %d inherited fossil links.", repaired)
+    return repaired
+
+
+def _fossil_electric_capacity_assets(n, carrier_to_tech=None):
+    carrier_to_tech = carrier_to_tech or FOSSIL_CAPACITY_CARRIER_TO_TECH
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+    rows = []
+
+    if not n.links.empty:
+        for asset, row in n.links.iterrows():
+            carrier = str(row.get("carrier", ""))
+            tech = carrier_to_tech.get(carrier)
+            if tech is None:
+                continue
+            bus_col, eff_col = _link_ac_output_port(row, n)
+            if bus_col is None:
+                continue
+            bus = row[bus_col]
+            country = bus_country.get(bus, "")
+            if not re.match(r"^[A-Z]{2}$", str(country)):
+                continue
+            p_nom = float(pd.to_numeric(row.get("p_nom", 0.0), errors="coerce") or 0.0)
+            eff = float(pd.to_numeric(row.get(eff_col, 1.0), errors="coerce") or 1.0)
+            rows.append(
+                {
+                    "component": "Link",
+                    "asset": asset,
+                    "country": country,
+                    "validation_tech": tech,
+                    "carrier": carrier,
+                    "bus": bus,
+                    "efficiency": abs(eff),
+                    "nominal_mw": p_nom,
+                    "electric_capacity_mw": p_nom * abs(eff),
+                }
+            )
+
+    if not n.generators.empty:
+        for asset, row in n.generators.iterrows():
+            carrier = str(row.get("carrier", ""))
+            tech = carrier_to_tech.get(carrier)
+            if tech is None:
+                continue
+            bus = row.get("bus")
+            if pd.isna(bus) or bus not in n.buses.index:
+                continue
+            if str(n.buses.at[bus, "carrier"]) != "AC":
+                continue
+            country = bus_country.get(bus, "")
+            if not re.match(r"^[A-Z]{2}$", str(country)):
+                continue
+            p_nom = float(pd.to_numeric(row.get("p_nom", 0.0), errors="coerce") or 0.0)
+            rows.append(
+                {
+                    "component": "Generator",
+                    "asset": asset,
+                    "country": country,
+                    "validation_tech": tech,
+                    "carrier": carrier,
+                    "bus": bus,
+                    "efficiency": 1.0,
+                    "nominal_mw": p_nom,
+                    "electric_capacity_mw": p_nom,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "component",
+                "asset",
+                "country",
+                "validation_tech",
+                "carrier",
+                "bus",
+                "efficiency",
+                "nominal_mw",
+                "electric_capacity_mw",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def _numeric_component_column(df, column, default=0.0):
+    if column in df.columns:
+        return pd.to_numeric(df[column], errors="coerce").reindex(df.index).fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _set_fossil_asset_nominal_capacity(n, asset, component, nominal_mw):
+    nominal_mw = max(float(nominal_mw), 0.0)
+    if component == "Link" and asset in n.links.index:
+        n.links.at[asset, "p_nom"] = nominal_mw
+        if "p_nom_min" in n.links.columns:
+            n.links.at[asset, "p_nom_min"] = nominal_mw
+    elif component == "Generator" and asset in n.generators.index:
+        n.generators.at[asset, "p_nom"] = nominal_mw
+        if "p_nom_min" in n.generators.columns:
+            n.generators.at[asset, "p_nom_min"] = nominal_mw
+
+
+def _set_fossil_asset_nominal_cap(n, asset, component, nominal_cap_mw, extendable=True):
+    finite_cap = pd.notna(nominal_cap_mw) and np.isfinite(float(nominal_cap_mw))
+    nominal_cap_mw = max(float(nominal_cap_mw), 0.0) if finite_cap else np.inf
+    if component == "Link" and asset in n.links.index:
+        if "p_nom_max" not in n.links.columns:
+            n.links["p_nom_max"] = np.inf
+        if "p_nom_min" not in n.links.columns:
+            n.links["p_nom_min"] = 0.0
+        min_nom = float(pd.to_numeric(n.links.at[asset, "p_nom_min"], errors="coerce") or 0.0)
+        if finite_cap:
+            nominal_cap_mw = max(nominal_cap_mw, min_nom)
+        n.links.at[asset, "p_nom_max"] = nominal_cap_mw
+        if "p_nom_extendable" in n.links.columns:
+            n.links.at[asset, "p_nom_extendable"] = bool(
+                extendable and (not finite_cap or nominal_cap_mw > min_nom + 1e-9)
+            )
+    elif component == "Generator" and asset in n.generators.index:
+        if "p_nom_max" not in n.generators.columns:
+            n.generators["p_nom_max"] = np.inf
+        if "p_nom_min" not in n.generators.columns:
+            n.generators["p_nom_min"] = 0.0
+        min_nom = float(pd.to_numeric(n.generators.at[asset, "p_nom_min"], errors="coerce") or 0.0)
+        if finite_cap:
+            nominal_cap_mw = max(nominal_cap_mw, min_nom)
+        n.generators.at[asset, "p_nom_max"] = nominal_cap_mw
+        if "p_nom_extendable" in n.generators.columns:
+            n.generators.at[asset, "p_nom_extendable"] = bool(
+                extendable and (not finite_cap or nominal_cap_mw > min_nom + 1e-9)
+            )
+
+
+def _cap_fossil_chp_links(n, planning_year, cfg, audit_dir):
+    if n.links.empty or not bool(cfg.get("cap_gas_chp_links", True)):
+        return pd.DataFrame()
+
+    carriers = set(str(c) for c in cfg.get("chp_carriers", FOSSIL_CHP_POWER_CARRIERS))
+    carrier_mask = n.links["carrier"].astype(str).isin(carriers)
+    if "build_year" in n.links.columns:
+        build_year = pd.to_numeric(n.links["build_year"], errors="coerce").fillna(0)
+        year_mask = build_year.le(int(planning_year))
+    else:
+        year_mask = pd.Series(True, index=n.links.index)
+    idx = n.links.index[carrier_mask & year_mask]
+    if len(idx) == 0:
+        return pd.DataFrame()
+
+    if "p_nom_min" not in n.links.columns:
+        n.links["p_nom_min"] = 0.0
+    if "p_nom_max" not in n.links.columns:
+        n.links["p_nom_max"] = np.inf
+    if "p_nom_extendable" not in n.links.columns:
+        n.links["p_nom_extendable"] = False
+
+    before = n.links.loc[idx].copy()
+    before_p_nom = _numeric_component_column(before, "p_nom", 0.0)
+    before_min = _numeric_component_column(before, "p_nom_min", 0.0)
+    fixed_nom = pd.concat([before_p_nom, before_min], axis=1).max(axis=1).clip(lower=0.0)
+
+    n.links.loc[idx, "p_nom"] = fixed_nom.values
+    n.links.loc[idx, "p_nom_min"] = fixed_nom.values
+    n.links.loc[idx, "p_nom_max"] = fixed_nom.values
+    n.links.loc[idx, "p_nom_extendable"] = False
+    n.links["p_nom_extendable"] = n.links["p_nom_extendable"].fillna(False).astype(bool)
+
+    audit = pd.DataFrame(
+        {
+            "year": int(planning_year),
+            "asset": idx,
+            "carrier": before.loc[idx, "carrier"].astype(str).values,
+            "p_nom_before_mw": before_p_nom.reindex(idx).values,
+            "p_nom_min_before_mw": before_min.reindex(idx).values,
+            "p_nom_max_before_mw": _numeric_component_column(before, "p_nom_max", np.inf).reindex(idx).values,
+            "p_nom_after_mw": fixed_nom.reindex(idx).values,
+            "p_nom_max_after_mw": fixed_nom.reindex(idx).values,
+            "policy": "fixed_existing_chp_capacity",
+        }
+    )
+    audit_path = audit_dir / f"gem_fossil_chp_capacity_caps_{int(planning_year)}.csv"
+    audit.to_csv(audit_path, index=False)
+    logger.info(
+        "Fixed %d gas CHP links at existing nominal capacity for %s; audit=%s",
+        len(idx),
+        planning_year,
+        audit_path,
+    )
+    return audit
+
+
+def apply_gem_fossil_capacity_caps(n, planning_year, config, context=""):
+    """
+    Keep historical fossil power capacity close to GEM country/fuel totals.
+
+    GEM references describe electric power capacity. Pure fossil-electric links
+    and generators are scaled to the reference where possible, then given only a
+    small expansion headroom. Gas CHP is capped separately because it is
+    heat-coupled and should not become an unlimited proxy for gas power capacity.
+    """
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    parent_cfg = global_cfg.get("fossil_capacity_alignment", {})
+    if not isinstance(parent_cfg, dict) or not bool(parent_cfg.get("enable", False)):
+        return
+
+    year = int(planning_year)
+    base_year = int(parent_cfg.get("year", 2020))
+    materialize_cfg = parent_cfg.get("materialize_2025", {}) or {}
+    materialize_year = int(materialize_cfg.get("year", 2025))
+    if year not in {base_year, materialize_year}:
+        return
+
+    merged_cfg = dict(parent_cfg)
+    if year == materialize_year and isinstance(materialize_cfg, dict):
+        merged_cfg.update(materialize_cfg)
+
+    carriers = set(str(c) for c in merged_cfg.get("carriers", ["coal", "gas", "oil"]))
+    min_reference_mw = float(merged_cfg.get("min_reference_mw", 1.0))
+    min_model_mw = float(merged_cfg.get("min_model_mw", 1.0))
+    cap_headroom_raw = merged_cfg.get("capacity_cap_headroom", None)
+    finite_capacity_caps = cap_headroom_raw is not None
+    cap_headroom = float(cap_headroom_raw) if finite_capacity_caps else np.inf
+    cap_min_headroom_mw = float(merged_cfg.get("capacity_cap_min_headroom_mw", 0.0))
+    scale_existing = bool(
+        merged_cfg.get("scale_existing_before_capacity_caps", merged_cfg.get("scale_existing", True))
+    )
+    scale_down_existing = bool(merged_cfg.get("scale_down_existing", True))
+    add_missing = bool(
+        merged_cfg.get("add_missing_for_capacity_caps", merged_cfg.get("add_missing", year == materialize_year))
+    )
+    force_add_missing_pairs = {
+        (str(country).upper(), str(tech))
+        for country, tech in merged_cfg.get("force_add_missing_pairs", [("SG", "gas")])
+    }
+
+    audit_dir = Path(_repo_path(merged_cfg.get("audit_dir", "validation/results")))
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    _repair_fossil_link_fuel_buses(n)
+    _cap_fossil_chp_links(n, year, merged_cfg, audit_dir)
+
+    try:
+        ref = _load_gem_fossil_capacity_reference(merged_cfg, year)
+    except Exception as exc:
+        logger.warning("GEM fossil capacity caps skipped for %s: %s", year, exc)
+        return
+    ref = ref.loc[
+        ref["validation_tech"].isin(carriers) & ref["reference_mw"].ge(min_reference_mw)
+    ].copy()
+    if ref.empty:
+        logger.warning("GEM fossil capacity caps skipped for %s: no configured references.", year)
+        return
+
+    assets = _fossil_electric_capacity_assets(n)
+    if assets.empty:
+        logger.warning("GEM fossil capacity caps skipped for %s: no fossil-electric assets.", year)
+        return
+
+    current = (
+        assets.groupby(["country", "validation_tech"], as_index=False)["electric_capacity_mw"]
+        .sum()
+        .rename(columns={"electric_capacity_mw": "model_before_mw"})
+    )
+    audit = ref.merge(current, on=["country", "validation_tech"], how="outer")
+    audit["reference_mw"] = audit["reference_mw"].fillna(0.0)
+    audit["model_before_mw"] = audit["model_before_mw"].fillna(0.0)
+    if finite_capacity_caps:
+        audit["cap_target_mw"] = np.maximum(
+            audit["reference_mw"] * (1.0 + cap_headroom),
+            audit["reference_mw"] + cap_min_headroom_mw,
+        )
+    else:
+        audit["cap_target_mw"] = np.inf
+    audit["factor"] = np.nan
+    audit["policy"] = "unchanged"
+    audit["context"] = context
+    added = scaled = capped = fixed_unreferenced = skipped = 0
+
+    for row in audit.itertuples(index=True):
+        country = str(row.country).upper()
+        tech = str(row.validation_tech)
+        target = float(row.reference_mw)
+        before = float(row.model_before_mw)
+        group_assets = assets.loc[
+            assets["country"].eq(country) & assets["validation_tech"].eq(tech)
+        ].copy()
+
+        if target <= 0.0:
+            for asset in group_assets.itertuples(index=False):
+                _set_fossil_asset_nominal_cap(
+                    n,
+                    asset.asset,
+                    asset.component,
+                    asset.nominal_mw,
+                    extendable=False,
+                )
+            audit.at[row.Index, "policy"] = "fixed_unreferenced_existing"
+            fixed_unreferenced += int(not group_assets.empty)
+            continue
+
+        if group_assets.empty:
+            allow_add_missing = add_missing or (country, tech) in force_add_missing_pairs
+            if allow_add_missing:
+                name, status = _add_fixed_fossil_link_capacity(
+                    n,
+                    country,
+                    tech,
+                    target,
+                    year,
+                    preferred_carrier=None,
+                    extendable=True,
+                )
+                audit.at[row.Index, "policy"] = status
+                audit.at[row.Index, "added_asset"] = name if name is not None else ""
+                if status == "added":
+                    added += 1
+                else:
+                    skipped += 1
+                assets = _fossil_electric_capacity_assets(n)
+                group_assets = assets.loc[
+                    assets["country"].eq(country) & assets["validation_tech"].eq(tech)
+                ].copy()
+                before = float(group_assets["electric_capacity_mw"].sum()) if not group_assets.empty else 0.0
+            else:
+                audit.at[row.Index, "policy"] = "skipped_no_model_capacity"
+                skipped += 1
+                continue
+
+        if before >= min_model_mw and scale_existing:
+            factor = target / before if before > 0.0 else 1.0
+            if factor < 1.0 and not scale_down_existing:
+                audit.at[row.Index, "policy"] = "kept_existing_above_reference"
+            else:
+                for asset in group_assets.itertuples(index=False):
+                    _set_fossil_asset_nominal_capacity(
+                        n,
+                        asset.asset,
+                        asset.component,
+                        asset.nominal_mw * factor,
+                    )
+                audit.at[row.Index, "factor"] = factor
+                audit.at[row.Index, "policy"] = "scaled_to_reference"
+                scaled += 1
+
+        if not finite_capacity_caps:
+            for asset in group_assets.itertuples(index=False):
+                _set_fossil_asset_nominal_cap(
+                    n,
+                    asset.asset,
+                    asset.component,
+                    np.inf,
+                    extendable=True,
+                )
+            if audit.at[row.Index, "policy"] == "scaled_to_reference":
+                audit.at[row.Index, "policy"] = "scaled_to_reference_unbounded"
+            elif audit.at[row.Index, "policy"] == "unchanged":
+                audit.at[row.Index, "policy"] = "reference_min_unbounded"
+            continue
+
+        assets_after_scale = _fossil_electric_capacity_assets(n)
+        group_after = assets_after_scale.loc[
+            assets_after_scale["country"].eq(country)
+            & assets_after_scale["validation_tech"].eq(tech)
+        ].copy()
+        after_scale = float(group_after["electric_capacity_mw"].sum()) if not group_after.empty else 0.0
+        cap_target = max(float(row.cap_target_mw), after_scale)
+        if after_scale <= 0.0:
+            audit.at[row.Index, "policy"] = "skipped_no_positive_capacity"
+            skipped += 1
+            continue
+        shares = group_after["electric_capacity_mw"].clip(lower=0.0)
+        if shares.sum() <= 0.0:
+            shares = pd.Series(1.0 / len(group_after), index=group_after.index)
+        else:
+            shares = shares / shares.sum()
+        for idx, asset in group_after.iterrows():
+            eff = max(float(asset["efficiency"]), 1e-9)
+            electric_cap_mw = cap_target * float(shares.loc[idx])
+            nominal_cap_mw = electric_cap_mw / eff
+            _set_fossil_asset_nominal_cap(
+                n,
+                asset["asset"],
+                asset["component"],
+                nominal_cap_mw,
+                extendable=True,
+            )
+        capped += 1
+
+    assets_after = _fossil_electric_capacity_assets(n)
+    after = (
+        assets_after.groupby(["country", "validation_tech"], as_index=False)["electric_capacity_mw"]
+        .sum()
+        .rename(columns={"electric_capacity_mw": "model_after_mw"})
+    )
+    audit = audit.merge(after, on=["country", "validation_tech"], how="left")
+    audit["model_after_mw"] = audit["model_after_mw"].fillna(0.0)
+    audit["year"] = year
+    audit["pct_error_after"] = np.where(
+        audit["reference_mw"].abs().gt(0.0),
+        100.0 * (audit["model_after_mw"] - audit["reference_mw"]) / audit["reference_mw"],
+        np.nan,
+    )
+    audit_path = audit_dir / f"gem_fossil_capacity_caps_{year}.csv"
+    audit.sort_values(["validation_tech", "country"]).to_csv(audit_path, index=False)
+    logger.info(
+        "Applied GEM fossil capacity caps for %s: scaled=%d, capped=%d, added=%d, fixed_unreferenced=%d, skipped=%d, model_before=%.1f GW, model_after=%.1f GW, reference=%.1f GW, audit=%s",
+        year,
+        scaled,
+        capped,
+        added,
+        fixed_unreferenced,
+        skipped,
+        audit["model_before_mw"].sum() / 1000.0,
+        audit["model_after_mw"].sum() / 1000.0,
+        audit["reference_mw"].sum() / 1000.0,
+        audit_path,
+    )
+
+
+def _find_fossil_fuel_bus(n, ac_bus, fuel_carrier, country):
+    candidates = [f"{ac_bus} {fuel_carrier}", f"{country} {fuel_carrier}", fuel_carrier]
+    for candidate in candidates:
+        if candidate in n.buses.index:
+            return candidate
+    if "carrier" in n.buses.columns:
+        bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+        buses = n.buses.index[
+            n.buses["carrier"].astype(str).eq(fuel_carrier)
+            & bus_country.eq(str(country).upper())
+        ]
+        if len(buses) > 0:
+            return str(pd.Index(buses).sort_values()[0])
+    return None
+
+
+def _ensure_fossil_fuel_bus_and_store(n, ac_bus, fuel_carrier, country):
+    fuel_bus = _find_fossil_fuel_bus(n, ac_bus, fuel_carrier, country)
+    if fuel_bus is None:
+        fuel_bus = f"{ac_bus} {fuel_carrier}"
+        bus_kwargs = {"carrier": fuel_carrier}
+        if "country" in n.buses.columns:
+            bus_kwargs["country"] = str(country).upper()
+        if "location" in n.buses.columns:
+            bus_kwargs["location"] = ac_bus
+        if "x" in n.buses.columns and ac_bus in n.buses.index:
+            bus_kwargs["x"] = n.buses.at[ac_bus, "x"]
+        if "y" in n.buses.columns and ac_bus in n.buses.index:
+            bus_kwargs["y"] = n.buses.at[ac_bus, "y"]
+        if fuel_carrier not in n.carriers.index:
+            n.add("Carrier", fuel_carrier)
+        n.add("Bus", fuel_bus, **bus_kwargs)
+
+    store_bus = (
+        n.stores["bus"].astype(str)
+        if not n.stores.empty and "bus" in n.stores.columns
+        else pd.Series(dtype=str)
+    )
+    store_carrier = (
+        n.stores["carrier"].astype(str)
+        if not n.stores.empty and "carrier" in n.stores.columns
+        else pd.Series("", index=n.stores.index, dtype=str)
+    )
+    has_store = bool((store_bus.eq(fuel_bus) & store_carrier.eq(fuel_carrier)).any())
+    if not has_store:
+        template = {}
+        same_carrier = n.stores.loc[store_carrier.eq(fuel_carrier)].copy() if not n.stores.empty else pd.DataFrame()
+        for col, default in {
+            "marginal_cost": 0.0,
+            "capital_cost": 0.0,
+            "standing_loss": 0.0,
+            "lifetime": np.inf,
+        }.items():
+            if col in same_carrier.columns and not same_carrier.empty:
+                values = pd.to_numeric(same_carrier[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                template[col] = float(values.median()) if not values.empty else default
+            else:
+                template[col] = default
+        store_name = f"{fuel_bus} validation store"
+        suffix = 2
+        while store_name in n.stores.index:
+            store_name = f"{fuel_bus} validation store-{suffix}"
+            suffix += 1
+        n.add(
+            "Store",
+            store_name,
+            bus=fuel_bus,
+            carrier=fuel_carrier,
+            e_nom=0.0,
+            e_nom_min=0.0,
+            e_nom_max=np.inf,
+            e_nom_extendable=True,
+            marginal_cost=template["marginal_cost"],
+            capital_cost=template["capital_cost"],
+            standing_loss=template["standing_loss"],
+            lifetime=template["lifetime"],
+        )
+    return fuel_bus
+
+
+def _link_template_from_network(n, carrier):
+    links = n.links.loc[n.links.carrier.astype(str).eq(str(carrier))].copy()
+    numeric_defaults = {
+        "marginal_cost": 0.0,
+        "capital_cost": 0.0,
+        "efficiency": 1.0,
+        "efficiency2": 0.0,
+        "lifetime": np.inf,
+    }
+    template = dict(numeric_defaults)
+    if not links.empty:
+        for col, default in numeric_defaults.items():
+            if col not in links.columns:
+                continue
+            values = pd.to_numeric(links[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            template[col] = float(values.median()) if not values.empty else default
+    return template
+
+
+def _add_fixed_fossil_link_capacity(
+    n,
+    country,
+    validation_tech,
+    electric_capacity_mw,
+    year,
+    preferred_carrier=None,
+    extendable=False,
+):
+    carrier_by_tech = {
+        "gas": preferred_carrier or "CCGT",
+        "coal": preferred_carrier or "coal",
+        "oil": preferred_carrier or "oil",
+    }
+    fuel_by_tech = {"gas": "gas", "coal": "coal", "oil": "oil"}
+    carrier = carrier_by_tech[str(validation_tech)]
+    fuel_carrier = fuel_by_tech[str(validation_tech)]
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+    ac_bus = _pick_country_ac_bus(n, country, bus_country)
+    if ac_bus is None:
+        return None, "missing_ac_bus"
+    fuel_bus = _ensure_fossil_fuel_bus_and_store(n, ac_bus, fuel_carrier, country)
+    if fuel_bus is None:
+        return None, "missing_fuel_bus"
+    if "co2 atmosphere" not in n.buses.index:
+        return None, "missing_co2_bus"
+    if carrier not in n.carriers.index:
+        n.add("Carrier", carrier)
+    template = _link_template_from_network(n, carrier)
+    eff = max(float(template.get("efficiency", 1.0)), 1e-9)
+    p_nom = float(electric_capacity_mw) / eff
+    base_name = f"{ac_bus} {carrier}-{year}-gem-fixed"
+    name = base_name
+    suffix = 2
+    while name in n.links.index:
+        name = f"{base_name}-{suffix}"
+        suffix += 1
+    n.add(
+        "Link",
+        name,
+        bus0=fuel_bus,
+        bus1=ac_bus,
+        bus2="co2 atmosphere",
+        carrier=carrier,
+        p_nom=p_nom,
+        p_nom_min=p_nom,
+        p_nom_max=np.inf if extendable else p_nom,
+        p_nom_extendable=bool(extendable),
+        marginal_cost=template.get("marginal_cost", 0.0),
+        capital_cost=template.get("capital_cost", 0.0),
+        efficiency=eff,
+        efficiency2=template.get("efficiency2", 0.0),
+        build_year=int(year),
+        lifetime=template.get("lifetime", np.inf),
+    )
+    return name, "added"
+
+
+def materialize_year2025_gem_fossil_capacities(n, planning_year, config):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    parent_cfg = global_cfg.get("fossil_capacity_alignment", {})
+    cfg = parent_cfg.get("materialize_2025", {}) if isinstance(parent_cfg, dict) else {}
+    if not isinstance(cfg, dict) or not bool(cfg.get("enable", False)):
+        return
+    year = int(cfg.get("year", 2025))
+    if int(planning_year) != year:
+        return
+
+    merged_cfg = dict(parent_cfg)
+    merged_cfg.update(cfg)
+    carriers = set(str(c) for c in merged_cfg.get("carriers", ["coal", "gas", "oil"]))
+    min_reference_mw = float(merged_cfg.get("min_reference_mw", 1.0))
+    min_model_mw = float(merged_cfg.get("min_model_mw", 1.0))
+    add_missing = bool(merged_cfg.get("add_missing", True))
+    scale_existing = bool(merged_cfg.get("scale_existing", True))
+    scale_down_existing = bool(merged_cfg.get("scale_down_existing", True))
+    make_links_extendable = bool(
+        merged_cfg.get("make_links_extendable_after_materialization", False)
+    )
+    scale_down_existing_carriers = set(
+        str(c) for c in merged_cfg.get("scale_down_existing_carriers", [])
+    )
+
+    _repair_fossil_link_fuel_buses(n)
+
+    try:
+        ref = _load_gem_fossil_capacity_reference(merged_cfg, year)
+    except Exception as exc:
+        logger.warning("2025 GEM fossil capacity materialization skipped: %s", exc)
+        return
+    ref = ref.loc[ref["validation_tech"].isin(carriers) & ref["reference_mw"].ge(min_reference_mw)].copy()
+    if ref.empty:
+        logger.warning("2025 GEM fossil capacity materialization skipped: no GEM references for configured carriers.")
+        return
+
+    assets_before = _fossil_electric_capacity_assets(n)
+    current = (
+        assets_before.groupby(["country", "validation_tech"], as_index=False)["electric_capacity_mw"]
+        .sum()
+        .rename(columns={"electric_capacity_mw": "model_before_mw"})
+    )
+    audit = ref.merge(current, on=["country", "validation_tech"], how="left")
+    audit["model_before_mw"] = audit["model_before_mw"].fillna(0.0)
+    audit["factor"] = np.where(
+        audit["model_before_mw"].ge(min_model_mw),
+        audit["reference_mw"] / audit["model_before_mw"],
+        np.nan,
+    )
+    audit["policy"] = "unchanged"
+    added = scaled = skipped = 0
+
+    for row in audit.itertuples(index=True):
+        country = str(row.country).upper()
+        tech = str(row.validation_tech)
+        target = float(row.reference_mw)
+        before = float(row.model_before_mw)
+        group_assets = assets_before.loc[
+            assets_before["country"].eq(country)
+            & assets_before["validation_tech"].eq(tech)
+        ]
+        if before >= min_model_mw and scale_existing:
+            factor = target / before if before > 0.0 else 1.0
+            if (
+                factor < 1.0
+                and not scale_down_existing
+                and tech not in scale_down_existing_carriers
+            ):
+                audit.at[row.Index, "factor"] = factor
+                audit.at[row.Index, "policy"] = "kept_existing_above_reference"
+                skipped += 1
+                continue
+            for asset in group_assets.itertuples(index=False):
+                if asset.component == "Link" and asset.asset in n.links.index:
+                    p_nom_after = None
+                    for col in ["p_nom", "p_nom_min", "p_nom_max"]:
+                        if col in n.links.columns:
+                            val = pd.to_numeric(n.links.at[asset.asset, col], errors="coerce")
+                            if pd.notna(val) and np.isfinite(val):
+                                scaled_val = float(val) * factor
+                                n.links.at[asset.asset, col] = scaled_val
+                                if col == "p_nom":
+                                    p_nom_after = scaled_val
+                    if make_links_extendable:
+                        if p_nom_after is None:
+                            p_nom_after = pd.to_numeric(
+                                n.links.at[asset.asset, "p_nom"], errors="coerce"
+                            )
+                        if pd.notna(p_nom_after) and np.isfinite(p_nom_after):
+                            if "p_nom_min" in n.links.columns:
+                                n.links.at[asset.asset, "p_nom_min"] = float(p_nom_after)
+                            if "p_nom_max" in n.links.columns:
+                                n.links.at[asset.asset, "p_nom_max"] = np.inf
+                    if "p_nom_extendable" in n.links.columns:
+                        n.links.at[asset.asset, "p_nom_extendable"] = make_links_extendable
+                elif asset.component == "Generator" and asset.asset in n.generators.index:
+                    for col in ["p_nom", "p_nom_min", "p_nom_max"]:
+                        if col in n.generators.columns:
+                            val = pd.to_numeric(n.generators.at[asset.asset, col], errors="coerce")
+                            if pd.notna(val) and np.isfinite(val):
+                                n.generators.at[asset.asset, col] = float(val) * factor
+                    if "p_nom_extendable" in n.generators.columns:
+                        n.generators.at[asset.asset, "p_nom_extendable"] = False
+            audit.at[row.Index, "policy"] = "scaled_existing"
+            scaled += 1
+        elif add_missing and target > before:
+            missing_capacity_mw = max(target - before, 0.0)
+            preferred_carrier = None
+            if not group_assets.empty:
+                preferred_carrier = str(group_assets.sort_values("electric_capacity_mw", ascending=False).iloc[0]["carrier"])
+            name, status = _add_fixed_fossil_link_capacity(
+                n,
+                country,
+                tech,
+                missing_capacity_mw,
+                year,
+                preferred_carrier=preferred_carrier,
+                extendable=make_links_extendable,
+            )
+            audit.at[row.Index, "policy"] = status
+            audit.at[row.Index, "added_asset"] = name if name is not None else ""
+            if status == "added":
+                added += 1
+            else:
+                skipped += 1
+        else:
+            audit.at[row.Index, "policy"] = "skipped_no_model_capacity"
+            skipped += 1
+
+    assets_after = _fossil_electric_capacity_assets(n)
+    after = (
+        assets_after.groupby(["country", "validation_tech"], as_index=False)["electric_capacity_mw"]
+        .sum()
+        .rename(columns={"electric_capacity_mw": "model_after_mw"})
+    )
+    audit = audit.merge(after, on=["country", "validation_tech"], how="left")
+    audit["model_after_mw"] = audit["model_after_mw"].fillna(0.0)
+    audit["year"] = year
+    audit["pct_error_after"] = np.where(
+        audit["reference_mw"].abs().gt(0.0),
+        100.0 * (audit["model_after_mw"] - audit["reference_mw"]) / audit["reference_mw"],
+        np.nan,
+    )
+    audit_dir = Path(_repo_path(merged_cfg.get("audit_dir", "validation/results")))
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / f"gem_fossil_capacity_materialization_{year}.csv"
+    audit.sort_values(["validation_tech", "country"]).to_csv(audit_path, index=False)
+    logger.info(
+        "Materialized 2025 GEM fossil capacities: scaled=%d, added=%d, skipped_or_preserved=%d, model_before=%.1f GW, model_after=%.1f GW, reference=%.1f GW, audit=%s",
+        scaled,
+        added,
+        skipped,
+        audit["model_before_mw"].sum() / 1000.0,
+        audit["model_after_mw"].sum() / 1000.0,
+        audit["reference_mw"].sum() / 1000.0,
+        audit_path,
+    )
+
+
+def _transmission_capacity_limits_config(config):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("transmission_capacity_limits", {})
+    return cfg if isinstance(cfg, dict) and bool(cfg.get("enable", False)) else None
+
+
+def _clean_gtd_numeric(series):
+    return pd.to_numeric(series.replace("-", np.nan), errors="coerce")
+
+
+def _country_pair_key(country0, country1):
+    a, b = sorted((str(country0).upper(), str(country1).upper()))
+    return f"{a}|{b}"
+
+def _load_gtd_country_pair_capacity(cfg, planning_year):
+    existing_csv = _repo_path(
+        cfg.get(
+            "existing_csv",
+            "validation/data/transmission/GTD-v1.1_regional_existing.csv",
+        )
+    )
+    planned_csv = _repo_path(
+        cfg.get(
+            "planned_csv",
+            "validation/data/transmission/GTD-v1.1_regional_planned.csv",
+        )
+    )
+    missing_year_default = int(cfg.get("missing_year_planned_default", 2025))
+    planned_policy = str(cfg.get("planned_policy", "by_year")).lower()
+
+    def read_one(path, include_planned=False):
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        df = pd.read_csv(path, encoding=cfg.get("encoding", "ISO-8859-1"))
+        required = {"from_country", "to_country", "max_flow", "max_counter_flow"}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"missing GTD columns in {path}: {sorted(missing)}")
+        if include_planned:
+            if "year_planned" not in df.columns:
+                raise ValueError(f"missing GTD planned column in {path}: year_planned")
+            df["year_planned"] = _clean_gtd_numeric(df["year_planned"]).fillna(missing_year_default)
+            if planned_policy == "by_year":
+                df = df.loc[df["year_planned"] <= int(planning_year)].copy()
+            elif planned_policy == "existing_only":
+                df = df.iloc[0:0].copy()
+            elif planned_policy == "all_by_2025":
+                pass
+            else:
+                raise ValueError(f"unknown planned_policy: {planned_policy}")
+            if "pathway" in df.columns and not df.empty:
+                df = (
+                    df.sort_values(["pathway", "year_planned"], ascending=[True, False])
+                    .drop_duplicates(subset="pathway", keep="first")
+                )
+        df["country0"] = df["from_country"].apply(_iso3_to_iso2_for_transmission)
+        df["country1"] = df["to_country"].apply(_iso3_to_iso2_for_transmission)
+        df = df.loc[df["country0"].notna() & df["country1"].notna()].copy()
+        df = df.loc[df["country0"] != df["country1"]].copy()
+        df["max_flow"] = _clean_gtd_numeric(df["max_flow"])
+        df["max_counter_flow"] = _clean_gtd_numeric(df["max_counter_flow"])
+        df["capacity_mw"] = df[["max_flow", "max_counter_flow"]].min(axis=1, skipna=False)
+        df["capacity_mw"] = df["capacity_mw"].fillna(0.0).clip(lower=0.0)
+        df["pair"] = [_country_pair_key(a, b) for a, b in zip(df["country0"], df["country1"])]
+        return df.groupby("pair")["capacity_mw"].sum()
+
+    existing = read_one(existing_csv, include_planned=False)
+    planned = read_one(planned_csv, include_planned=True)
+    pairs = existing.index.union(planned.index)
+    out = pd.DataFrame(index=pairs)
+    out["gtd_existing_mw"] = existing.reindex(pairs).fillna(0.0)
+    out["gtd_planned_available_mw"] = planned.reindex(pairs).fillna(0.0)
+    out["gtd_total_available_mw"] = out["gtd_existing_mw"] + out["gtd_planned_available_mw"]
+    return out
+
+
+def _transmission_audit_dir(cfg):
+    audit_dir = cfg.get("audit_dir", "validation/results") if isinstance(cfg, dict) else "validation/results"
+    return Path(_repo_path(audit_dir))
+
+
+def _transmission_capacity_year_multiplier(cfg, planning_year):
+    multipliers = cfg.get("capacity_multiplier_by_year", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(multipliers, dict) or not multipliers:
+        return 1.0
+
+    parsed = {}
+    for year, value in multipliers.items():
+        try:
+            parsed[int(year)] = float(value)
+        except Exception:
+            logger.warning(
+                "Ignoring invalid transmission capacity multiplier entry %r: %r",
+                year,
+                value,
+            )
+    if not parsed:
+        return 1.0
+
+    planning_year = int(planning_year)
+    if planning_year in parsed:
+        return max(0.0, parsed[planning_year])
+
+    earlier = [year for year in parsed if year <= planning_year]
+    if earlier:
+        return max(0.0, parsed[max(earlier)])
+
+    return max(0.0, parsed[min(parsed)])
+
+
+def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=None):
+    cfg = _transmission_capacity_limits_config(config)
+    if cfg is None:
+        return n
+
+    if n.lines.empty:
+        return n
+
+    planning_year = int(planning_year)
+    s_max_pu_value = float(s_max_pu if s_max_pu is not None else cfg.get("s_max_pu", 0.7))
+    if s_max_pu_value <= 0.0:
+        logger.warning("GTD transmission limits skipped: non-positive s_max_pu=%s", s_max_pu_value)
+        return n
+
+    try:
+        gtd = _load_gtd_country_pair_capacity(cfg, planning_year)
+    except Exception as exc:
+        logger.warning("GTD transmission limits skipped for %s: %s", planning_year, exc)
+        return n
+
+    bus_country = _bus_country_lookup(n)
+    lines = n.lines.copy()
+    country0 = lines["bus0"].map(bus_country).fillna("")
+    country1 = lines["bus1"].map(bus_country).fillna("")
+    cross_border = country0.ne("") & country1.ne("") & country0.ne(country1)
+    if not cross_border.any():
+        logger.info("GTD transmission limits: no inter-country AC lines found for %s.", planning_year)
+        return n
+
+    line_index = lines.index[cross_border]
+    line_pairs = pd.Series(
+        [_country_pair_key(country0.at[line], country1.at[line]) for line in line_index],
+        index=line_index,
+        dtype=object,
+    )
+    original_s_nom = pd.to_numeric(n.lines.loc[line_index, "s_nom"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    pair_model_nom = original_s_nom.groupby(line_pairs).sum()
+    fallback_ratio = float(cfg.get("fallback_ratio", 0.115))
+    missing_policy = str(cfg.get("missing_pair_policy", "zero_capacity")).lower()
+    explicit_zero_policy = str(cfg.get("explicit_zero_policy", "zero_capacity")).lower()
+    year_multiplier = _transmission_capacity_year_multiplier(cfg, planning_year)
+
+    audit_rows = []
+    matched = explicit_zero = fallback = 0
+    total_effective_before = float((original_s_nom * s_max_pu_value).sum())
+    total_effective_after = 0.0
+
+    for pair, pair_nom in pair_model_nom.items():
+        pair_lines = line_pairs.index[line_pairs == pair]
+        if pair in gtd.index:
+            gtd_row = gtd.loc[pair]
+            target_effective = float(gtd_row["gtd_total_available_mw"])
+            gtd_existing = float(gtd_row["gtd_existing_mw"])
+            gtd_planned = float(gtd_row["gtd_planned_available_mw"])
+            if target_effective > 0.0:
+                policy_source = "gtd"
+                matched += 1
+            else:
+                policy_source = "gtd_explicit_zero"
+                explicit_zero += 1
+                if explicit_zero_policy != "zero_capacity":
+                    target_effective = fallback_ratio * float(pair_nom)
+                    policy_source = f"explicit_zero_{explicit_zero_policy}"
+        else:
+            gtd_existing = 0.0
+            gtd_planned = 0.0
+            if missing_policy == "pypsa_default_0.7":
+                target_effective = float(pair_nom) * s_max_pu_value
+                policy_source = "missing_pypsa_default"
+            elif missing_policy == "zero_capacity":
+                target_effective = 0.0
+                policy_source = "missing_zero_capacity"
+            else:
+                target_effective = fallback_ratio * float(pair_nom)
+                policy_source = "missing_derived_low_cap"
+            fallback += 1
+
+        target_effective_before_multiplier = max(0.0, target_effective)
+        target_effective = target_effective_before_multiplier * year_multiplier
+        target_nominal_pair = target_effective / s_max_pu_value if target_effective > 0.0 else 0.0
+        weights = original_s_nom.loc[pair_lines]
+        if float(weights.sum()) > 0.0:
+            line_targets = target_nominal_pair * weights / float(weights.sum())
+        else:
+            line_targets = pd.Series(target_nominal_pair / max(len(pair_lines), 1), index=pair_lines)
+
+        n.lines.loc[pair_lines, "s_nom_max"] = line_targets.values
+        n.lines.loc[pair_lines, "s_nom"] = np.minimum(
+            pd.to_numeric(n.lines.loc[pair_lines, "s_nom"], errors="coerce").fillna(0.0).values,
+            line_targets.values,
+        )
+        if "s_nom_min" in n.lines.columns:
+            n.lines.loc[pair_lines, "s_nom_min"] = np.minimum(
+                pd.to_numeric(n.lines.loc[pair_lines, "s_nom_min"], errors="coerce").fillna(0.0).values,
+                line_targets.values,
+            )
+        else:
+            n.lines.loc[pair_lines, "s_nom_min"] = n.lines.loc[pair_lines, "s_nom"]
+        if target_nominal_pair <= 0.0:
+            n.lines.loc[pair_lines, "s_nom_extendable"] = False
+            n.lines.loc[pair_lines, "s_nom"] = 0.0
+            n.lines.loc[pair_lines, "s_nom_min"] = 0.0
+
+        total_effective_after += target_effective
+        audit_rows.append(
+            {
+                "country0": pair.split("|")[0],
+                "country1": pair.split("|")[1],
+                "model_nominal_before_mw": float(pair_nom),
+                "model_effective_before_mw": float(pair_nom) * s_max_pu_value,
+                "gtd_existing_mw": gtd_existing,
+                "gtd_planned_available_mw": gtd_planned,
+                "capacity_year_multiplier": year_multiplier,
+                "target_effective_cap_before_multiplier_mw": target_effective_before_multiplier,
+                "target_effective_cap_mw": target_effective,
+                "target_nominal_cap_mw": target_nominal_pair,
+                "s_max_pu": s_max_pu_value,
+                "policy_source": policy_source,
+                "target_to_model_effective_ratio": target_effective / (float(pair_nom) * s_max_pu_value) if pair_nom > 0.0 else np.nan,
+            }
+        )
+
+    audit = pd.DataFrame(audit_rows)
+    audit_dir = _transmission_audit_dir(cfg)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit.sort_values(["policy_source", "country0", "country1"]).to_csv(
+        audit_dir / f"gtd_transmission_capacity_limits_{planning_year}.csv",
+        index=False,
+    )
+
+    logger.info(
+        "Applied GTD inter-country transmission limits for %s: pairs=%d, matched=%d, explicit_zero=%d, fallback=%d, year_multiplier=%.3f, effective_before=%.1f GW, effective_after=%.1f GW, audit_dir=%s",
+        planning_year,
+        len(pair_model_nom),
+        matched,
+        explicit_zero,
+        fallback,
+        year_multiplier,
+        total_effective_before / 1000.0,
+        total_effective_after / 1000.0,
+        audit_dir,
+    )
+    return n
 
 
 def align_country_hydro_reservoir_inflow_to_owid(n, investment_year, config):
@@ -1886,7 +3502,36 @@ def align_country_hydro_reservoir_inflow_to_owid(n, investment_year, config):
 
 
 def adjust_hydro(n, investment_year, config):
-    scale = 4347.02 / 3614.71
+    if not isinstance(getattr(n, "meta", None), dict):
+        n.meta = {}
+    meta_key = f"validation_adjust_hydro_applied_{int(investment_year)}"
+    if n.meta.get(meta_key):
+        logger.info("Skipping hydro adjustment for %s; already applied on this network.", investment_year)
+        return
+
+    cfg = (
+        (config.get("global_specific", {}) if isinstance(config, dict) else {})
+        .get("hydro_generation_adjustment", {})
+    )
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    # Absolute multipliers relative to raw hydro inputs. The previous hard-coded
+    # value was 4347.02 / 3614.71 ~= 1.204, so these defaults already include
+    # that existing correction plus the observed residual hydro shortfall.
+    default_scale = 1.34
+    year_defaults = {
+        "2020": 1.34,
+        "2025": 1.26,
+    }
+
+    year_multipliers = cfg.get("year_multiplier", {}) if isinstance(cfg, dict) else {}
+    scale = float(
+        year_multipliers.get(
+            str(investment_year),
+            cfg.get("multiplier", year_defaults.get(str(investment_year), default_scale)),
+        )
+    )
     hydro = n.storage_units.index[n.storage_units.carrier.astype(str).eq("hydro")] if not n.storage_units.empty else pd.Index([])
     inflow_cols = n.storage_units_t.inflow.columns.intersection(hydro) if not n.storage_units_t.inflow.empty else pd.Index([])
     if len(inflow_cols):
@@ -1896,10 +3541,24 @@ def adjust_hydro(n, investment_year, config):
         ts_cols = n.generators_t.p_max_pu.columns.intersection(ror) if not n.generators_t.p_max_pu.empty else pd.Index([])
         static_cols = ror.difference(ts_cols)
         if len(ts_cols):
-            n.generators_t.p_max_pu.loc[:, ts_cols] = n.generators_t.p_max_pu.loc[:, ts_cols].fillna(0.0) * scale
+            n.generators_t.p_max_pu.loc[:, ts_cols] = (
+                n.generators_t.p_max_pu.loc[:, ts_cols].fillna(0.0) * scale
+            ).clip(upper=1.0)
         if len(static_cols):
-            n.generators.loc[static_cols, "p_max_pu"] = pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce").fillna(0.0) * scale
-    logger.info("Adjusted hydro for %s with global scale %.6f (reservoir_assets=%d, ror_assets=%d).", investment_year, scale, len(inflow_cols), len(ror))
+            n.generators.loc[static_cols, "p_max_pu"] = (
+                pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce")
+                .fillna(0.0)
+                .mul(scale)
+                .clip(upper=1.0)
+            )
+    n.meta[meta_key] = True
+    logger.info(
+        "Adjusted hydro for %s with absolute global scale %.6f (reservoir_assets=%d, ror_assets=%d).",
+        investment_year,
+        scale,
+        len(inflow_cols),
+        len(ror),
+    )
 
 
 def align_country_onwind_profiles_to_owid(n, investment_year, config):
@@ -2593,6 +4252,637 @@ def apply_country_hydro_iteration_scaling(n, investment_year, config):
         min_scale,
         max_scale,
     )
+
+
+def _load_gogpt_oil_only_capacity_reference(path, year):
+    gogpt = pd.read_csv(path, encoding="utf-8-sig")
+    required = {
+        "Country/Area",
+        "Fuel classification?",
+        "Capacity (MW)",
+        "Status",
+        "Start year",
+        "Retired year",
+    }
+    missing = required.difference(gogpt.columns)
+    if missing:
+        raise ValueError(f"Missing required GOGPT oil columns in {path}: {sorted(missing)}")
+
+    status = gogpt["Status"].astype(str).str.strip().str.lower()
+    start_year = gogpt["Start year"].apply(_parse_gem_year)
+    retired_year = gogpt["Retired year"].apply(_parse_gem_year)
+    active = (
+        status.eq("operating")
+        & (start_year.isna() | start_year.le(int(year)))
+        & (retired_year.isna() | retired_year.gt(int(year)))
+    )
+    oil_only = gogpt["Fuel classification?"].astype(str).str.strip().str.lower().eq("oil only")
+    gogpt = gogpt.loc[active & oil_only].copy()
+    if gogpt.empty:
+        return pd.Series(dtype=float)
+
+    lookup = {c: _gem_country_to_iso2(c) for c in gogpt["Country/Area"].dropna().unique()}
+    gogpt["country"] = gogpt["Country/Area"].map(lookup)
+    gogpt["reference_mw"] = pd.to_numeric(
+        gogpt["Capacity (MW)"].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    ).fillna(0.0)
+    ref = gogpt.loc[gogpt["country"].notna()].groupby("country")["reference_mw"].sum()
+    return ref
+
+
+def apply_gogpt_oil_capacity_fix(n, investment_year, config):
+    year = int(investment_year)
+    if year < 2020:
+        return
+    reference_year = 2020 if year < 2025 else 2025
+    fixed_historical_year = year <= 2025
+    if n.links.empty:
+        return
+
+    oil_csv = _repo_path("validation/data/Global-Oil-and-Gas-Plant-Tracker-GOGPT-August-2025.csv")
+    if not os.path.exists(oil_csv):
+        logger.warning("GOGPT oil capacity fix skipped: file not found at %s", oil_csv)
+        return
+
+    ref = _load_gogpt_oil_only_capacity_reference(oil_csv, reference_year)
+    if ref.empty:
+        logger.warning("GOGPT oil capacity fix skipped: no oil-only reference rows for %s", reference_year)
+        return
+
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+    records = []
+    for asset, row in n.links.loc[n.links.carrier.astype(str).eq("oil")].iterrows():
+        bus_col, eff_col = _link_ac_output_port(row, n)
+        if bus_col is None:
+            continue
+        bus = row[bus_col]
+        country = bus_country.get(bus, "")
+        if not re.match(r"^[A-Z]{2}$", str(country)):
+            continue
+        eff = float(pd.to_numeric(row.get(eff_col, 1.0), errors="coerce") or 0.0)
+        if eff <= 0.0:
+            continue
+        p_nom = float(pd.to_numeric(row.get("p_nom", 0.0), errors="coerce") or 0.0)
+        records.append(
+            {
+                "asset": asset,
+                "country": country,
+                "efficiency": abs(eff),
+                "electric_capacity_mw": p_nom * abs(eff),
+            }
+        )
+    assets = pd.DataFrame(records)
+    if assets.empty:
+        logger.warning("GOGPT oil capacity fix skipped: no oil links with AC output found.")
+        return
+
+    oil_template = n.links.loc[n.links.carrier.astype(str).eq("oil")].iloc[0]
+    existing_oil_countries = set(assets["country"])
+    added_links = 0
+    for country in sorted(set(ref.index).difference(existing_oil_countries)):
+        ac_buses = n.buses.index[
+            n.buses.carrier.astype(str).eq("AC")
+            & n.buses.country.astype(str).str.upper().eq(country)
+        ]
+        if len(ac_buses) == 0:
+            continue
+        ac_bus = ac_buses[0]
+        oil_bus = f"{ac_bus} oil"
+        if oil_bus not in n.buses.index:
+            n.add(
+                "Bus",
+                oil_bus,
+                carrier="oil",
+                country=country,
+                x=0.0,
+                y=0.0,
+            )
+        link_name = f"{ac_bus} oil-{reference_year}"
+        if link_name in n.links.index:
+            continue
+        eff = float(pd.to_numeric(oil_template.get("efficiency", 0.35), errors="coerce") or 0.35)
+        bus2 = oil_template.get("bus2", "")
+        if not isinstance(bus2, str) or bus2 not in n.buses.index:
+            bus2 = "co2 atmosphere" if "co2 atmosphere" in n.buses.index else ""
+        attrs = {
+            "bus0": oil_bus,
+            "bus1": ac_bus,
+            "carrier": "oil",
+            "p_nom_extendable": False,
+            "efficiency": eff,
+            "capital_cost": oil_template.get("capital_cost", 0.0),
+            "marginal_cost": oil_template.get("marginal_cost", 0.0),
+            "lifetime": oil_template.get("lifetime", 25.0),
+            "build_year": reference_year,
+            "p_min_pu": oil_template.get("p_min_pu", 0.0),
+            "p_max_pu": oil_template.get("p_max_pu", 1.0),
+            "p_nom": 0.0,
+            "p_nom_min": 0.0,
+            "p_nom_max": 0.0,
+        }
+        if bus2:
+            attrs["bus2"] = bus2
+            attrs["efficiency2"] = oil_template.get("efficiency2", 0.0)
+        n.add("Link", link_name, **attrs)
+        records.append(
+            {
+                "asset": link_name,
+                "country": country,
+                "efficiency": abs(eff),
+                "electric_capacity_mw": 0.0,
+            }
+        )
+        added_links += 1
+
+    assets = pd.DataFrame(records)
+    matched_countries = sorted(set(assets["country"]).intersection(set(ref.index)))
+    if not matched_countries:
+        logger.warning("GOGPT oil capacity fix skipped: no model oil countries matched GOGPT.")
+        return
+
+    before_mw = float(assets["electric_capacity_mw"].sum())
+    target_by_asset = pd.Series(0.0, index=assets["asset"], dtype=float)
+    for country, group in assets.groupby("country"):
+        country_target = float(ref.get(country, 0.0))
+        if country_target <= 0.0:
+            continue
+        weights = group["electric_capacity_mw"].clip(lower=0.0)
+        if float(weights.sum()) <= 0.0:
+            weights = pd.Series(1.0, index=group.index)
+        shares = weights / float(weights.sum())
+        target_by_asset.loc[group["asset"].values] = shares.values * country_target
+
+    link_idx = pd.Index(target_by_asset.index)
+    eff = assets.set_index("asset").loc[link_idx, "efficiency"]
+    p_nom_target = target_by_asset.div(eff).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    for col in ["p_nom", "p_nom_min", "p_nom_opt"]:
+        if col in n.links.columns:
+            n.links.loc[link_idx, col] = p_nom_target.reindex(link_idx).to_numpy()
+    if "p_nom_max" in n.links.columns:
+        if fixed_historical_year:
+            n.links.loc[link_idx, "p_nom_max"] = p_nom_target.reindex(link_idx).to_numpy()
+        else:
+            n.links.loc[link_idx, "p_nom_max"] = np.inf
+    if "p_nom_extendable" in n.links.columns:
+        n.links.loc[link_idx, "p_nom_extendable"] = not fixed_historical_year
+
+    after_mw = float(target_by_asset.sum())
+    zeroed_countries = sorted(set(assets["country"]).difference(set(ref.index)))
+    logger.info(
+        "Applied GOGPT oil capacity fix for %s from %s: reference_year=%s, fixed_historical_year=%s, oil_links=%d, added_links=%d, matched_countries=%d, electric_capacity_before=%.2f GW, electric_capacity_after=%.2f GW, reference=%.2f GW, zeroed_model_countries=%d%s",
+        year,
+        oil_csv,
+        reference_year,
+        fixed_historical_year,
+        len(link_idx),
+        added_links,
+        len(matched_countries),
+        before_mw / 1000.0,
+        after_mw / 1000.0,
+        float(ref.sum()) / 1000.0,
+        len(zeroed_countries),
+        f" (sample: {', '.join(zeroed_countries[:5])})" if zeroed_countries else "",
+    )
+
+
+def _load_ember_bioenergy_capacity_reference(path, year):
+    df = pd.read_csv(path)
+    required = {
+        "ISO 3 code",
+        "Year",
+        "Area type",
+        "Category",
+        "Variable",
+        "Unit",
+        "Value",
+    }
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f"Ember bioenergy capacity reference {path} missing columns: {sorted(missing)}"
+        )
+
+    ref = df.loc[
+        df["Category"].astype(str).eq("Capacity")
+        & df["Variable"].astype(str).eq("Bioenergy")
+        & df["Unit"].astype(str).eq("GW")
+        & df["Area type"].astype(str).eq("Country or economy")
+        & pd.to_numeric(df["Year"], errors="coerce").eq(int(year))
+    ].copy()
+    if ref.empty:
+        return pd.Series(dtype=float)
+
+    ref["country"] = ref["ISO 3 code"].astype(str).str.strip().apply(_safe_iso3_to_iso2)
+    ref["capacity_mw"] = pd.to_numeric(ref["Value"], errors="coerce") * 1000.0
+    ref = ref.dropna(subset=["country", "capacity_mw"])
+    ref = ref.loc[ref["capacity_mw"] >= 0.0]
+    return ref.groupby("country")["capacity_mw"].sum()
+
+
+def apply_ember_bioenergy_capacity_fix(n, investment_year, config):
+    year = int(investment_year)
+    if year < 2020:
+        return
+    reference_year = 2020 if year < 2025 else 2025
+    fixed_historical_year = year <= 2025
+    if n.links.empty:
+        return
+
+    ember_csv = _repo_path("validation/data/ember_yearly_full_release_long_format.csv")
+    if not os.path.exists(ember_csv):
+        logger.warning("Ember bioenergy capacity fix skipped: file not found at %s", ember_csv)
+        return
+
+    ref = _load_ember_bioenergy_capacity_reference(ember_csv, reference_year)
+    if ref.empty:
+        logger.warning(
+            "Ember bioenergy capacity fix skipped: no country Bioenergy capacity rows for %s",
+            reference_year,
+        )
+        return
+
+    def _finite_float(value, default=0.0):
+        value = pd.to_numeric(value, errors="coerce")
+        if pd.isna(value) or not np.isfinite(float(value)):
+            return default
+        return float(value)
+
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+
+    def _link_electric_capacity_records(carriers):
+        rows = []
+        carrier_set = set(carriers)
+        for asset, row in n.links.loc[n.links.carrier.astype(str).isin(carrier_set)].iterrows():
+            bus_col, eff_col = _link_ac_output_port(row, n)
+            if bus_col is None:
+                continue
+            bus = row[bus_col]
+            country = bus_country.get(bus, "")
+            if not re.match(r"^[A-Z]{2}$", str(country)):
+                continue
+            eff = abs(_finite_float(row.get(eff_col, 1.0), 0.0))
+            if eff <= 0.0:
+                continue
+            p_nom = _finite_float(row.get("p_nom", 0.0), 0.0)
+            p_nom_opt = _finite_float(row.get("p_nom_opt", np.nan), np.nan)
+            effective_p_nom = max([x for x in [p_nom, p_nom_opt, 0.0] if np.isfinite(x)])
+            rows.append(
+                {
+                    "asset": asset,
+                    "country": country,
+                    "efficiency": eff,
+                    "electric_capacity_mw": effective_p_nom * eff,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    dedicated_assets = _link_electric_capacity_records(["biomass"])
+    chp_assets = _link_electric_capacity_records(
+        ["urban central solid biomass CHP", "urban central solid biomass CHP CC"]
+    )
+    if dedicated_assets.empty and chp_assets.empty:
+        logger.warning("Ember bioenergy capacity fix skipped: no bioenergy links with AC output found.")
+        return
+
+    chp_by_country = (
+        chp_assets.groupby("country")["electric_capacity_mw"].sum()
+        if not chp_assets.empty
+        else pd.Series(dtype=float)
+    )
+    dedicated_target = (ref - chp_by_country.reindex(ref.index).fillna(0.0)).clip(lower=0.0)
+    chp_exceeds_ref = ref.index[chp_by_country.reindex(ref.index).fillna(0.0).gt(ref)].tolist()
+
+    biomass_template = None
+    if not n.links.loc[n.links.carrier.astype(str).eq("biomass")].empty:
+        biomass_template = n.links.loc[n.links.carrier.astype(str).eq("biomass")].iloc[0]
+
+    records = dedicated_assets.to_dict("records") if not dedicated_assets.empty else []
+    existing_dedicated_countries = set(dedicated_assets["country"]) if not dedicated_assets.empty else set()
+    added_links = 0
+    for country in sorted(set(dedicated_target.loc[dedicated_target > 0.0].index).difference(existing_dedicated_countries)):
+        if biomass_template is None:
+            continue
+        bus_carrier = (
+            n.buses["carrier"].astype(str)
+            if "carrier" in n.buses.columns
+            else pd.Series("", index=n.buses.index)
+        )
+        ac_buses = n.buses.index[
+            bus_carrier.eq("AC")
+            & bus_country.reindex(n.buses.index).astype(str).str.upper().eq(country)
+        ]
+        if len(ac_buses) == 0:
+            continue
+        ac_bus = str(ac_buses[0])
+        bus0 = biomass_template.get("bus0", "")
+        if not isinstance(bus0, str) or bus0 not in n.buses.index:
+            bus0 = "Earth solid biomass power" if "Earth solid biomass power" in n.buses.index else ""
+        if not bus0:
+            continue
+        link_name = f"{ac_bus} biomass-{reference_year}"
+        if link_name in n.links.index:
+            continue
+        eff = abs(_finite_float(biomass_template.get("efficiency", 0.35), 0.35))
+        if eff <= 0.0:
+            continue
+        attrs = {
+            "bus0": bus0,
+            "bus1": ac_bus,
+            "carrier": "biomass",
+            "p_nom_extendable": False,
+            "efficiency": eff,
+            "capital_cost": biomass_template.get("capital_cost", 0.0),
+            "marginal_cost": biomass_template.get("marginal_cost", 0.0),
+            "lifetime": biomass_template.get("lifetime", 25.0),
+            "build_year": reference_year,
+            "p_min_pu": biomass_template.get("p_min_pu", 0.0),
+            "p_max_pu": biomass_template.get("p_max_pu", 1.0),
+            "p_nom": 0.0,
+            "p_nom_min": 0.0,
+            "p_nom_max": 0.0,
+        }
+        for port in [2, 3, 4]:
+            bus_col = f"bus{port}"
+            eff_col = f"efficiency{port}"
+            bus_value = biomass_template.get(bus_col, "")
+            if isinstance(bus_value, str) and bus_value in n.buses.index:
+                attrs[bus_col] = bus_value
+                attrs[eff_col] = biomass_template.get(eff_col, 0.0)
+        n.add("Link", link_name, **attrs)
+        records.append(
+            {
+                "asset": link_name,
+                "country": country,
+                "efficiency": eff,
+                "electric_capacity_mw": 0.0,
+            }
+        )
+        added_links += 1
+
+    assets = pd.DataFrame(records)
+    if assets.empty:
+        logger.warning(
+            "Ember bioenergy capacity fix skipped: no dedicated biomass links available to adjust."
+        )
+        return
+
+    adjustable_assets = assets.loc[assets["country"].isin(dedicated_target.index)].copy()
+    if adjustable_assets.empty:
+        logger.warning("Ember bioenergy capacity fix skipped: no biomass assets in Ember countries.")
+        return
+
+    before_dedicated_mw = float(adjustable_assets["electric_capacity_mw"].sum())
+    target_by_asset = pd.Series(0.0, index=adjustable_assets["asset"], dtype=float)
+    for country, group in adjustable_assets.groupby("country"):
+        country_target = float(dedicated_target.get(country, 0.0))
+        if country_target <= 0.0:
+            continue
+        weights = group["electric_capacity_mw"].clip(lower=0.0)
+        if float(weights.sum()) <= 0.0:
+            weights = pd.Series(1.0, index=group.index)
+        shares = weights / float(weights.sum())
+        target_by_asset.loc[group["asset"].values] = shares.values * country_target
+
+    link_idx = pd.Index(target_by_asset.index)
+    eff = assets.set_index("asset").loc[link_idx, "efficiency"]
+    p_nom_target = target_by_asset.div(eff).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    if "p_nom" in n.links.columns:
+        n.links.loc[link_idx, "p_nom"] = p_nom_target.reindex(link_idx).to_numpy()
+    if "p_nom_opt" in n.links.columns:
+        n.links.loc[link_idx, "p_nom_opt"] = p_nom_target.reindex(link_idx).to_numpy()
+    if "p_nom_min" in n.links.columns:
+        if fixed_historical_year:
+            n.links.loc[link_idx, "p_nom_min"] = 0.0
+        else:
+            n.links.loc[link_idx, "p_nom_min"] = p_nom_target.reindex(link_idx).to_numpy()
+    if "p_nom_max" in n.links.columns:
+        if fixed_historical_year:
+            n.links.loc[link_idx, "p_nom_max"] = p_nom_target.reindex(link_idx).to_numpy()
+        else:
+            n.links.loc[link_idx, "p_nom_max"] = np.inf
+    if "p_nom_extendable" in n.links.columns:
+        n.links.loc[link_idx, "p_nom_extendable"] = True
+
+    after_dedicated_mw = float(target_by_asset.sum())
+    model_bioenergy_countries = sorted(
+        set(ref.index).intersection(set(assets["country"]).union(set(chp_by_country.index)))
+    )
+    matched_ref_mw = float(ref.reindex(model_bioenergy_countries).fillna(0.0).sum())
+    matched_chp_mw = float(chp_by_country.reindex(model_bioenergy_countries).fillna(0.0).sum())
+    total_after_mw = after_dedicated_mw + matched_chp_mw
+    untouched_dedicated_countries = sorted(set(assets["country"]).difference(set(ref.index)))
+    if fixed_historical_year and untouched_dedicated_countries:
+        untouched_assets = pd.Index(assets.loc[assets["country"].isin(untouched_dedicated_countries), "asset"])
+        for col in ["p_nom", "p_nom_min", "p_nom_max", "p_nom_opt"]:
+            if col in n.links.columns:
+                n.links.loc[untouched_assets, col] = 0.0
+        if "p_nom_extendable" in n.links.columns:
+            n.links.loc[untouched_assets, "p_nom_extendable"] = False
+
+    logger.info(
+        "Applied Ember bioenergy capacity fix for %s from %s: reference_year=%s, fixed_historical_year=%s, adjusted_dedicated_biomass_links=%d, added_links=%d, matched_countries=%d, dedicated_before=%.2f GW, dedicated_after=%.2f GW, preserved_chp=%.2f GW, total_after=%.2f GW, reference=%.2f GW, chp_exceeds_reference_countries=%d%s, untouched_model_countries_without_ember=%d%s",
+        year,
+        ember_csv,
+        reference_year,
+        fixed_historical_year,
+        len(link_idx),
+        added_links,
+        len(model_bioenergy_countries),
+        before_dedicated_mw / 1000.0,
+        after_dedicated_mw / 1000.0,
+        matched_chp_mw / 1000.0,
+        total_after_mw / 1000.0,
+        matched_ref_mw / 1000.0,
+        len(chp_exceeds_ref),
+        f" (sample: {', '.join(chp_exceeds_ref[:5])})" if chp_exceeds_ref else "",
+        len(untouched_dedicated_countries),
+        f" (sample: {', '.join(untouched_dedicated_countries[:5])})" if untouched_dedicated_countries else "",
+    )
+
+
+def apply_pris_nuclear_capacity_and_availability(n, investment_year, config):
+    pris_csv = _repo_path("validation/data/pris_nuclear_validation.csv")
+    if not os.path.exists(pris_csv):
+        logger.warning("PRIS nuclear adjustment skipped: file not found at %s", pris_csv)
+        return
+    if n.generators.empty:
+        return
+
+    idx = n.generators.index[n.generators.carrier.astype(str).eq("nuclear")]
+    if len(idx) == 0:
+        logger.warning("PRIS nuclear adjustment skipped: no nuclear generators found.")
+        return
+
+    pris = pd.read_csv(pris_csv)
+    required = {
+        "country_iso2",
+        "pris_capacity_gw",
+        "pris_nuclear_generation_twh",
+    }
+    missing = required.difference(pris.columns)
+    if missing:
+        logger.warning(
+            "PRIS nuclear adjustment skipped: missing columns %s in %s",
+            sorted(missing),
+            pris_csv,
+        )
+        return
+
+    pris = pris.copy()
+    pris["country"] = pris["country_iso2"].astype(str).str.upper().str.strip()
+    pris["capacity_gw"] = pd.to_numeric(pris["pris_capacity_gw"], errors="coerce")
+    pris["generation_twh"] = pd.to_numeric(
+        pris["pris_nuclear_generation_twh"], errors="coerce"
+    )
+    pris = pris.loc[
+        pris["country"].str.len().eq(2) & pris["capacity_gw"].gt(0.0)
+    ].copy()
+    if pris.empty:
+        logger.warning("PRIS nuclear adjustment skipped: no valid country rows in %s", pris_csv)
+        return
+
+    ref = pris.groupby("country", as_index=True)[["capacity_gw", "generation_twh"]].sum()
+    ref["p_max_pu"] = (
+        ref["generation_twh"] / (ref["capacity_gw"] * 8.76)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0, upper=1.0)
+
+    bus_country_lu = _bus_country_lookup(n)
+    country = n.generators.loc[idx, "bus"].map(bus_country_lu).fillna("")
+    valid = country.ne("")
+    idx = idx[valid.values]
+    country = country.loc[valid]
+    if len(idx) == 0:
+        logger.warning("PRIS nuclear adjustment skipped: no nuclear generators with country mapping.")
+        return
+
+    model_cap_mw = pd.to_numeric(n.generators.loc[idx, "p_nom"], errors="coerce").fillna(0.0)
+    model_country_cap_mw = model_cap_mw.groupby(country).sum()
+    matched_countries = model_country_cap_mw.index.intersection(ref.index)
+    if len(matched_countries) == 0:
+        logger.warning("PRIS nuclear adjustment skipped: no model nuclear countries matched PRIS.")
+        return
+
+    target_cap_mw = ref.loc[matched_countries, "capacity_gw"] * 1000.0
+    factors = target_cap_mw.div(model_country_cap_mw.reindex(matched_countries)).replace(
+        [np.inf, -np.inf], np.nan
+    )
+    factors = factors.dropna()
+    gen_factor = country.map(factors).fillna(1.0)
+    matched_idx = idx[country.isin(factors.index).values]
+    if len(matched_idx) > 0:
+        n.generators.loc[matched_idx, "p_nom"] = (
+            pd.to_numeric(n.generators.loc[matched_idx, "p_nom"], errors="coerce")
+            .fillna(0.0)
+            .mul(gen_factor.reindex(matched_idx).fillna(1.0))
+        )
+        if "p_nom_opt" in n.generators.columns:
+            n.generators.loc[matched_idx, "p_nom_opt"] = n.generators.loc[matched_idx, "p_nom"]
+        if "p_nom_min" in n.generators.columns:
+            n.generators.loc[matched_idx, "p_nom_min"] = n.generators.loc[matched_idx, "p_nom"]
+        if "p_nom_max" in n.generators.columns:
+            current_max = pd.to_numeric(n.generators.loc[matched_idx, "p_nom_max"], errors="coerce")
+            n.generators.loc[matched_idx, "p_nom_max"] = current_max.where(
+                current_max.ge(n.generators.loc[matched_idx, "p_nom"]),
+                n.generators.loc[matched_idx, "p_nom"],
+            )
+        if "p_nom_extendable" in n.generators.columns:
+            n.generators.loc[matched_idx, "p_nom_extendable"] = False
+
+    unmatched_idx = idx[~country.isin(ref.index).values]
+    if len(unmatched_idx) > 0:
+        for col in ["p_nom", "p_nom_opt", "p_nom_min", "p_nom_max"]:
+            if col in n.generators.columns:
+                n.generators.loc[unmatched_idx, col] = 0.0
+        if "p_nom_extendable" in n.generators.columns:
+            n.generators.loc[unmatched_idx, "p_nom_extendable"] = False
+
+    pmax = country.map(ref["p_max_pu"]).dropna()
+    pmax_idx = idx.intersection(pmax.index)
+    ts_cols = n.generators_t.p_max_pu.columns.intersection(pmax_idx)
+    static_cols = pmax_idx.difference(ts_cols)
+    if len(ts_cols) > 0:
+        n.generators_t.p_max_pu.loc[:, ts_cols] = pmax.reindex(ts_cols).to_numpy()
+    if len(static_cols) > 0:
+        n.generators.loc[static_cols, "p_max_pu"] = pmax.reindex(static_cols).to_numpy()
+    if len(unmatched_idx) > 0:
+        unmatched_ts_cols = n.generators_t.p_max_pu.columns.intersection(unmatched_idx)
+        unmatched_static_cols = unmatched_idx.difference(unmatched_ts_cols)
+        if len(unmatched_ts_cols) > 0:
+            n.generators_t.p_max_pu.loc[:, unmatched_ts_cols] = 0.0
+        if len(unmatched_static_cols) > 0:
+            n.generators.loc[unmatched_static_cols, "p_max_pu"] = 0.0
+
+    missing_model_countries = sorted(set(ref.index).difference(set(model_country_cap_mw.index)))
+    zeroed_model_countries = sorted(set(country.loc[unmatched_idx]))
+    logger.info(
+        "Applied PRIS nuclear capacity/availability for %s from %s: matched_countries=%d, nuclear_generators=%d, capacity_before=%.2f GW, capacity_after=%.2f GW, reference_capacity=%.2f GW, cf_range=[%.3f, %.3f], zeroed_model_countries=%d%s, missing_model_countries=%d%s",
+        investment_year,
+        pris_csv,
+        len(matched_countries),
+        len(matched_idx),
+        model_country_cap_mw.reindex(matched_countries).sum() / 1000.0,
+        pd.to_numeric(n.generators.loc[matched_idx, "p_nom"], errors="coerce").sum() / 1000.0,
+        ref.loc[matched_countries, "capacity_gw"].sum(),
+        ref.loc[matched_countries, "p_max_pu"].min(),
+        ref.loc[matched_countries, "p_max_pu"].max(),
+        len(zeroed_model_countries),
+        f" (sample: {', '.join(zeroed_model_countries[:5])})" if zeroed_model_countries else "",
+        len(missing_model_countries),
+        f" (sample: {', '.join(missing_model_countries[:5])})" if missing_model_countries else "",
+    )
+
+
+
+def apply_final_historical_capacity_validation_fixes(n, investment_year, config, context=""):
+    """Re-apply historical capacity validation after baseyear/brownfield stock edits."""
+    year = int(investment_year)
+    label = f" for {context}" if context else ""
+    logger.info("Applying final historical capacity validation fixes for %s%s.", year, label)
+
+    _repair_fossil_link_fuel_buses(n)
+    apply_pris_nuclear_capacity_and_availability(n, year, config)
+    apply_gogpt_oil_capacity_fix(n, year, config)
+    apply_ember_bioenergy_capacity_fix(n, year, config)
+
+    if hasattr(n, "links") and not n.links.empty:
+        links = n.links
+        if "p_nom" in links.columns:
+            nan_p_nom = links["p_nom"].isna()
+            if nan_p_nom.any():
+                logger.warning(
+                    "Final capacity validation cleanup filled %d link p_nom NaNs with 0.",
+                    int(nan_p_nom.sum()),
+                )
+                links.loc[nan_p_nom, "p_nom"] = 0.0
+        if "p_nom_min" in links.columns:
+            nan_p_nom_min = links["p_nom_min"].isna()
+            if nan_p_nom_min.any():
+                links.loc[nan_p_nom_min, "p_nom_min"] = 0.0
+        if "p_nom_max" in links.columns:
+            nan_p_nom_max = links["p_nom_max"].isna()
+            if nan_p_nom_max.any():
+                links.loc[nan_p_nom_max, "p_nom_max"] = np.inf
+        if "p_nom_extendable" in links.columns:
+            links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+
+    if hasattr(n, "generators") and not n.generators.empty:
+        gens = n.generators
+        if "p_nom" in gens.columns:
+            nan_p_nom = gens["p_nom"].isna()
+            if nan_p_nom.any():
+                fallback = (
+                    gens["p_nom_min"].fillna(0.0)
+                    if "p_nom_min" in gens.columns
+                    else pd.Series(0.0, index=gens.index)
+                )
+                gens.loc[nan_p_nom, "p_nom"] = fallback.loc[nan_p_nom]
+        if "p_nom_min" in gens.columns:
+            gens["p_nom_min"] = gens["p_nom_min"].fillna(gens["p_nom"].fillna(0.0))
+        if "p_nom_max" in gens.columns:
+            gens["p_nom_max"] = gens["p_nom_max"].fillna(np.inf)
+        if "p_nom_extendable" in gens.columns:
+            gens["p_nom_extendable"] = gens["p_nom_extendable"].fillna(False).astype(bool)
 
 
 def apply_country_nuclear_iteration_scaling(n, investment_year, config):

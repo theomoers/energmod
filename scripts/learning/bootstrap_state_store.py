@@ -201,6 +201,43 @@ def _build_nested_scenario_excluder(
     return _exclude
 
 
+def _build_toplevel_dir_allowlist_excluder(
+    source_root: Path,
+    *,
+    shared_dir_names: set[str],
+):
+    source_root = source_root.resolve()
+
+    def _exclude(path: Path) -> bool:
+        try:
+            rel = path.resolve().relative_to(source_root)
+        except Exception:
+            return False
+        if len(rel.parts) == 0:
+            return False
+        top = rel.parts[0]
+        top_path = source_root / top
+        if top_path.is_dir() and top not in shared_dir_names:
+            return True
+        return False
+
+    return _exclude
+
+
+def _build_resources_excluder(source_root: Path):
+    allowlist_excluder = _build_toplevel_dir_allowlist_excluder(
+        source_root,
+        shared_dir_names=DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS,
+    )
+    nested_scenario_excluder = _build_nested_scenario_excluder(
+        source_root,
+        shared_dir_names=DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS,
+        scenario_markers=DEFAULT_RESOURCES_SCENARIO_MARKERS,
+    )
+
+    return lambda path: allowlist_excluder(path) or nested_scenario_excluder(path)
+
+
 def _merge_summary(parts: list[MirrorSummary]) -> MirrorSummary:
     merged = MirrorSummary()
     for part in parts:
@@ -269,11 +306,7 @@ def save_bootstrap_state(
     resources_target_dir = target_dir.resolve() / "__resources_sector__"
     resources_source_exists = resources_source_dir.exists() and resources_source_dir.is_dir()
     if resources_source_exists:
-        resources_excluder = _build_nested_scenario_excluder(
-            resources_source_dir,
-            shared_dir_names=DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS,
-            scenario_markers=DEFAULT_RESOURCES_SCENARIO_MARKERS,
-        )
+        resources_excluder = _build_resources_excluder(resources_source_dir)
         summaries.append(
             mirror_tree(
                 resources_source_dir,
@@ -358,11 +391,7 @@ def restore_bootstrap_state(
         except ValueError:
             companion_resources_source = None
         if companion_resources_source is not None and companion_resources_source.exists() and companion_resources_source.is_dir():
-            resources_excluder = _build_nested_scenario_excluder(
-                companion_resources_source,
-                shared_dir_names=DEFAULT_RESOURCES_SHARED_TOPLEVEL_DIRS,
-                scenario_markers=DEFAULT_RESOURCES_SCENARIO_MARKERS,
-            )
+            resources_excluder = _build_resources_excluder(companion_resources_source)
             summaries.append(
                 mirror_tree(
                     companion_resources_source,

@@ -917,13 +917,18 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                             n.links.loc[already_build[mask], "lifetime"] = lifetime_assets.loc[bases[mask]].to_numpy()
 
             if not new_build.empty:
-                new_capacity = capacity.loc[new_build.str.replace(name_suffix, "")]
+                new_capacity = capacity.loc[new_build.str.replace(name_suffix, "", regex=False)]
+
+                if isinstance(bus0, (pd.Index, pd.Series, list, tuple, np.ndarray)) and len(bus0) == len(capacity):
+                    new_bus0 = pd.Series(list(bus0), index=capacity.index).reindex(new_capacity.index).to_list()
+                else:
+                    new_bus0 = bus0
 
                 n.madd( # changed from https://github.com/pypsa-meets-earth/pypsa-earth/pull/1678/changes
                     "Link",
                     new_capacity.index,
                     suffix=name_suffix,
-                    bus0=bus0,
+                    bus0=new_bus0,
                     bus1=new_capacity.index,
                     bus2="co2 atmosphere",
                     carrier=generator,
@@ -1372,6 +1377,62 @@ if __name__ == "__main__":
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_extendable/e_nom_extendable = False")
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_min = p_nom (and e_nom_min = e_nom for storage) to prevent capacity reduction")
 
+    fossil_alignment_cfg = snakemake.config.get("global_specific", {}).get("fossil_capacity_alignment", {})
+    if (
+        int(baseyear) == int(fossil_alignment_cfg.get("year", 2020))
+        and bool(fossil_alignment_cfg.get("make_baseyear_fossil_links_extendable", False))
+        and hasattr(n, "links")
+        and not n.links.empty
+    ):
+        links = n.links
+        fossil_link_carriers = set(
+            str(c) for c in fossil_alignment_cfg.get(
+                "extendable_baseyear_carriers", ["coal", "lignite", "CCGT", "OCGT", "oil"]
+            )
+        )
+        carrier_mask = (
+            links.carrier.astype(str).isin(fossil_link_carriers)
+            if "carrier" in links.columns
+            else pd.Series(False, index=links.index)
+        )
+        if "build_year" in links.columns:
+            build_year = pd.to_numeric(links.build_year, errors="coerce")
+            year_mask = build_year.eq(int(baseyear))
+        else:
+            logger.warning(
+                "Link component has no build_year column; applying baseyear fossil extendability by carrier only."
+            )
+            year_mask = pd.Series(True, index=links.index)
+
+        fossil_assets = links.index[carrier_mask & year_mask]
+        if len(fossil_assets):
+            if "p_nom_extendable" not in links.columns:
+                links["p_nom_extendable"] = np.zeros(len(links), dtype=np.bool_)
+            if "p_nom_min" not in links.columns:
+                links["p_nom_min"] = 0.0
+            if "p_nom_max" not in links.columns:
+                links["p_nom_max"] = np.inf
+
+            p_nom = pd.to_numeric(links.loc[fossil_assets, "p_nom"], errors="coerce").fillna(0.0)
+            links.loc[fossil_assets, "p_nom_extendable"] = True
+            links.loc[fossil_assets, "p_nom_min"] = p_nom.to_numpy()
+            links.loc[fossil_assets, "p_nom_max"] = p_nom.to_numpy()
+            links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+            logger.info(
+                "In baseyear %s: Reopened %d fossil power links for GEM-bounded expansion with p_nom_min=p_nom (carriers=%s).",
+                baseyear,
+                len(fossil_assets),
+                sorted(fossil_link_carriers),
+            )
+
+    if hasattr(_validation_hooks, "apply_gem_fossil_capacity_caps"):
+        _validation_hooks.apply_gem_fossil_capacity_caps(
+            n,
+            planning_year=baseyear,
+            config=snakemake.config,
+            context="add_existing_baseyear",
+        )
+
     # Final cleanup: ensure generator capacities are not NaN
     if hasattr(n, "generators") and not n.generators.empty:
         gens = n.generators
@@ -1455,6 +1516,14 @@ if __name__ == "__main__":
 
     # if options.get("cluster_heat_buses", False):
     #     cluster_heat_buses(n)
+
+    if hasattr(_validation_hooks, "apply_final_historical_capacity_validation_fixes"):
+        _validation_hooks.apply_final_historical_capacity_validation_fixes(
+            n,
+            investment_year=baseyear,
+            config=snakemake.config,
+            context="add_existing_baseyear",
+        )
 
     # Preserve existing n.meta entries (e.g., temporal_cluster_period_id) before updating
     if not hasattr(n, 'meta') or n.meta is None:

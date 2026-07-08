@@ -8,7 +8,7 @@ Usage:
 
 Environment variables:
   Bootstrap always runs with Snakemake parallelism fixed to 100 jobs
-  LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
+  LEARNING_SECTOR_NAME Override the shared sector_name (default: run.sector_name from config.myopic.yaml)
   LEARNING_CONDA_ENV   Conda env to activate when snakemake is not already on PATH
   LEARNING_SNAKEMAKE_LOCK
                        auto|on|off; auto disables the lock only when
@@ -70,6 +70,24 @@ TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_bootstrap.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
 
+read_config_sector_name() {
+  awk '
+    in_run && /^  sector_name:/ {
+      value = $0
+      sub(/^  sector_name: */, "", value)
+      sub(/ *#.*$/, "", value)
+      sub(/^"/, "", value)
+      sub(/"$/, "", value)
+      sub(/^\047/, "", value)
+      sub(/\047$/, "", value)
+      print value
+      exit
+    }
+    /^run:$/ { in_run = 1; next }
+    in_run && /^[A-Za-z0-9_-]+:/ { exit }
+  ' "$ROOT_DIR/config.myopic.yaml"
+}
+
 sanitize_token() {
   local raw="$1"
   local token
@@ -81,12 +99,17 @@ sanitize_token() {
   printf '%s' "$token"
 }
 
+CONFIG_SECTOR_NAME="$(read_config_sector_name)"
+if [[ -z "$CONFIG_SECTOR_NAME" ]]; then
+  CONFIG_SECTOR_NAME="Global_200"
+fi
+
 if [[ -n "${LEARNING_SECTOR_NAME:-}" ]]; then
   JOB_SECTOR_NAME="${LEARNING_SECTOR_NAME}"
 elif [[ -n "$SCENARIO_NAME" ]]; then
-  JOB_SECTOR_NAME="Global_200/$(sanitize_token "$SCENARIO_NAME")"
+  JOB_SECTOR_NAME="${CONFIG_SECTOR_NAME}/$(sanitize_token "$SCENARIO_NAME")"
 else
-  JOB_SECTOR_NAME="Global_200"
+  JOB_SECTOR_NAME="$CONFIG_SECTOR_NAME"
 fi
 
 SNAKEMAKE_JOBS="100"
@@ -144,6 +167,10 @@ CMD=(
   "$OVERLAY_FILE"
   "${EXTRA_CONFIGFILES[@]}"
   "${SNAKEMAKE_LOCK_ARGS[@]}"
+  --set-resources
+  build_renewable_profiles:renewable_profile_slot=1
+  --resources
+  renewable_profile_slot=1
   --rerun-incomplete
   --rerun-trigger
   mtime

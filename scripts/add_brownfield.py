@@ -432,8 +432,8 @@ def adjust_battery_capacity_2025(n, year):
     logger.info(f"Total battery capacity adjusted for {year}: {total_e_adjusted:.1f} MWh energy, {total_p_adjusted:.1f} MW power")
 
 
-def materialize_year2025_irena_fixed_renewables(n, year, config):
-    """Add 2025 historical renewable capacity in brownfield preprocessing only."""
+def materialize_year2025_historical_capacities(n, year, config):
+    """Add/adjust 2025 historical renewable and fossil capacity in brownfield preprocessing."""
     if int(year) != 2025:
         return
 
@@ -449,6 +449,21 @@ def materialize_year2025_irena_fixed_renewables(n, year, config):
             n,
             planning_year=year,
             config=config,
+        )
+
+    if hasattr(_validation_hooks, "materialize_year2025_gem_fossil_capacities"):
+        _validation_hooks.materialize_year2025_gem_fossil_capacities(
+            n,
+            planning_year=year,
+            config=config,
+        )
+
+    if hasattr(_validation_hooks, "apply_gem_fossil_capacity_caps"):
+        _validation_hooks.apply_gem_fossil_capacity_caps(
+            n,
+            planning_year=year,
+            config=config,
+            context="add_brownfield",
         )
 
 
@@ -596,7 +611,7 @@ if __name__ == "__main__":
     #    n.generators.loc[nuclear_gens, "p_nom_extendable"] = True
     #    logger.info(f"Set {len(nuclear_gens)} nuclear generators to p_nom_extendable=True")
 
-    materialize_year2025_irena_fixed_renewables(n, year, snakemake.config)
+    materialize_year2025_historical_capacities(n, year, snakemake.config)
 
     for carrier in ['coal', 'gas', 'oil']:
         fuel_gens = n.generators.index[n.generators.carrier == carrier]
@@ -608,6 +623,14 @@ if __name__ == "__main__":
     # adjust battery capacity with build year 2025 based on csv
     if year == 2025:
         adjust_battery_capacity_2025(n, year)
+
+    if hasattr(_validation_hooks, "apply_final_historical_capacity_validation_fixes"):
+        _validation_hooks.apply_final_historical_capacity_validation_fixes(
+            n,
+            investment_year=year,
+            config=snakemake.config,
+            context="add_brownfield",
+        )
 
     disable_grid_expansion_if_limit_hit(n)
 
