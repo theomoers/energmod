@@ -65,8 +65,6 @@ test/tmp/
 playground/
 pypsa-eur
 !validation/data/*
-!validation/data/
-!validation
 validation/results_compare/
 validation/results_dashboard/
 validation/state_snapshots/
@@ -80,6 +78,9 @@ permstorage/bootstrap_snapshots/*
 permstorage/*
 # Local bootstrap state snapshots can be large; do not sync the generated tree.
 bootstrap-states/
+scripts/learning/tests/
+scripts/learning/test_*.py
+validation/scripts/test_*.py
 
 # Specific configuration files
 configs/*

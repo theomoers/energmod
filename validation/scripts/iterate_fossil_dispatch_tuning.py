@@ -88,7 +88,7 @@ def _run_snakemake(args):
     tmp_cfg = REPO_ROOT / "validation" / ".tmp" / "fossil_tuning_enable.yaml"
     tmp_cfg.parent.mkdir(parents=True, exist_ok=True)
     tmp_cfg.write_text(
-        "global_specific:\\n  baseyear_generation:\\n    fossil_price_tuning_enabled: true\\n",
+        "global_specific:\\n  baseyear_generation:\\n    fossil_price_tuning_enabled: false\\n",
         encoding="utf-8",
     )
     configfiles = [*args.configfiles, str(tmp_cfg.relative_to(REPO_ROOT))]
