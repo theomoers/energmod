@@ -4326,6 +4326,9 @@ if __name__ == "__main__":
     apply_country_wind_iteration_scaling(n, investment_year, snakemake.config)
     # Optional per-country iterative solar overrides written by calibration wrapper.
     apply_country_solar_iteration_scaling(n, investment_year, snakemake.config)
+    # Compact profile tuning is applied after baseyear/brownfield stock edits,
+    # so inherited assets are converted from the previous tuning vintage to
+    # the current one without mixing 2020 and 2025 multipliers.
     # Historical capacity validation for nuclear, oil, and bioenergy is applied
     # after add_existing_baseyear/add_brownfield so downstream stock edits cannot undo it.
     # Clip within-country onwind availability outliers before capacity constraints.
@@ -4370,6 +4373,19 @@ if __name__ == "__main__":
     # Apply country-specific WACCs to ALL renewable generators (must be last to catch all generators)
     logger.info("Applying regional WACCs to all renewable generators...")
     apply_regional_waccs(n, costs, wacc_dict, Nyears)
+
+    if hasattr(_validation_hooks, "apply_gtd_line_adjustments"):
+        n = _validation_hooks.apply_gtd_line_adjustments(
+            n,
+            planning_year=investment_year,
+            config=snakemake.config,
+        )
+    if hasattr(_validation_hooks, "apply_manual_validation_line_adjustments"):
+        n = _validation_hooks.apply_manual_validation_line_adjustments(
+            n,
+            planning_year=investment_year,
+            config=snakemake.config,
+        )
 
     if biomass_allocation is not None:
         if not isinstance(getattr(n, "meta", None), dict):

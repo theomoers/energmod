@@ -13,7 +13,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import xarray as xr
-from _helpers import read_csv_nafix
+from _helpers import read_csv_nafix, regularize_cutout_coordinates
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
@@ -29,6 +29,7 @@ if __name__ == "__main__":
         snakemake.input.cutout
     )  # os.path.abspath(snakemake.config["atlite"]["cutout"])
     cutout = atlite.Cutout(cutout_path)
+    cutout = regularize_cutout_coordinates(cutout)
 
     grid_cells = cutout.grid.geometry
 

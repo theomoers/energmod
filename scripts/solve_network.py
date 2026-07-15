@@ -2369,7 +2369,7 @@ def prepare_network(n, solve_opts):
             carrier="Load",
             sign=1,
             marginal_cost=solve_opts.get("load_shedding") * 1000,  # convert to Eur/MWh
-            p_nom=1e12,
+            p_nom=1e6,
         )
 
     if solve_opts.get("noisy_costs"):
@@ -4834,12 +4834,6 @@ def extra_functionality(n, snapshots):
             )
 
         add_country_fossil_capacity_ceiling(
-            n,
-            planning_year=planning_year,
-            config=config,
-        )
-
-        add_ember_bioenergy_capacity_balance(
             n,
             planning_year=planning_year,
             config=config,

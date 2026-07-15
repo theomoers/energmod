@@ -135,3 +135,7 @@ learning:
     fuels: ["oil", "gas", "coal"]
     expectation_mode: block_average_expected   # point_cost | block_average_expected
     annual_weights: [1.0, 1.0, 1.0, 1.0, 1.0]  # when block_average_expected, first weight is previous-horizon year (e.g. 2025 for 2030 pricing)
+    historical_market_overrides:
+      - {year: 2020, fuel_type: gas, country: JP, market: JKM}
+      - {year: 2020, fuel_type: gas, country: KR, market: JKM}
+      - {year: 2020, fuel_type: gas, country: TW, market: JKM}

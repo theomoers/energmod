@@ -1,7 +1,7 @@
 global_specific:
   baseyear_generation:
     hydro_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
-    hydro_inflow_alignment: true
+    hydro_inflow_alignment: false
     hydro_inflow_min_reference_twh: 1.0
     hydro_inflow_min_model_twh: 0.1
     hydro_inflow_scale_min: 0.25
@@ -13,7 +13,7 @@ global_specific:
     hydro_iteration_scale_max: 20.0
     hydro_ror_p_max_pu_cap: 1.0
 
-    onwind_profile_alignment: true
+    onwind_profile_alignment: false
     onwind_baseline_network: results/Global_200/postnetworks/baseline_snapshots/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base_baseline_nobal_nohydroscale.nc
     onwind_min_reference_twh: 1.0
     onwind_min_model_twh: 0.1
@@ -23,13 +23,13 @@ global_specific:
     onwind_p_max_pu_cap: 1.0
 
     # Enable cumulative tuned profile/availability overrides from one shared overlay.
-    wind_iteration_scaling_enabled: true
+    wind_iteration_scaling_enabled: false
     wind_iteration_override_csv: validation/data/wind_iteration_scaling_overrides.csv
     wind_iteration_scale_min: 0.05
     wind_iteration_scale_max: 20.0
     offwind_p_max_pu_cap: 1.0
 
-    solar_iteration_scaling_enabled: true
+    solar_iteration_scaling_enabled: false
     solar_iteration_override_csv: validation/data/solar_iteration_scaling_overrides.csv
     solar_iteration_scale_min: 0.05
     solar_iteration_scale_max: 20.0
@@ -37,8 +37,7 @@ global_specific:
 
     # During iterative tuning, the explicit hydro iteration overrides are the only
     # hydro scaling we want active.
-    hydro_inflow_alignment: false
-    hydro_iteration_scaling_enabled: true
+    hydro_iteration_scaling_enabled: false
     hydro_iteration_override_csv: validation/data/hydro_iteration_scaling_overrides.csv
     hydro_iteration_scale_min: 0.05
     hydro_iteration_scale_max: 20.0

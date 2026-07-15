@@ -11,7 +11,7 @@ import atlite
 import geopandas as gpd
 import pandas as pd
 import xarray as xr
-from _helpers import read_csv_nafix, to_csv_nafix
+from _helpers import read_csv_nafix, regularize_cutout_coordinates, to_csv_nafix
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
@@ -27,6 +27,7 @@ if __name__ == "__main__":
         snakemake.input.cutout
     )  # os.path.abspath(snakemake.config["atlite"]["cutout"])
     cutout = atlite.Cutout(cutout_path)
+    cutout = regularize_cutout_coordinates(cutout)
     # cutout = atlite.Cutout(snakemake.config['atlite']['cutout'])
 
     clustered_regions = (

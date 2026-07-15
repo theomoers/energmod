@@ -202,7 +202,12 @@ import numpy as np
 import pandas as pd
 import progressbar as pgb
 import xarray as xr
-from _helpers import BASE_DIR, configure_logging, create_logger
+from _helpers import (
+    BASE_DIR,
+    configure_logging,
+    create_logger,
+    regularize_cutout_coordinates,
+)
 from add_electricity import load_powerplants
 from dask.distributed import Client
 from pypsa.geo import haversine
@@ -611,6 +616,7 @@ if __name__ == "__main__":
         client = None
 
     cutout = atlite.Cutout(paths["cutout"])
+    cutout = regularize_cutout_coordinates(cutout)
 
     check_cutout_match(cutout=cutout, geodf=regions)
 

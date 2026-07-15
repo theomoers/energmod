@@ -85,6 +85,7 @@ def load_historical_average_country_fuel_prices_frame(
     fuelprices_path,
     investment_year,
     window_years: int = HISTORICAL_AVERAGE_WINDOW_YEARS,
+    market_overrides=None,
 ) -> pd.DataFrame:
     """Build country fuel prices from a fixed historical/forecast market window."""
     bundle_root = _resolve_default_bundle_root(fuelprices_path)
@@ -159,6 +160,30 @@ def load_historical_average_country_fuel_prices_frame(
         axis=1,
     )
 
+    investment_year = int(investment_year)
+    if market_overrides:
+        overrides = pd.DataFrame(market_overrides).copy()
+        required_override = {"year", "fuel_type", "country", "market"}
+        missing_override = required_override.difference(overrides.columns)
+        if missing_override:
+            raise ValueError(
+                "Historical market overrides are missing required columns: "
+                f"{sorted(missing_override)}"
+            )
+        overrides["year"] = pd.to_numeric(overrides["year"], errors="coerce")
+        overrides = overrides.loc[overrides["year"].eq(investment_year)].copy()
+        overrides["fuel_type"] = overrides["fuel_type"].astype(str).str.lower().str.strip()
+        overrides["country"] = overrides["country"].astype(str).str.upper().str.strip()
+        if overrides.duplicated(["fuel_type", "country"]).any():
+            raise ValueError("Historical market overrides must be unique by year, fuel_type, and country.")
+        for row in overrides.itertuples(index=False):
+            match = country_map["fuel_type"].eq(row.fuel_type) & country_map["country"].eq(row.country)
+            if int(match.sum()) != 1:
+                raise ValueError(
+                    f"Historical market override has no unique country mapping: {row.fuel_type}/{row.country}."
+                )
+            country_map.loc[match, "market"] = normalize_market_name(row.fuel_type, row.market)
+
     historical["fuel_type"] = historical["fuel_type"].astype(str).str.lower()
     historical["market"] = historical.apply(
         lambda row: normalize_market_name(row["fuel_type"], row["market"]),
@@ -192,7 +217,6 @@ def load_historical_average_country_fuel_prices_frame(
         ]:
             ar1_parameters[column] = pd.to_numeric(ar1_parameters[column], errors="coerce")
 
-    investment_year = int(investment_year)
     first_year = investment_year - int(window_years) + 1
     target_years = set(range(first_year, investment_year + 1))
 

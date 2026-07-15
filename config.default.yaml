@@ -109,6 +109,10 @@ global_specific:
     enable: false
     audit_dir: validation/results
     carry_forward_anchor_year: 2025
+    country_demand_splits:
+      enable: false
+      ember_csv: validation/data/ember_yearly_full_release_long_format.csv
+      splits: []
     anchors:
       2020:
         year: 2020
@@ -171,6 +175,15 @@ global_specific:
       skip_if_min_exceeds_cap: true
     make_baseyear_fossil_links_extendable: false
     extendable_baseyear_carriers: [coal, lignite, CCGT, OCGT, oil]
+    nodal_allocation:
+      enable: false
+      years: [2020, 2025]
+      ember_generation_csv: validation/data/owid-elecbalance2025.csv
+      min_ember_reference_twh: 1.0
+      reserve_margin: 1.10
+      ac_import_credit_fraction: 0.25
+      min_load_share_multiplier: 0.25
+      max_load_share_multiplier: 3.0
     materialize_2025:
       enable: false
       year: 2025

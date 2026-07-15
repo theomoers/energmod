@@ -451,6 +451,13 @@ def materialize_year2025_historical_capacities(n, year, config):
             config=config,
         )
 
+    if hasattr(_validation_hooks, "materialize_year2025_historical_capacity_validation"):
+        _validation_hooks.materialize_year2025_historical_capacity_validation(
+            n,
+            planning_year=year,
+            config=config,
+        )
+
     if hasattr(_validation_hooks, "materialize_year2025_gem_fossil_capacities"):
         _validation_hooks.materialize_year2025_gem_fossil_capacities(
             n,
@@ -465,6 +472,68 @@ def materialize_year2025_historical_capacities(n, year, config):
             config=config,
             context="add_brownfield",
         )
+
+
+def freeze_year2025_historical_electric_assets(n):
+    """Fix selected 2025 historical electricity assets at their materialized stock."""
+    generator_carriers = {"solar", "onwind", "offwind-ac", "offwind-dc", "geothermal"}
+    link_carriers = {"biomass", "biomass EOP", "urban central solid biomass CHP", "urban central solid biomass CHP CC", "CCGT", "coal", "lignite", "OCGT"}
+
+    if hasattr(n, "generators") and not n.generators.empty:
+        generators = n.generators
+        assets = generators.index[generators.carrier.astype(str).isin(generator_carriers)]
+        if len(assets):
+            if "p_nom_extendable" not in generators.columns:
+                generators["p_nom_extendable"] = False
+            if "p_nom_min" not in generators.columns:
+                generators["p_nom_min"] = 0.0
+            p_nom = pd.to_numeric(generators.loc[assets, "p_nom"], errors="coerce").fillna(0.0)
+            generators.loc[assets, "p_nom_min"] = p_nom.to_numpy()
+            generators.loc[assets, "p_nom_extendable"] = False
+            generators["p_nom_extendable"] = generators["p_nom_extendable"].fillna(False).astype(bool)
+            logger.info("Fixed %d 2025 historical generators (carriers=%s).", len(assets), sorted(generator_carriers))
+
+    if hasattr(n, "links") and not n.links.empty:
+        links = n.links
+        assets = links.index[links.carrier.astype(str).isin(link_carriers)]
+        if len(assets):
+            if "p_nom_extendable" not in links.columns:
+                links["p_nom_extendable"] = False
+            if "p_nom_min" not in links.columns:
+                links["p_nom_min"] = 0.0
+            p_nom = pd.to_numeric(links.loc[assets, "p_nom"], errors="coerce").fillna(0.0)
+            links.loc[assets, "p_nom_min"] = p_nom.to_numpy()
+            links.loc[assets, "p_nom_extendable"] = False
+            links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+            logger.info("Fixed %d 2025 historical electricity links (carriers=%s).", len(assets), sorted(link_carriers))
+
+    if hasattr(n, "stores") and not n.stores.empty:
+        stores = n.stores
+        assets = stores.index[stores.carrier.astype(str).eq("battery")]
+        if len(assets):
+            if "e_nom_extendable" not in stores.columns:
+                stores["e_nom_extendable"] = False
+            if "e_nom_min" not in stores.columns:
+                stores["e_nom_min"] = 0.0
+            e_nom = pd.to_numeric(stores.loc[assets, "e_nom"], errors="coerce").fillna(0.0)
+            stores.loc[assets, "e_nom_min"] = e_nom.to_numpy()
+            stores.loc[assets, "e_nom_extendable"] = False
+            stores["e_nom_extendable"] = stores["e_nom_extendable"].fillna(False).astype(bool)
+            logger.info("Fixed %d 2025 battery stores.", len(assets))
+
+    if hasattr(n, "lines") and not n.lines.empty:
+        lines = n.lines
+        assets = lines.index[lines.carrier.astype(str).eq("AC")]
+        if len(assets):
+            if "s_nom_extendable" not in lines.columns:
+                lines["s_nom_extendable"] = False
+            if "s_nom_min" not in lines.columns:
+                lines["s_nom_min"] = 0.0
+            s_nom = pd.to_numeric(lines.loc[assets, "s_nom"], errors="coerce").fillna(0.0)
+            lines.loc[assets, "s_nom_min"] = s_nom.to_numpy()
+            lines.loc[assets, "s_nom_extendable"] = False
+            lines["s_nom_extendable"] = lines["s_nom_extendable"].fillna(False).astype(bool)
+            logger.info("Fixed %d 2025 AC lines.", len(assets))
 
 
 # def adjust_renewable_profiles(n, input_profiles, params, year):
@@ -631,6 +700,51 @@ if __name__ == "__main__":
             config=snakemake.config,
             context="add_brownfield",
         )
+
+    if hasattr(_validation_hooks, "apply_final_validation_network_fixes"):
+        _validation_hooks.apply_final_validation_network_fixes(
+            n,
+            investment_year=year,
+            config=snakemake.config,
+            context="add_brownfield",
+        )
+
+    if hasattr(_validation_hooks, "apply_gtd_line_adjustments"):
+        n = _validation_hooks.apply_gtd_line_adjustments(
+            n,
+            planning_year=year,
+            config=snakemake.config,
+        )
+    if hasattr(_validation_hooks, "apply_manual_validation_line_adjustments"):
+        n = _validation_hooks.apply_manual_validation_line_adjustments(
+            n,
+            planning_year=year,
+            config=snakemake.config,
+        )
+
+    if hasattr(_validation_hooks, "apply_country_renewable_profile_tuning"):
+        previous_tuning_year = None
+        if isinstance(getattr(n_p, "meta", None), dict):
+            previous_tuning_year = n_p.meta.get("renewable_profile_tuning_year")
+        if previous_tuning_year is None and year > 2020:
+            previous_tuning_year = year - 5
+        _validation_hooks.apply_country_renewable_profile_tuning(
+            n,
+            investment_year=year,
+            config=snakemake.config,
+            previous_tuning_year=previous_tuning_year,
+        )
+
+    if hasattr(_validation_hooks, "allocate_historical_fossil_and_biomass_links"):
+        _validation_hooks.allocate_historical_fossil_and_biomass_links(
+            n,
+            investment_year=year,
+            config=snakemake.config,
+            context="add_brownfield",
+        )
+
+    if year == 2025:
+        freeze_year2025_historical_electric_assets(n)
 
     disable_grid_expansion_if_limit_hit(n)
 

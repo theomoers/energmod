@@ -12,6 +12,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import xarray as xr
+from _helpers import regularize_cutout_coordinates
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
@@ -29,6 +30,7 @@ if __name__ == "__main__":
     )  # os.path.abspath(snakemake.config["atlite"]["cutout"])
 
     cutout = atlite.Cutout(cutout_path).sel(time=time)
+    cutout = regularize_cutout_coordinates(cutout)
 
     clustered_regions = (
         gpd.read_file(snakemake.input.regions_onshore)

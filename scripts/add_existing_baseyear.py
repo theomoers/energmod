@@ -646,9 +646,15 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
         # capacity is the capacity in MW at each node for this
         capacity = df.loc[grouping_year, generator]
         capacity = capacity[~capacity.isna()]
-        capacity = capacity[
-            capacity > snakemake.params.existing_capacities["threshold_capacity"]
-        ]
+        if generator in ["solar", "onwind", "offwind"]:
+            # Historical renewable capacities must retain every positive IRENA
+            # allocation; the generic plant threshold would otherwise lose small
+            # country totals before materialization.
+            capacity = capacity[capacity > 0.0]
+        else:
+            capacity = capacity[
+                capacity > snakemake.params.existing_capacities["threshold_capacity"]
+            ]
         suffix = "-ac" if generator == "offwind" else ""
         carrier_label = generator + suffix
         name_suffix = f" {generator}{suffix}-{grouping_year}"
@@ -688,15 +694,40 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                 for bus in buses_to_adjust:
                     external_capacity = capacity[bus]
                     existing_capacity = existing_capacity_by_bus[bus]
+                    gens_at_bus = existing_renewable_gens[
+                        n.generators.loc[existing_renewable_gens, "bus"] == bus
+                    ]
                     
                     if existing_capacity != external_capacity:
-                        # Scale existing generators at this bus to match IRENA data
-                        scaling_factor = external_capacity / existing_capacity
-                        gens_at_bus = existing_renewable_gens[n.generators.loc[existing_renewable_gens, 'bus'] == bus]
-                        
-                        logger.debug(f"Adjusting {generator} capacity at {bus} for year {grouping_year}: {existing_capacity:.1f} MW -> {external_capacity:.1f} MW (factor: {scaling_factor:.3f})")
-                        n.generators.loc[gens_at_bus, 'p_nom'] *= scaling_factor
-                        n.generators.loc[gens_at_bus, 'p_nom_min'] = n.generators.loc[gens_at_bus, 'p_nom']
+                        if existing_capacity > 0.0:
+                            # Scale positive existing generators at this bus to match IRENA.
+                            scaling_factor = external_capacity / existing_capacity
+                            logger.debug(
+                                f"Adjusting {generator} capacity at {bus} for year "
+                                f"{grouping_year}: {existing_capacity:.1f} MW -> "
+                                f"{external_capacity:.1f} MW (factor: {scaling_factor:.3f})"
+                            )
+                            n.generators.loc[gens_at_bus, "p_nom"] *= scaling_factor
+                        else:
+                            # Populate zero-capacity placeholders directly with IRENA capacity.
+                            if gens_at_bus.empty:
+                                logger.warning(
+                                    "Cannot materialize %s capacity at %s for %s: "
+                                    "zero-capacity placeholder has no generator asset.",
+                                    generator, bus, grouping_year,
+                                )
+                            else:
+                                p_nom_each = external_capacity / len(gens_at_bus)
+                                logger.debug(
+                                    f"Materializing {generator} zero-capacity placeholder at {bus} "
+                                    f"for year {grouping_year}: 0.0 MW -> {external_capacity:.1f} MW"
+                                )
+                                n.generators.loc[gens_at_bus, "p_nom"] = p_nom_each
+
+                        if not gens_at_bus.empty:
+                            n.generators.loc[gens_at_bus, "p_nom_min"] = n.generators.loc[
+                                gens_at_bus, "p_nom"
+                            ]
                     
                     capacity = capacity.drop(bus)
                 
@@ -1377,54 +1408,6 @@ if __name__ == "__main__":
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_extendable/e_nom_extendable = False")
         logger.info(f"In baseyear {baseyear}: All existing assets set to p_nom_min = p_nom (and e_nom_min = e_nom for storage) to prevent capacity reduction")
 
-    fossil_alignment_cfg = snakemake.config.get("global_specific", {}).get("fossil_capacity_alignment", {})
-    if (
-        int(baseyear) == int(fossil_alignment_cfg.get("year", 2020))
-        and bool(fossil_alignment_cfg.get("make_baseyear_fossil_links_extendable", False))
-        and hasattr(n, "links")
-        and not n.links.empty
-    ):
-        links = n.links
-        fossil_link_carriers = set(
-            str(c) for c in fossil_alignment_cfg.get(
-                "extendable_baseyear_carriers", ["coal", "lignite", "CCGT", "OCGT", "oil"]
-            )
-        )
-        carrier_mask = (
-            links.carrier.astype(str).isin(fossil_link_carriers)
-            if "carrier" in links.columns
-            else pd.Series(False, index=links.index)
-        )
-        if "build_year" in links.columns:
-            build_year = pd.to_numeric(links.build_year, errors="coerce")
-            year_mask = build_year.eq(int(baseyear))
-        else:
-            logger.warning(
-                "Link component has no build_year column; applying baseyear fossil extendability by carrier only."
-            )
-            year_mask = pd.Series(True, index=links.index)
-
-        fossil_assets = links.index[carrier_mask & year_mask]
-        if len(fossil_assets):
-            if "p_nom_extendable" not in links.columns:
-                links["p_nom_extendable"] = np.zeros(len(links), dtype=np.bool_)
-            if "p_nom_min" not in links.columns:
-                links["p_nom_min"] = 0.0
-            if "p_nom_max" not in links.columns:
-                links["p_nom_max"] = np.inf
-
-            p_nom = pd.to_numeric(links.loc[fossil_assets, "p_nom"], errors="coerce").fillna(0.0)
-            links.loc[fossil_assets, "p_nom_extendable"] = True
-            links.loc[fossil_assets, "p_nom_min"] = p_nom.to_numpy()
-            links.loc[fossil_assets, "p_nom_max"] = p_nom.to_numpy()
-            links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
-            logger.info(
-                "In baseyear %s: Reopened %d fossil power links for GEM-bounded expansion with p_nom_min=p_nom (carriers=%s).",
-                baseyear,
-                len(fossil_assets),
-                sorted(fossil_link_carriers),
-            )
-
     if hasattr(_validation_hooks, "apply_gem_fossil_capacity_caps"):
         _validation_hooks.apply_gem_fossil_capacity_caps(
             n,
@@ -1524,6 +1507,63 @@ if __name__ == "__main__":
             config=snakemake.config,
             context="add_existing_baseyear",
         )
+
+    if hasattr(_validation_hooks, "apply_final_validation_network_fixes"):
+        _validation_hooks.apply_final_validation_network_fixes(
+            n,
+            investment_year=baseyear,
+            config=snakemake.config,
+            context="add_existing_baseyear",
+        )
+
+    if hasattr(_validation_hooks, "apply_gtd_line_adjustments"):
+        n = _validation_hooks.apply_gtd_line_adjustments(
+            n,
+            planning_year=baseyear,
+            config=snakemake.config,
+        )
+    if hasattr(_validation_hooks, "apply_manual_validation_line_adjustments"):
+        n = _validation_hooks.apply_manual_validation_line_adjustments(
+            n,
+            planning_year=baseyear,
+            config=snakemake.config,
+        )
+
+    if hasattr(_validation_hooks, "apply_country_renewable_profile_tuning"):
+        _validation_hooks.apply_country_renewable_profile_tuning(
+            n,
+            investment_year=baseyear,
+            config=snakemake.config,
+        )
+
+    if hasattr(_validation_hooks, "allocate_historical_fossil_and_biomass_links"):
+        _validation_hooks.allocate_historical_fossil_and_biomass_links(
+            n,
+            investment_year=baseyear,
+            config=snakemake.config,
+            context="add_existing_baseyear",
+        )
+
+    # Freeze selected historical electricity-conversion links after final validation.
+    if int(baseyear) == 2020 and hasattr(n, "links") and not n.links.empty:
+        links = n.links
+        carriers_to_freeze = {"biomass", "biomass EOP", "urban central solid biomass CHP", "urban central solid biomass CHP CC", "CCGT", "coal", "lignite", "OCGT", "oil"}
+        assets = links.index[links.carrier.astype(str).isin(carriers_to_freeze)]
+        if len(assets):
+            if "p_nom_extendable" not in links.columns:
+                links["p_nom_extendable"] = False
+            if "p_nom_min" not in links.columns:
+                links["p_nom_min"] = 0.0
+            p_nom = pd.to_numeric(links.loc[assets, "p_nom"], errors="coerce").fillna(0.0)
+            links.loc[assets, "p_nom_min"] = p_nom.to_numpy()
+            links.loc[assets, "p_nom_extendable"] = False
+            links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
+            logger.info(
+                "In baseyear 2020: Set %d historical electricity links non-extendable "
+                "with p_nom_min=p_nom (carriers=%s).",
+                len(assets),
+                sorted(carriers_to_freeze),
+            )
 
     # Preserve existing n.meta entries (e.g., temporal_cluster_period_id) before updating
     if not hasattr(n, 'meta') or n.meta is None:

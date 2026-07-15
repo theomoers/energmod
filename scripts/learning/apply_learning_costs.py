@@ -833,6 +833,10 @@ def get_fossil_price_cfg(learning_cfg):
             "Only annual fossil price evolution is currently supported "
             f"(got fossil_price_uncertainty.annual_step={annual_step})."
         )
+    historical_market_overrides = cfg.get("historical_market_overrides", []) or []
+    if not isinstance(historical_market_overrides, list):
+        raise ValueError("fossil_price_uncertainty.historical_market_overrides must be a list.")
+
     return {
         "enabled": bool(cfg.get("enabled", False)),
         "bundle_root": str(cfg.get("bundle_root", "")),
@@ -841,6 +845,7 @@ def get_fossil_price_cfg(learning_cfg):
         "fuels": fuels,
         "expectation_mode": str(cfg.get("expectation_mode", DEFAULT_FOSSIL_PRICE_EXPECTATION_MODE)),
         "annual_weights": cfg.get("annual_weights", None),
+        "historical_market_overrides": historical_market_overrides,
     }
 
 
@@ -4769,6 +4774,10 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
     next_states = {fuel: dict(input_states.get(fuel, {}) or {}) for fuel in cfg["fuels"]}
     expectation_weights = get_fossil_price_expectation_weights(learning_cfg)
     expectation_weights_json = get_fossil_price_expectation_weights_json(learning_cfg)
+    market_overrides = {
+        (int(row["year"]), str(row["fuel_type"]).lower(), str(row["country"]).upper()): str(row["market"])
+        for row in cfg["historical_market_overrides"]
+    }
     for fuel_type in cfg["fuels"]:
         fuel_params = bundle["params_df"].loc[
             bundle["params_df"]["fuel_type"].astype(str).str.lower() == fuel_type
@@ -4798,6 +4807,7 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
             "data/fuels/all_fuels_prices_by_country.csv",
             current_year,
             window_years=len(expectation_weights),
+            market_overrides=cfg["historical_market_overrides"],
         )
         if not averaged_prices.empty:
             historical_average_prices = {
@@ -4812,7 +4822,10 @@ def _build_fossil_price_payload(learning_cfg, runtime_metadata, current_year, st
         ]
         for row in mapping_rows.to_dict(orient="records"):
             country = str(row["country"])
-            market = str(row["market"])
+            market = market_overrides.get(
+                (int(current_year), fuel_type, country),
+                str(row["market"]),
+            )
             state = (next_states.get(fuel_type, {}) or {}).get(market)
             if state is None:
                 if cfg["fallback_to_static_prices"]:

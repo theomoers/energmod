@@ -1744,6 +1744,111 @@ def _estimated_end_use_link_withdrawal_twh(n, anchor_cfg):
     return estimated_end_use_link_twh, baseline_network
 
 
+def _load_ember_country_demand_twh(csv_path, year, iso3_codes):
+    """Load Ember annual direct-electricity demand for selected countries."""
+    path = _repo_path(csv_path)
+    columns = {
+        "ISO 3 code", "Year", "Area type", "Category", "Subcategory",
+        "Variable", "Unit", "Value",
+    }
+    data = pd.read_csv(path, usecols=lambda column: column in columns)
+    missing = columns.difference(data.columns)
+    if missing:
+        raise ValueError(f"missing Ember demand columns in {path}: {sorted(missing)}")
+    data = data.loc[
+        data["ISO 3 code"].astype(str).str.upper().isin(iso3_codes)
+        & pd.to_numeric(data["Year"], errors="coerce").eq(int(year))
+        & data["Area type"].astype(str).eq("Country or economy")
+        & data["Category"].astype(str).eq("Electricity demand")
+        & data["Subcategory"].astype(str).eq("Demand")
+        & data["Variable"].astype(str).eq("Demand")
+        & data["Unit"].astype(str).eq("TWh")
+    ].copy()
+    data["Value"] = pd.to_numeric(data["Value"], errors="coerce")
+    return data.dropna(subset=["Value"]).groupby("ISO 3 code")["Value"].sum()
+
+
+def _apply_configured_country_demand_splits(n, investment_year, cfg):
+    """Move configured source-country demand profiles to empty target countries."""
+    split_cfg = cfg.get("country_demand_splits", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(split_cfg, dict) or not split_cfg.get("enable", False):
+        return
+    elec_loads, load_country = _electric_load_index_and_country(n)
+    if len(elec_loads) == 0:
+        return
+
+    bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+    ember_csv = split_cfg.get(
+        "ember_csv", "validation/data/ember_yearly_full_release_long_format.csv"
+    )
+    for split in split_cfg.get("splits", []) or []:
+        if not isinstance(split, dict) or not split.get("enable", True):
+            continue
+        source = str(split.get("source_country", "CN")).upper()
+        target = str(split.get("target_country", "TW")).upper()
+        source_iso3 = str(split.get("source_iso3", "CHN")).upper()
+        target_iso3 = str(split.get("target_iso3", "TWN")).upper()
+        source_loads = elec_loads[load_country.reindex(elec_loads).eq(source)]
+        if source == target or len(source_loads) == 0:
+            continue
+        target_loads = elec_loads[load_country.reindex(elec_loads).eq(target)]
+        if float(_electric_load_energy_by_load_mwh(n, target_loads).sum()) > 1e-3:
+            continue
+        target_bus = _pick_country_ac_bus(n, target, bus_country)
+        if target_bus is None:
+            logger.warning(
+                "Skipping %s->%s demand split for %s: no target AC bus.",
+                source, target, investment_year,
+            )
+            continue
+        try:
+            demand = _load_ember_country_demand_twh(
+                split.get("ember_csv", ember_csv),
+                investment_year,
+                {source_iso3, target_iso3},
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping %s->%s demand split for %s: %s",
+                source, target, investment_year, exc,
+            )
+            continue
+        source_ref = float(demand.get(source_iso3, 0.0))
+        target_ref = float(demand.get(target_iso3, 0.0))
+        denominator = source_ref + target_ref
+        if source_ref <= 0.0 or target_ref <= 0.0:
+            continue
+        target_share = target_ref / denominator
+
+        time_loads = n.loads_t.p_set.columns.intersection(source_loads)
+        moved_profile = pd.Series(0.0, index=n.snapshots, dtype=float)
+        if len(time_loads):
+            moved_profile = n.loads_t.p_set.loc[:, time_loads].sum(axis=1).mul(target_share)
+            n.loads_t.p_set.loc[:, time_loads] *= 1.0 - target_share
+        static_loads = source_loads.difference(time_loads)
+        moved_static = 0.0
+        if len(static_loads):
+            static = pd.to_numeric(
+                n.loads.loc[static_loads, "p_set"], errors="coerce"
+            ).fillna(0.0)
+            moved_static = float(static.sum() * target_share)
+            n.loads.loc[static_loads, "p_set"] = static * (1.0 - target_share)
+
+        name = f"{target_bus} validation demand from {source}-{int(investment_year)}"
+        suffix = 2
+        while name in n.loads.index:
+            name = f"{target_bus} validation demand from {source}-{int(investment_year)}-{suffix}"
+            suffix += 1
+        n.add("Load", name, bus=target_bus, carrier="electricity")
+        if len(time_loads):
+            n.loads_t.p_set[name] = moved_profile + moved_static
+        else:
+            n.loads.loc[name, "p_set"] = moved_static
+        logger.info(
+            "Moved %.3f%% of %s direct electricity demand to %s for %s using Ember demand shares.",
+            100.0 * target_share, source, target, investment_year,
+        )
+
 def align_country_electricity_demand_to_owid(n, investment_year, config):
     cfg = _electricity_demand_alignment_config(config)
     if cfg is None:
@@ -1767,6 +1872,7 @@ def align_country_electricity_demand_to_owid(n, investment_year, config):
         )
         return
 
+    _apply_configured_country_demand_splits(n, investment_year, cfg)
     elec_loads, load_country = _electric_load_index_and_country(n)
     if len(elec_loads) == 0:
         logger.warning(
@@ -2693,6 +2799,7 @@ def _add_fixed_fossil_link_capacity(
     year,
     preferred_carrier=None,
     extendable=False,
+    ac_bus=None,
 ):
     carrier_by_tech = {
         "gas": preferred_carrier or "CCGT",
@@ -2703,9 +2810,11 @@ def _add_fixed_fossil_link_capacity(
     carrier = carrier_by_tech[str(validation_tech)]
     fuel_carrier = fuel_by_tech[str(validation_tech)]
     bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
-    ac_bus = _pick_country_ac_bus(n, country, bus_country)
+    ac_bus = _pick_country_ac_bus(n, country, bus_country) if ac_bus is None else str(ac_bus)
     if ac_bus is None:
         return None, "missing_ac_bus"
+    if ac_bus not in n.buses.index or str(bus_country.get(ac_bus, "")) != str(country):
+        return None, "invalid_ac_bus"
     fuel_bus = _ensure_fossil_fuel_bus_and_store(n, ac_bus, fuel_carrier, country)
     if fuel_bus is None:
         return None, "missing_fuel_bus"
@@ -2846,7 +2955,8 @@ def materialize_year2025_gem_fossil_capacities(n, planning_year, config):
                             if pd.notna(val) and np.isfinite(val):
                                 n.generators.at[asset.asset, col] = float(val) * factor
                     if "p_nom_extendable" in n.generators.columns:
-                        n.generators.at[asset.asset, "p_nom_extendable"] = False
+                        # Fossil generators represent expandable reserve capacity; validation must not freeze them.
+                        n.generators.at[asset.asset, "p_nom_extendable"] = True
             audit.at[row.Index, "policy"] = "scaled_existing"
             scaled += 1
         elif add_missing and target > before:
@@ -2901,6 +3011,185 @@ def materialize_year2025_gem_fossil_capacities(n, planning_year, config):
         audit["reference_mw"].sum() / 1000.0,
         audit_path,
     )
+
+
+def _add_dedicated_biomass_link_at_bus(n, country, ac_bus, electric_capacity_mw, year):
+    candidates = n.links.loc[n.links.carrier.astype(str).eq("biomass")]
+    if candidates.empty:
+        return None
+    countries = _bus_country_lookup(n).astype(str).str.upper()
+    template = candidates.iloc[0]
+    for _name, row in candidates.iterrows():
+        bus_col, _eff_col = _link_ac_output_port(row, n)
+        if bus_col is not None and str(countries.get(row[bus_col], "")) == str(country):
+            template = row
+            break
+    bus_col, eff_col = _link_ac_output_port(template, n)
+    fuel_bus = str(template.get("bus0", ""))
+    if bus_col != "bus1" or fuel_bus not in n.buses.index:
+        return None
+    eff = abs(pd.to_numeric(pd.Series([template.get(eff_col, 1.0)]), errors="coerce").fillna(0.0).iloc[0])
+    if eff <= 1e-9:
+        return None
+    name = f"{ac_bus} biomass-{int(year)}-nodal-allocation"
+    suffix = 2
+    while name in n.links.index:
+        name = f"{ac_bus} biomass-{int(year)}-nodal-allocation-{suffix}"
+        suffix += 1
+    p_nom = float(electric_capacity_mw) / eff
+    n.add("Link", name, bus0=fuel_bus, bus1=ac_bus, carrier="biomass", p_nom=p_nom, p_nom_min=p_nom, p_nom_max=np.inf, p_nom_extendable=True, efficiency=eff, build_year=int(year), capital_cost=template.get("capital_cost", 0.0), marginal_cost=template.get("marginal_cost", 0.0), lifetime=template.get("lifetime", np.inf))
+    return name
+
+
+def allocate_historical_fossil_and_biomass_links(n, investment_year, config, context=""):
+    """Reallocate historical fossil and dedicated biomass links with local adequacy floors."""
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    parent_cfg = global_cfg.get("fossil_capacity_alignment", {})
+    cfg = parent_cfg.get("nodal_allocation", {}) if isinstance(parent_cfg, dict) else {}
+    if not isinstance(cfg, dict) or not bool(cfg.get("enable", False)):
+        return pd.DataFrame()
+    year = int(investment_year)
+    if year not in {int(y) for y in cfg.get("years", [2020, 2025])}:
+        return pd.DataFrame()
+    try:
+        from scipy.optimize import linprog
+    except Exception as exc:
+        logger.warning("Historical nodal allocation skipped: scipy unavailable: %s", exc)
+        return pd.DataFrame()
+
+    def records():
+        out = []
+        countries = _bus_country_lookup(n).astype(str).str.upper()
+        for asset, row in n.links.iterrows():
+            carrier = str(row.get("carrier", ""))
+            tech = FOSSIL_CAPACITY_CARRIER_TO_TECH.get(carrier)
+            if tech is None and carrier == "biomass":
+                tech = "biomass"
+            if tech is None:
+                continue
+            bus_col, eff_col = _link_ac_output_port(row, n)
+            if bus_col is None:
+                continue
+            bus = str(row[bus_col]); country = str(countries.get(bus, ""))
+            if len(country) != 2:
+                continue
+            eff = abs(pd.to_numeric(pd.Series([row.get(eff_col, 1.0)]), errors="coerce").fillna(0.0).iloc[0])
+            nominal = pd.to_numeric(pd.Series([row.get("p_nom", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+            if eff > 1e-9:
+                out.append({"asset": asset, "country": country, "tech": tech, "carrier": carrier, "bus": bus, "efficiency": float(eff), "capacity": max(float(nominal), 0.0) * float(eff)})
+        return pd.DataFrame(out)
+
+    assets = records()
+    if assets.empty:
+        return pd.DataFrame()
+    countries = _bus_country_lookup(n).astype(str).str.upper()
+    ac_buses = n.buses.index[n.buses.carrier.astype(str).eq("AC")]
+    load = pd.DataFrame(0.0, index=n.snapshots, columns=ac_buses)
+    p_set_t = getattr(n.loads_t, "p_set", pd.DataFrame(index=n.snapshots))
+    for name, row in n.loads.loc[n.loads.bus.astype(str).isin(ac_buses)].iterrows():
+        static = pd.to_numeric(pd.Series([row.get("p_set", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+        profile = pd.to_numeric(p_set_t[name], errors="coerce").reindex(n.snapshots).fillna(static) if name in p_set_t.columns else pd.Series(static, index=n.snapshots)
+        load[str(row.bus)] = load[str(row.bus)].add(profile.clip(lower=0.0), fill_value=0.0)
+    weights = _generator_snapshot_weights(n).reindex(n.snapshots).fillna(0.0)
+    annual_load = load.mul(weights, axis=0).sum(axis=0)
+    potential = pd.DataFrame(0.0, index=n.snapshots, columns=ac_buses)
+    renewable = {"solar", "onwind", "offwind-ac", "offwind-dc", "ror", "nuclear"}
+    pmax_t = getattr(n.generators_t, "p_max_pu", pd.DataFrame(index=n.snapshots))
+    for name, row in n.generators.loc[n.generators.carrier.astype(str).isin(renewable)].iterrows():
+        bus = str(row.get("bus", ""))
+        if bus not in potential.columns:
+            continue
+        nominal = pd.to_numeric(pd.Series([row.get("p_nom", 0.0), row.get("p_nom_min", 0.0)]), errors="coerce").fillna(0.0).max()
+        static = pd.to_numeric(pd.Series([row.get("p_max_pu", 1.0)]), errors="coerce").fillna(1.0).iloc[0]
+        profile = pd.to_numeric(pmax_t[name], errors="coerce").reindex(n.snapshots).fillna(static) if name in pmax_t.columns else pd.Series(static, index=n.snapshots)
+        potential[bus] = potential[bus].add(profile.clip(lower=0.0) * nominal, fill_value=0.0)
+    credit = pd.Series(0.0, index=ac_buses)
+    credit_fraction = float(cfg.get("ac_import_credit_fraction", 0.25))
+    for _name, row in n.lines.iterrows():
+        b0, b1 = str(row.get("bus0", "")), str(row.get("bus1", ""))
+        if b0 not in credit.index and b1 not in credit.index:
+            continue
+        cap = pd.to_numeric(pd.Series([row.get("s_nom", 0.0)]), errors="coerce").fillna(0.0).iloc[0] * credit_fraction
+        if b0 in credit.index: credit.at[b0] += max(float(cap), 0.0)
+        if b1 in credit.index: credit.at[b1] += max(float(cap), 0.0)
+    ref = _owid_country_metric_reference(_repo_path(cfg.get("ember_generation_csv", "validation/data/owid-elecbalance2025.csv")), year, ["coal_electricity", "gas_electricity", "oil_electricity"])
+    reference = ref.set_index(["country", "metric"])["reference_twh"].to_dict() if not ref.empty else {}
+    reserve = float(cfg.get("reserve_margin", 1.10)); share_min = float(cfg.get("min_load_share_multiplier", 0.25)); share_max = float(cfg.get("max_load_share_multiplier", 3.0)); min_ref = float(cfg.get("min_ember_reference_twh", 1.0))
+    audit = []
+
+    for country, group in assets.groupby("country"):
+        buses = annual_load.index[countries.reindex(annual_load.index).eq(country) & annual_load.gt(0.0)]
+        if len(buses) < 2:
+            continue
+        shares = annual_load.reindex(buses); shares = shares / shares.sum()
+        capacity = group.groupby("tech").capacity.sum().loc[lambda x: x.gt(1e-6)]
+        if capacity.empty:
+            continue
+        techs = list(capacity.index); residual = load.reindex(columns=buses).sub(potential.reindex(columns=buses), fill_value=0.0).clip(lower=0.0)
+        floor = residual.sub(credit.reindex(buses), axis=1).clip(lower=0.0).max(axis=0) * reserve
+        total = float(capacity.sum()); baseline_total = shares * total
+        opportunity = pd.Series({bus: float(residual[bus].clip(upper=baseline_total.at[bus]).mul(weights).sum() / baseline_total.at[bus]) if baseline_total.at[bus] > 1e-9 else 0.0 for bus in buses})
+        keys = [(bus, tech) for tech in techs for bus in buses]; nx = len(keys); xidx = {key: i for i, key in enumerate(keys)}
+        targets = {tech: float(reference.get((country, f"{tech}_electricity"), np.nan)) * 1e6 for tech in techs if tech in {"coal", "gas", "oil"}}
+        targets = {tech: value for tech, value in targets.items() if np.isfinite(value) and value >= min_ref * 1e6}
+        dev = {tech: (nx + 2 * i, nx + 2 * i + 1) for i, tech in enumerate(targets)}; delta_start = nx + 2 * len(targets); delta = {key: (delta_start + 2 * i, delta_start + 2 * i + 1) for i, key in enumerate(keys)}; nv = delta_start + 2 * nx
+        objective = np.zeros(nv)
+        for tech, pair in dev.items(): objective[list(pair)] = 1.0 / max(targets[tech], 1e6)
+        for pair in delta.values(): objective[list(pair)] = 1e-6 / max(total, 1.0)
+        bounds = [(share_min * shares.at[bus] * capacity.at[tech], share_max * shares.at[bus] * capacity.at[tech]) for bus, tech in keys] + [(0.0, None)] * (nv - nx)
+        aeq, beq, aub, bub = [], [], [], []
+        for tech in techs:
+            row = np.zeros(nv)
+            for bus in buses: row[xidx[(bus, tech)]] = 1.0
+            aeq.append(row); beq.append(float(capacity.at[tech]))
+        for key, pair in delta.items():
+            bus, tech = key; row = np.zeros(nv); row[xidx[key]] = 1.0; row[pair[0]] = -1.0; row[pair[1]] = 1.0
+            aeq.append(row); beq.append(float(shares.at[bus] * capacity.at[tech]))
+        for tech, value in targets.items():
+            row = np.zeros(nv)
+            for bus in buses: row[xidx[(bus, tech)]] = float(opportunity.at[bus])
+            row[dev[tech][0]] = -1.0; row[dev[tech][1]] = 1.0
+            aeq.append(row); beq.append(value)
+        for bus in buses:
+            row = np.zeros(nv)
+            for tech in techs: row[xidx[(bus, tech)]] = -1.0
+            aub.append(row); bub.append(-float(floor.at[bus]))
+        result = linprog(objective, A_ub=np.asarray(aub), b_ub=np.asarray(bub), A_eq=np.asarray(aeq), b_eq=np.asarray(beq), bounds=bounds, method="highs")
+        if not result.success:
+            audit.extend({"year": year, "context": context, "country": country, "bus": bus, "status": "skipped_infeasible", "reason": result.message, "load_share": shares.at[bus], "firm_capacity_floor_mw": floor.at[bus]} for bus in buses)
+            continue
+        before_capacity = {(bus, tech): float(group.loc[(group.tech == tech) & (group.bus == bus), "capacity"].sum()) for bus, tech in keys}
+        allocation = pd.Series(result.x[:nx], index=pd.MultiIndex.from_tuples(keys)); created = []; failed = False
+        for bus, tech in keys:
+            if allocation.at[(bus, tech)] <= 1e-6 or not group.loc[(group.tech == tech) & (group.bus == bus)].empty: continue
+            if tech == "biomass": new_asset = _add_dedicated_biomass_link_at_bus(n, country, bus, allocation.at[(bus, tech)], year)
+            else:
+                existing = group.loc[group.tech.eq(tech)].sort_values("capacity", ascending=False); carrier = str(existing.iloc[0].carrier) if not existing.empty else None
+                new_asset, status = _add_fixed_fossil_link_capacity(n, country, tech, allocation.at[(bus, tech)], year, preferred_carrier=carrier, extendable=True, ac_bus=bus); new_asset = new_asset if status == "added" else None
+            if new_asset is None: failed = True; break
+            created.append(new_asset)
+        if failed:
+            for name in created: n.remove("Link", name)
+            audit.extend({"year": year, "context": context, "country": country, "bus": bus, "status": "skipped_missing_template", "load_share": shares.at[bus], "firm_capacity_floor_mw": floor.at[bus]} for bus in buses)
+            continue
+        updated = records().loc[lambda df: df.country.eq(country)]
+        for tech in techs:
+            for bus in buses:
+                local = updated.loc[(updated.tech == tech) & (updated.bus == bus)].copy()
+                if local.empty: continue
+                before = before_capacity[(bus, tech)]; after = float(allocation.at[(bus, tech)]); split = local.capacity / local.capacity.sum() if local.capacity.sum() > 1e-9 else pd.Series(1.0 / len(local), index=local.index)
+                for index, asset in local.iterrows():
+                    nominal = after * float(split.at[index]) / float(asset.efficiency); n.links.at[asset.asset, "p_nom"] = nominal; n.links.at[asset.asset, "p_nom_min"] = nominal
+                    if "p_nom_max" in n.links.columns:
+                        pmax = pd.to_numeric(pd.Series([n.links.at[asset.asset, "p_nom_max"]]), errors="coerce").iloc[0]
+                        if pd.notna(pmax) and np.isfinite(pmax) and pmax < nominal: n.links.at[asset.asset, "p_nom_max"] = nominal
+                audit.append({"year": year, "context": context, "country": country, "bus": bus, "tech": tech, "status": "allocated", "load_share": shares.at[bus], "potential_peak_mw": potential[bus].max(), "residual_peak_mw": residual[bus].max(), "ac_import_credit_mw": credit.at[bus], "firm_capacity_floor_mw": floor.at[bus], "capacity_before_mw": before, "capacity_after_mw": after, "ember_reference_twh": targets.get(tech, np.nan) / 1e6 if tech in targets else np.nan})
+    audit = pd.DataFrame(audit)
+    if not audit.empty:
+        audit_dir = Path(_repo_path(cfg.get("audit_dir", "validation/results"))); audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / f"gem_fossil_nodal_allocation_{year}.csv"; audit.to_csv(audit_path, index=False)
+        logger.info("Historical nodal allocation for %s: allocated=%d skipped=%d, audit=%s", year, int(audit.status.eq("allocated").sum()), int(audit.status.ne("allocated").sum()), audit_path)
+    return audit
 
 
 def _transmission_capacity_limits_config(config):
@@ -2961,7 +3250,6 @@ def _load_gtd_country_pair_capacity(cfg, planning_year):
         df["country0"] = df["from_country"].apply(_iso3_to_iso2_for_transmission)
         df["country1"] = df["to_country"].apply(_iso3_to_iso2_for_transmission)
         df = df.loc[df["country0"].notna() & df["country1"].notna()].copy()
-        df = df.loc[df["country0"] != df["country1"]].copy()
         df["max_flow"] = _clean_gtd_numeric(df["max_flow"])
         df["max_counter_flow"] = _clean_gtd_numeric(df["max_counter_flow"])
         df["capacity_mw"] = df[["max_flow", "max_counter_flow"]].min(axis=1, skipna=False)
@@ -3013,7 +3301,20 @@ def _transmission_capacity_year_multiplier(cfg, planning_year):
     return max(0.0, parsed[min(parsed)])
 
 
-def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=None):
+def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
+    """Apply GTD cross-border and domestic AC line stock by planning year."""
+    bus_country = _bus_country_lookup(n).fillna("").astype(str).str.upper()
+    es_dz_lines = n.lines.index[
+        n.lines.carrier.astype(str).eq("AC")
+        & (
+            (n.lines.bus0.map(bus_country).eq("ES") & n.lines.bus1.map(bus_country).eq("DZ"))
+            | (n.lines.bus0.map(bus_country).eq("DZ") & n.lines.bus1.map(bus_country).eq("ES"))
+        )
+    ]
+    if len(es_dz_lines):
+        n.mremove("Line", es_dz_lines)
+        logger.info("Removed %d unsupported Spain-Algeria AC line(s).", len(es_dz_lines))
+
     cfg = _transmission_capacity_limits_config(config)
     if cfg is None:
         return n
@@ -3033,21 +3334,98 @@ def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=No
         logger.warning("GTD transmission limits skipped for %s: %s", planning_year, exc)
         return n
 
-    bus_country = _bus_country_lookup(n)
+    bus_country = _bus_country_lookup(n).fillna("").astype(str).str.upper()
+    historical_year = planning_year in {2020, 2025}
+    added_lines = 0
+
+    if bool(cfg.get("remove_us_alaska_line", True)):
+        us_lines = n.lines.loc[
+            n.lines.carrier.astype(str).eq("AC")
+            & n.lines.bus0.map(bus_country).eq("US")
+            & n.lines.bus1.map(bus_country).eq("US")
+        ]
+        min_length_km = float(cfg.get("us_alaska_min_length_km", 3000.0))
+        if not us_lines.empty:
+            lengths = pd.to_numeric(us_lines["length"], errors="coerce").fillna(0.0)
+            target = lengths.idxmax()
+            if float(lengths.at[target]) >= min_length_km:
+                n.mremove("Line", pd.Index([target]))
+                logger.info("Removed US-Alaska AC line %s (length=%.1f km).", target, float(lengths.at[target]))
+
+    # Add one nearest-bus AC connection for each positive GTD country pair that
+    # the model does not already connect. The explicit Palestine-Israel
+    # validation line is restored separately after this GTD pass.
+    if bool(cfg.get("add_missing_cross_border_lines", True)):
+        ac_buses = n.buses.index[n.buses.carrier.astype(str).eq("AC")]
+        ac_country = bus_country.reindex(ac_buses).fillna("")
+        ac_lines = n.lines.loc[n.lines.carrier.astype(str).eq("AC")].copy()
+        template = ac_lines.iloc[0] if not ac_lines.empty else pd.Series(dtype=object)
+        template_length = max(float(pd.to_numeric(template.get("length", 1.0), errors="coerce") or 1.0), 1.0)
+        x_per_km = float(pd.to_numeric(template.get("x", 0.0), errors="coerce") or 0.0) / template_length
+        r_per_km = float(pd.to_numeric(template.get("r", 0.0), errors="coerce") or 0.0) / template_length
+        b_per_km = float(pd.to_numeric(template.get("b", 0.0), errors="coerce") or 0.0) / template_length
+        cost_per_km = float(pd.to_numeric(template.get("capital_cost", 0.0), errors="coerce") or 0.0) / template_length
+
+        for pair, row in gtd.iterrows():
+            country0, country1 = pair.split("|")
+            effective_mw = float(row["gtd_total_available_mw"])
+            if pair == "DZ|ES" or country0 == country1 or effective_mw <= 0.0:
+                continue
+            buses0 = ac_buses[ac_country.eq(country0).values]
+            buses1 = ac_buses[ac_country.eq(country1).values]
+            if len(buses0) == 0 or len(buses1) == 0:
+                continue
+            existing_pair = (
+                (ac_lines.bus0.map(bus_country).eq(country0) & ac_lines.bus1.map(bus_country).eq(country1))
+                | (ac_lines.bus0.map(bus_country).eq(country1) & ac_lines.bus1.map(bus_country).eq(country0))
+            )
+            if existing_pair.any():
+                continue
+            coords0 = n.buses.loc[buses0, ["x", "y"]].apply(pd.to_numeric, errors="coerce")
+            coords1 = n.buses.loc[buses1, ["x", "y"]].apply(pd.to_numeric, errors="coerce")
+            distances = (
+                (coords0["x"].to_numpy()[:, None] - coords1["x"].to_numpy()[None, :]) ** 2
+                + (coords0["y"].to_numpy()[:, None] - coords1["y"].to_numpy()[None, :]) ** 2
+            )
+            i0, i1 = np.unravel_index(np.nanargmin(distances), distances.shape)
+            bus0, bus1 = str(buses0[i0]), str(buses1[i1])
+            mean_lat = np.deg2rad((float(coords0.loc[bus0, "y"]) + float(coords1.loc[bus1, "y"])) / 2.0)
+            length = max(float(np.hypot((float(coords0.loc[bus0, "x"]) - float(coords1.loc[bus1, "x"])) * 111.32 * np.cos(mean_lat), (float(coords0.loc[bus0, "y"]) - float(coords1.loc[bus1, "y"])) * 111.32)), 1.0)
+            nominal_mw = effective_mw / s_max_pu_value
+            max_mw = nominal_mw * _transmission_capacity_year_multiplier(cfg, planning_year)
+            name = f"GTD {country0}-{country1} AC"
+            n.add(
+                "Line", name, bus0=bus0, bus1=bus1, carrier="AC",
+                s_nom=nominal_mw, s_nom_min=nominal_mw, s_nom_max=(nominal_mw if historical_year else max_mw),
+                s_nom_extendable=not historical_year, s_max_pu=s_max_pu_value, length=length,
+                x=max(abs(x_per_km) * length, 1e-6), r=max(abs(r_per_km) * length, 1e-6),
+                b=max(abs(b_per_km) * length, 0.0), capital_cost=max(cost_per_km * length, 0.0),
+                build_year=0, lifetime=1000.0,
+            )
+            added_lines += 1
+        if added_lines:
+            logger.info("Added %d missing GTD cross-border AC lines for %s.", added_lines, planning_year)
+
     lines = n.lines.copy()
     country0 = lines["bus0"].map(bus_country).fillna("")
     country1 = lines["bus1"].map(bus_country).fillna("")
-    cross_border = country0.ne("") & country1.ne("") & country0.ne(country1)
-    if not cross_border.any():
-        logger.info("GTD transmission limits: no inter-country AC lines found for %s.", planning_year)
-        return n
-
-    line_index = lines.index[cross_border]
-    line_pairs = pd.Series(
-        [_country_pair_key(country0.at[line], country1.at[line]) for line in line_index],
-        index=line_index,
+    is_ac = lines["carrier"].astype(str).eq("AC")
+    cross_border = is_ac & country0.ne("") & country1.ne("") & country0.ne(country1)
+    domestic = is_ac & country0.ne("") & country0.eq(country1)
+    country_bus_count = bus_country.reindex(n.buses.index[n.buses.carrier.astype(str).eq("AC")]).value_counts()
+    domestic &= country0.map(country_bus_count).fillna(0).gt(1)
+    all_pairs = pd.Series(
+        [_country_pair_key(country0.at[line], country1.at[line]) for line in lines.index],
+        index=lines.index,
         dtype=object,
     )
+    domestic_with_gtd = domestic & all_pairs.isin(gtd.index)
+    line_index = lines.index[cross_border | domestic_with_gtd]
+    if len(line_index) == 0:
+        logger.info("GTD line adjustments: no eligible AC lines found for %s.", planning_year)
+        return n
+
+    line_pairs = all_pairs.reindex(line_index)
     original_s_nom = pd.to_numeric(n.lines.loc[line_index, "s_nom"], errors="coerce").fillna(0.0).clip(lower=0.0)
     pair_model_nom = original_s_nom.groupby(line_pairs).sum()
     fallback_ratio = float(cfg.get("fallback_ratio", 0.115))
@@ -3093,34 +3471,40 @@ def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=No
         target_effective_before_multiplier = max(0.0, target_effective)
         target_effective = target_effective_before_multiplier * year_multiplier
         target_nominal_pair = target_effective / s_max_pu_value if target_effective > 0.0 else 0.0
+        base_nominal_pair = target_effective_before_multiplier / s_max_pu_value if target_effective_before_multiplier > 0.0 else 0.0
+        is_domestic_pair = country0.loc[pair_lines].eq(country1.loc[pair_lines]).all()
         weights = original_s_nom.loc[pair_lines]
-        if float(weights.sum()) > 0.0:
+        if is_domestic_pair or float(weights.sum()) <= 0.0:
+            line_targets = pd.Series(target_nominal_pair / len(pair_lines), index=pair_lines)
+            base_targets = pd.Series(base_nominal_pair / len(pair_lines), index=pair_lines)
+        else:
             line_targets = target_nominal_pair * weights / float(weights.sum())
-        else:
-            line_targets = pd.Series(target_nominal_pair / max(len(pair_lines), 1), index=pair_lines)
+            base_targets = base_nominal_pair * weights / float(weights.sum())
 
-        n.lines.loc[pair_lines, "s_nom_max"] = line_targets.values
-        n.lines.loc[pair_lines, "s_nom"] = np.minimum(
-            pd.to_numeric(n.lines.loc[pair_lines, "s_nom"], errors="coerce").fillna(0.0).values,
-            line_targets.values,
-        )
-        if "s_nom_min" in n.lines.columns:
-            n.lines.loc[pair_lines, "s_nom_min"] = np.minimum(
-                pd.to_numeric(n.lines.loc[pair_lines, "s_nom_min"], errors="coerce").fillna(0.0).values,
-                line_targets.values,
-            )
-        else:
-            n.lines.loc[pair_lines, "s_nom_min"] = n.lines.loc[pair_lines, "s_nom"]
         if target_nominal_pair <= 0.0:
+            n.lines.loc[pair_lines, ["s_nom", "s_nom_min", "s_nom_max"]] = 0.0
             n.lines.loc[pair_lines, "s_nom_extendable"] = False
-            n.lines.loc[pair_lines, "s_nom"] = 0.0
-            n.lines.loc[pair_lines, "s_nom_min"] = 0.0
+        elif historical_year:
+            n.lines.loc[pair_lines, "s_nom"] = line_targets.values
+            n.lines.loc[pair_lines, "s_nom_min"] = line_targets.values
+            n.lines.loc[pair_lines, "s_nom_max"] = line_targets.values
+            n.lines.loc[pair_lines, "s_nom_extendable"] = False
+        else:
+            previous_min = pd.to_numeric(n.lines.loc[pair_lines, "s_nom_min"], errors="coerce").fillna(0.0)
+            future_min = np.maximum(previous_min.values, base_targets.values)
+            future_max = np.maximum(line_targets.values, future_min)
+            current = pd.to_numeric(n.lines.loc[pair_lines, "s_nom"], errors="coerce").fillna(0.0).values
+            n.lines.loc[pair_lines, "s_nom_min"] = future_min
+            n.lines.loc[pair_lines, "s_nom_max"] = future_max
+            n.lines.loc[pair_lines, "s_nom"] = np.clip(current, future_min, future_max)
+            n.lines.loc[pair_lines, "s_nom_extendable"] = True
 
         total_effective_after += target_effective
         audit_rows.append(
             {
                 "country0": pair.split("|")[0],
                 "country1": pair.split("|")[1],
+                "scope": "domestic" if is_domestic_pair else "cross_border",
                 "model_nominal_before_mw": float(pair_nom),
                 "model_effective_before_mw": float(pair_nom) * s_max_pu_value,
                 "gtd_existing_mw": gtd_existing,
@@ -3144,7 +3528,7 @@ def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=No
     )
 
     logger.info(
-        "Applied GTD inter-country transmission limits for %s: pairs=%d, matched=%d, explicit_zero=%d, fallback=%d, year_multiplier=%.3f, effective_before=%.1f GW, effective_after=%.1f GW, audit_dir=%s",
+        "Applied GTD AC line adjustments for %s: pairs=%d, matched=%d, explicit_zero=%d, fallback=%d, year_multiplier=%.3f, effective_before=%.1f GW, effective_after=%.1f GW, audit_dir=%s",
         planning_year,
         len(pair_model_nom),
         matched,
@@ -3156,6 +3540,79 @@ def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=No
         audit_dir,
     )
     return n
+
+
+def apply_manual_validation_line_adjustments(n, planning_year, config=None):
+    """Restore the explicitly configured Palestine-Israel connection."""
+    bus0, bus1 = "PS 0", "IL 0"
+    line_name = "PS 0 IL 0 validation AC"
+    capacity_mw = 5_000.0
+
+    if bus0 not in n.buses.index or bus1 not in n.buses.index:
+        logger.warning(
+            "Manual validation AC connection skipped for %s-%s in %s: bus missing.",
+            bus0,
+            bus1,
+            int(planning_year),
+        )
+        return n
+
+    ac_lines = n.lines.loc[n.lines.carrier.astype(str).eq("AC")]
+    existing = ac_lines.index[
+        (ac_lines.bus0.eq(bus0) & ac_lines.bus1.eq(bus1))
+        | (ac_lines.bus0.eq(bus1) & ac_lines.bus1.eq(bus0))
+    ]
+    if len(existing):
+        target = existing[0]
+        n.lines.loc[target, ["s_nom", "s_nom_min", "s_nom_max"]] = capacity_mw
+        n.lines.loc[target, "s_nom_extendable"] = False
+        return n
+
+    template = ac_lines.iloc[0] if not ac_lines.empty else pd.Series(dtype=object)
+    template_length = max(
+        float(pd.to_numeric(template.get("length", 1.0), errors="coerce") or 1.0),
+        1.0,
+    )
+    x_per_km = float(pd.to_numeric(template.get("x", 0.0), errors="coerce") or 0.0) / template_length
+    r_per_km = float(pd.to_numeric(template.get("r", 0.0), errors="coerce") or 0.0) / template_length
+    b_per_km = float(pd.to_numeric(template.get("b", 0.0), errors="coerce") or 0.0) / template_length
+    cost_per_km = float(
+        pd.to_numeric(template.get("capital_cost", 0.0), errors="coerce") or 0.0
+    ) / template_length
+
+    coords = n.buses.loc[[bus0, bus1], ["x", "y"]].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    x0, y0 = coords.loc[bus0]
+    x1, y1 = coords.loc[bus1]
+    mean_lat = np.deg2rad((y0 + y1) / 2.0)
+    length = max(
+        float(np.hypot((x1 - x0) * 111.32 * np.cos(mean_lat), (y1 - y0) * 111.32)),
+        1.0,
+    )
+    n.add(
+        "Line",
+        line_name,
+        bus0=bus0,
+        bus1=bus1,
+        carrier="AC",
+        s_nom=capacity_mw,
+        s_nom_min=capacity_mw,
+        s_nom_max=capacity_mw,
+        s_nom_extendable=False,
+        s_max_pu=float(pd.to_numeric(template.get("s_max_pu", 0.7), errors="coerce") or 0.7),
+        length=length,
+        x=max(abs(x_per_km) * length, 1e-6),
+        r=max(abs(r_per_km) * length, 1e-6),
+        b=max(abs(b_per_km) * length, 0.0),
+        capital_cost=max(cost_per_km * length, 0.0),
+        build_year=0,
+        lifetime=1000.0,
+    )
+    logger.info("Added manual Palestine-Israel AC validation line for %s.", int(planning_year))
+    return n
+
+def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=None):
+    """Backward-compatible alias for the shared GTD line-adjustment hook."""
+    return apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=s_max_pu)
 
 
 def align_country_hydro_reservoir_inflow_to_owid(n, investment_year, config):
@@ -4104,6 +4561,369 @@ def apply_country_solar_iteration_scaling(n, investment_year, config):
     )
 
 
+def _renewable_profile_tuning_config(config):
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("renewable_profile_tuning", {})
+    return cfg if isinstance(cfg, dict) and bool(cfg.get("enable", False)) else None
+
+
+def _read_renewable_profile_tuning_table(config, investment_year):
+    cfg = _renewable_profile_tuning_config(config)
+    if cfg is None:
+        return None, None
+
+    csv_cfg = cfg.get("override_csv", "")
+    if not csv_cfg:
+        logger.warning("Renewable profile tuning enabled but no override_csv configured.")
+        return None, cfg
+
+    override_csv = _repo_path(csv_cfg)
+    if not os.path.exists(override_csv):
+        logger.warning("Renewable profile tuning skipped: override file not found at %s", override_csv)
+        return None, cfg
+
+    override = pd.read_csv(override_csv)
+    if override.empty:
+        logger.warning("Renewable profile tuning skipped: override file is empty at %s", override_csv)
+        return None, cfg
+
+    cols = {c.lower().strip(): c for c in override.columns}
+    if "country" not in cols:
+        logger.warning("Renewable profile tuning skipped: column 'country' missing in %s", override_csv)
+        return None, cfg
+
+    rename_cols = {cols["country"]: "country"}
+    for col in ["year", "solar_scale", "onwind_scale", "offwind_scale", "nuclear_scale", "hydro_scale"]:
+        if col in cols:
+            rename_cols[cols[col]] = col
+    override = override.rename(columns=rename_cols)
+    if "year" not in override.columns:
+        override["year"] = int(cfg.get("carry_forward_year", 2025))
+    for col in ["solar_scale", "onwind_scale", "offwind_scale", "nuclear_scale", "hydro_scale"]:
+        if col not in override.columns:
+            override[col] = 1.0
+
+    override["country"] = override["country"].astype(str).str.upper().str.strip()
+    override = override.loc[override["country"].str.len().eq(2)].copy()
+    override["year"] = pd.to_numeric(override["year"], errors="coerce").astype("Int64")
+    override = override.loc[override["year"].notna()].copy()
+    if override.empty:
+        logger.warning("Renewable profile tuning skipped: no valid rows in %s", override_csv)
+        return None, cfg
+
+    year = int(investment_year)
+    carry_year = int(cfg.get("carry_forward_year", 2025))
+    if year > carry_year and bool(cfg.get("carry_forward", True)):
+        selected_year = carry_year
+    else:
+        selected_year = year
+
+    selected = override.loc[override["year"].astype(int).eq(selected_year)].copy()
+    if selected.empty:
+        message = (
+            f"Renewable profile tuning requires an explicit {selected_year} row in "
+            f"{override_csv} for planning year {year}; no matching rows were found."
+        )
+        if bool(cfg.get("require_explicit_carry_forward_source", False)):
+            raise ValueError(message)
+        logger.warning("%s Profiles remain unscaled.", message)
+        return None, cfg
+
+    default_min_scale = float(cfg.get("scale_min", 0.25))
+    default_max_scale = float(cfg.get("scale_max", 2.0))
+    bounds = {
+        "solar_scale": (
+            float(cfg.get("solar_scale_min", default_min_scale)),
+            float(cfg.get("solar_scale_max", default_max_scale)),
+        ),
+        "onwind_scale": (
+            float(cfg.get("wind_scale_min", default_min_scale)),
+            float(cfg.get("wind_scale_max", default_max_scale)),
+        ),
+        "offwind_scale": (
+            float(cfg.get("wind_scale_min", default_min_scale)),
+            float(cfg.get("wind_scale_max", default_max_scale)),
+        ),
+        "nuclear_scale": (
+            float(cfg.get("nuclear_scale_min", default_min_scale)),
+            float(cfg.get("nuclear_scale_max", default_max_scale)),
+        ),
+        "hydro_scale": (
+            float(cfg.get("hydro_scale_min", default_min_scale)),
+            float(cfg.get("hydro_scale_max", default_max_scale)),
+        ),
+    }
+    for col, (min_scale, max_scale) in bounds.items():
+        selected[col] = (
+            pd.to_numeric(selected[col], errors="coerce")
+            .fillna(1.0)
+            .clip(lower=min_scale, upper=max_scale)
+        )
+
+    table = selected.groupby("country")[["solar_scale", "onwind_scale", "offwind_scale", "nuclear_scale", "hydro_scale"]].mean()
+    table.attrs["selected_year"] = selected_year
+    table.attrs["override_csv"] = str(override_csv)
+    table.attrs["bounds"] = bounds
+    return table, cfg
+
+
+def _renewable_tuning_generation_reference(config, year):
+    """Load optional country/technology generation targets for zero-profile repair."""
+    cfg = _renewable_profile_tuning_config(config) or {}
+    capacity_cfg = cfg.get("capacity_alignment", {})
+    if not isinstance(capacity_cfg, dict) or not bool(capacity_cfg.get("enable", False)):
+        return pd.DataFrame(columns=["country", "technology", "reference_twh"])
+    path = _repo_path(capacity_cfg.get("reference_csv", "validation/data/ember_yearly_full_release_long_format.csv"))
+    if not os.path.exists(path):
+        logger.warning("Renewable profile capacity alignment skipped: reference file not found at %s", path)
+        return pd.DataFrame(columns=["country", "technology", "reference_twh"])
+    required = {"Year", "Variable", "Value", "ISO 3 code"}
+    ref = pd.read_csv(path, usecols=lambda col: col in required, low_memory=False)
+    if not required.issubset(ref.columns):
+        logger.warning("Renewable profile capacity alignment skipped: missing columns %s in %s", sorted(required.difference(ref.columns)), path)
+        return pd.DataFrame(columns=["country", "technology", "reference_twh"])
+    tech_map = {"Solar": "solar", "Wind": "wind", "Nuclear": "nuclear", "Hydro": "hydro"}
+    ref = ref.loc[pd.to_numeric(ref["Year"], errors="coerce").eq(int(year)) & ref["Variable"].isin(tech_map)].copy()
+    ref["country"] = ref["ISO 3 code"].map(_safe_iso3_to_iso2)
+    ref["technology"] = ref["Variable"].map(tech_map)
+    ref["reference_twh"] = pd.to_numeric(ref["Value"], errors="coerce")
+    ref = ref.dropna(subset=["country", "reference_twh"])
+    return ref.groupby(["country", "technology"], as_index=False)["reference_twh"].sum()
+
+
+def _apply_renewable_tuning_zero_profile_fallback(n, table, cfg, investment_year):
+    """Repair zero renewable profiles from nearest non-zero donors."""
+    fallback_cfg = cfg.get("zero_profile_fallback", {})
+    if not isinstance(fallback_cfg, dict) or not bool(fallback_cfg.get("enable", False)):
+        return 0
+    if n.generators.empty:
+        return 0
+    if n.generators_t.p_max_pu.empty:
+        n.generators_t.p_max_pu = pd.DataFrame(index=n.snapshots)
+
+    bus_country = _bus_country_lookup(n)
+    weights = _generator_snapshot_weights(n).reindex(n.snapshots).fillna(0.0)
+    ref = _renewable_tuning_generation_reference({"global_specific": {"renewable_profile_tuning": cfg}}, investment_year)
+    ref_lookup = ref.set_index(["country", "technology"])["reference_twh"] if not ref.empty else pd.Series(dtype=float)
+    specs = [
+        ({"solar"}, "solar_scale", "solar", float(cfg.get("solar_p_max_pu_cap", 1.0))),
+        ({"onwind"}, "onwind_scale", "wind", float(cfg.get("onwind_p_max_pu_cap", 1.0))),
+        ({"offwind-ac", "offwind-dc"}, "offwind_scale", "wind", float(cfg.get("offwind_p_max_pu_cap", 1.0))),
+        ({"nuclear"}, "nuclear_scale", "nuclear", float(cfg.get("nuclear_p_max_pu_cap", 1.0))),
+        ({"ror"}, "hydro_scale", "hydro", float(cfg.get("hydro_ror_p_max_pu_cap", 1.0))),
+    ]
+    repaired = 0
+    for carriers, scale_col, reference_tech, pmax_cap in specs:
+        idx = n.generators.index[n.generators.carrier.astype(str).isin(carriers)]
+        if len(idx) == 0:
+            continue
+        profiles = n.generators_t.p_max_pu.reindex(index=n.snapshots, columns=idx, fill_value=0.0).fillna(0.0)
+        zero_idx = idx[profiles.abs().sum(axis=0).le(1e-12).values]
+        donor_idx = idx.difference(zero_idx)
+        if len(zero_idx) == 0 or len(donor_idx) == 0:
+            continue
+        countries = n.generators.loc[idx, "bus"].map(bus_country).fillna("")
+        nominal = pd.to_numeric(n.generators.loc[idx, "p_nom"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        if "p_nom_max" in n.generators.columns:
+            max_nominal = pd.to_numeric(n.generators.loc[idx, "p_nom_max"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+            nominal = nominal.where(nominal.gt(0.0), max_nominal)
+        nominal = nominal.where(nominal.gt(0.0), 1.0)
+        nominal_by_country = nominal.groupby(countries).sum()
+        for target in zero_idx:
+            target_country = str(countries.get(target, ""))
+            candidates = donor_idx[countries.reindex(donor_idx).eq(target_country).values]
+            if len(candidates) == 0:
+                candidates = donor_idx
+            target_bus = n.generators.at[target, "bus"]
+            tx = pd.to_numeric(pd.Series([n.buses.at[target_bus, "x"]]), errors="coerce").iloc[0] if target_bus in n.buses.index and "x" in n.buses.columns else np.nan
+            ty = pd.to_numeric(pd.Series([n.buses.at[target_bus, "y"]]), errors="coerce").iloc[0] if target_bus in n.buses.index and "y" in n.buses.columns else np.nan
+            if pd.notna(tx) and pd.notna(ty) and "x" in n.buses.columns and "y" in n.buses.columns:
+                donor_buses = n.generators.loc[candidates, "bus"]
+                dx = pd.to_numeric(donor_buses.map(n.buses["x"]), errors="coerce")
+                dy = pd.to_numeric(donor_buses.map(n.buses["y"]), errors="coerce")
+                valid = dx.notna() & dy.notna()
+                candidates = candidates[valid.values] if valid.any() else candidates
+                if len(candidates) > 0:
+                    donor = ((dx.reindex(candidates) - tx) ** 2 + (dy.reindex(candidates) - ty) ** 2).idxmin()
+                else:
+                    donor = candidates[0]
+            else:
+                donor = candidates[0]
+            donor_country = str(countries.get(donor, ""))
+            donor_factor = float(table.loc[donor_country, scale_col]) if donor_country in table.index else 1.0
+            target_factor = float(table.loc[target_country, scale_col]) if target_country in table.index else 1.0
+            shape = profiles[donor].astype(float).clip(lower=0.0)
+            if donor_factor > 0.0:
+                shape = shape / donor_factor
+            repaired_profile = shape * target_factor
+            capacity_cfg = cfg.get("capacity_alignment", {})
+            capacity_enabled = bool(fallback_cfg.get("capacity_alignment", capacity_cfg.get("enable", False))) if isinstance(capacity_cfg, dict) else bool(fallback_cfg.get("capacity_alignment", False))
+            ref_twh = ref_lookup.get((target_country, reference_tech), np.nan)
+            min_ref = float(capacity_cfg.get("min_reference_twh", 0.1)) if isinstance(capacity_cfg, dict) else 0.1
+            if capacity_enabled and pd.notna(ref_twh) and float(ref_twh) >= min_ref:
+                cap = float(nominal.get(target, 1.0))
+                country_cap = float(nominal_by_country.get(target_country, cap))
+                available_mwh = cap * float((shape * weights).sum())
+                desired_twh = float(ref_twh) * target_factor * cap / max(country_cap, cap)
+                if available_mwh > 1e-9:
+                    repaired_profile = shape * (desired_twh * 1e6 / available_mwh)
+            if pmax_cap > 0.0:
+                repaired_profile = repaired_profile.clip(lower=0.0, upper=pmax_cap)
+            n.generators_t.p_max_pu.loc[:, target] = repaired_profile.reindex(n.snapshots).fillna(0.0).values
+            repaired += 1
+    if repaired:
+        logger.warning("Repaired %d zero renewable profiles from nearest non-zero donors for planning year %s; future zero-capacity assets receive their carried-forward profile before brownfield export.", repaired, investment_year)
+    return repaired
+
+
+def apply_country_renewable_profile_tuning(
+    n, investment_year, config, previous_tuning_year=None
+):
+    """Apply historical country-level renewable availability multipliers.
+
+    Hydro scales both reservoir inflow and run-of-river availability; the other
+    technologies scale generator p_max_pu.
+
+    Rows for 2020 apply only to 2020. Rows for 2025 apply to 2025 and, by
+    default, all later years. Missing countries/technologies default to 1.0.
+    """
+    table, cfg = _read_renewable_profile_tuning_table(config, investment_year)
+    if table is None or cfg is None:
+        return
+
+    # Brownfield networks contain profiles inherited from the previous solved
+    # horizon as well as raw profiles for assets built in the current horizon.
+    # Convert inherited profiles from the previous tuning vintage to the target
+    # vintage instead of multiplying the target factor on top of it.
+    previous_table = None
+    if previous_tuning_year is not None:
+        previous_table, _ = _read_renewable_profile_tuning_table(
+            config, int(previous_tuning_year)
+        )
+
+    if n.generators_t.p_max_pu.empty:
+        n.generators_t.p_max_pu = pd.DataFrame(index=n.snapshots)
+
+    bus_country_lu = _bus_country_lookup(n)
+    cap_by_carrier = {
+        "solar": float(cfg.get("solar_p_max_pu_cap", 1.0)),
+        "onwind": float(cfg.get("onwind_p_max_pu_cap", 1.0)),
+        "offwind": float(cfg.get("offwind_p_max_pu_cap", 1.0)),
+        "nuclear": float(cfg.get("nuclear_p_max_pu_cap", 1.0)),
+        "ror": float(cfg.get("hydro_ror_p_max_pu_cap", 1.0)),
+    }
+    carrier_specs = [
+        ({"solar"}, "solar_scale", "solar"),
+        ({"onwind"}, "onwind_scale", "onwind"),
+        ({"offwind-ac", "offwind-dc"}, "offwind_scale", "offwind"),
+        ({"nuclear"}, "nuclear_scale", "nuclear"),
+        ({"ror"}, "hydro_scale", "ror"),
+    ]
+
+    summary = []
+    for carriers, scale_col, label in carrier_specs:
+        idx = n.generators.index[n.generators.carrier.astype(str).isin(carriers)]
+        if len(idx) == 0:
+            summary.append((label, 0, 0))
+            continue
+
+        country = n.generators.loc[idx, "bus"].map(bus_country_lu).fillna("")
+        valid = country.ne("")
+        idx = idx[valid.values]
+        country = country.loc[valid]
+        if len(idx) == 0:
+            summary.append((label, 0, 0))
+            continue
+
+        target_factors = country.map(table[scale_col]).fillna(1.0)
+        factors = target_factors
+        if previous_table is not None and "build_year" in n.generators.columns:
+            build_year = pd.to_numeric(
+                n.generators.loc[idx, "build_year"], errors="coerce"
+            )
+            inherited = build_year.ne(int(investment_year))
+            source_factors = country.map(previous_table[scale_col]).fillna(1.0)
+            factors = target_factors.where(
+                ~inherited,
+                target_factors.divide(source_factors.replace(0.0, np.nan)).fillna(
+                    target_factors
+                ),
+            )
+        scaled_entries = int((~np.isclose(factors, 1.0, atol=1e-12)).sum())
+        pmax_cap = cap_by_carrier.get(label, 1.0)
+
+        ts_cols = n.generators_t.p_max_pu.columns.intersection(idx)
+        static_cols = idx.difference(ts_cols)
+        if len(ts_cols) > 0:
+            scaled_ts = n.generators_t.p_max_pu.loc[:, ts_cols].mul(
+                factors.reindex(ts_cols).fillna(1.0), axis=1
+            )
+            if pmax_cap > 0.0:
+                scaled_ts = scaled_ts.clip(lower=0.0, upper=pmax_cap)
+            n.generators_t.p_max_pu.loc[:, ts_cols] = scaled_ts
+        if len(static_cols) > 0:
+            scaled_static = (
+                pd.to_numeric(n.generators.loc[static_cols, "p_max_pu"], errors="coerce")
+                .fillna(0.0)
+                .mul(factors.reindex(static_cols).fillna(1.0))
+            )
+            if pmax_cap > 0.0:
+                scaled_static = scaled_static.clip(lower=0.0, upper=pmax_cap)
+            n.generators.loc[static_cols, "p_max_pu"] = scaled_static
+        summary.append((label, len(idx), scaled_entries))
+
+    su_idx = (
+        n.storage_units.index[n.storage_units.carrier.astype(str).eq("hydro")]
+        if not n.storage_units.empty
+        else pd.Index([])
+    )
+    inflow_cols = (
+        n.storage_units_t.inflow.columns.intersection(su_idx)
+        if not n.storage_units_t.inflow.empty
+        else pd.Index([])
+    )
+    inflow_scaled = 0
+    if len(inflow_cols) > 0:
+        country = n.storage_units.loc[inflow_cols, "bus"].map(bus_country_lu).fillna("")
+        valid = country.ne("")
+        inflow_cols = inflow_cols[valid.values]
+        country = country.loc[valid]
+        target_factors = country.map(table["hydro_scale"]).fillna(1.0)
+        factors = target_factors
+        if previous_table is not None and "build_year" in n.storage_units.columns:
+            build_year = pd.to_numeric(
+                n.storage_units.loc[inflow_cols, "build_year"], errors="coerce"
+            )
+            inherited = build_year.ne(int(investment_year))
+            source_factors = country.map(previous_table["hydro_scale"]).fillna(1.0)
+            factors = target_factors.where(
+                ~inherited,
+                target_factors.divide(source_factors.replace(0.0, np.nan)).fillna(
+                    target_factors
+                ),
+            )
+        inflow_scaled = int((~np.isclose(factors, 1.0, atol=1e-12)).sum())
+        n.storage_units_t.inflow.loc[:, inflow_cols] = n.storage_units_t.inflow.loc[:, inflow_cols].mul(
+            factors.reindex(inflow_cols).fillna(1.0), axis=1
+        )
+    summary.append(("hydro reservoir inflow", len(inflow_cols), inflow_scaled))
+    _apply_renewable_tuning_zero_profile_fallback(n, table, cfg, investment_year)
+
+    if not isinstance(getattr(n, "meta", None), dict):
+        n.meta = {}
+    n.meta["renewable_profile_tuning_year"] = int(investment_year)
+
+    logger.info(
+        "Applied renewable profile tuning from %s for planning year %s using calibration year %s: %s, country_rows=%d, scale_bounds=[%.3f, %.3f].",
+        table.attrs.get("override_csv", ""),
+        investment_year,
+        table.attrs.get("selected_year", investment_year),
+        ", ".join(f"{label}:entries={count},scaled={scaled}" for label, count, scaled in summary),
+        len(table),
+        min(v[0] for v in table.attrs.get("bounds", {"x": (np.nan, np.nan)}).values()),
+        max(v[1] for v in table.attrs.get("bounds", {"x": (np.nan, np.nan)}).values()),
+    )
+
 def apply_country_hydro_iteration_scaling(n, investment_year, config):
     """
     Apply per-country iterative hydro scaling jointly to reservoir inflow and ror profiles.
@@ -4446,7 +5266,14 @@ def apply_gogpt_oil_capacity_fix(n, investment_year, config):
     )
 
 
-def _load_ember_bioenergy_capacity_reference(path, year):
+def _load_ember_capacity_reference(
+    path,
+    variable,
+    year,
+    latest_available=False,
+    latest_available_since=None,
+):
+    """Load Ember country capacity in MW using one explicit reference policy."""
     df = pd.read_csv(path)
     required = {
         "ISO 3 code",
@@ -4459,17 +5286,22 @@ def _load_ember_bioenergy_capacity_reference(path, year):
     }
     missing = required.difference(df.columns)
     if missing:
-        raise ValueError(
-            f"Ember bioenergy capacity reference {path} missing columns: {sorted(missing)}"
-        )
+        raise ValueError(f"Ember capacity reference {path} missing columns: {sorted(missing)}")
 
     ref = df.loc[
         df["Category"].astype(str).eq("Capacity")
-        & df["Variable"].astype(str).eq("Bioenergy")
+        & df["Variable"].astype(str).eq(str(variable))
         & df["Unit"].astype(str).eq("GW")
         & df["Area type"].astype(str).eq("Country or economy")
-        & pd.to_numeric(df["Year"], errors="coerce").eq(int(year))
     ].copy()
+    ref["Year"] = pd.to_numeric(ref["Year"], errors="coerce")
+    if latest_available:
+        ref = ref.loc[ref["Year"].le(int(year))]
+        if latest_available_since is not None:
+            ref = ref.loc[ref["Year"].ge(int(latest_available_since))]
+        ref = ref.sort_values(["ISO 3 code", "Year"]).groupby("ISO 3 code", as_index=False).tail(1)
+    else:
+        ref = ref.loc[ref["Year"].eq(int(year))]
     if ref.empty:
         return pd.Series(dtype=float)
 
@@ -4480,11 +5312,23 @@ def _load_ember_bioenergy_capacity_reference(path, year):
     return ref.groupby("country")["capacity_mw"].sum()
 
 
+def _load_ember_bioenergy_capacity_reference(path, year):
+    # Capacity validation uses the latest reported country observation in the
+    # 2023--2025 window for the 2025 comparison. Keep materialisation aligned.
+    return _load_ember_capacity_reference(
+        path,
+        variable="Bioenergy",
+        year=year,
+        latest_available=int(year) >= 2025,
+        latest_available_since=2023 if int(year) >= 2025 else None,
+    )
+
 def apply_ember_bioenergy_capacity_fix(n, investment_year, config):
     year = int(investment_year)
     if year < 2020:
         return
     reference_year = 2020 if year < 2025 else 2025
+    reference_policy = "exact_year" if year < 2025 else "latest_available_2023_to_2025"
     fixed_historical_year = year <= 2025
     if n.links.empty:
         return
@@ -4671,20 +5515,14 @@ def apply_ember_bioenergy_capacity_fix(n, investment_year, config):
     matched_ref_mw = float(ref.reindex(model_bioenergy_countries).fillna(0.0).sum())
     matched_chp_mw = float(chp_by_country.reindex(model_bioenergy_countries).fillna(0.0).sum())
     total_after_mw = after_dedicated_mw + matched_chp_mw
-    untouched_dedicated_countries = sorted(set(assets["country"]).difference(set(ref.index)))
-    if fixed_historical_year and untouched_dedicated_countries:
-        untouched_assets = pd.Index(assets.loc[assets["country"].isin(untouched_dedicated_countries), "asset"])
-        for col in ["p_nom", "p_nom_min", "p_nom_max", "p_nom_opt"]:
-            if col in n.links.columns:
-                n.links.loc[untouched_assets, col] = 0.0
-        if "p_nom_extendable" in n.links.columns:
-            n.links.loc[untouched_assets, "p_nom_extendable"] = False
+    unmatched_model_countries = sorted(set(assets["country"]).difference(set(ref.index)))
 
     logger.info(
-        "Applied Ember bioenergy capacity fix for %s from %s: reference_year=%s, fixed_historical_year=%s, adjusted_dedicated_biomass_links=%d, added_links=%d, matched_countries=%d, dedicated_before=%.2f GW, dedicated_after=%.2f GW, preserved_chp=%.2f GW, total_after=%.2f GW, reference=%.2f GW, chp_exceeds_reference_countries=%d%s, untouched_model_countries_without_ember=%d%s",
+        "Applied Ember bioenergy capacity fix for %s from %s: reference_year=%s, reference_policy=%s, fixed_historical_year=%s, adjusted_dedicated_biomass_links=%d, added_links=%d, matched_countries=%d, dedicated_before=%.2f GW, dedicated_after=%.2f GW, preserved_chp=%.2f GW, total_after=%.2f GW, reference=%.2f GW, chp_exceeds_reference_countries=%d%s, unmatched_model_countries_preserved=%d%s",
         year,
         ember_csv,
         reference_year,
+        reference_policy,
         fixed_historical_year,
         len(link_idx),
         added_links,
@@ -4696,10 +5534,145 @@ def apply_ember_bioenergy_capacity_fix(n, investment_year, config):
         matched_ref_mw / 1000.0,
         len(chp_exceeds_ref),
         f" (sample: {', '.join(chp_exceeds_ref[:5])})" if chp_exceeds_ref else "",
-        len(untouched_dedicated_countries),
-        f" (sample: {', '.join(untouched_dedicated_countries[:5])})" if untouched_dedicated_countries else "",
+        len(unmatched_model_countries),
+        f" (sample: {', '.join(unmatched_model_countries[:5])})" if unmatched_model_countries else "",
     )
 
+
+
+def materialize_year2025_historical_capacity_validation(n, planning_year, config):
+    """Fix 2025 hydro, geothermal, and bioenergy stocks before they are frozen."""
+    try:
+        year = int(planning_year)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Could not parse planning year '%s' for 2025 historical capacity validation.",
+            planning_year,
+        )
+        return
+    if year != 2025:
+        return
+
+    def match_country_capacity(reference_mw, component_carriers, label):
+        records = []
+        bus_country = _bus_country_lookup(n).astype(str).str.strip().str.upper()
+        for component_name, carrier in component_carriers:
+            component = getattr(n, component_name)
+            if component.empty or "carrier" not in component.columns:
+                continue
+            idx = component.index[component["carrier"].astype(str).eq(carrier)]
+            if len(idx) == 0:
+                continue
+            country = component.loc[idx, "bus"].map(bus_country).fillna("").str.upper()
+            capacity = pd.concat(
+                [
+                    pd.to_numeric(component.loc[idx, col], errors="coerce").fillna(0.0)
+                    for col in ["p_nom", "p_nom_min"]
+                    if col in component.columns
+                ],
+                axis=1,
+            ).max(axis=1)
+            records.extend(
+                {
+                    "component": component_name,
+                    "asset": asset,
+                    "country": country.at[asset],
+                    "capacity_mw": capacity.at[asset],
+                }
+                for asset in idx
+                if re.match(r"^[A-Z]{2}$", country.at[asset])
+            )
+
+        assets = pd.DataFrame(records)
+        if assets.empty or reference_mw.empty:
+            logger.warning(
+                "2025 %s capacity materialization skipped: no model assets or reference countries.",
+                label,
+            )
+            return
+
+        matched = 0
+        missing_assets = []
+        capacity_before_mw = 0.0
+        capacity_after_mw = 0.0
+        for country, target_mw in reference_mw.items():
+            country_assets = assets.loc[assets["country"].eq(country)].copy()
+            if country_assets.empty:
+                missing_assets.append(country)
+                continue
+            weights = country_assets["capacity_mw"].clip(lower=0.0)
+            if weights.sum() <= 1e-9:
+                weights = pd.Series(1.0, index=country_assets.index)
+            target_by_asset = float(target_mw) * weights / weights.sum()
+            capacity_before_mw += float(country_assets["capacity_mw"].sum())
+            capacity_after_mw += float(target_by_asset.sum())
+            matched += 1
+
+            for component_name, component_assets in country_assets.groupby("component"):
+                component = getattr(n, component_name)
+                idx = pd.Index(component_assets["asset"])
+                target = target_by_asset.reindex(component_assets.index).to_numpy()
+                for col in ["p_nom", "p_nom_min", "p_nom_max", "p_nom_opt"]:
+                    if col in component.columns:
+                        component.loc[idx, col] = target
+                if "p_nom_extendable" in component.columns:
+                    component.loc[idx, "p_nom_extendable"] = False
+
+        logger.info(
+            "Materialized 2025 %s capacity: matched_countries=%d, capacity_before=%.2f GW, capacity_after=%.2f GW, reference=%.2f GW, missing_model_countries=%d%s.",
+            label,
+            matched,
+            capacity_before_mw / 1000.0,
+            capacity_after_mw / 1000.0,
+            float(reference_mw.sum()) / 1000.0,
+            len(missing_assets),
+            f" (sample: {', '.join(sorted(missing_assets)[:5])})" if missing_assets else "",
+        )
+
+    ember_csv = _repo_path("validation/data/ember_yearly_full_release_long_format.csv")
+    if os.path.exists(ember_csv):
+        hydro_reference_mw = _load_ember_capacity_reference(
+            ember_csv,
+            variable="Hydro",
+            year=year,
+            latest_available=True,
+            latest_available_since=2023,
+        )
+        match_country_capacity(
+            hydro_reference_mw,
+            [("generators", "ror"), ("storage_units", "hydro")],
+            "Ember hydro (ror plus reservoir)",
+        )
+    else:
+        logger.warning("2025 hydro capacity materialization skipped: file not found at %s", ember_csv)
+
+    year2025_cfg = (config.get("global_specific", {}) or {}).get("year2025_capacity", {}) or {}
+    irena_csv = _repo_path(year2025_cfg.get("irena_csv", "validation/data/IRENA_2025_capacity.csv"))
+    if os.path.exists(irena_csv):
+        try:
+            geothermal_ref, _ = _irena_country_capacity_reference(
+                irena_csv=irena_csv,
+                year=year,
+                carrier_technology_map={"geothermal": ["Geothermal energy"]},
+                fallback_to_latest=False,
+            )
+        except Exception as exc:
+            logger.warning("2025 geothermal capacity materialization skipped: %s", exc)
+        else:
+            geothermal_reference_mw = geothermal_ref.loc[
+                geothermal_ref["carrier"].eq("geothermal")
+            ].set_index("country")["reference_mw"]
+            match_country_capacity(
+                geothermal_reference_mw,
+                [("generators", "geothermal")],
+                "IRENA geothermal",
+            )
+    else:
+        logger.warning("2025 geothermal capacity materialization skipped: file not found at %s", irena_csv)
+
+    # This is the only 2025 invocation; apply_final_historical_capacity_validation_fixes
+    # deliberately skips it for add_brownfield to avoid a second materialisation pass.
+    apply_ember_bioenergy_capacity_fix(n, year, config)
 
 def apply_pris_nuclear_capacity_and_availability(n, investment_year, config):
     pris_csv = _repo_path("validation/data/pris_nuclear_validation.csv")
@@ -4743,6 +5716,34 @@ def apply_pris_nuclear_capacity_and_availability(n, investment_year, config):
         return
 
     ref = pris.groupby("country", as_index=True)[["capacity_gw", "generation_twh"]].sum()
+    ember_csv = _repo_path("validation/data/ember_yearly_full_release_long_format.csv")
+    if "UA" in ref.index and os.path.exists(ember_csv):
+        try:
+            ember = pd.read_csv(
+                ember_csv,
+                usecols=["ISO 3 code", "Year", "Category", "Subcategory", "Variable", "Unit", "Value"],
+            )
+            ukraine_nuclear = ember.loc[
+                ember["ISO 3 code"].astype(str).str.upper().eq("UKR")
+                & ember["Category"].astype(str).eq("Electricity generation")
+                & ember["Subcategory"].astype(str).eq("Fuel")
+                & ember["Variable"].astype(str).eq("Nuclear")
+                & ember["Unit"].astype(str).eq("TWh")
+            ].copy()
+            ukraine_nuclear["Value"] = pd.to_numeric(ukraine_nuclear["Value"], errors="coerce")
+            ukraine_nuclear["Year"] = pd.to_numeric(ukraine_nuclear["Year"], errors="coerce")
+            ukraine_nuclear = ukraine_nuclear.loc[ukraine_nuclear["Value"].gt(0.0) & ukraine_nuclear["Year"].notna()].sort_values("Year")
+            if not ukraine_nuclear.empty:
+                available = ukraine_nuclear.loc[ukraine_nuclear["Year"].le(float(investment_year))]
+                reference = (available if not available.empty else ukraine_nuclear).iloc[-1]
+                ref.loc["UA", "generation_twh"] = float(reference["Value"])
+                logger.info(
+                    "Using Ember instead of PRIS for Ukraine nuclear availability: year=%d, generation=%.3f TWh.",
+                    int(reference["Year"]),
+                    float(reference["Value"]),
+                )
+        except Exception as exc:
+            logger.warning("Ember Ukraine nuclear availability override skipped: %s", exc)
     ref["p_max_pu"] = (
         ref["generation_twh"] / (ref["capacity_gw"] * 8.76)
     ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0, upper=1.0)
@@ -4834,6 +5835,164 @@ def apply_pris_nuclear_capacity_and_availability(n, investment_year, config):
 
 
 
+def repair_undersized_bev_chargers(n, investment_year, config=None, context=""):
+    """Size fixed BEV chargers to serve independently derived EV demand."""
+    if (
+        not hasattr(n, "links")
+        or n.links.empty
+        or "carrier" not in n.links.columns
+        or not hasattr(n, "loads")
+        or n.loads.empty
+        or "bus" not in n.loads.columns
+    ):
+        return pd.DataFrame()
+
+    chargers = n.links.index[n.links.carrier.astype(str).eq("BEV charger")]
+    load_carrier = n.loads.get("carrier", pd.Series("", index=n.loads.index)).astype(str)
+    ev_loads = n.loads.index[load_carrier.eq("land transport EV")]
+    if len(chargers) == 0 or len(ev_loads) == 0:
+        return pd.DataFrame()
+
+    snapshots = n.snapshots
+    load_p_set_t = getattr(n.loads_t, "p_set", pd.DataFrame(index=snapshots))
+    link_p_max_pu_t = getattr(n.links_t, "p_max_pu", pd.DataFrame(index=snapshots))
+    link_efficiency_t = getattr(n.links_t, "efficiency", pd.DataFrame(index=snapshots))
+    tolerance = 1e-9
+    headroom = 1.01
+    records = []
+
+    for charger in chargers:
+        row = n.links.loc[charger]
+        if bool(row.get("p_nom_extendable", False)):
+            continue
+        output_bus = str(row.get("bus1", ""))
+        attached = ev_loads[n.loads.loc[ev_loads, "bus"].astype(str).eq(output_bus)]
+        if len(attached) == 0:
+            continue
+
+        demand = pd.Series(0.0, index=snapshots, dtype=float)
+        for load in attached:
+            static = float(
+                pd.to_numeric(pd.Series([n.loads.at[load, "p_set"]]), errors="coerce")
+                .fillna(0.0)
+                .iloc[0]
+            )
+            profile = (
+                pd.to_numeric(load_p_set_t[load], errors="coerce")
+                .reindex(snapshots)
+                .fillna(static)
+                if load in load_p_set_t.columns
+                else pd.Series(static, index=snapshots, dtype=float)
+            )
+            demand = demand.add(profile, fill_value=0.0)
+        demand = demand.clip(lower=0.0)
+        required_snapshots = demand.gt(tolerance)
+        if not required_snapshots.any():
+            continue
+
+        static_p_max_pu = float(
+            pd.to_numeric(pd.Series([row.get("p_max_pu", 1.0)]), errors="coerce")
+            .fillna(1.0)
+            .iloc[0]
+        )
+        p_max_pu = (
+            pd.to_numeric(link_p_max_pu_t[charger], errors="coerce")
+            .reindex(snapshots)
+            .fillna(static_p_max_pu)
+            if charger in link_p_max_pu_t.columns
+            else pd.Series(static_p_max_pu, index=snapshots, dtype=float)
+        ).clip(lower=0.0)
+
+        static_efficiency = float(
+            pd.to_numeric(pd.Series([row.get("efficiency", 1.0)]), errors="coerce")
+            .fillna(1.0)
+            .iloc[0]
+        )
+        efficiency = (
+            pd.to_numeric(link_efficiency_t[charger], errors="coerce")
+            .reindex(snapshots)
+            .fillna(static_efficiency)
+            if charger in link_efficiency_t.columns
+            else pd.Series(static_efficiency, index=snapshots, dtype=float)
+        ).clip(lower=0.0)
+
+        denominator = p_max_pu * efficiency
+        impossible = required_snapshots & denominator.le(tolerance)
+        if impossible.any():
+            sample = [str(s) for s in impossible.index[impossible][:5]]
+            raise ValueError(
+                f"Fixed BEV charger {charger!r} has positive EV demand but zero "
+                f"availability/efficiency in {int(impossible.sum())} snapshots "
+                f"(sample: {sample})."
+            )
+
+        required_p_nom = float(
+            (demand.loc[required_snapshots] / denominator.loc[required_snapshots]).max()
+        )
+        current_p_nom = float(
+            pd.to_numeric(pd.Series([row.get("p_nom", 0.0)]), errors="coerce")
+            .fillna(0.0)
+            .iloc[0]
+        )
+        if current_p_nom + tolerance >= required_p_nom:
+            continue
+
+        repaired_p_nom = required_p_nom * headroom
+        n.links.at[charger, "p_nom"] = repaired_p_nom
+        if "p_nom_min" in n.links.columns:
+            n.links.at[charger, "p_nom_min"] = repaired_p_nom
+        if "p_nom_max" in n.links.columns:
+            current_max = pd.to_numeric(
+                pd.Series([n.links.at[charger, "p_nom_max"]]), errors="coerce"
+            ).iloc[0]
+            if pd.notna(current_max) and np.isfinite(current_max) and current_max < repaired_p_nom:
+                n.links.at[charger, "p_nom_max"] = repaired_p_nom
+
+        input_bus = str(row.get("bus0", ""))
+        records.append(
+            {
+                "year": int(investment_year),
+                "context": context,
+                "country": input_bus[:2].upper(),
+                "charger": str(charger),
+                "input_bus": input_bus,
+                "ev_bus": output_bus,
+                "p_nom_before_mw": current_p_nom,
+                "minimum_required_p_nom_mw": required_p_nom,
+                "p_nom_after_mw": repaired_p_nom,
+                "peak_ev_demand_mw": float(demand.max()),
+                "headroom_multiplier": headroom,
+                "policy": "fixed_minimum_capacity_for_positive_ev_demand",
+            }
+        )
+
+    audit = pd.DataFrame(records)
+    if audit.empty:
+        return audit
+
+    audit_dir_cfg = (
+        (config or {})
+        .get("global_specific", {})
+        .get("debug_feasibility_sanitize", {})
+        .get("audit_dir", "validation/results")
+    )
+    audit_dir = Path(_repo_path(audit_dir_cfg))
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / f"bev_charger_capacity_repair_{int(investment_year)}.csv"
+    audit.sort_values(["country", "charger"]).to_csv(audit_path, index=False)
+    logger.warning(
+        "Repaired %d undersized fixed BEV chargers for %s%s "
+        "(%.2f -> %.2f MW total); audit=%s",
+        len(audit),
+        int(investment_year),
+        f" for {context}" if context else "",
+        float(audit["p_nom_before_mw"].sum()),
+        float(audit["p_nom_after_mw"].sum()),
+        audit_path,
+    )
+    return audit
+
+
 def apply_final_historical_capacity_validation_fixes(n, investment_year, config, context=""):
     """Re-apply historical capacity validation after baseyear/brownfield stock edits."""
     year = int(investment_year)
@@ -4843,7 +6002,17 @@ def apply_final_historical_capacity_validation_fixes(n, investment_year, config,
     _repair_fossil_link_fuel_buses(n)
     apply_pris_nuclear_capacity_and_availability(n, year, config)
     apply_gogpt_oil_capacity_fix(n, year, config)
-    apply_ember_bioenergy_capacity_fix(n, year, config)
+    # Brownfield materializes the 2025 bioenergy stock in the single dedicated
+    # 2025 capacity hook before the historical-capacity freeze below.
+    if not (year == 2025 and context == "add_brownfield"):
+        apply_ember_bioenergy_capacity_fix(n, year, config)
+
+    repair_undersized_bev_chargers(
+        n,
+        investment_year=year,
+        config=config,
+        context=context,
+    )
 
     if hasattr(n, "links") and not n.links.empty:
         links = n.links
@@ -4883,6 +6052,68 @@ def apply_final_historical_capacity_validation_fixes(n, investment_year, config,
             gens["p_nom_max"] = gens["p_nom_max"].fillna(np.inf)
         if "p_nom_extendable" in gens.columns:
             gens["p_nom_extendable"] = gens["p_nom_extendable"].fillna(False).astype(bool)
+
+        fossil_generator_carriers = {"coal", "lignite", "oil", "gas", "CCGT", "OCGT"}
+        fossil_assets = gens.index[gens.carrier.astype(str).isin(fossil_generator_carriers)]
+        if len(fossil_assets):
+            gens.loc[fossil_assets, "p_nom_min"] = pd.to_numeric(
+                gens.loc[fossil_assets, "p_nom"], errors="coerce"
+            ).fillna(0.0)
+            logger.info(
+                "Set p_nom_min=p_nom for %d fossil generators after historical validation.",
+                len(fossil_assets),
+            )
+
+def apply_final_validation_network_fixes(n, investment_year, config=None, context=""):
+    """Repair small validation-network topology/fuel gaps after stock edits.
+
+    This hook is called by both add_existing_baseyear and add_brownfield after
+    their stock edits. It therefore applies to 2020, 2025, and later planning
+    horizons without being reset by brownfield logic.
+    """
+    year = int(investment_year)
+    bus_country = _bus_country_lookup(n).fillna("").astype(str).str.upper()
+    added_fuel_sources = 0
+
+    # Supply the Singapore gas bus directly. This is a fuel source, not an
+    # electrical generator, so it does not add electric capacity to Singapore.
+    sg_ac_buses = n.buses.index[
+        bus_country.eq("SG") & n.buses.carrier.astype(str).eq("AC")
+    ]
+    for ac_bus in sg_ac_buses:
+        gas_bus = _ensure_fossil_fuel_bus_and_store(n, str(ac_bus), "gas", "SG")
+        if gas_bus is None:
+            continue
+
+        source_name = f"{gas_bus} validation fuel availability"
+        source_kwargs = {
+            "bus": gas_bus,
+            "carrier": "gas",
+            "p_nom": 1_000_000.0,
+            "p_nom_min": 0.0,
+            "p_nom_max": 1_000_000.0,
+            "p_nom_extendable": False,
+            "marginal_cost": 0.0,
+            "capital_cost": 0.0,
+            "build_year": 0,
+            "lifetime": 1000.0,
+        }
+        if source_name in n.generators.index:
+            for column, value in source_kwargs.items():
+                if column in n.generators.columns:
+                    n.generators.at[source_name, column] = value
+        else:
+            n.add("Generator", source_name, **source_kwargs)
+            added_fuel_sources += 1
+
+    label = f" for {context}" if context else ""
+    logger.info(
+        "Applied final validation network fixes for %s%s: fuel_sources_added=%d.",
+        year,
+        label,
+        added_fuel_sources,
+    )
+    return n
 
 
 def apply_country_nuclear_iteration_scaling(n, investment_year, config):
@@ -5650,10 +6881,12 @@ def add_year2025_irena_historical_capacity_distribution(n, planning_year, config
     """
     global_cfg = config.get("global_specific", {})
     cfg = global_cfg.get("year2025_capacity", {})
-    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+    if not cfg:
         return
-    if not bool(cfg.get("materialize_historical_capacity_by_2020_shares", False)):
-        return
+
+    # This is brownfield preprocessing, not a solve-time constraint. Historical
+    # 2025 stock must be materialized even when optional IRENA capacity bands
+    # are disabled for the optimizer.
 
     try:
         current_year = int(float(planning_year))
@@ -5997,7 +7230,20 @@ def _fixed_generator_profile(n, gen_name, bus, carrier, current_year):
     if not hasattr(n, "generators_t") or "p_max_pu" not in n.generators_t:
         return None
 
+    # Existing renewable profiles are stored under their static generator names
+    # (for example, "AD 0 solar"), not under a planning-year suffix. Reuse the
+    # node profile before looking for a donor profile for a newly added asset.
     generator, suffix = _carrier_profile_name_parts(carrier)
+    static_profile_col = f"{bus} {generator}{suffix}"
+    if static_profile_col in n.generators_t.p_max_pu.columns:
+        static_profile = pd.to_numeric(
+            n.generators_t.p_max_pu[static_profile_col], errors="coerce"
+        ).fillna(0.0)
+        if static_profile.abs().sum() > 1e-12:
+            static_profile = static_profile.clip(lower=0.0, upper=1.0)
+            static_profile.name = gen_name
+            return static_profile
+
     profile_col = f"{bus} {generator}{suffix}-{current_year}"
     profile = pd.DataFrame(0.0, index=n.snapshots, columns=[profile_col])
     profile = _replace_zero_profile_columns_with_nearest(
@@ -6014,18 +7260,26 @@ def _fixed_generator_profile(n, gen_name, bus, carrier, current_year):
         series.name = gen_name
         return series
 
-    pool_cols = [
+    year_suffixed_pool = [
         c
         for c in n.generators_t.p_max_pu.columns
         if isinstance(c, str) and f" {generator}{suffix}-" in c
     ]
+    static_pool = n.generators.index[
+        n.generators.carrier.astype(str).eq(str(carrier))
+    ].intersection(n.generators_t.p_max_pu.columns).tolist()
+    pool_cols = list(dict.fromkeys(year_suffixed_pool + static_pool))
     if pool_cols:
         pool = n.generators_t.p_max_pu[pool_cols].fillna(0.0)
         nonzero = pool.columns[pool.sum(axis=0).abs() > 1e-12]
         if len(nonzero) > 0:
-            raise ValueError(
-                f"No node-specific {carrier} p_max_pu profile found for fixed 2025 IRENA generator {gen_name} on {bus}; refusing generic profile {nonzero[0]}."
+            donor = pd.to_numeric(pool[nonzero[0]], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
+            donor.name = gen_name
+            logger.warning(
+                "Using fallback %s p_max_pu profile %s for fixed 2025 IRENA generator %s on %s.",
+                carrier, nonzero[0], gen_name, bus,
             )
+            return donor
 
     raise ValueError(
         f"No node-specific {carrier} p_max_pu profile found for fixed 2025 IRENA generator {gen_name} on {bus}; refusing p_max_pu=1.0 fallback."
@@ -6043,10 +7297,12 @@ def add_year2025_irena_missing_fixed_generators(n, planning_year, config):
     """
     global_cfg = config.get("global_specific", {})
     cfg = global_cfg.get("year2025_capacity", {})
-    if not cfg or not cfg.get("year2025_capacity_constraint", False):
+    if not cfg:
         return
-    if not bool(cfg.get("add_missing_fixed_generators", True)):
-        return
+
+    # Keep this companion materialization independent of solver-time IRENA
+    # capacity bands: it supplies countries lacking an existing asset to which
+    # the historical stock can be assigned.
 
     try:
         current_year = int(float(planning_year))

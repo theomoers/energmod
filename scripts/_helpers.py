@@ -2228,3 +2228,77 @@ def sanitize_locations(n):
             n.buses.country.ne("") & n.buses.country.notnull(),
             n.buses.location.map(n.buses.country),
         )
+
+
+def regularize_cutout_coordinates(cutout, *, rtol=1e-4, atol=1e-7):
+    """Remove numerical duplicate cells from a regularly spaced cutout grid.
+
+    Atlite constructs cell geometries under the assumption that its coordinate
+    axes are regular. Some ERA5 cutouts contain near-identical, consecutive
+    coordinates instead (for example ``131.39999`` and ``131.4``). Those cells
+    overlap spatially and are counted twice by ``grid`` and ``indicatormatrix``.
+
+    The nominal spacing is inferred independently for each axis, so this is
+    safe for cutouts at resolutions other than the default 0.3 degrees. Only
+    numerical jitter and duplicated cells are repaired. Missing cells or
+    genuinely irregular axes raise an error rather than silently fabricating
+    weather data.
+    """
+
+    def _regularize_axis(ds, dim):
+        values = np.asarray(ds.coords[dim].values, dtype=float)
+        if values.ndim != 1 or values.size < 2:
+            return ds
+
+        differences = np.diff(values)
+        if np.any(differences < 0):
+            raise ValueError(
+                f"Cutout coordinate '{dim}' must be strictly increasing; "
+                "cannot safely regularize it."
+            )
+
+        positive_differences = differences[differences > 0]
+        if positive_differences.size == 0:
+            raise ValueError(
+                f"Could not infer a positive spacing for cutout coordinate '{dim}'."
+            )
+        # The upper quartile excludes the near-zero intervals caused by duplicate cells.
+        spacing = float(np.quantile(positive_differences, 0.75))
+        if not np.isfinite(spacing) or spacing <= 0:
+            raise ValueError(
+                f"Could not infer a positive spacing for cutout coordinate '{dim}'."
+            )
+
+        steps = np.rint((values - values[0]) / spacing).astype(int)
+        snapped = values[0] + steps * spacing
+        tolerance = max(atol, abs(spacing) * rtol)
+        if np.any(np.abs(values - snapped) > tolerance):
+            raise ValueError(
+                f"Cutout coordinate '{dim}' is genuinely irregular, not just "
+                "numerically jittered; rebuild or repair the cutout explicitly."
+            )
+
+        _, keep_idx = np.unique(steps, return_index=True)
+        keep_idx = np.sort(keep_idx)
+        if keep_idx.size != values.size:
+            logger.warning(
+                "Dropping %d duplicated '%s' coordinates after snapping to %.9g-degree spacing.",
+                values.size - keep_idx.size,
+                dim,
+                spacing,
+            )
+
+        kept_steps = steps[keep_idx]
+        if np.any(np.diff(kept_steps) != 1):
+            raise ValueError(
+                f"Cutout coordinate '{dim}' has missing grid cells; refusing "
+                "to invent weather data during regularization."
+            )
+
+        return ds.isel({dim: keep_idx}).assign_coords(
+            {dim: np.round(snapped[keep_idx], 10)}
+        )
+
+    cutout.data = _regularize_axis(cutout.data, "x")
+    cutout.data = _regularize_axis(cutout.data, "y")
+    return cutout

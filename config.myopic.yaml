@@ -1,6 +1,6 @@
 run:
-  name: "Earth_200_v7" # use this to keep track of runs with different settings
-  sector_name: "Global_200_v7" # use this to keep track of sector scenario runs
+  name: "Earth_200_v8" # use this to keep track of runs with different settings
+  sector_name: "Global_200_v8" # use this to keep track of sector scenario runs
   shared_cutouts: true # set to true to share the default cutout(s) across runs
   allow_scenario_failure: true # If True, the workflow will continue even if a scenario in run_scenario fails
 
@@ -22,7 +22,7 @@ scenario:
   sopts:
   - "1h"
   demand:  # Demand scenarios - data must exist in data/demand/scenarios/{scenario}/
-  - "AB"  # AB=central (baseline), NZ=fast_electrification, DF=fossil era
+  - "AB"  
   #- "NZ"
   #- "DF"
   learning_rate:  # Canonical format: tech_code.methodvalue, e.g. s.o0.10 or w.m1.10; use "base" for no adjustment
@@ -108,13 +108,21 @@ global_specific:
     enable: true
     audit_dir: validation/results
     carry_forward_anchor_year: 2025
+    country_demand_splits:
+      enable: true
+      ember_csv: validation/data/ember_yearly_full_release_long_format.csv
+      splits:
+        - source_country: CN
+          target_country: TW
+          source_iso3: CHN
+          target_iso3: TWN
     anchors:
       2020:
         year: 2020
         csv: validation/data/owid-energy-data.csv
         schema: owid_energy
         target_column: electricity_demand
-        electricity_demand_baseline_network: results/Global_200_v7/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+        electricity_demand_baseline_network: results/Global_200_v8/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
         electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
       2025:
         year: 2025
@@ -128,7 +136,7 @@ global_specific:
             csv: validation/data/owid-energy-data.csv
             schema: owid_energy
             target_column: electricity_demand
-        electricity_demand_baseline_network: results/Global_200_v7/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+        electricity_demand_baseline_network: results/Global_200_v8/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
         electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
 
   transmission_capacity_limits:
@@ -150,6 +158,35 @@ global_specific:
       2045: 1.60
       2050: 1.75
 
+  renewable_profile_tuning:
+    enable: true
+    override_csv: validation/data/renewable_profile_tuning_overrides.csv
+    carry_forward_year: 2025
+    carry_forward: true
+    require_explicit_carry_forward_source: true
+    capacity_alignment:
+      enable: true
+      reference_csv: validation/data/ember_yearly_full_release_long_format.csv
+      min_reference_twh: 0.1
+    zero_profile_fallback:
+      enable: true
+      capacity_alignment: true
+    scale_min: 0.1
+    scale_max: 4.0
+    solar_scale_min: 0.1
+    solar_scale_max: 4.0
+    wind_scale_min: 0.1
+    wind_scale_max: 4.0
+    nuclear_scale_min: 0.1
+    nuclear_scale_max: 4.0
+    hydro_scale_min: 0.1
+    hydro_scale_max: 4.0
+    solar_p_max_pu_cap: 1.0
+    onwind_p_max_pu_cap: 1.0
+    offwind_p_max_pu_cap: 1.0
+    nuclear_p_max_pu_cap: 1.0
+    hydro_ror_p_max_pu_cap: 1.0
+
   fossil_capacity_alignment:
     enable: true
     year: 2020
@@ -166,12 +203,21 @@ global_specific:
     capacity_cap_headroom: null
     # Aggregate country/fuel ceiling applied in solve; keeps regional siting flexible.
     country_fuel_capacity_ceiling:
-      enable: true
+      enable: false
       multiplier: 1.2
       tolerance_mw: 1.0
       skip_if_min_exceeds_cap: true
     make_baseyear_fossil_links_extendable: true
     extendable_baseyear_carriers: [coal, lignite, CCGT, OCGT, oil]
+    nodal_allocation:
+      enable: true
+      years: [2020, 2025]
+      ember_generation_csv: validation/data/owid-elecbalance2025.csv
+      min_ember_reference_twh: 1.0
+      reserve_margin: 1.10
+      ac_import_credit_fraction: 0.1
+      min_load_share_multiplier: 0.1
+      max_load_share_multiplier: 4.0
     materialize_2025:
       enable: true
       year: 2025
@@ -198,7 +244,7 @@ global_specific:
     baseyear_generation_constraint: false # 2020 country-level electricity generation constrained to OWID historical values
     year: 2020
     owid_csv: validation/data/owid-energy-data.csv
-    electricity_demand_baseline_network: results/Global_200_v7/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
+    electricity_demand_baseline_network: results/Global_200_v8/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
     electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
     tolerance: 0.02
     absolute_tolerance_twh: 0.25
@@ -245,7 +291,7 @@ global_specific:
       - electricity_generation
 
   year2025_capacity:
-    year2025_capacity_constraint: true
+    year2025_capacity_constraint: false
     year: 2025
     units: GW
     irena_csv: validation/data/IRENA_2025_capacity.csv
@@ -309,7 +355,7 @@ permstore:
     gas_network: false
     industry_distribution: false # adjusted for gadm clustering
     elec_prepared: false
-    renewable_profiles: true
+    renewable_profiles: false
     solar_thermal_profile: false
     costs: true
     raw_osm: true
