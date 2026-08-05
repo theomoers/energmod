@@ -39,7 +39,7 @@ jobs:
         shell: bash -l {0}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Use base env file if it was changed
       run: |
@@ -57,7 +57,7 @@ jobs:
           echo "env_file=${{ matrix.env_file }}" >> $GITHUB_ENV
         fi
 
-    - uses: conda-incubator/setup-miniconda@v3
+    - uses: conda-incubator/setup-miniconda@v4
       with:
         miniforge-version: latest
         activate-environment: pypsa-earth
@@ -65,7 +65,7 @@ jobs:
         conda-remove-defaults: true
 
     - name: Cache Conda env
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ env.CONDA }}/envs
         key: conda-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}', env.env_file)) }}
@@ -83,7 +83,7 @@ jobs:
 
     - name: Upload artifacts
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: results-${{ matrix.os }}
         path: |
