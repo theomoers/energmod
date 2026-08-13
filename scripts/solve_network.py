@@ -19,6 +19,7 @@ Relevant Settings
             formulation:
             clip_p_max_pu:
             load_shedding:
+            load_shedding_capacity:
             noisy_costs:
             nhours:
             min_iterations:
@@ -130,6 +131,24 @@ def _acceptable_solve(status, condition):
     return status == "ok" and str(condition).lower() in {"optimal", "suboptimal"}
 
 
+def _record_accepted_solve(n, status, condition, stage):
+    """Persist an explicit audit marker when accepting a non-optimal solution."""
+    if str(condition).lower() != "suboptimal":
+        return
+
+    logger.warning(
+        "Accepting suboptimal solver result from %s: status=%r, condition=%r",
+        stage,
+        status,
+        condition,
+    )
+    if not isinstance(getattr(n, "meta", None), dict):
+        n.meta = {}
+    n.meta["solver_status"] = str(status)
+    n.meta["solver_termination_condition"] = str(condition)
+    n.meta["solver_acceptance_stage"] = stage
+
+
 def _load_task_runtime_budget():
     raw_max_seconds = os.environ.get("LEARNING_TASK_MAX_SECONDS")
     if not raw_max_seconds:
@@ -199,6 +218,7 @@ def _prepare_initial_solver_options(runtime_budget, solver_name, solver_options)
 
 
 def _prepare_retry_solver_options(runtime_budget, solver_name, solver_options):
+    """Apply the remaining task budget to a retry, or decline a too-short retry."""
     if runtime_budget is None:
         return dict(solver_options)
 
@@ -214,7 +234,7 @@ def _prepare_retry_solver_options(runtime_budget, solver_name, solver_options):
         reserve_seconds,
         retry_min_seconds,
     )
-    if retry_window_seconds < retry_min_seconds:
+    if retry_window_seconds <= 0 or retry_window_seconds < retry_min_seconds:
         return None
 
     if solver_name == "gurobi":
@@ -224,7 +244,12 @@ def _prepare_retry_solver_options(runtime_budget, solver_name, solver_options):
             "Retry budget is active but solver '%s' has no explicit injected TimeLimit",
             solver_name,
         )
-    return _apply_solver_time_limit(solver_name, solver_options, retry_window_seconds)
+    return _apply_solver_time_limit(
+        solver_name,
+        solver_options,
+        retry_window_seconds,
+    )
+
 
 
 # Baseyear generation validation helpers moved to scripts/validation.py
@@ -2360,6 +2385,19 @@ def prepare_network(n, solve_opts):
         n.line_volume_limit_dual = n.global_constraints.at["lv_limit", "mu"]
 
     if solve_opts.get("load_shedding"):
+        load_shedding_capacity = solve_opts.get("load_shedding_capacity", 1e12)
+        if isinstance(load_shedding_capacity, bool):
+            raise ValueError("solving.options.load_shedding_capacity must be numeric")
+        try:
+            load_shedding_capacity = float(load_shedding_capacity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "solving.options.load_shedding_capacity must be numeric"
+            ) from exc
+        if not np.isfinite(load_shedding_capacity) or load_shedding_capacity <= 0.0:
+            raise ValueError(
+                "solving.options.load_shedding_capacity must be finite and positive"
+            )
         n.add("Carrier", "Load")
         n.madd(
             "Generator",
@@ -2369,8 +2407,9 @@ def prepare_network(n, solve_opts):
             carrier="Load",
             sign=1,
             marginal_cost=solve_opts.get("load_shedding") * 1000,  # convert to Eur/MWh
-            p_nom=1e6,
+            p_nom=load_shedding_capacity,
         )
+        logger.info("Added load shedding with p_nom=%g MW per bus.", load_shedding_capacity)
 
     if solve_opts.get("noisy_costs"):
         for t in n.iterate_components():
@@ -4852,11 +4891,10 @@ def solve_network(n, config, solving, **kwargs):
     set_of_options = solving["solver"]["options"]
     cf_solving = solving["options"]
 
-    kwargs["solver_options"] = (
+    base_solver_opts = dict(
         solving["solver_options"][set_of_options] if set_of_options else {}
     )
-    kwargs["solver_options"]["DualReductions"] = 0
-    base_solver_opts = dict(kwargs["solver_options"])
+    base_solver_opts["DualReductions"] = 0
     logger.info("Added DualReductions=0 to force infeasible/unbounded determination")
     kwargs["solver_name"] = solving["solver"]["name"]
     kwargs["extra_functionality"] = extra_functionality
@@ -4864,7 +4902,7 @@ def solve_network(n, config, solving, **kwargs):
     kwargs["solver_options"] = _prepare_initial_solver_options(
         task_runtime_budget,
         kwargs["solver_name"],
-        kwargs["solver_options"],
+        base_solver_opts,
     )
 
     _ensure_pypsa_nodal_balance_busname_compat()
@@ -4878,6 +4916,12 @@ def solve_network(n, config, solving, **kwargs):
             n.opts = globals().get("opts", [])
 
     n = apply_optional_sector_clustering(n, config)
+
+    if hasattr(_validation_hooks, "remove_fixed_zero_capacity_components"):
+        _validation_hooks.remove_fixed_zero_capacity_components(
+            n,
+            context="pre-solve",
+        )
 
     planning_year = _infer_planning_year(n)
 
@@ -5074,26 +5118,13 @@ def solve_network(n, config, solving, **kwargs):
         else:
             logger.info("LP file saving is disabled (set solving.save_lpfile: true to enable)")
         
+    if _acceptable_solve(status, condition):
+        _record_accepted_solve(n, status, condition, "initial solve")
+        return n
     if not _acceptable_solve(status, condition):
         logger.error(f"Solver status: {status}")
         logger.error(f"Termination condition: {condition}")
-        robust_solver_options = _prepare_retry_solver_options(
-            task_runtime_budget,
-            kwargs.get("solver_name"),
-            base_solver_opts,
-        )
-        if task_runtime_budget is not None and robust_solver_options is None:
-            remaining_snapshot = _runtime_budget_snapshot(task_runtime_budget)
-            remaining_seconds = remaining_snapshot["remaining_seconds"]
-            reserve_seconds = task_runtime_budget["reserve_seconds"]
-            retry_min_seconds = task_runtime_budget["retry_min_seconds"]
-            retry_window_seconds = max(0, remaining_seconds - reserve_seconds)
-            raise RuntimeError(
-                "Skipping retry because only "
-                f"{retry_window_seconds}s remain after reserve (minimum required is {retry_min_seconds}s). "
-                f"Initial solve ended with status '{status}' and condition '{condition}'."
-            )
-        
+
         # Remove components with undefined buses first
         buses_to_keep = set(n.buses.index)
         
@@ -5163,7 +5194,7 @@ def solve_network(n, config, solving, **kwargs):
                             logger.info(f"Cleaning {attr_name} time series for {len(cols_to_remove)} links")
                             setattr(n.links_t, attr_name, attr_data.drop(columns=cols_to_remove))
         
-        # Fix generator expansion limits that cause infeasibility
+        # Fix generator expansion limits that may cause infeasibility
         problematic_gens = n.generators.query("p_nom_max < p_nom_min")
         if len(problematic_gens) > 0:
             logger.info(f"Fixing {len(problematic_gens)} generators with p_nom_max < p_nom_min")
@@ -5173,46 +5204,78 @@ def solve_network(n, config, solving, **kwargs):
             n.generators.loc[problematic_gens.index, "p_nom_max"] = n.generators.loc[problematic_gens.index, "p_nom_min"] * 2
 
         retry_option_set = set_of_options
-        if kwargs.get("solver_name") == "gurobi" and "gurobi-numeric-focus" in solving.get("solver_options", {}):
-            retry_option_set = "gurobi-numeric-focus"
-            robust_solver_options = dict(solving["solver_options"][retry_option_set])
-            robust_solver_options["DualReductions"] = 0
-        else:
-            robust_solver_options = dict(robust_solver_options)
+        retry_base_options = dict(base_solver_opts)
+        if (
+            kwargs.get("solver_name") == "gurobi"
+            and "gurobi-default" in solving.get("solver_options", {})
+        ):
+            retry_option_set = "gurobi-default" # changed from numeric focus
+            retry_base_options = dict(
+                solving["solver_options"][retry_option_set]
+            )
+            #retry_base_options["DualReductions"] = 0
 
-        robust_solver_options = _prepare_retry_solver_options(
+        retry_solver_options = _prepare_retry_solver_options(
             task_runtime_budget,
             kwargs.get("solver_name"),
-            robust_solver_options,
-        ) or robust_solver_options
+            retry_base_options,
+        )
+        if task_runtime_budget is not None and retry_solver_options is None:
+            remaining_snapshot = _runtime_budget_snapshot(task_runtime_budget)
+            remaining_seconds = remaining_snapshot["remaining_seconds"]
+            reserve_seconds = task_runtime_budget["reserve_seconds"]
+            retry_min_seconds = task_runtime_budget["retry_min_seconds"]
+            retry_window_seconds = max(0, remaining_seconds - reserve_seconds)
+            raise RuntimeError(
+                "Skipping retry because only "
+                f"{retry_window_seconds}s remain after reserve (minimum required is "
+                f"{retry_min_seconds}s). Initial solve ended with status "
+                f"'{status}' and condition '{condition}'."
+            )
 
-        logger.info(
-            "Retrying with solver options profile '%s' from config.myopic.yaml...",
+        logger.warning(
+            "Initial solve ended with status=%r, condition=%r; retrying once "
+            "with solver profile %r.",
+            status,
+            condition,
             retry_option_set,
         )
-        logger.info(f"Using robust solver options: {robust_solver_options}")
-        kwargs_robust = kwargs.copy()
-        kwargs_robust["solver_options"] = robust_solver_options
-
+        logger.info("Retry solver options: %s", retry_solver_options)
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["solver_options"] = retry_solver_options
 
         try:
             if skip_iterations:
-                status, condition = n.optimize(**kwargs_robust)
+                status, condition = n.optimize(**retry_kwargs)
             else:
-                status, condition = optimize_transmission_expansion_iteratively(n, **kwargs_robust)
-                
-            logger.info(f"Retry result: status='{status}', condition='{condition}'")
-            
-            if not _acceptable_solve(status, condition):
-                logger.error(f"Retry still failed: {status} / {condition}")
-                raise RuntimeError(f"Solving status '{status}' with termination condition '{condition}' after retry")
-                
-        except Exception as e:
-            logger.error(f"Retry failed with exception: {e}")
-            raise RuntimeError(f"Retry failed with exception: {e}") from e
-        
-        # If we reach here, retry was successful
-        return n
+                retry_iter_kwargs = dict(retry_kwargs)
+                retry_iter_kwargs.pop("log_fn", None)
+                status, condition = optimize_transmission_expansion_iteratively(
+                    n,
+                    **retry_iter_kwargs,
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Solver retry with profile {retry_option_set!r} raised an exception"
+            ) from exc
+
+        logger.info(
+            "Solver retry result: status=%r, condition=%r",
+            status,
+            condition,
+        )
+        if _acceptable_solve(status, condition):
+            _record_accepted_solve(
+                n,
+                status,
+                condition,
+                f"retry:{retry_option_set}",
+            )
+            return n
+        raise RuntimeError(
+            f"Solver retry with profile {retry_option_set!r} ended with "
+            f"status {status!r} and condition {condition!r}"
+        )
 
     return n
 

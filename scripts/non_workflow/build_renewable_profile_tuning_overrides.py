@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build country-level renewable p_max_pu tuning overrides from a solved network."""
+"""Update country-level renewable-profile tuning overrides from a solved network.
+
+The update targets solved country generation, not pre-solve availability. It
+can be used repeatedly, compounding damped corrections from the existing
+override file.
+"""
 
 import argparse
 from pathlib import Path
@@ -82,18 +87,51 @@ def model_generation_by_country(n):
 def ember_reference(ember_csv, year):
     ember = pd.read_csv(ember_csv, low_memory=False)
     ref = ember.loc[
-        ember["Year"].eq(int(year))
+        pd.to_numeric(ember["Year"], errors="coerce").le(int(year))
         & ember["Category"].eq("Electricity generation")
         & ember["Unit"].eq("TWh")
         & ember["Area type"].eq("Country or economy")
         & ember["Variable"].isin(["Solar", "Wind", "Nuclear", "Hydro"])
-    ].copy()
+    ].dropna(subset=["ISO 3 code"]).copy()
+    ref["Year"] = pd.to_numeric(ref["Year"], errors="coerce")
+    ref = (
+        ref.sort_values("Year")
+        .groupby(["ISO 3 code", "Variable"], as_index=False)
+        .tail(1)
+    )
+    if int(year) >= 2025:
+        ref = ref.loc[ref["Year"].ge(2023)].copy()
     ref["country"] = ref["ISO 3 code"].map(iso3_to_iso2)
     ref = ref.loc[ref["country"].notna()].copy()
     ref["technology"] = ref["Variable"].map({"Solar": "solar", "Wind": "wind", "Nuclear": "nuclear", "Hydro": "hydro"})
     ref["reference_twh"] = pd.to_numeric(ref["Value"], errors="coerce")
     ref = ref.dropna(subset=["reference_twh"])
-    return ref.groupby(["country", "technology"], as_index=False)["reference_twh"].sum()
+    return ref.groupby(["country", "technology"], as_index=False).agg(
+        reference_twh=("reference_twh", "sum"),
+        reference_year=("Year", "min"),
+    )
+
+
+def pris_nuclear_reference(pris_csv, year):
+    """Return the PRIS country-generation reference used by the LaTeX table."""
+    pris = pd.read_csv(pris_csv)
+    required = {"generation_year", "country_iso2", "pris_nuclear_generation_twh"}
+    missing = required.difference(pris.columns)
+    if missing:
+        raise ValueError(f"PRIS reference is missing columns: {sorted(missing)}")
+    pris["generation_year"] = pd.to_numeric(pris["generation_year"], errors="coerce")
+    pris = pris.loc[pris["generation_year"].eq(int(year))].copy()
+    if pris.empty:
+        return pd.DataFrame(columns=["country", "reference_twh", "reference_year"])
+    pris["country"] = pris["country_iso2"].astype(str).str.upper().str.strip()
+    pris["reference_twh"] = pd.to_numeric(
+        pris["pris_nuclear_generation_twh"], errors="coerce"
+    )
+    pris = pris.loc[pris["country"].str.len().eq(2)].dropna(subset=["reference_twh"])
+    return pris.groupby("country", as_index=False).agg(
+        reference_twh=("reference_twh", "sum"),
+        reference_year=("generation_year", "min"),
+    )
 
 
 def load_existing(path):
@@ -117,7 +155,13 @@ def main():
     ap.add_argument("--output", default="validation/data/renewable_profile_tuning_overrides.csv")
     ap.add_argument("--existing", default="validation/data/renewable_profile_tuning_overrides.csv")
     ap.add_argument("--ember", default="validation/data/ember_yearly_full_release_long_format.csv")
-    ap.add_argument("--scale-min", default=0.25, type=float)
+    ap.add_argument("--pris", default="validation/data/pris_nuclear_validation.csv")
+    ap.add_argument(
+        "--reset-year",
+        action="store_true",
+        help="Derive the selected year factors from 1.0 rather than compounding existing overrides.",
+    )
+    ap.add_argument("--scale-min", default=0.5, type=float)
     ap.add_argument("--scale-max", default=2.0, type=float)
     ap.add_argument("--solar-scale-min", default=None, type=float)
     ap.add_argument("--solar-scale-max", default=None, type=float)
@@ -129,7 +173,15 @@ def main():
     ap.add_argument("--hydro-scale-max", default=None, type=float)
     ap.add_argument("--min-reference-twh", default=0.1, type=float)
     ap.add_argument("--min-model-twh", default=0.1, type=float)
+    ap.add_argument(
+        "--damping",
+        default=1.0,
+        type=float,
+        help="Exponent on the solved-generation correction ratio; 1.0 is a full update.",
+    )
     args = ap.parse_args()
+    if not 0.0 <= args.damping <= 1.0:
+        ap.error("--damping must lie between 0 and 1")
 
     n = pypsa.Network(args.network)
     model = model_generation_by_country(n)
@@ -138,10 +190,28 @@ def main():
     nuclear_model = model.loc[model["technology"].eq("nuclear"), ["country", "model_twh"]].rename(columns={"model_twh": "nuclear_model_twh"})
     hydro_model = model.loc[model["technology"].eq("hydro")].groupby("country", as_index=False)["model_twh"].sum().rename(columns={"model_twh": "hydro_model_twh"})
     ref = ember_reference(args.ember, args.year)
-    solar_ref = ref.loc[ref["technology"].eq("solar"), ["country", "reference_twh"]].rename(columns={"reference_twh": "solar_reference_twh"})
-    wind_ref = ref.loc[ref["technology"].eq("wind"), ["country", "reference_twh"]].rename(columns={"reference_twh": "wind_reference_twh"})
-    nuclear_ref = ref.loc[ref["technology"].eq("nuclear"), ["country", "reference_twh"]].rename(columns={"reference_twh": "nuclear_reference_twh"})
-    hydro_ref = ref.loc[ref["technology"].eq("hydro"), ["country", "reference_twh"]].rename(columns={"reference_twh": "hydro_reference_twh"})
+
+    def technology_reference(technology):
+        cols = ["country", "reference_twh", "reference_year"]
+        selected = ref.loc[ref["technology"].eq(technology), cols].copy()
+        return selected.rename(columns={
+            "reference_twh": f"{technology}_reference_twh",
+            "reference_year": f"{technology}_reference_year",
+        })
+
+    solar_ref = technology_reference("solar")
+    wind_ref = technology_reference("wind")
+    hydro_ref = technology_reference("hydro")
+    pris_ref = pris_nuclear_reference(args.pris, args.year)
+    if int(args.year) >= 2025 and not pris_ref.empty:
+        nuclear_ref = pris_ref.rename(columns={
+            "reference_twh": "nuclear_reference_twh",
+            "reference_year": "nuclear_reference_year",
+        })
+        nuclear_reference_source = "PRIS"
+    else:
+        nuclear_ref = technology_reference("nuclear")
+        nuclear_reference_source = "Ember"
 
     countries = sorted(set(solar_model.country) | set(wind_model.country) | set(nuclear_model.country) | set(hydro_model.country) | set(solar_ref.country) | set(wind_ref.country) | set(nuclear_ref.country) | set(hydro_ref.country))
     out = pd.DataFrame({"country": countries})
@@ -149,9 +219,15 @@ def main():
     out = out.merge(wind_ref, on="country", how="left").merge(wind_model, on="country", how="left")
     out = out.merge(nuclear_ref, on="country", how="left").merge(nuclear_model, on="country", how="left")
     out = out.merge(hydro_ref, on="country", how="left").merge(hydro_model, on="country", how="left")
+    out["solar_reference_source"] = "Ember"
+    out["wind_reference_source"] = "Ember"
+    out["hydro_reference_source"] = "Ember"
+    out["nuclear_reference_source"] = nuclear_reference_source
 
     existing = load_existing(args.existing)
     current = existing.loc[existing["year"].astype("Int64").eq(args.year)].copy()
+    if args.reset_year:
+        current = pd.DataFrame(columns=current.columns)
     current = current.groupby("country", as_index=False)[["solar_scale", "onwind_scale", "offwind_scale", "nuclear_scale", "hydro_scale"]].mean() if not current.empty else pd.DataFrame(columns=["country", "solar_scale", "onwind_scale", "offwind_scale", "nuclear_scale", "hydro_scale"])
     out = out.merge(current, on="country", how="left")
     for col in ["solar_scale", "onwind_scale", "offwind_scale", "nuclear_scale", "hydro_scale"]:
@@ -166,11 +242,14 @@ def main():
     nuclear_ratio = out["nuclear_reference_twh"] / out["nuclear_model_twh"]
     hydro_ratio = out["hydro_reference_twh"] / out["hydro_model_twh"]
 
-    out["solar_scale_new"] = np.where(solar_valid, out["solar_scale"] * solar_ratio, out["solar_scale"])
-    out["onwind_scale_new"] = np.where(wind_valid, out["onwind_scale"] * wind_ratio, out["onwind_scale"])
-    out["offwind_scale_new"] = np.where(wind_valid, out["offwind_scale"] * wind_ratio, out["offwind_scale"])
-    out["nuclear_scale_new"] = np.where(nuclear_valid, out["nuclear_scale"] * nuclear_ratio, out["nuclear_scale"])
-    out["hydro_scale_new"] = np.where(hydro_valid, out["hydro_scale"] * hydro_ratio, out["hydro_scale"])
+    def damped_update(scale, ratio, valid):
+        return np.where(valid, scale * np.power(ratio, args.damping), scale)
+
+    out["solar_scale_new"] = damped_update(out["solar_scale"], solar_ratio, solar_valid)
+    out["onwind_scale_new"] = damped_update(out["onwind_scale"], wind_ratio, wind_valid)
+    out["offwind_scale_new"] = damped_update(out["offwind_scale"], wind_ratio, wind_valid)
+    out["nuclear_scale_new"] = damped_update(out["nuclear_scale"], nuclear_ratio, nuclear_valid)
+    out["hydro_scale_new"] = damped_update(out["hydro_scale"], hydro_ratio, hydro_valid)
     solar_min = args.scale_min if args.solar_scale_min is None else args.solar_scale_min
     solar_max = args.scale_max if args.solar_scale_max is None else args.solar_scale_max
     wind_min = args.scale_min if args.wind_scale_min is None else args.wind_scale_min
@@ -205,10 +284,11 @@ def main():
 
     audit = out.copy()
     audit.insert(0, "year", args.year)
+    audit["damping"] = args.damping
     audit_path = output.with_name(output.stem + f"_{args.year}_audit.csv")
     audit.to_csv(audit_path, index=False)
     print(f"wrote {output} ({len(final)} rows); audit={audit_path}")
-    print("solar tuned countries", int(solar_valid.sum()), "wind tuned countries", int(wind_valid.sum()), "nuclear tuned countries", int(nuclear_valid.sum()), "hydro tuned countries", int(hydro_valid.sum()))
+    print("damping", args.damping, "solar tuned countries", int(solar_valid.sum()), "wind tuned countries", int(wind_valid.sum()), "nuclear tuned countries", int(nuclear_valid.sum()), "hydro tuned countries", int(hydro_valid.sum()))
 
 
 if __name__ == "__main__":

@@ -142,6 +142,15 @@ def _mirror_file(src: Path, dst: Path, hardlink_first: bool, summary: MirrorSumm
     dst.parent.mkdir(parents=True, exist_ok=True)
     if src.is_symlink():
         os.symlink(os.readlink(src), dst)
+        # Snakemake compares the symlink's own mtime for restored outputs.
+        # Match it to the linked artifact so a fresh scenario is not marked
+        # stale solely because its link was just created.
+        resolved_src = src.resolve()
+        os.utime(
+            dst,
+            ns=(resolved_src.stat().st_atime_ns, resolved_src.stat().st_mtime_ns + 1),
+            follow_symlinks=False,
+        )
         summary.symlinked += 1
         return
     if hardlink_first and _try_hardlink(src, dst):

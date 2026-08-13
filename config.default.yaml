@@ -133,6 +133,10 @@ global_specific:
             schema: owid_energy
             target_column: electricity_demand
         electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
+  wind_solar_capacity_factor_multipliers:
+    enable: false
+    solar: 1.0
+    wind: 1.0
   transmission_capacity_limits:
     enable: false
     audit_dir: validation/results
@@ -143,6 +147,7 @@ global_specific:
     missing_pair_policy: zero_capacity
     fallback_ratio: 0.115
     explicit_zero_policy: zero_capacity
+    domestic_capacity_multiplier: 1.0
     capacity_multiplier_by_year:
       2020: 1.0
       2025: 1.0
@@ -926,6 +931,7 @@ solving:
   options:
     formulation: kirchhoff
     load_shedding: 100 # Set to "false" or willingness to pay in €/kWh, e.g. 100 €/kWh (intersect between macroeconomic and surveybased willingness to pay http://journal.frontiersin.org/article/10.3389/fenrg.2015.00055/full)
+    load_shedding_capacity: 1.0e12 # MW per bus; restores the pre-5eb9e41d feasibility-safeguard bound
     noisy_costs: true
     min_iterations: 4
     max_iterations: 6

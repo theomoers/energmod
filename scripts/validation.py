@@ -30,6 +30,48 @@ STRUCTURAL_BIOMASS_POWER_CARRIERS = (
 _STRUCTURAL_BIOMASS_EFFICIENCY_CACHE = {}
 
 
+def apply_wind_solar_capacity_factor_multipliers(n, investment_year, config):
+    """Apply configured wind/solar availability multipliers after calibration."""
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    cfg = global_cfg.get("wind_solar_capacity_factor_multipliers", {}) or {}
+    if not bool(cfg.get("enable", False)):
+        return
+    requested = {"solar": float(cfg.get("solar", 1.0)), "wind": float(cfg.get("wind", 1.0))}
+    if not isinstance(getattr(n, "meta", None), dict):
+        n.meta = {}
+    marker = n.meta.get("wind_solar_capacity_factor_multipliers_applied")
+    if marker == requested:
+        logger.info("Wind/solar capacity-factor multipliers already applied in %s; skipping duplicate application.", investment_year)
+        return
+    multipliers = {
+        "solar": requested["solar"],
+        "solar rooftop": requested["solar"],
+        "onwind": requested["wind"],
+        "offwind-ac": requested["wind"],
+        "offwind-dc": requested["wind"],
+    }
+    if n.generators.empty or n.generators_t.p_max_pu.empty:
+        return
+    for carrier, multiplier in multipliers.items():
+        if not np.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError(f"wind_solar_capacity_factor_multipliers.{carrier} must be positive")
+        if np.isclose(multiplier, 1.0):
+            continue
+        columns = n.generators.index[n.generators.carrier.astype(str).eq(carrier)]
+        columns = columns.intersection(n.generators_t.p_max_pu.columns)
+        if len(columns):
+            before = float(n.generators_t.p_max_pu.loc[:, columns].mean().mean())
+            n.generators_t.p_max_pu.loc[:, columns] = (
+                n.generators_t.p_max_pu.loc[:, columns] * multiplier
+            ).clip(0.0, 1.0)
+            after = float(n.generators_t.p_max_pu.loc[:, columns].mean().mean())
+            logger.info(
+                "Applied %s capacity-factor multiplier %.3f in %s: mean_cf %.4f -> %.4f",
+                carrier, multiplier, investment_year, before, after
+            )
+    n.meta["wind_solar_capacity_factor_multipliers_applied"] = requested
+
+
 def _get_bus_country_for_clustering(n):
     country = (
         n.buses["country"]
@@ -3301,6 +3343,81 @@ def _transmission_capacity_year_multiplier(cfg, planning_year):
     return max(0.0, parsed[min(parsed)])
 
 
+def _set_validation_ac_line_electrical_parameters(n, line_names):
+    """Give synthetic AC lines the same electrical type as the model grid."""
+    line_names = pd.Index(line_names).intersection(n.lines.index)
+    if line_names.empty:
+        return
+
+    typed_ac = n.lines.loc[
+        n.lines.carrier.astype(str).eq("AC")
+        & n.lines.type.astype(str).ne("")
+    ]
+    if typed_ac.empty:
+        logger.warning(
+            "Could not assign electrical parameters to %d validation AC line(s): "
+            "the network has no typed AC-line template.",
+            len(line_names),
+        )
+        return
+
+    line_type = str(typed_ac["type"].mode().iat[0])
+    if line_type not in n.line_types.index:
+        logger.warning(
+            "Could not assign electrical parameters to %d validation AC line(s): "
+            "line type %s is unavailable.",
+            len(line_names),
+            line_type,
+        )
+        return
+
+    type_data = n.line_types.loc[line_type]
+    f_nom = float(pd.to_numeric(type_data.get("f_nom", 50.0), errors="coerce"))
+    i_nom = float(pd.to_numeric(type_data.get("i_nom", np.nan), errors="coerce"))
+    r_per_km = float(
+        pd.to_numeric(type_data.get("r_per_length", np.nan), errors="coerce")
+    )
+    x_per_km = float(
+        pd.to_numeric(type_data.get("x_per_length", np.nan), errors="coerce")
+    )
+    c_per_km = float(
+        pd.to_numeric(type_data.get("c_per_length", 0.0), errors="coerce")
+    )
+    if not all(np.isfinite(value) for value in (f_nom, i_nom, r_per_km, x_per_km)):
+        logger.warning(
+            "Could not assign electrical parameters to %d validation AC line(s): "
+            "line type %s has incomplete data.",
+            len(line_names),
+            line_type,
+        )
+        return
+
+    for line_name in line_names:
+        line = n.lines.loc[line_name]
+        length = max(
+            float(pd.to_numeric(line.get("length", 1.0), errors="coerce") or 1.0),
+            1.0,
+        )
+        v_nom = float(
+            pd.to_numeric(n.buses.at[line.bus0, "v_nom"], errors="coerce")
+        )
+        nominal = max(
+            float(pd.to_numeric(line.get("s_nom", 0.0), errors="coerce") or 0.0),
+            0.0,
+        )
+        circuit_capacity = np.sqrt(3.0) * v_nom * i_nom
+        num_parallel = max(
+            nominal / circuit_capacity if circuit_capacity > 0.0 else 0.0,
+            1.0,
+        )
+        n.lines.loc[line_name, ["type", "num_parallel"]] = [line_type, num_parallel]
+        n.lines.loc[line_name, "r"] = r_per_km * length / num_parallel
+        n.lines.loc[line_name, "x"] = x_per_km * length / num_parallel
+        n.lines.loc[line_name, "b"] = (
+            2.0 * np.pi * 1e-9 * f_nom * c_per_km * length * num_parallel
+        )
+
+
 def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
     """Apply GTD cross-border and domestic AC line stock by planning year."""
     bus_country = _bus_country_lookup(n).fillna("").astype(str).str.upper()
@@ -3361,9 +3478,6 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
         ac_lines = n.lines.loc[n.lines.carrier.astype(str).eq("AC")].copy()
         template = ac_lines.iloc[0] if not ac_lines.empty else pd.Series(dtype=object)
         template_length = max(float(pd.to_numeric(template.get("length", 1.0), errors="coerce") or 1.0), 1.0)
-        x_per_km = float(pd.to_numeric(template.get("x", 0.0), errors="coerce") or 0.0) / template_length
-        r_per_km = float(pd.to_numeric(template.get("r", 0.0), errors="coerce") or 0.0) / template_length
-        b_per_km = float(pd.to_numeric(template.get("b", 0.0), errors="coerce") or 0.0) / template_length
         cost_per_km = float(pd.to_numeric(template.get("capital_cost", 0.0), errors="coerce") or 0.0) / template_length
 
         for pair, row in gtd.iterrows():
@@ -3398,8 +3512,7 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
                 "Line", name, bus0=bus0, bus1=bus1, carrier="AC",
                 s_nom=nominal_mw, s_nom_min=nominal_mw, s_nom_max=(nominal_mw if historical_year else max_mw),
                 s_nom_extendable=not historical_year, s_max_pu=s_max_pu_value, length=length,
-                x=max(abs(x_per_km) * length, 1e-6), r=max(abs(r_per_km) * length, 1e-6),
-                b=max(abs(b_per_km) * length, 0.0), capital_cost=max(cost_per_km * length, 0.0),
+                capital_cost=max(cost_per_km * length, 0.0),
                 build_year=0, lifetime=1000.0,
             )
             added_lines += 1
@@ -3432,6 +3545,13 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
     missing_policy = str(cfg.get("missing_pair_policy", "zero_capacity")).lower()
     explicit_zero_policy = str(cfg.get("explicit_zero_policy", "zero_capacity")).lower()
     year_multiplier = _transmission_capacity_year_multiplier(cfg, planning_year)
+    domestic_capacity_multiplier = float(cfg.get("domestic_capacity_multiplier", 1.0))
+    if not np.isfinite(domestic_capacity_multiplier) or domestic_capacity_multiplier < 0.0:
+        logger.warning(
+            "Invalid domestic transmission capacity multiplier %r; using 1.0",
+            domestic_capacity_multiplier,
+        )
+        domestic_capacity_multiplier = 1.0
 
     audit_rows = []
     matched = explicit_zero = fallback = 0
@@ -3440,6 +3560,7 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
 
     for pair, pair_nom in pair_model_nom.items():
         pair_lines = line_pairs.index[line_pairs == pair]
+        is_domestic_pair = country0.loc[pair_lines].eq(country1.loc[pair_lines]).all()
         if pair in gtd.index:
             gtd_row = gtd.loc[pair]
             target_effective = float(gtd_row["gtd_total_available_mw"])
@@ -3469,10 +3590,11 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
             fallback += 1
 
         target_effective_before_multiplier = max(0.0, target_effective)
+        if is_domestic_pair:
+            target_effective_before_multiplier *= domestic_capacity_multiplier
         target_effective = target_effective_before_multiplier * year_multiplier
         target_nominal_pair = target_effective / s_max_pu_value if target_effective > 0.0 else 0.0
         base_nominal_pair = target_effective_before_multiplier / s_max_pu_value if target_effective_before_multiplier > 0.0 else 0.0
-        is_domestic_pair = country0.loc[pair_lines].eq(country1.loc[pair_lines]).all()
         weights = original_s_nom.loc[pair_lines]
         if is_domestic_pair or float(weights.sum()) <= 0.0:
             line_targets = pd.Series(target_nominal_pair / len(pair_lines), index=pair_lines)
@@ -3510,6 +3632,7 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
                 "gtd_existing_mw": gtd_existing,
                 "gtd_planned_available_mw": gtd_planned,
                 "capacity_year_multiplier": year_multiplier,
+                "domestic_capacity_multiplier": domestic_capacity_multiplier if is_domestic_pair else 1.0,
                 "target_effective_cap_before_multiplier_mw": target_effective_before_multiplier,
                 "target_effective_cap_mw": target_effective,
                 "target_nominal_cap_mw": target_nominal_pair,
@@ -3518,6 +3641,12 @@ def apply_gtd_line_adjustments(n, planning_year, config, s_max_pu=None):
                 "target_to_model_effective_ratio": target_effective / (float(pair_nom) * s_max_pu_value) if pair_nom > 0.0 else np.nan,
             }
         )
+
+    synthetic_lines = n.lines.index[
+        n.lines.index.astype(str).str.startswith("GTD ")
+        & n.lines.carrier.astype(str).eq("AC").to_numpy()
+    ]
+    _set_validation_ac_line_electrical_parameters(n, synthetic_lines)
 
     audit = pd.DataFrame(audit_rows)
     audit_dir = _transmission_audit_dir(cfg)
@@ -3547,13 +3676,27 @@ def apply_manual_validation_line_adjustments(n, planning_year, config=None):
     bus0, bus1 = "PS 0", "IL 0"
     line_name = "PS 0 IL 0 validation AC"
     capacity_mw = 5_000.0
+    planning_year = int(planning_year)
+
+    global_cfg = config.get("global_specific", {}) if isinstance(config, dict) else {}
+    transmission_cfg = (
+        global_cfg.get("transmission_capacity_limits", {})
+        if isinstance(global_cfg, dict)
+        else {}
+    )
+    year_multiplier = _transmission_capacity_year_multiplier(
+        transmission_cfg if isinstance(transmission_cfg, dict) else {},
+        planning_year,
+    )
+    historical_year = planning_year in {2020, 2025}
+    maximum_mw = capacity_mw if historical_year else capacity_mw * year_multiplier
 
     if bus0 not in n.buses.index or bus1 not in n.buses.index:
         logger.warning(
             "Manual validation AC connection skipped for %s-%s in %s: bus missing.",
             bus0,
             bus1,
-            int(planning_year),
+            planning_year,
         )
         return n
 
@@ -3564,8 +3707,28 @@ def apply_manual_validation_line_adjustments(n, planning_year, config=None):
     ]
     if len(existing):
         target = existing[0]
-        n.lines.loc[target, ["s_nom", "s_nom_min", "s_nom_max"]] = capacity_mw
-        n.lines.loc[target, "s_nom_extendable"] = False
+        current = float(
+            pd.to_numeric(
+                n.lines.loc[[target], "s_nom"], errors="coerce"
+            ).fillna(0.0).iloc[0]
+        )
+        previous_min = float(
+            pd.to_numeric(
+                n.lines.loc[[target], "s_nom_min"], errors="coerce"
+            ).fillna(0.0).iloc[0]
+        )
+        installed_mw = (
+            capacity_mw
+            if historical_year
+            else max(capacity_mw, current, previous_min)
+        )
+        n.lines.loc[target, ["s_nom", "s_nom_min", "s_nom_max"]] = [
+            installed_mw,
+            installed_mw,
+            max(maximum_mw, installed_mw),
+        ]
+        n.lines.loc[target, "s_nom_extendable"] = not historical_year
+        _set_validation_ac_line_electrical_parameters(n, [target])
         return n
 
     template = ac_lines.iloc[0] if not ac_lines.empty else pd.Series(dtype=object)
@@ -3573,19 +3736,25 @@ def apply_manual_validation_line_adjustments(n, planning_year, config=None):
         float(pd.to_numeric(template.get("length", 1.0), errors="coerce") or 1.0),
         1.0,
     )
-    x_per_km = float(pd.to_numeric(template.get("x", 0.0), errors="coerce") or 0.0) / template_length
-    r_per_km = float(pd.to_numeric(template.get("r", 0.0), errors="coerce") or 0.0) / template_length
-    b_per_km = float(pd.to_numeric(template.get("b", 0.0), errors="coerce") or 0.0) / template_length
     cost_per_km = float(
         pd.to_numeric(template.get("capital_cost", 0.0), errors="coerce") or 0.0
     ) / template_length
 
-    coords = n.buses.loc[[bus0, bus1], ["x", "y"]].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    coords = (
+        n.buses.loc[[bus0, bus1], ["x", "y"]]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
     x0, y0 = coords.loc[bus0]
     x1, y1 = coords.loc[bus1]
     mean_lat = np.deg2rad((y0 + y1) / 2.0)
     length = max(
-        float(np.hypot((x1 - x0) * 111.32 * np.cos(mean_lat), (y1 - y0) * 111.32)),
+        float(
+            np.hypot(
+                (x1 - x0) * 111.32 * np.cos(mean_lat),
+                (y1 - y0) * 111.32,
+            )
+        ),
         1.0,
     )
     n.add(
@@ -3596,19 +3765,20 @@ def apply_manual_validation_line_adjustments(n, planning_year, config=None):
         carrier="AC",
         s_nom=capacity_mw,
         s_nom_min=capacity_mw,
-        s_nom_max=capacity_mw,
-        s_nom_extendable=False,
-        s_max_pu=float(pd.to_numeric(template.get("s_max_pu", 0.7), errors="coerce") or 0.7),
+        s_nom_max=maximum_mw,
+        s_nom_extendable=not historical_year,
+        s_max_pu=float(
+            pd.to_numeric(template.get("s_max_pu", 0.7), errors="coerce") or 0.7
+        ),
         length=length,
-        x=max(abs(x_per_km) * length, 1e-6),
-        r=max(abs(r_per_km) * length, 1e-6),
-        b=max(abs(b_per_km) * length, 0.0),
         capital_cost=max(cost_per_km * length, 0.0),
         build_year=0,
         lifetime=1000.0,
     )
-    logger.info("Added manual Palestine-Israel AC validation line for %s.", int(planning_year))
+    _set_validation_ac_line_electrical_parameters(n, [line_name])
+    logger.info("Added manual Palestine-Israel AC validation line for %s.", planning_year)
     return n
+
 
 def apply_gtd_transmission_capacity_limits(n, planning_year, config, s_max_pu=None):
     """Backward-compatible alias for the shared GTD line-adjustment hook."""
@@ -4629,7 +4799,7 @@ def _read_renewable_profile_tuning_table(config, investment_year):
         logger.warning("%s Profiles remain unscaled.", message)
         return None, cfg
 
-    default_min_scale = float(cfg.get("scale_min", 0.25))
+    default_min_scale = float(cfg.get("scale_min", 0.5))
     default_max_scale = float(cfg.get("scale_max", 2.0))
     bounds = {
         "solar_scale": (
@@ -5994,19 +6164,36 @@ def repair_undersized_bev_chargers(n, investment_year, config=None, context=""):
 
 
 def apply_final_historical_capacity_validation_fixes(n, investment_year, config, context=""):
-    """Re-apply historical capacity validation after baseyear/brownfield stock edits."""
+    """Apply historical capacity validation after baseyear/brownfield stock edits.
+
+    Historical reference data materialises the 2020 and 2025 starting stock.
+    Forecast years instead inherit the preceding solved stock and expand under
+    the normal model rules.
+    """
     year = int(investment_year)
     label = f" for {context}" if context else ""
     logger.info("Applying final historical capacity validation fixes for %s%s.", year, label)
 
+    historical_year = year in {2020, 2025}
     _repair_fossil_link_fuel_buses(n)
-    apply_pris_nuclear_capacity_and_availability(n, year, config)
-    apply_gogpt_oil_capacity_fix(n, year, config)
-    # Brownfield materializes the 2025 bioenergy stock in the single dedicated
-    # 2025 capacity hook before the historical-capacity freeze below.
-    if not (year == 2025 and context == "add_brownfield"):
-        apply_ember_bioenergy_capacity_fix(n, year, config)
+    if historical_year:
+        apply_pris_nuclear_capacity_and_availability(n, year, config)
+        apply_gogpt_oil_capacity_fix(n, year, config)
+        # Brownfield materializes the 2025 bioenergy stock in the single
+        # dedicated 2025 capacity hook before this historical freeze.
+        if not (year == 2025 and context == "add_brownfield"):
+            apply_ember_bioenergy_capacity_fix(n, year, config)
+    else:
+        logger.info(
+            "Skipped historical capacity materialization for forecast year %s%s.",
+            year,
+            label,
+        )
 
+    # EV demand changes in every planning horizon, including forecast years.
+    # Recheck inherited fixed charger capacity after the year-specific demand
+    # profiles have been applied, rather than limiting this feasibility repair
+    # to the two historical-stock years.
     repair_undersized_bev_chargers(
         n,
         investment_year=year,
@@ -6063,6 +6250,187 @@ def apply_final_historical_capacity_validation_fixes(n, investment_year, config,
                 "Set p_nom_min=p_nom for %d fossil generators after historical validation.",
                 len(fossil_assets),
             )
+
+
+def remove_fixed_zero_capacity_components(n, tolerance=1e-9, context=""):
+    """Remove fixed zero-capacity placeholders before export or optimization.
+
+    Historical validation deliberately freezes materialized stock. Freezing every
+    template also turns zero-capacity build placeholders into permanent assets;
+    they have no feasible dispatch but otherwise create one row per snapshot.
+    Extendable zero-capacity assets are retained because they are valid future
+    build options. A battery Store and its charger/discharger Links are removed
+    only as a complete, fixed-zero triplet. Passive branches and other storage
+    are deliberately retained because removing them can change topology or
+    initial-state logic.
+    """
+    tolerance = float(tolerance)
+
+    def fixed_zero_mask(table, nominal_col, minimum_col, extendable_col):
+        if table is None or table.empty or nominal_col not in table.columns:
+            return pd.Series(False, index=getattr(table, "index", pd.Index([])))
+        extendable = (
+            table[extendable_col].fillna(False).astype(bool)
+            if extendable_col in table.columns
+            else pd.Series(False, index=table.index)
+        )
+        nominal = pd.to_numeric(table[nominal_col], errors="coerce")
+        minimum = (
+            pd.to_numeric(table[minimum_col], errors="coerce")
+            if minimum_col in table.columns
+            else pd.Series(0.0, index=table.index)
+        )
+        well_formed = (
+            nominal.notna()
+            & minimum.notna()
+            & np.isfinite(nominal)
+            & np.isfinite(minimum)
+            & nominal.ge(0.0)
+            & minimum.ge(0.0)
+        )
+        return (
+            ~extendable
+            & well_formed
+            & nominal.abs().le(tolerance)
+            & minimum.abs().le(tolerance)
+        )
+
+    removed = {"Generator": 0, "Link": 0, "Store": 0}
+
+    # Battery assets form one logical component. Removing only a Store or one
+    # conversion Link would leave a malformed partial battery in the network.
+    stores = getattr(n, "stores", None)
+    links = getattr(n, "links", None)
+    if (
+        stores is not None
+        and not stores.empty
+        and links is not None
+        and not links.empty
+        and "carrier" in stores.columns
+        and "carrier" in links.columns
+    ):
+        zero_stores = fixed_zero_mask(
+            stores, "e_nom", "e_nom_min", "e_nom_extendable"
+        )
+        zero_links = fixed_zero_mask(
+            links, "p_nom", "p_nom_min", "p_nom_extendable"
+        )
+
+        store_names = stores.index[
+            stores.carrier.astype(str).str.lower().eq("battery")
+            & zero_stores
+            & stores.index.astype(str).str.endswith(" battery")
+        ]
+        charger_names = links.index[
+            links.carrier.astype(str).str.lower().eq("battery charger")
+            & zero_links
+            & links.index.astype(str).str.endswith(" battery charger")
+        ]
+        discharger_names = links.index[
+            links.carrier.astype(str).str.lower().eq("battery discharger")
+            & zero_links
+            & links.index.astype(str).str.endswith(" battery discharger")
+        ]
+
+        stores_by_key = {
+            str(name)[: -len(" battery")]: name for name in store_names
+        }
+        chargers_by_key = {
+            str(name)[: -len(" battery charger")]: name for name in charger_names
+        }
+        dischargers_by_key = {
+            str(name)[: -len(" battery discharger")]: name
+            for name in discharger_names
+        }
+        complete_keys = (
+            stores_by_key.keys()
+            & chargers_by_key.keys()
+            & dischargers_by_key.keys()
+        )
+
+        valid_keys = []
+        for key in sorted(complete_keys):
+            store = stores_by_key[key]
+            charger = chargers_by_key[key]
+            discharger = dischargers_by_key[key]
+            store_bus = str(stores.at[store, "bus"])
+            charger_bus = str(links.at[charger, "bus1"])
+            discharger_bus = str(links.at[discharger, "bus0"])
+            if store_bus == charger_bus == discharger_bus:
+                valid_keys.append(key)
+            else:
+                logger.warning(
+                    "Preserving zero-capacity battery triplet %s because its "
+                    "Store/charger/discharger buses do not match.",
+                    key,
+                )
+
+        if valid_keys:
+            battery_links = [
+                name
+                for key in valid_keys
+                for name in (chargers_by_key[key], dischargers_by_key[key])
+            ]
+            battery_stores = [stores_by_key[key] for key in valid_keys]
+            n.mremove("Link", battery_links)
+            n.mremove("Store", battery_stores)
+            removed["Link"] += len(battery_links)
+            removed["Store"] += len(battery_stores)
+
+    specs = (
+        ("Generator", "generators", "p_nom", "p_nom_min", "p_nom_extendable"),
+        ("Link", "links", "p_nom", "p_nom_min", "p_nom_extendable"),
+    )
+    for component, table_name, nominal_col, minimum_col, extendable_col in specs:
+        table = getattr(n, table_name, None)
+        if table is None or table.empty or nominal_col not in table.columns:
+            continue
+
+        nominal = pd.to_numeric(table[nominal_col], errors="coerce")
+        minimum = (
+            pd.to_numeric(table[minimum_col], errors="coerce")
+            if minimum_col in table.columns
+            else pd.Series(0.0, index=table.index)
+        )
+        malformed = (
+            nominal.isna()
+            | minimum.isna()
+            | ~np.isfinite(nominal)
+            | ~np.isfinite(minimum)
+            | nominal.lt(0.0)
+            | minimum.lt(0.0)
+        )
+        if malformed.any():
+            logger.warning(
+                "Preserving %d malformed %s capacity row(s) during fixed-zero cleanup.",
+                int(malformed.sum()),
+                component,
+            )
+        protected = pd.Series(False, index=table.index)
+        if component == "Link" and "carrier" in table.columns:
+            protected = table.carrier.astype(str).str.lower().isin(
+                {"battery charger", "battery discharger"}
+            )
+        names = table.index[
+            fixed_zero_mask(table, nominal_col, minimum_col, extendable_col)
+            & ~malformed
+            & ~protected
+        ]
+        if len(names):
+            n.mremove(component, names)
+        removed[component] += int(len(names))
+
+    total = sum(removed.values())
+    if total:
+        label = f" for {context}" if context else ""
+        logger.info(
+            "Removed %d fixed zero-capacity component(s)%s: %s",
+            total,
+            label,
+            removed,
+        )
+    return removed
+
 
 def apply_final_validation_network_fixes(n, investment_year, config=None, context=""):
     """Repair small validation-network topology/fuel gaps after stock edits.

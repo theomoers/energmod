@@ -177,7 +177,8 @@ def normalize_run_entry(raw_run: dict, baseline: dict, config: dict) -> dict:
 
     scenario_prefix = str((config.get("ensemble", {}) or {}).get("scenario_prefix", "sens")).strip()
     scenario_name = str(run.get("scenario_name") or f"{scenario_prefix}_{run_id}").strip()
-    sector_name = str(run.get("sector_name") or resolve_scenario_sector_name(scenario_name)).strip()
+    sector_root = str(run.get("sector_root") or (config.get("ensemble", {}) or {}).get("sector_root") or "Global_200").strip()
+    sector_name = str(run.get("sector_name") or resolve_scenario_sector_name(scenario_name, sector_root=sector_root)).strip()
 
     overlay = deepcopy(baseline_run.get("config_overrides", {}) or {})
     deep_update(overlay, run.get("config_overrides", {}) or {})
@@ -817,7 +818,15 @@ def build_snakemake_cmd(
         "--rerun-trigger",
         "code",
         "params",
-        "input",
+        "--allowed-rules",
+        "solve_sector_networks_myopic_stochastic_branch",
+        "solve_network_myopic",
+        "add_brownfield",
+        "apply_learning_costs",
+        "export_postsolve_learning_costs_seeded_bootstrap",
+        "export_postsolve_learning_costs",
+        "export_stochastic_run_bundle",
+        "cleanup_stochastic_branch_raw_artifacts",
     ]
     if dry_run:
         cmd.append("-n")

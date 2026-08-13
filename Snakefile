@@ -79,32 +79,23 @@ def get_tsam_clustering_path(wildcards):
 
 
 def get_learning_enabled():
-    """
-    Check if learning is enabled in the configuration.
-    
-    Returns:
-        True if learning is enabled, False otherwise
-    """
-    try:
-        with open("config.learning.yaml", "r") as f:
-            learning_config = yaml.safe_load(f)
-        return learning_config.get("learning", {}).get("enabled", False)
-    except FileNotFoundError:
-        return False
+    """Check whether learning is enabled in the effective merged config."""
+    return bool((config.get("learning", {}) or {}).get("enabled", False))
 
 
 def get_learning_anchor_year():
     """
     Read the anchor year used for learning-rate scenario recalibration.
-    Defaults to the first planning horizon when config.learning.yaml is unavailable.
+    Defaults to the first planning horizon when no anchor is configured.
     """
-    try:
-        with open("config.learning.yaml", "r") as f:
-            learning_config = yaml.safe_load(f) or {}
-        beta_cfg = learning_config.get("learning", {}).get("beta_adjustment", {}) or {}
-        return int(beta_cfg.get("anchor_year", config["scenario"]["planning_horizons"][0]))
-    except FileNotFoundError:
-        return int(config["scenario"]["planning_horizons"][0])
+    learning_config = config.get("learning", {}) or {}
+    beta_cfg = learning_config.get("beta_adjustment", {}) or {}
+    return int(
+        beta_cfg.get(
+            "anchor_year",
+            config["scenario"]["planning_horizons"][0],
+        )
+    )
 
 
 HTTP = HTTPRemoteProvider()
@@ -166,7 +157,7 @@ def ln_cp():
   fi
   mkdir -p "$(dirname "$dst")"
   if abs_src="$(readlink -f "$src" 2>/dev/null)"; then
-    ( ln -sf "$abs_src" "$dst" 2>/dev/null ) || {{ rm -f "$dst"; cp -a "$src" "$dst"; }}
+    ( ln -sf "$abs_src" "$dst" 2>/dev/null && touch -h -d "@$(( $(stat -c %Y "$src") + 1 ))" "$dst" ) || {{ rm -f "$dst"; cp -a "$src" "$dst"; }}
   else
     rm -f "$dst"
     cp -a "$src" "$dst"
@@ -2493,7 +2484,7 @@ if need_perm("base_energy_totals"):
             unsd_export_path = directory("data/demand/unsd/data/"),
         shell:
             ln_cp() + r' <<< "{}" "{}"; '.format("{input.energy_totals_base}", "{output.energy_totals_base}") + \
-            r'cp -r "{input.unsd_data}" "{output.unsd_export_path}"'
+            r'cp -r "{input.unsd_data}" "{output.unsd_export_path}"; touch -d "@$(( $(stat -c %Y "{input.energy_totals_base}") + 1 ))" "{output.unsd_export_path}"'
 else:
     rule build_base_energy_totals:
         params:
@@ -3602,7 +3593,6 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
                     snapshots=config["snapshots"],
                     carriers=config["electricity"]["renewable_carriers"],
                 input:
-                    simplify_busmap="resources/" + RDIR + "bus_regions/busmap_elec_s{simpl}.csv",
                     cluster_busmap="resources/"
                     + RDIR
                     + "bus_regions/busmap_elec_s{simpl}_{clusters}.csv",
@@ -3819,7 +3809,6 @@ if config["foresight"] == "myopic" and not is_rolling_horizon_enabled():
             carriers=config["electricity"]["renewable_carriers"],
         input:
             # unpack(input_profile_tech_brownfield),
-            simplify_busmap="resources/" + RDIR + "bus_regions/busmap_elec_s{simpl}.csv",
             cluster_busmap="resources/"
             + RDIR
             + "bus_regions/busmap_elec_s{simpl}_{clusters}.csv",
@@ -4294,7 +4283,6 @@ if config["foresight"] == "myopic" and is_rolling_horizon_enabled():
             snapshots=config["snapshots"],
             carriers=config["electricity"]["renewable_carriers"],
         input:
-            simplify_busmap="resources/" + RDIR + "bus_regions/busmap_elec_s{simpl}.csv",
             cluster_busmap="resources/"
             + RDIR
             + "bus_regions/busmap_elec_s{simpl}_{clusters}.csv",

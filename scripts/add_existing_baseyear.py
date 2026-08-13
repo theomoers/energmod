@@ -43,6 +43,25 @@ if hasattr(_validation_hooks, "_replace_zero_profile_columns_with_nearest"):
     logger.info("Using centralized profile fallback hook from scripts/validation.py")
 
 
+def _wind_solar_capacity_factor_multiplier(config, generator):
+    """Return the configured absolute availability multiplier for a renewable."""
+    cfg = (config.get("global_specific", {}) or {}).get(
+        "wind_solar_capacity_factor_multipliers", {}
+    ) or {}
+    if not bool(cfg.get("enable", False)):
+        return 1.0
+    generator = str(generator)
+    if generator not in {"solar", "onwind", "offwind"}:
+        return 1.0
+    key = "solar" if generator == "solar" else "wind"
+    multiplier = float(cfg.get(key, 1.0))
+    if not np.isfinite(multiplier) or multiplier <= 0.0:
+        raise ValueError(
+            f"wind_solar_capacity_factor_multipliers.{key} must be positive"
+        )
+    return multiplier
+
+
 def load_country_waccs(wacc_path):
     """
     Load country-specific WACCs for renewable technologies.
@@ -800,8 +819,10 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                             p_max_pu.columns = [bus + f" {generator}{suffix}-{grouping_year}" for bus in new_capacity.index]
                         else:
                             # Ultimate fallback: use 1.0 for all timesteps
-                            logger.warning(f"No p_max_pu reference data found for {generator}, using 1.0 for all timesteps")
-                            p_max_pu = pd.DataFrame(1.0, index=n.snapshots, 
+                            logger.warning(f"No p_max_pu reference data found for {generator}; using the configured CF fallback for all timesteps")
+                            p_max_pu = pd.DataFrame(
+                                _wind_solar_capacity_factor_multiplier(snakemake.config, generator),
+                                index=n.snapshots,
                                                     columns=[bus + f" {generator}{suffix}-{grouping_year}" for bus in new_capacity.index])
                     else:
                         # Use available reference data
@@ -822,7 +843,9 @@ def add_power_capacities_installed_before_baseyear(n, grouping_years, costs, bas
                             else:
                                 # Use 1.0
                                 for bus in missing_buses:
-                                    p_max_pu[bus + f" {generator}{suffix}-{grouping_year}"] = 1.0
+                                    p_max_pu[bus + f" {generator}{suffix}-{grouping_year}"] = (
+                                        _wind_solar_capacity_factor_multiplier(snakemake.config, generator)
+                                    )
 
                     # Handle profiles that exist but are all-zero (e.g. JP/TW onwind),
                     # by borrowing the nearest non-zero profile from the same technology.
@@ -1547,14 +1570,20 @@ if __name__ == "__main__":
     # Freeze selected historical electricity-conversion links after final validation.
     if int(baseyear) == 2020 and hasattr(n, "links") and not n.links.empty:
         links = n.links
-        carriers_to_freeze = {"biomass", "biomass EOP", "urban central solid biomass CHP", "urban central solid biomass CHP CC", "CCGT", "coal", "lignite", "OCGT", "oil"}
-        assets = links.index[links.carrier.astype(str).isin(carriers_to_freeze)]
+        carriers_to_freeze = {"biomass", "biomass EOP", "urban central solid biomass CHP", "urban central solid biomass CHP CC", "CCGT", "coal", "lignite", "OCGT", "oil", "H2 Fuel Cell"}
+        capacity = pd.to_numeric(links["p_nom"], errors="coerce")
+        assets = links.index[
+            links.carrier.astype(str).isin(carriers_to_freeze)
+            & capacity.notna()
+            & np.isfinite(capacity)
+            & capacity.gt(1e-9)
+        ]
         if len(assets):
             if "p_nom_extendable" not in links.columns:
                 links["p_nom_extendable"] = False
             if "p_nom_min" not in links.columns:
                 links["p_nom_min"] = 0.0
-            p_nom = pd.to_numeric(links.loc[assets, "p_nom"], errors="coerce").fillna(0.0)
+            p_nom = capacity.loc[assets]
             links.loc[assets, "p_nom_min"] = p_nom.to_numpy()
             links.loc[assets, "p_nom_extendable"] = False
             links["p_nom_extendable"] = links["p_nom_extendable"].fillna(False).astype(bool)
@@ -1564,6 +1593,12 @@ if __name__ == "__main__":
                 len(assets),
                 sorted(carriers_to_freeze),
             )
+
+    if hasattr(_validation_hooks, "remove_fixed_zero_capacity_components"):
+        _validation_hooks.remove_fixed_zero_capacity_components(
+            n,
+            context="add_existing_baseyear export",
+        )
 
     # Preserve existing n.meta entries (e.g., temporal_cluster_period_id) before updating
     if not hasattr(n, 'meta') or n.meta is None:

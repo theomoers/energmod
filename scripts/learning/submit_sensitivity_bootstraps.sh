@@ -21,4 +21,7 @@ submit_bootstrap() {
 submit_bootstrap AB bootstrap_AB
 submit_bootstrap DF bootstrap_DF --overlay-config configs/sensitivity_bootstrap_DF.yaml
 submit_bootstrap NZ bootstrap_NZ --overlay-config configs/sensitivity_bootstrap_NZ.yaml
-submit_bootstrap CO2CAP bootstrap_CO2CAP --overlay-config configs/sensitivity_bootstrap_CO2CAP.yaml
+submit_bootstrap TX0 bootstrap_TX0 --overlay-config configs/sensitivity_bootstrap_TX0.yaml
+submit_bootstrap TX1 bootstrap_TX1 --overlay-config configs/sensitivity_bootstrap_TX1.yaml
+submit_bootstrap TD0 bootstrap_TD0 --overlay-config configs/sensitivity_bootstrap_TD0.yaml
+submit_bootstrap TD1 bootstrap_TD1 --overlay-config configs/sensitivity_bootstrap_TD1.yaml

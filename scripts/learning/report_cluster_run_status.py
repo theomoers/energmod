@@ -15,7 +15,7 @@ from bootstrap_state_store import resolve_scenario_sector_name
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 LEGACY_RESULTS_DIR = ROOT_DIR / "results" / "Global_200"
-LOG_PATTERN = re.compile(r"run_learning_cluster_array_task\.sh\.(?P<stream>[oe])(?P<jobid>\d+)\.(?P<taskid>\d+)$")
+LOG_PATTERN = re.compile(r"run_learning_(?:cluster|sensitivity_ensemble)_array_task\.sh\.(?P<stream>[oe])(?P<jobid>\d+)\.(?P<taskid>\d+)$")
 RULE_BLOCK_RE = re.compile(
     r"rule (?P<rule>[A-Za-z0-9_]+):(?P<body>.*?)(?=\n\[|\nrule |\Z)",
     re.DOTALL,
@@ -106,6 +106,13 @@ def load_planning_horizons() -> list[int]:
     return years or [2020, 2025, 2030, 2035, 2040, 2045, 2050]
 
 
+def task_seed(task: dict) -> int:
+    value = task.get("seed", task.get("learning_seed"))
+    if value is None:
+        raise KeyError("task manifest requires seed or learning_seed")
+    return int(value)
+
+
 def token_for_seed(model: str, seed: int) -> str:
     if model == "legacy_curve":
         return "deterministic"
@@ -113,19 +120,28 @@ def token_for_seed(model: str, seed: int) -> str:
 
 
 def _task_results_dirs(task: dict, base_results_dirs: list[Path] | None) -> list[Path]:
-    candidates = list(base_results_dirs or [])
+    # Prefer the fully resolved per-task sector path. This avoids scanning all
+    # sensitivity sectors for every task and supports non-default sector roots.
+    # Compact completion markers are archived at archive_sector_name, whereas
+    # sector_name points at the per-draw working directory.
+    sector_name = str(task.get("archive_sector_name", "")).strip()
+    if not sector_name:
+        sector_name = str(task.get("sector_name", "")).strip()
+    if not sector_name:
+        sector_name = str(task.get("resolved_sector_name", "")).strip()
+    if sector_name:
+        return [(ROOT_DIR / "results" / Path(sector_name)).resolve()]
     scenario = str(task.get("scenario_name", "")).strip()
     if scenario:
-        candidates.insert(0, (ROOT_DIR / "results" / Path(resolve_scenario_sector_name(scenario))).resolve())
-    if not candidates:
-        candidates.append(LEGACY_RESULTS_DIR.resolve())
-    return _dedupe_paths(candidates)
-
+        return [(ROOT_DIR / "results" / Path(resolve_scenario_sector_name(scenario))).resolve()]
+    if base_results_dirs:
+        return _dedupe_paths(list(base_results_dirs))
+    return [LEGACY_RESULTS_DIR.resolve()]
 
 def compact_complete(task: dict, results_dirs: list[Path] | None = None) -> bool:
     scenario = str(task["scenario_name"])
     model = str(task["model"])
-    token = token_for_seed(model, int(task["seed"]))
+    token = token_for_seed(model, task_seed(task))
     for results_dir in _task_results_dirs(task, results_dirs):
         compact_dir = results_dir / "learning-compact" / scenario / model / f"seed_{token}"
         if list(compact_dir.glob("raw_cleanup_complete*.txt")):
@@ -141,7 +157,7 @@ def fallback_complete(task: dict, horizons: list[int]) -> bool:
 
 def collect_logs(logs_dir: Path) -> dict[int, TaskLogInfo]:
     info: dict[int, TaskLogInfo] = {}
-    for path in logs_dir.glob("run_learning_cluster_array_task.sh.*"):
+    for path in logs_dir.glob("run_learning_*_array_task.sh.*"):
         match = LOG_PATTERN.match(path.name)
         if not match:
             continue
@@ -336,7 +352,7 @@ def summarize(submit_dir: Path, tasks: list[dict]) -> str:
         rows.append(
             {
                 "task": idx,
-                "seed": task["seed"],
+                "seed": task_seed(task),
                 "status": display_status if status == "failed" else status,
                 "stage": stage,
                 "job": job,

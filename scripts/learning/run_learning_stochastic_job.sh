@@ -15,6 +15,8 @@ Environment variables:
   JOBS                 Snakemake parallelism override
   NSLOTS               Cluster slot count fallback when JOBS is unset
   LEARNING_SECTOR_NAME Override the shared sector_name (default: Global_200)
+  LEARNING_EFFECTIVE_CONFIG Immutable merged config snapshot from the array submitter
+  LEARNING_CONFIG_OVERLAY  Legacy single-overlay fallback
 
 Modes:
   full    Run the full seeded learning chain
@@ -171,17 +173,50 @@ if [[ -n "$COST_EXPECTATION_MODE" || -n "$COST_EXPECTATION_WEIGHTS" || -n "$COST
   } >>"$OVERLAY_FILE"
 fi
 
+USER_CONFIGFILES=()
+if [[ -n "${LEARNING_EFFECTIVE_CONFIG:-}" ]]; then
+  if [[ ! -f "${LEARNING_EFFECTIVE_CONFIG}" || ! -s "${LEARNING_EFFECTIVE_CONFIG}" ]]; then
+    echo "Effective config is missing or empty: ${LEARNING_EFFECTIVE_CONFIG}" >&2
+    exit 1
+  fi
+  USER_CONFIGFILES+=("${LEARNING_EFFECTIVE_CONFIG}")
+  echo "  effective_config=${LEARNING_EFFECTIVE_CONFIG}"
+elif [[ -n "${LEARNING_CONFIG_OVERLAY:-}" ]]; then
+  if [[ ! -f "${LEARNING_CONFIG_OVERLAY}" || ! -s "${LEARNING_CONFIG_OVERLAY}" ]]; then
+    echo "Configured overlay is missing or empty: ${LEARNING_CONFIG_OVERLAY}" >&2
+    exit 1
+  fi
+  USER_CONFIGFILES+=(config.myopic.yaml config.learning.yaml "${LEARNING_CONFIG_OVERLAY}")
+  echo "  config_overlay=${LEARNING_CONFIG_OVERLAY}"
+else
+  USER_CONFIGFILES+=(config.myopic.yaml config.learning.yaml)
+fi
+
 CMD=(
   snakemake
   "-j${SNAKEMAKE_JOBS}"
   "$TARGET_RULE"
   --configfile
-  config.myopic.yaml
-  config.learning.yaml
+  "${USER_CONFIGFILES[@]}"
   "$OVERLAY_FILE"
   --rerun-trigger
   mtime
 )
+
+if [[ "$RUN_MODE" == "branch" ]]; then
+  CMD+=(
+    --allowed-rules
+    solve_sector_networks_myopic_stochastic_branch
+    add_brownfield
+    add_export
+    apply_learning_costs
+    solve_network_myopic
+    export_postsolve_learning_costs
+    export_postsolve_learning_costs_seeded_bootstrap
+    export_stochastic_run_bundle
+    cleanup_stochastic_branch_raw_artifacts
+  )
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   CMD+=(-n)

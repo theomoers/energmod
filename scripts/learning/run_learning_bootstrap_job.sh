@@ -66,6 +66,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+STAGING_LOCK_FILE="${LEARNING_STAGING_LOCK_FILE:-$ROOT_DIR/.snakemake/learning_staging.lock}"
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_bootstrap.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
@@ -194,6 +195,13 @@ if [[ "${#EXTRA_CONFIGFILES[@]}" -gt 0 ]]; then
 fi
 if [[ -n "$SAVE_BOOTSTRAP_STATE" ]]; then
   echo "  save_bootstrap_state=$SAVE_BOOTSTRAP_STATE"
+fi
+
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$(dirname "$STAGING_LOCK_FILE")"
+  exec 9>"$STAGING_LOCK_FILE"
+  flock 9
+  echo "  staging_lock=$STAGING_LOCK_FILE"
 fi
 
 cd "$ROOT_DIR"

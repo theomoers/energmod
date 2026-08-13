@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_branch_prereqs_job.sh [--scenario-name NAME] [--overlay-config PATH] [--save-bootstrap-state PATH] [--dry-run]
+  bash scripts/learning/run_learning_branch_prereqs_job.sh [--scenario-name NAME] [--overlay-config PATH] [--bootstrap-state-source PATH] [--reuse-resources-from PATH] [--save-bootstrap-state PATH] [--dry-run]
 
 Environment variables:
   JOBS                 Snakemake parallelism override
@@ -16,13 +16,15 @@ Environment variables:
                        --scenario-name creates a separate result dir
 
 This builds the shared 2030+ prenetwork export inputs once before launching the
-seed-specific stochastic branch array.
+seed-specific stochastic branch array. A bootstrap state source can be restored
+into a fresh scenario before building the future shared inputs.
 USAGE
 }
 
 DRY_RUN=0
 SCENARIO_NAME=""
 SAVE_BOOTSTRAP_STATE=""
+BOOTSTRAP_STATE_SOURCE=""
 EXTRA_CONFIGFILES=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +48,14 @@ while [[ $# -gt 0 ]]; do
       EXTRA_CONFIGFILES+=("$2")
       shift 2
       ;;
+    --bootstrap-state-source)
+      if [[ $# -lt 2 ]]; then
+        echo "--bootstrap-state-source requires an argument" >&2
+        exit 1
+      fi
+      BOOTSTRAP_STATE_SOURCE="$2"
+      shift 2
+      ;;
     --save-bootstrap-state)
       if [[ $# -lt 2 ]]; then
         echo "--save-bootstrap-state requires an argument" >&2
@@ -67,6 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+STAGING_LOCK_FILE="${LEARNING_STAGING_LOCK_FILE:-$ROOT_DIR/.snakemake/learning_staging.lock}"
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
 OVERLAY_FILE="$(mktemp "$TMPDIR_ROOT/energymod_learning_branch_prereqs.XXXXXX.yaml")"
 trap 'rm -f "$OVERLAY_FILE"' EXIT
@@ -178,6 +189,12 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   CMD+=(-n)
 fi
 
+if [[ "$DRY_RUN" -eq 0 && -n "$BOOTSTRAP_STATE_SOURCE" ]]; then
+  python "$ROOT_DIR/scripts/learning/bootstrap_state_store.py" restore \
+    --source-dir "$BOOTSTRAP_STATE_SOURCE" \
+    --target-sector-dir "$ROOT_DIR/results/$JOB_SECTOR_NAME"
+fi
+
 echo "Running shared stochastic branch prerequisites:"
 echo "  sector_name=$JOB_SECTOR_NAME"
 echo "  jobs=$SNAKEMAKE_JOBS"
@@ -190,8 +207,18 @@ echo "  overlay=$OVERLAY_FILE"
 if [[ "${#EXTRA_CONFIGFILES[@]}" -gt 0 ]]; then
   echo "  extra_configfiles=${EXTRA_CONFIGFILES[*]}"
 fi
+if [[ -n "$BOOTSTRAP_STATE_SOURCE" ]]; then
+  echo "  bootstrap_state_source=$BOOTSTRAP_STATE_SOURCE"
+fi
 if [[ -n "$SAVE_BOOTSTRAP_STATE" ]]; then
   echo "  save_bootstrap_state=$SAVE_BOOTSTRAP_STATE"
+fi
+
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$(dirname "$STAGING_LOCK_FILE")"
+  exec 9>"$STAGING_LOCK_FILE"
+  flock 9
+  echo "  staging_lock=$STAGING_LOCK_FILE"
 fi
 
 cd "$ROOT_DIR"

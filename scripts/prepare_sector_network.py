@@ -4333,6 +4333,11 @@ if __name__ == "__main__":
     # after add_existing_baseyear/add_brownfield so downstream stock edits cannot undo it.
     # Clip within-country onwind availability outliers before capacity constraints.
     apply_country_onwind_mean_cf_caps(n, investment_year)
+    # Apply the ±CF sensitivity only after all baseline profile calibration and
+    # outlier capping, so this is the final wind/solar availability adjustment.
+    _validation_hooks.apply_wind_solar_capacity_factor_multipliers(
+        n, investment_year, snakemake.config
+    )
     # Legacy compatibility hook; the actual nodal_distribution_limit is now enforced
     # as a solve-time linear constraint in solve_network/validation.
     apply_renewable_nodal_share_caps(n, investment_year, snakemake.config)
@@ -4358,16 +4363,19 @@ if __name__ == "__main__":
 
     adjust_hydro(n, investment_year, snakemake.config)
     
-    # Match geothermal capacity to CSV data by country
-    geothermal_csv = snakemake.input.geothermal_capacity
-
-    regions_shapefile = snakemake.input.shapes_path
-    
-    match_geothermal_capacity_from_csv(
-        n, 2020, geothermal_csv, 
-        costs=costs,
-        regions_shapefile=regions_shapefile
-    ) # based on owid data
+    # Match the baseyear geothermal stock to the 2020 reference. The 2025
+    # historical stock is materialised later in add_brownfield; future years
+    # must instead inherit and expand the preceding solved stock.
+    if investment_year == 2020:
+        geothermal_csv = snakemake.input.geothermal_capacity
+        regions_shapefile = snakemake.input.shapes_path
+        match_geothermal_capacity_from_csv(
+            n,
+            2020,
+            geothermal_csv,
+            costs=costs,
+            regions_shapefile=regions_shapefile,
+        )
     
 
     # Apply country-specific WACCs to ALL renewable generators (must be last to catch all generators)

@@ -1,0 +1,5 @@
+global_specific:
+  wind_solar_capacity_factor_multipliers:
+    enable: true
+    solar: 1.20
+    wind: 1.20

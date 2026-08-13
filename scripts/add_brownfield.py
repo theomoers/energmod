@@ -477,7 +477,7 @@ def materialize_year2025_historical_capacities(n, year, config):
 def freeze_year2025_historical_electric_assets(n):
     """Fix selected 2025 historical electricity assets at their materialized stock."""
     generator_carriers = {"solar", "onwind", "offwind-ac", "offwind-dc", "geothermal"}
-    link_carriers = {"biomass", "biomass EOP", "urban central solid biomass CHP", "urban central solid biomass CHP CC", "CCGT", "coal", "lignite", "OCGT"}
+    link_carriers = {"biomass", "biomass EOP", "urban central solid biomass CHP", "urban central solid biomass CHP CC", "CCGT", "coal", "lignite", "OCGT", "H2 Fuel Cell", "battery charger", "battery discharger"}
 
     if hasattr(n, "generators") and not n.generators.empty:
         generators = n.generators
@@ -682,12 +682,13 @@ if __name__ == "__main__":
 
     materialize_year2025_historical_capacities(n, year, snakemake.config)
 
-    for carrier in ['coal', 'gas', 'oil']:
-        fuel_gens = n.generators.index[n.generators.carrier == carrier]
-        
-        if not fuel_gens.empty:
-            n.generators.loc[fuel_gens, "p_nom"] = n.generators.loc[fuel_gens, "p_nom_min"]
-            logger.info(f"Set {len(fuel_gens)} {carrier} generators' p_nom to p_nom_min")
+    if year <= 2025:
+        for carrier in ["coal", "gas", "oil"]:
+            fuel_gens = n.generators.index[n.generators.carrier == carrier]
+
+            if not fuel_gens.empty:
+                n.generators.loc[fuel_gens, "p_nom"] = n.generators.loc[fuel_gens, "p_nom_min"]
+                logger.info(f"Set {len(fuel_gens)} {carrier} generators p_nom to p_nom_min")
 
     # adjust battery capacity with build year 2025 based on csv
     if year == 2025:
@@ -745,6 +746,12 @@ if __name__ == "__main__":
 
     if year == 2025:
         freeze_year2025_historical_electric_assets(n)
+
+    if hasattr(_validation_hooks, "remove_fixed_zero_capacity_components"):
+        _validation_hooks.remove_fixed_zero_capacity_components(
+            n,
+            context=f"add_brownfield {year} export",
+        )
 
     disable_grid_expansion_if_limit_hit(n)
 

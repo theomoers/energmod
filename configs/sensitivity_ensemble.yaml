@@ -6,28 +6,26 @@
 #     L2_WAY_RHO035:                              1000
 #     L1_CGRW:                                    1000
 #
-#   New sensitivities in this file:               5100
-#   Total suite after completion:                 8100
+#   New sensitivities in this file:               5500
+#   Total suite after completion:                 8500
 #
 # The baseline block below is the inheritance/reference configuration.
 # Do not resubmit BASE if the 1000-draw baseline has already completed.
 
 ensemble:
-  name: stochastic_learning_sensitivity_ensemble_ne_si_5100
+  name: stochastic_learning_sensitivity_ensemble_ne_si_5500
   scenario_prefix: sens
   base_seed: 20260504
   seed_mode: sequential
   seed_upper_bound: 1000000000
   use_common_random_numbers: true
+  sector_root: Global_200_v8
   default_budget: secondary
   submit_baseline: false
 
 draw_budgets:
-  light: 300
-  secondary: 300
-  joint_lag: 300
-  core: 300
-  architecture: 300
+  core: 250
+  architecture: 250
   completed_headline: 1000
 
 baseline:
@@ -171,7 +169,7 @@ runs:
   - run_id: L4_DETERMINISTIC_LEARNING
     group: learning_model
     description: Median stochastic-learning draw while preserving other stochastic channels
-    budget: secondary
+    budget: core
     model: shared_state_bayesian_regime_wright
     config_overrides:
       learning:
@@ -219,7 +217,7 @@ runs:
   - run_id: WU0_DETERMINISTIC_THRESHOLDS
     group: deployment_threshold_uncertainty
     description: Disable stochastic deployment-threshold shocks while keeping mean wedge calibration
-    budget: secondary
+    budget: core
     config_overrides:
       learning:
         deployment_constraints:
@@ -237,7 +235,7 @@ runs:
   - run_id: D1_LOW_DEMAND
     group: demand
     description: Fossil-era/low-electrification demand scenario
-    budget: architecture
+    budget: core
     run_mode: branch
     bootstrap_group: DF
     config_overrides:
@@ -247,7 +245,7 @@ runs:
   - run_id: D2_HIGH_DEMAND
     group: demand
     description: Fast-electrification/high-demand scenario
-    budget: architecture
+    budget: core
     run_mode: branch
     bootstrap_group: NZ
     config_overrides:
@@ -261,7 +259,7 @@ runs:
   - run_id: F0_DETERMINISTIC_FOSSIL
     group: fossil_prices
     description: Deterministic fossil fuel prices from static cost inputs
-    budget: secondary
+    budget: core
     config_overrides:
       learning:
         fossil_price_uncertainty:
@@ -277,7 +275,7 @@ runs:
     description: Use stochastic learning artifacts trained only to the 2020 origin cutoff
     enabled: false
     disabled_reason: Not used in the revised sensitivity suite; not informative for the paper.
-    budget: secondary
+    budget: core
     config_overrides:
       learning:
         training_window: origin_cutoff
@@ -290,7 +288,7 @@ runs:
   - run_id: K0_POINT_COST
     group: cost_kernel_lags
     description: Use point costs instead of block-average expected costs
-    budget: secondary
+    budget: core
     config_overrides:
       learning:
         cost_expectations:
@@ -299,7 +297,7 @@ runs:
   - run_id: K1_GLOBAL_CURRENT_WINDOW
     group: cost_kernel_lags
     description: Use the same current 5-year expectation window for all learning technologies
-    budget: light
+    budget: core
     config_overrides:
       learning:
         cost_expectations:
@@ -309,7 +307,7 @@ runs:
   - run_id: K2_UNIFORM_KERNEL_WEIGHTS
     group: cost_kernel_lags
     description: Use uniform 5-year cost-expectation kernel weights for all learning technologies
-    budget: light
+    budget: core
     config_overrides:
       learning:
         cost_expectations:
@@ -323,19 +321,19 @@ runs:
   - run_id: JK1_ALL_SHORT_LAGS
     group: joint_kernel_lags
     description: All procurement lags shortened
-    budget: joint_lag
+    budget: core
     config_overrides:
       learning:
         cost_expectations:
           lag_years_by_tech:
             solar_power: 0
-            onwind_power: 2
+            onwind_power: 1
             battery_energy: 0
 
   - run_id: JK2_ALL_LONG_LAGS
     group: joint_kernel_lags
     description: All procurement lags lengthened
-    budget: joint_lag
+    budget: core
     config_overrides:
       learning:
         cost_expectations:
@@ -351,7 +349,9 @@ runs:
   - run_id: P1_BINDING_CO2_CAP
     group: policy_boundary
     description: Year-specific CO2Limit that leaves 2025 historical outcomes unchanged and reaches zero annual power-sector emissions by 2050
-    budget: secondary
+    enabled: false
+    disabled_reason: Not needed in the revised sensitivity suite.
+    budget: core
     run_mode: branch
     bootstrap_group: CO2CAP
     config_overrides:
@@ -382,6 +382,97 @@ runs:
             2050: 0.00
 
   # ---------------------------------------------------------------------------
+  # Transmission-capacity checks.
+  # Future caps apply the configured multiplier to the same GTD-allocated
+  # 2025 country-pair capacity. Domestic country totals are allocated evenly
+  # across domestic AC lines before the multiplier is applied.
+  # ---------------------------------------------------------------------------
+
+  - run_id: TX0_NO_FUTURE_EXPANSION
+    group: transmission
+    bootstrap_group: TX0
+    description: Hold GTD transmission capacity at its allocated 2025 level through 2050
+    budget: core
+    config_overrides:
+      global_specific:
+        transmission_capacity_limits:
+          capacity_multiplier_by_year:
+            2020: 1.0
+            2025: 1.0
+            2030: 1.0
+            2035: 1.0
+            2040: 1.0
+            2045: 1.0
+            2050: 1.0
+
+  - run_id: TX1_HIGH_FUTURE_EXPANSION
+    group: transmission
+    bootstrap_group: TX1
+    description: Double the baseline five-year transmission expansion increments after 2025
+    budget: core
+    config_overrides:
+      global_specific:
+        transmission_capacity_limits:
+          capacity_multiplier_by_year:
+            2020: 1.0
+            2025: 1.0
+            2030: 1.30
+            2035: 1.60
+            2040: 1.90
+            2045: 2.20
+            2050: 2.50
+
+  - run_id: TD0_LOW_DOMESTIC_CAPACITY
+    group: transmission
+    bootstrap_group: TD0
+    description: Allocate 30 percent of each GTD domestic total evenly across domestic lines; future expansion starts from that 2025 allocation
+    budget: core
+    config_overrides:
+      global_specific:
+        transmission_capacity_limits:
+          domestic_capacity_multiplier: 0.30
+
+  - run_id: TD1_HIGH_DOMESTIC_CAPACITY
+    group: transmission
+    bootstrap_group: TD1
+    description: Allocate 150 percent of each GTD domestic total evenly across domestic lines; future expansion starts from that 2025 allocation
+    budget: core
+    config_overrides:
+      global_specific:
+        transmission_capacity_limits:
+          domestic_capacity_multiplier: 1.50
+
+  # ---------------------------------------------------------------------------
+  # Wind/solar capacity-factor checks.
+  # The multiplier is applied in prepare_sector_network after all baseline
+  # profile calibration; existing and brownfield assets inherit it.
+  # ---------------------------------------------------------------------------
+
+  - run_id: CF0_LOW_WIND_SOLAR_CF
+    group: capacity_factors
+    bootstrap_group: CF0
+    description: Reduce wind and solar availability profiles by 20 percent
+    budget: core
+    config_overrides:
+      global_specific:
+        wind_solar_capacity_factor_multipliers:
+          enable: true
+          solar: 0.80
+          wind: 0.80
+
+  - run_id: CF1_HIGH_WIND_SOLAR_CF
+    group: capacity_factors
+    bootstrap_group: CF1
+    description: Increase wind and solar availability profiles by 20 percent, capped at one
+    budget: core
+    config_overrides:
+      global_specific:
+        wind_solar_capacity_factor_multipliers:
+          enable: true
+          solar: 1.20
+          wind: 1.20
+
+  # ---------------------------------------------------------------------------
   # Battery/storage anchor checks.
   # These are the most important additions relative to the previous suite,
   # because the paper's branching-architecture story depends on storage.
@@ -390,7 +481,7 @@ runs:
   - run_id: BA0_NO_STORAGE_ANCHOR
     group: battery_anchor
     description: Remove one-time 2030 battery pipeline anchor
-    budget: secondary
+    budget: core
     config_overrides:
       learning:
         battery_pipeline_anchor:
@@ -399,7 +490,7 @@ runs:
   - run_id: BA1_LOW_STORAGE_ANCHOR
     group: battery_anchor
     description: 50 percent of baseline 2030 battery pipeline anchor
-    budget: architecture
+    budget: core
     config_overrides:
       learning:
         battery_pipeline_anchor:
@@ -410,7 +501,7 @@ runs:
   - run_id: BA2_HIGH_STORAGE_ANCHOR
     group: battery_anchor
     description: 150 percent of baseline 2030 battery pipeline anchor
-    budget: secondary
+    budget: core
     config_overrides:
       learning:
         battery_pipeline_anchor:

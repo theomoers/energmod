@@ -139,6 +139,10 @@ global_specific:
         electricity_demand_baseline_network: results/Global_200_v8/postnetworks/elec_s_200_ec_lcopt_1h_1h_2020_0.071_AB_0.0export_base.nc
         electricity_demand_end_use_link_output_bus_carrier_substrings: ["heat"]
 
+  wind_solar_capacity_factor_multipliers:
+    enable: false
+    solar: 1.0
+    wind: 1.0
   transmission_capacity_limits:
     enable: true
     audit_dir: validation/results
@@ -149,6 +153,7 @@ global_specific:
     missing_pair_policy: zero_capacity
     fallback_ratio: 0.115
     explicit_zero_policy: zero_capacity
+    domestic_capacity_multiplier: 1.0
     capacity_multiplier_by_year: # max possible transmission expansion relative to 2025 capacities. 
       2020: 1.0
       2025: 1.0
@@ -171,16 +176,16 @@ global_specific:
     zero_profile_fallback:
       enable: true
       capacity_alignment: true
-    scale_min: 0.1
-    scale_max: 4.0
-    solar_scale_min: 0.1
-    solar_scale_max: 4.0
-    wind_scale_min: 0.1
-    wind_scale_max: 4.0
-    nuclear_scale_min: 0.1
-    nuclear_scale_max: 4.0
-    hydro_scale_min: 0.1
-    hydro_scale_max: 4.0
+    scale_min: 0.5
+    scale_max: 2.0
+    solar_scale_min: 0.5
+    solar_scale_max: 2.0
+    wind_scale_min: 0.5
+    wind_scale_max: 2.0
+    nuclear_scale_min: 0.5
+    nuclear_scale_max: 2.0
+    hydro_scale_min: 0.5
+    hydro_scale_max: 2.0
     solar_p_max_pu_cap: 1.0
     onwind_p_max_pu_cap: 1.0
     offwind_p_max_pu_cap: 1.0
@@ -236,8 +241,8 @@ global_specific:
     owid_csv: validation/data/owid-energy-data.csv
     carriers: [solar, onwind, offwind]
     min_reference_twh: 1.0
-    min_share_multiplier: 0.1
-    max_share_multiplier: 3.0
+    min_share_multiplier: 0.9
+    max_share_multiplier: 1.3
     fallback_to_load_shares: true
 
   baseyear_generation:
@@ -310,8 +315,8 @@ global_specific:
     energy_calibration_owid_csv: validation/data/owid-elecbalance2025.csv
     energy_calibration_carriers: [solar, onwind, offshore_wind]
     energy_calibration_min_reference_twh: 1.0
-    energy_calibration_min_share_multiplier: 0.1
-    energy_calibration_max_share_multiplier: 3.0
+    energy_calibration_min_share_multiplier: 0.9
+    energy_calibration_max_share_multiplier: 1.3
     fixed_capacity_overshoot_policy: constrain_additions_only
     irena_technology_by_constraint:
       solar: ["Solar photovoltaic"] # excludes CSP / solar thermal
@@ -429,8 +434,27 @@ export:
     fill_time: 24 # hours, for 48h see Hampp2021
     unload_time: 24 # hours for 48h see Hampp2021
 
+fossil_reserves:
+  oil: 0 #TWh Maybe redundant
+
 sector:
   include_heat: true # If false, disables all heat demand and heat infrastructure (heat pumps, thermal storage, district heating, etc.)
+  land_transport_fuel_cell_share:
+    AB_2020: 0.0
+    AB_2025: 0.0
+    AB_2030: 0.002
+    AB_2035: 0.005
+    AB_2040: 0.01
+    AB_2045: 0.02
+    AB_2050: 0.04
+  shipping_hydrogen_share:
+    AB_2020: 0.0
+    AB_2025: 0.0
+    AB_2030: 0.01
+    AB_2035: 0.03
+    AB_2040: 0.06
+    AB_2045: 0.10
+    AB_2050: 0.15
   gas:
     spatial_gas: true # ALWAYS TRUE
     network: false # ALWAYS FALSE for now (NOT USED)
@@ -698,7 +722,7 @@ solving:
       FeasibilityTol: 1.e-4 
       OptimalityTol: 1.e-4 
       ScaleFlag: -1 
-      threads: 16
+      threads: 12
       Seed: 123
       DualReductions: 0
       InfUnbdInfo: 1

@@ -48,6 +48,11 @@ def resolve_configfiles(submit_dir: Path, extra_configfiles: list[str]) -> list[
         return configfiles
 
     metadata = load_submission_metadata(submit_dir)
+    effective_config = metadata.get("effective_config")
+    if effective_config:
+        effective_path = Path(effective_config).resolve()
+        if effective_path.is_file():
+            return [str(effective_path)]
     metadata_configfiles = metadata.get("configfiles", [])
     if metadata_configfiles:
         return [str(Path(cfg).resolve()) for cfg in metadata_configfiles]
@@ -68,6 +73,8 @@ def apply_submission_defaults(args, submit_dir: Path):
         args.grid_ncpus = metadata.get("grid_ncpus", "40")
     if args.grid_submit is None:
         args.grid_submit = metadata.get("grid_submit", "batch")
+    if getattr(args, "grid_array_concurrency", None) is None:
+        args.grid_array_concurrency = metadata.get("grid_array_concurrency", 200)
     return args
 
 
@@ -154,6 +161,9 @@ def build_topup_tasks(
     seed_upper_bound = int(mc_cfg.get("seed_upper_bound", 1000000000) or 1000000000)
 
     target_counts = Counter(str(task["model"]) for task in original_tasks)
+    template_by_model = {}
+    for task in original_tasks:
+        template_by_model.setdefault(str(task["model"]), task)
     used_by_model = used_seeds_by_model(submission_dirs)
     completed_by_model = completed_seeds_by_model(submission_dirs)
 
@@ -175,13 +185,9 @@ def build_topup_tasks(
             raise ValueError(f"Unsupported learning.monte_carlo.seed_mode: {seed_mode}")
 
         for seed in replacements:
-            tasks.append(
-                {
-                    "scenario_name": scenario_name,
-                    "model": model,
-                    "seed": int(seed),
-                }
-            )
+            task = dict(template_by_model[model])
+            task["seed"] = int(seed)
+            tasks.append(task)
             used.add(int(seed))
 
     return scenario_name, tasks, summary
@@ -203,10 +209,11 @@ def write_topup_submission(
     manifest_path = submit_dir / "task_manifest.json"
     manifest_path.write_text(json.dumps(tasks, indent=2, sort_keys=True), encoding="utf-8")
 
+    resolved_sector_name = str(tasks[0].get("resolved_sector_name") or resolve_scenario_sector_name(scenario_name))
     metadata_payload = {
         "scenario_name": scenario_name,
-        "resolved_sector_name": resolve_scenario_sector_name(scenario_name),
-        "resolved_sector_names": [resolve_scenario_sector_name(scenario_name)],
+        "resolved_sector_name": resolved_sector_name,
+        "resolved_sector_names": [resolved_sector_name],
         "run_mode": args.run_mode,
         "source_submission": str(original_submit_dir.resolve()),
         "configfiles": [str(Path(cfg).resolve()) for cfg in configfiles],
@@ -287,6 +294,7 @@ def main() -> int:
     parser.add_argument("--grid-mem")
     parser.add_argument("--grid-ncpus")
     parser.add_argument("--grid-submit")
+    parser.add_argument("--grid-array-concurrency", type=int)
     parser.add_argument("--allow-running", action="store_true")
     parser.add_argument("--print-only", action="store_true")
     parser.add_argument("configfiles", nargs="*")
