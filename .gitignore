@@ -54,6 +54,8 @@ dask-worker-space/
 img/
 logs/
 networks/
+sensitivity_work/
+pilot_battery_subsidy/
 notebooks
 notebooks/
 pypsa/
