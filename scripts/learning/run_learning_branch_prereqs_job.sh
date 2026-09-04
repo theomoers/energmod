@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash scripts/learning/run_learning_branch_prereqs_job.sh [--scenario-name NAME] [--overlay-config PATH] [--bootstrap-state-source PATH] [--reuse-resources-from PATH] [--save-bootstrap-state PATH] [--dry-run]
+  bash scripts/learning/run_learning_branch_prereqs_job.sh [--scenario-name NAME] [--overlay-config PATH] [--bootstrap-state-source PATH] [--force-target PATH]... [--allowed-rule RULE]... [--unlink-path PATH]... [--save-bootstrap-state PATH] [--dry-run]
 
 Environment variables:
   JOBS                 Snakemake parallelism override
@@ -17,7 +17,7 @@ Environment variables:
 
 This builds the shared 2030+ prenetwork export inputs once before launching the
 seed-specific stochastic branch array. A bootstrap state source can be restored
-into a fresh scenario before building the future shared inputs.
+into a fresh scenario before building the future shared inputs. With --force-target, it instead rebuilds only the named output paths. Paths supplied to --unlink-path are relative to the scenario result directory and are unlinked after restore, before Snakemake runs; this prevents a restored hardlink from being modified in the source state.
 USAGE
 }
 
@@ -26,6 +26,9 @@ SCENARIO_NAME=""
 SAVE_BOOTSTRAP_STATE=""
 BOOTSTRAP_STATE_SOURCE=""
 EXTRA_CONFIGFILES=()
+FORCE_TARGETS=()
+ALLOWED_RULES=()
+UNLINK_PATHS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
@@ -54,6 +57,36 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       BOOTSTRAP_STATE_SOURCE="$2"
+      shift 2
+      ;;
+    --force-target)
+      if [[ $# -lt 2 ]]; then
+        echo "--force-target requires an argument" >&2
+        exit 1
+      fi
+      FORCE_TARGETS+=("$2")
+      shift 2
+      ;;
+    --allowed-rule)
+      if [[ $# -lt 2 ]]; then
+        echo "--allowed-rule requires an argument" >&2
+        exit 1
+      fi
+      ALLOWED_RULES+=("$2")
+      shift 2
+      ;;
+    --unlink-path)
+      if [[ $# -lt 2 ]]; then
+        echo "--unlink-path requires an argument" >&2
+        exit 1
+      fi
+      case "$2" in
+        /*|*".."*)
+          echo "--unlink-path must be a relative path below the scenario result directory: $2" >&2
+          exit 1
+          ;;
+      esac
+      UNLINK_PATHS+=("$2")
       shift 2
       ;;
     --save-bootstrap-state)
@@ -172,7 +205,16 @@ EOF2
 CMD=(
   snakemake
   "-j${SNAKEMAKE_JOBS}"
-  solve_sector_networks_myopic_stochastic_shared_inputs
+)
+
+if [[ "${#FORCE_TARGETS[@]}" -gt 0 ]]; then
+  CMD+=("${FORCE_TARGETS[@]}")
+else
+  CMD+=(solve_sector_networks_myopic_stochastic_shared_inputs)
+fi
+
+CMD=(
+  "${CMD[@]}"
   --configfile
   config.myopic.yaml
   config.learning.yaml
@@ -185,6 +227,14 @@ CMD=(
   mtime
 )
 
+if [[ "${#FORCE_TARGETS[@]}" -gt 0 ]]; then
+  CMD+=(--forcerun "${FORCE_TARGETS[@]}")
+fi
+
+if [[ "${#ALLOWED_RULES[@]}" -gt 0 ]]; then
+  CMD+=(--allowed-rules "${ALLOWED_RULES[@]}")
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   CMD+=(-n)
 fi
@@ -193,6 +243,12 @@ if [[ "$DRY_RUN" -eq 0 && -n "$BOOTSTRAP_STATE_SOURCE" ]]; then
   python "$ROOT_DIR/scripts/learning/bootstrap_state_store.py" restore \
     --source-dir "$BOOTSTRAP_STATE_SOURCE" \
     --target-sector-dir "$ROOT_DIR/results/$JOB_SECTOR_NAME"
+fi
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  for path in "${UNLINK_PATHS[@]}"; do
+    rm -f "$ROOT_DIR/results/$JOB_SECTOR_NAME/$path"
+  done
 fi
 
 echo "Running shared stochastic branch prerequisites:"
@@ -209,6 +265,15 @@ if [[ "${#EXTRA_CONFIGFILES[@]}" -gt 0 ]]; then
 fi
 if [[ -n "$BOOTSTRAP_STATE_SOURCE" ]]; then
   echo "  bootstrap_state_source=$BOOTSTRAP_STATE_SOURCE"
+fi
+if [[ "${#FORCE_TARGETS[@]}" -gt 0 ]]; then
+  echo "  force_targets=${FORCE_TARGETS[*]}"
+fi
+if [[ "${#ALLOWED_RULES[@]}" -gt 0 ]]; then
+  echo "  allowed_rules=${ALLOWED_RULES[*]}"
+fi
+if [[ "${#UNLINK_PATHS[@]}" -gt 0 ]]; then
+  echo "  unlink_paths=${UNLINK_PATHS[*]}"
 fi
 if [[ -n "$SAVE_BOOTSTRAP_STATE" ]]; then
   echo "  save_bootstrap_state=$SAVE_BOOTSTRAP_STATE"

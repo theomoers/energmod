@@ -26,7 +26,11 @@
 *.xlsx
 *.org\
 
-
+.tmp*
+python.e*
+python.o*
+python.pe*
+python.po*
 *.sh.e*
 *.sh.o*
 *.sh.pe*
@@ -81,6 +85,12 @@ bootstrap-states/
 scripts/learning/tests/
 scripts/learning/test_*.py
 validation/scripts/test_*.py
+
+# Keep the focused solver/config and validation regression suites versioned.
+!scripts/learning/tests/
+scripts/learning/tests/*
+!scripts/learning/tests/test_learning_timeout_and_topup.py
+!validation/scripts/test_demand_transmission_alignment.py
 
 # Specific configuration files
 configs/*

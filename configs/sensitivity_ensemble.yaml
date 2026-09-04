@@ -6,8 +6,8 @@
 #     L2_WAY_RHO035:                              1000
 #     L1_CGRW:                                    1000
 #
-#   New sensitivities in this file:               5500
-#   Total suite after completion:                 8500
+#   New sensitivities in this file:               6700
+#   Total suite after completion:                 9700
 #
 # The baseline block below is the inheritance/reference configuration.
 # Do not resubmit BASE if the 1000-draw baseline has already completed.
@@ -24,8 +24,9 @@ ensemble:
   submit_baseline: false
 
 draw_budgets:
-  core: 250
+  core: 300
   architecture: 250
+  profile_scale_cap: 100
   completed_headline: 1000
 
 baseline:
@@ -471,6 +472,20 @@ runs:
           enable: true
           solar: 1.20
           wind: 1.20
+
+  - run_id: CF2_SOLAR_WIND_PROFILE_CAP_150
+    group: capacity_factors
+    bootstrap_group: CF2
+    description: Cap country-level calibrated solar and wind profile multipliers at 1.5 (floor retained at 0.5)
+    budget: profile_scale_cap
+    config_overrides:
+      global_specific:
+        renewable_profile_tuning:
+          override_csv: validation/data/renewable_profile_tuning_overrides_solar_wind_0p5_1p5.csv
+          solar_scale_min: 0.50
+          solar_scale_max: 1.50
+          wind_scale_min: 0.50
+          wind_scale_max: 1.50
 
   # ---------------------------------------------------------------------------
   # Battery/storage anchor checks.

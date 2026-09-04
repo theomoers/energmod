@@ -171,14 +171,20 @@ def mirror_tree(
     target_dir = target_dir.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     summary = MirrorSummary()
-    for src in sorted(source_dir.rglob("*")):
-        if exclude_path is not None and exclude_path(src):
-            continue
-        if src.is_dir():
-            continue
-        rel = src.relative_to(source_dir)
-        dst = target_dir / rel
-        _mirror_file(src, dst, hardlink_first=hardlink_first, summary=summary)
+    for current_root, dirnames, filenames in os.walk(source_dir, topdown=True, followlinks=False):
+        current_dir = Path(current_root)
+        dirnames.sort()
+        if exclude_path is not None:
+            dirnames[:] = [
+                name for name in dirnames if not exclude_path(current_dir / name)
+            ]
+        for filename in sorted(filenames):
+            src = current_dir / filename
+            if exclude_path is not None and exclude_path(src):
+                continue
+            rel = src.relative_to(source_dir)
+            dst = target_dir / rel
+            _mirror_file(src, dst, hardlink_first=hardlink_first, summary=summary)
     return summary
 
 
@@ -298,10 +304,17 @@ def save_bootstrap_state(
 ) -> dict[str, object]:
     source_sector_dir = _require_directory(source_sector_dir, "Bootstrap source sector directory")
     required_counts = validate_state_source(source_sector_dir, required_patterns=required_patterns)
-    results_excluder = _build_nested_scenario_excluder(
+    results_allowlist_excluder = _build_toplevel_dir_allowlist_excluder(
+        source_sector_dir,
+        shared_dir_names=DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS,
+    )
+    nested_results_excluder = _build_nested_scenario_excluder(
         source_sector_dir,
         shared_dir_names=DEFAULT_RESULTS_SHARED_TOPLEVEL_DIRS,
         scenario_markers=DEFAULT_RESULTS_SCENARIO_MARKERS,
+    )
+    results_excluder = lambda path: (
+        results_allowlist_excluder(path) or nested_results_excluder(path)
     )
     summaries = [
         mirror_tree(
@@ -436,6 +449,7 @@ def main() -> int:
         action="store_true",
         help="Require only exported branch prerequisite prenetworks, not full bootstrap markers.",
     )
+    save_parser.add_argument("--dry-run", action="store_true", help="Validate source and target without copying files.")
 
     restore_parser = subparsers.add_parser("restore", help="Restore bootstrap/prereq state into a results sector")
     restore_parser.add_argument("--source-dir", required=True)
@@ -443,10 +457,25 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "save":
+        source_sector_dir = Path(os.path.expandvars(args.source_sector_dir))
+        target_dir = Path(os.path.expandvars(args.target_dir))
+        required_patterns = PREREQ_REQUIRED_PATTERNS if args.prereq_only else DEFAULT_REQUIRED_PATTERNS
+        if args.dry_run:
+            required_counts = validate_state_source(source_sector_dir, required_patterns=required_patterns)
+            if target_dir.exists():
+                raise FileExistsError(f"Dry-run target already exists: {target_dir.resolve()}")
+            print(json.dumps({
+                "dry_run": True,
+                "source_dir": str(source_sector_dir.resolve()),
+                "target_dir": str(target_dir.resolve()),
+                "required_artifact_counts": required_counts,
+                "writes": [],
+            }, indent=2, sort_keys=True))
+            return 0
         result = save_bootstrap_state(
-            Path(os.path.expandvars(args.source_sector_dir)),
-            Path(os.path.expandvars(args.target_dir)),
-            required_patterns=PREREQ_REQUIRED_PATTERNS if args.prereq_only else DEFAULT_REQUIRED_PATTERNS,
+            source_sector_dir,
+            target_dir,
+            required_patterns=required_patterns,
         )
     else:
         result = restore_bootstrap_state(

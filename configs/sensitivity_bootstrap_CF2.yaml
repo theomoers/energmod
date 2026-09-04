@@ -1,0 +1,11 @@
+# Isolated prerequisite overlay for the country-level renewable-profile
+# calibration cap sensitivity. The dedicated CSV caps solar and wind only;
+# nuclear and hydro retain the baseline table and bounds.
+global_specific:
+  renewable_profile_tuning:
+    enable: true
+    override_csv: validation/data/renewable_profile_tuning_overrides_solar_wind_0p5_1p5.csv
+    solar_scale_min: 0.50
+    solar_scale_max: 1.50
+    wind_scale_min: 0.50
+    wind_scale_max: 1.50

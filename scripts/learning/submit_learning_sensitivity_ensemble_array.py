@@ -131,14 +131,22 @@ def seed_list_for_run(
     seed_mode: str,
     seed_upper_bound: int,
     common_random_numbers: bool,
+    seed_start: int = 0,
 ) -> list[int]:
     if n_draws <= 0:
         raise ValueError("draw count must be positive")
+    if seed_start < 0:
+        raise ValueError("seed_start must be non-negative")
     if seed_mode == "sequential":
         if common_random_numbers:
-            return list(range(n_draws))
-        return [stable_uint32(base_seed, run_id, draw_id) for draw_id in range(n_draws)]
+            return list(range(seed_start, seed_start + n_draws))
+        return [
+            stable_uint32(base_seed, run_id, draw_id)
+            for draw_id in range(seed_start, seed_start + n_draws)
+        ]
     if seed_mode == "random":
+        if seed_start:
+            raise ValueError("seed_start is supported only with sequential seed mode")
         if n_draws > seed_upper_bound:
             raise ValueError("n_draws cannot exceed seed_upper_bound")
         rng_seed = base_seed if common_random_numbers else stable_uint32(base_seed, run_id)
@@ -275,9 +283,10 @@ def build_tasks(config: dict, args: argparse.Namespace) -> list[dict]:
             seed_mode=seed_mode,
             seed_upper_bound=seed_upper_bound,
             common_random_numbers=common_random_numbers,
+            seed_start=int(args.seed_start),
         )
         run_tasks: list[dict] = []
-        for draw_index, seed in enumerate(seeds):
+        for draw_index, seed in enumerate(seeds, start=int(args.seed_start)):
             archive_sector_name = str(run["sector_name"])
             working_sector_name = task_working_sector_name(archive_sector_name, run["model"], int(seed))
             overlay = deepcopy(run["config_overrides"])
@@ -371,8 +380,14 @@ def resolve_archive_sector_names(tasks: list[dict]) -> list[str]:
 def build_grid_run_cmd(args: argparse.Namespace, manifest_path: Path, tasks: list[dict]) -> list[str]:
     task_count = len(tasks)
     grid_array = f"1-{task_count}"
-    array_concurrency = int(args.grid_array_concurrency or DEFAULT_GRID_ARRAY_CONCURRENCY)
-    if task_count > array_concurrency:
+    array_concurrency = (
+        DEFAULT_GRID_ARRAY_CONCURRENCY
+        if args.grid_array_concurrency is None
+        else int(args.grid_array_concurrency)
+    )
+    if array_concurrency < 0:
+        raise ValueError("grid_array_concurrency must be non-negative")
+    if array_concurrency and task_count > array_concurrency:
         grid_array = f"{grid_array}/{array_concurrency}"
     worker_script = str((SCRIPT_DIR / "run_learning_sensitivity_ensemble_array_task.sh").resolve())
     return [
@@ -894,6 +909,7 @@ def run_worker(args: argparse.Namespace) -> None:
         subprocess.run(unlock_cmd, check=True, cwd=job_dir, env=env)
 
     run_cmd = _with_timeout(cmd, runtime, args.dry_run)
+    completed = False
     try:
         try:
             subprocess.run(run_cmd, check=True, cwd=job_dir, env=env)
@@ -909,10 +925,17 @@ def run_worker(args: argparse.Namespace) -> None:
             _copy_compact_bundle_to_archive(task, job_dir)
             _write_draw_complete(task, job_dir)
             _cleanup_working_sector(task, job_dir)
+            completed = True
     finally:
         overlay_path.unlink(missing_ok=True)
+        # Failed draws have no compact completion marker and are eligible for a
+        # later top-up. Preserve the scheduler log, but release their large
+        # per-draw results/resources and staged Snakemake state immediately.
+        if not args.dry_run and not completed:
+            _cleanup_working_sector(task, job_dir)
+            shutil.rmtree(job_dir, ignore_errors=True)
 
-    if not args.dry_run:
+    if not args.dry_run and completed:
         shutil.rmtree(job_dir)
 
 
@@ -923,6 +946,12 @@ def main() -> None:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--budget", help="Override all run budgets using any key in draw_budgets, or 'custom' with --n-draws")
     parser.add_argument("--n-draws", type=int)
+    parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=0,
+        help="First sequential learning seed. Use to append non-overlapping draws.",
+    )
     parser.add_argument(
         "--test-draws-per-run",
         type=int,
@@ -957,7 +986,8 @@ def main() -> None:
         type=int,
         help=(
             f"Maximum concurrent SGE array tasks. Defaults to {DEFAULT_GRID_ARRAY_CONCURRENCY}; "
-            "draws are isolated into per-task working sectors so same-spec draws can run concurrently."
+            "pass 0 for no limit. Draws are isolated into per-task working sectors so "
+            "same-spec draws can run concurrently."
         ),
     )
     parser.add_argument(
